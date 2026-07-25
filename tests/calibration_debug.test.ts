@@ -107,16 +107,26 @@ describe('calibrateDebugSuggestions', () => {
     const m = sugs.find((s) => s.code === 'pip-resolver')!;
     expect(m).toBeTruthy();
     expect(m.hint).toMatch(/scikit-learn|opencv-python/);
-  });
+});
 
-  it('catches replace_in_file no-op self-feedback', () => {
-    const sugs = calibrateDebugSuggestions(
-      `tool calls:\n  - replace_in_file FAIL no-op edit refused: find === replace`,
-    );
-    expect(sugs.find((s) => s.code === 'replace-no-op')).toBeTruthy();
-  });
+it('catches replace_in_file no-op self-feedback', () => {
+  const sugs = calibrateDebugSuggestions(
+    `tool calls:\n  - replace_in_file FAIL no-op edit refused: find === replace`,
+  );
+  expect(sugs.find((s) => s.code === 'replace-no-op')).toBeTruthy();
+});
 
-  it('requires patch and run_program verification for network API failures', () => {
+it('catches replace_in_file missing-path self-feedback', () => {
+  const sugs = calibrateDebugSuggestions(
+    `tool calls:\n  - replace_in_file FAIL invalid replace_in_file args: path must be a non-empty string`,
+  );
+  const fix = sugs.find((s) => s.code === 'replace-missing-path');
+  expect(fix).toBeTruthy();
+  expect(fix!.hint).toMatch(/args\.path/);
+  expect(fix!.hint).toMatch(/writable allowlist/);
+});
+
+it('requires patch and run_program verification for network API failures', () => {
     const sugs = calibrateDebugSuggestions(
       `Network API failure detected. Evidence: 403 Client Error: Forbidden for url: https://timor.tech/api/holiday/`,
     );

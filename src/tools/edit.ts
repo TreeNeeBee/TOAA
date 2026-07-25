@@ -12,9 +12,9 @@ export const replaceInFileTool: Tool<
   { path: string; find: string; replace: string; expectedCount?: number },
   { occurrences: number }
 > = {
-  name: 'replace_in_file',
-  description: '把当前 Step writable allowlist 内目标文件的 find 字符串精确替换为 replace（默认要求出现 1 次）。',
-  argsSchema: { path: 'string', find: 'string', replace: 'string', expectedCount: 'number?' },
+ name: 'replace_in_file',
+ description: '把当前 Step writable allowlist 内目标文件的 find 字符串精确替换为 replace（默认要求出现 1 次）。必须提供 args.path（目标文件相对路径，取自 writable allowlist）、args.find、args.replace 三个字符串参数；缺少 path 会被拒绝。',
+ argsSchema: { path: 'string', find: 'string', replace: 'string', expectedCount: 'number?' },
   async run(args, ctx) {
     if (!args || typeof args.path !== 'string' || args.path.trim() === '') {
       return { ok: false, error: 'invalid replace_in_file args: path must be a non-empty string' };

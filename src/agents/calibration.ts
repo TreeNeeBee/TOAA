@@ -1448,21 +1448,30 @@ const PYTHON_ERROR_RULES: SuggestionRule[] = [
     build: () =>
       `[UnicodeDecodeError] 打开二进制文件用 \`open(..., "rb")\`；文本读 UTF-8 显式 \`encoding="utf-8"\`，` +
       `必要时加 \`errors="replace"\`。`,
-  },
+ },
 
-  // —— Executor 工具反馈 ——————————————————————————————
-  {
-    code: 'replace-no-op',
-    severity: 1,
-    patterns: [/no-op edit refused: find === replace/],
-    build: () =>
-      `[replace_in_file 被拒：find===replace] 你提交了无意义的相同字符串替换。` +
-      `请先 \`read_file\` 看清原文，再给出**真正不同**的 replace；如只是想确认内容用 \`read_file\`，不要走 \`replace_in_file\`。`,
-  },
-  {
-    code: 'replace-not-found',
-    severity: 2,
-    patterns: [/expected \d+ occurrences of find, found 0 in/],
+// —— Executor 工具反馈 ——————————————————————————————
+{
+  code: 'replace-missing-path',
+  severity: 1,
+  patterns: [/invalid replace_in_file args: path must be a non-empty string/i],
+  build: () =>
+    `[replace_in_file 缺少 path] 你调用了 replace_in_file 但没有提供 args.path。` +
+    `args.path 是目标文件的相对路径（取自当前 Step writable allowlist），必填且不能为空。` +
+    `请从 writable allowlist 或 required outputs 中选取目标文件路径，重新提交包含 path、find、replace 三个字段的 replace_in_file 调用。`,
+},
+{
+  code: 'replace-no-op',
+ severity: 1,
+ patterns: [/no-op edit refused: find === replace/],
+ build: () =>
+   `[replace_in_file 被拒：find===replace] 你提交了无意义的相同字符串替换。` +
+   `请先 \`read_file\` 看清原文，再给出**真正不同**的 replace；如只是想确认内容用 \`read_file\`，不要走 \`replace_in_file\`。`,
+ },
+ {
+   code: 'replace-not-found',
+   severity: 2,
+   patterns: [/expected \d+ occurrences of find, found 0 in/],
     build: () =>
       `[replace_in_file: find 未命中] 文件实际内容与你假设不一致。` +
       `立即 \`read_file\` 完整读出该文件，按真实字节构造 find；连续 2 次仍失败请改用 \`write_file\` 整文件重写。`,
