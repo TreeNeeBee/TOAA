@@ -619,6 +619,10 @@ const messages: Messages = {
     sandboxStatus: (r) => `sandbox: ${r}`,
     autoFixedSrcImports: (n, files) => `  ⚠ auto-fixed sys.path bootstrap in ${n} entry file(s): ${files}`,
     debugResumeNotice: (id, n) => `  ↻ ${id} previous session ended FAILED (${n} attempts so far); first round of this run goes straight into Debugger mode.`,
+    cachedTestRevalidationNotice: (id, n) =>
+      `  ↻ ${id} has a cached FAILED result (${n} attempts so far); rerunning its current test gate before any V-model rollback.`,
+    testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
+      `  ↳ ${testId} ${testPhase} gate failed; V-model rollback → ${sourceId} ${sourcePhase} Debugger.`,
     debugResumeInfraRetry: (id, n) => `  ↻ ${id} previous session only recorded LLM provider/connectivity failures (${n} attempt(s)); clearing the stale debug cache entry and rerunning the step normally.`,
     spinDebugRetry: (id, attempt, budget, cap, reason) => `🛠  ${id} DEBUG retry ${attempt}/${budget} (cap=${cap}) — ${reason}`,
     retryException: (a, b, msg) => `retry ${a}/${b} threw: ${msg}`,
@@ -870,10 +874,14 @@ Return strict JSON StepPlan for the current phase only.`,
       'Invalid DEBUG issue completion: issueResolutionPlan is required before the issue can be resolved. Return JSON with a concise handling plan plus the needed repair or verification actions.',
   },
   skills: {
-    patcher: 'Use apply_patch / replace_in_file for small in-place edits to existing files; never overwrite a whole file.',
-    author: 'Use write_file to create new files; prefer paths inside the current Step writable allowlist.',
+    patcher:
+      'Use apply_patch / replace_in_file for small in-place edits to existing files; never overwrite a whole file. ' +
+      'replace_in_file requires args.path, args.find, and args.replace together. path must be a concrete workspace-relative file in the current Step writable allowlist; read_file that same path first when its current bytes are uncertain.',
+    author:
+      'Use write_file to create new files. It requires a non-empty args.path and string args.content; path must be a concrete workspace-relative path from the current Step outputs or writable allowlist.',
     tester:
       'Write and run pytest tests verifying function behaviour; on failure parse with analyze_error. ' +
+      '[Path contract] Every read_file/write_file/append_file/replace_in_file call must include a concrete workspace-relative args.path; never omit it, use a path outside the project, or pass a directory as a file. ' +
       '[Self-contained fixtures] Tests **must NOT** open() a sample file that does not exist on disk. ' +
       'When the target function needs file input, first reuse a real user/workspace sample; if none exists, use http_fetch to get a small reference sample from official docs, the upstream repository, or a public standard/example, ' +
       'save it under tests/fixtures/<name>, and record the source. Only for simple text formats such as CSV/JSON/INI may you construct a minimal pytest tmp_path sample and immediately run_tests. ' +
@@ -885,12 +893,15 @@ Return strict JSON StepPlan for the current phase only.`,
     dep_resolver: 'On ModuleNotFoundError, use add_dependency to write the package back into requirements.txt and rebuild the sandbox.',
     debugger:
       'First run_tests / run_python to reproduce the error → analyze_error → patch / replace_in_file / add_dependency to fix → run_tests again. Make the smallest possible change each round. ' +
+      '[Path contract] File tools require a concrete workspace-relative args.path. replace_in_file requires path/find/replace together, and path must come from the current Step writable allowlist. ' +
       '[Missing dependencies] Add the real dependency or use the real library selected by the design; never fake modules/classes/functions, empty implementations, or fallback mocks in production src/ code. ' +
       '[Fixture discipline] If tests fail with behavioural assertions, do not keep rewriting fixtures. Only change fixtures for clear missing-file, malformed-fixture, or fixture parse errors; otherwise fix source code, contracts, dependencies, or the incorrect assertion. ' +
       '[Network/API failures] Locate the failing URL, try only a small number of replacement API probes, then patch the source and run_program to prove the entrypoint no longer emits API failure. ' +
       '[Important] If replace_in_file on the same file fails ≥ 2 times in a row, switch to read_file and then patch or rewrite within the current runtime chunk limit; stop guessing the find string. ' +
       '[No no-ops] replace_in_file find and replace must differ — if you only want to "verify" a snippet, use read_file; do not submit identical-string replacements.',
-    refactorer: 'Refactors must preserve behaviour: run regression tests → modify → run regression tests again.',
+    refactorer:
+      'Refactors must preserve behaviour: run regression tests → modify → run regression tests again. ' +
+      'Every file tool requires a concrete workspace-relative args.path; read_file the same target before a local replacement to confirm its current bytes.',
   },
   doctor: {
     cliDescription: 'check that config / LLM / sandbox / skills are ready',

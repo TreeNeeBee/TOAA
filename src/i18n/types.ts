@@ -346,6 +346,8 @@ export interface Messages {
     sandboxStatus: (reason: string) => string;
     autoFixedSrcImports: (n: number, files: string) => string;
     debugResumeNotice: (id: string, n: number) => string;
+    cachedTestRevalidationNotice: (id: string, n: number) => string;
+    testRollbackNotice: (testId: string, testPhase: string, sourceId: string, sourcePhase: string) => string;
     debugResumeInfraRetry: (id: string, n: number) => string;
     spinDebugRetry: (id: string, attempt: number, budget: number, cap: number, reason: string) => string;
     retryException: (attempt: number, budget: number, msg: string) => string;

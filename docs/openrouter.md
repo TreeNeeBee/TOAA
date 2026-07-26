@@ -50,6 +50,7 @@ llm:
       api_key: ${OPENROUTER_API_KEY}
       base_url: https://openrouter.ai/api/v1
       model: openrouter/free
+      context_window: 128K
       tags: [cluster]
       connect_timeout_ms: 60000
       request_timeout_ms: 900000
@@ -73,6 +74,13 @@ If an OpenAI-compatible request fails, XCompiler reports the provider, model, ba
 
 The three network timeouts cover different stages: `connect_timeout_ms` controls DNS/TCP/TLS establishment, `stream_first_token_timeout_ms` allows slow model startup, and `stream_idle_timeout_ms` detects a stalled stream after output has begun. Increase only the stage that actually timed out.
 
+`context_window` is the model's combined input and output capacity in tokens. It
+accepts values such as `131072` or `128K`; an empty or omitted value defaults to
+128K. XCompiler recalculates response, `read_file`, write-content, and tool
+feedback windows before the primary provider starts and whenever fallback
+switches to another provider. For routed providers, configure a conservative
+window supported by the possible route targets.
+
 ## 3. Choose A Free Model
 
 OpenRouter free models normally use model ids ending with `:free`.
@@ -85,11 +93,13 @@ providers:
     api_key: ${OPENROUTER_API_KEY}
     base_url: https://openrouter.ai/api/v1
     model: qwen/qwen3-coder:free
+    context_window: 128K
   openrouter_free:
     type: openai
     api_key: ${OPENROUTER_API_KEY}
     base_url: https://openrouter.ai/api/v1
     model: openrouter/free
+    context_window: 128K
     tags: [cluster]
 ```
 
@@ -129,6 +139,7 @@ local_openai:
   api_key: ${LOCAL_OPENAI_API_KEY}
   base_url: ${LOCAL_OPENAI_BASE_URL}
   model: ${LOCAL_OPENAI_MODEL}
+  context_window: 128K
 ```
 
 For no-auth local servers, set `LOCAL_OPENAI_API_KEY=` or leave the provider `api_key` empty.
@@ -140,6 +151,7 @@ ollama_code:
   type: ollama
   base_url: ${OLLAMA_BASE_URL}
   model: ${OLLAMA_CODE_MODEL}
+  context_window: 128K
   think: false
 ```
 

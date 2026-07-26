@@ -89,6 +89,7 @@ The default template uses OpenRouter Free mode through a `type: openai` OpenAI-c
 ```yaml
 model: openrouter/free
 base_url: https://openrouter.ai/api/v1
+context_window: 128K
 ```
 
 `config.yaml`, `llm_scores.yaml`, and `llm_scores_user.yaml` are local files and are intentionally not committed. The npm package ships `config.example.yaml` and `.env.example` as templates. `llm_scores.yaml` is XCompiler-maintained runtime state; create `llm_scores_user.yaml` only when you want fixed local score overrides such as `provider: 0` to disable one provider.
@@ -177,6 +178,7 @@ LLM routing is configured under `config.yaml -> llm.*`.
 | Field | Default | Effect |
 |---|---|---|
 | `roles.<Role>` | role dependent | Ordered/scored provider chain for Planner, Architect, Coder, Tester, Debugger |
+| `providers.<name>.context_window` | `128K` | Model input+output context capacity; accepts token counts such as `131072`, `128K`, or an empty value for the default |
 | `scores.<provider>` | `1.0` | Backward-compatible initial score; prefer `llm_scores_user.yaml` for manual overrides |
 | `llm_scores_user.yaml` | absent | Local user score overrides; `0` disables, `0.1..1` fixes effective priority |
 | `cluster_score_min/max` | `0.2..0.5` | Dynamic score band for providers tagged `cluster`; user overrides may still use `0.1..1` |
@@ -188,7 +190,7 @@ LLM routing is configured under `config.yaml -> llm.*`.
 | `max_debug_retries` | `3` | Debug retry attempts |
 | `--debug-wiki-path <dir>` | XCompiler path `.xcompiler/debug-wiki` | Shared layered debug wiki root |
 | `max_edit_lines_per_step` | `auto` | Adaptive EditGuard cumulative write-line budget |
-| `max_write_chunk_bytes` | `auto` | Adaptive per-call write chunk budget |
+| `max_write_chunk_bytes` | `auto` | Per-call write budget derived from the active Provider context window and current prompt; a number remains a hard override |
 | `agent.sandboxes.<language>.<local\|docker>.limits.network` | `download-only` | Docker supports enforceable `off`; subprocess rejects `off` instead of claiming isolation it cannot provide |
 
 ---

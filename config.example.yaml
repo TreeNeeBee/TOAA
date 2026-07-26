@@ -10,6 +10,8 @@ llm:
       api_key: ${OPENROUTER_API_KEY}
       base_url: https://openrouter.ai/api/v1
       model: openrouter/free
+      # Input + output context capacity. Empty/omitted values default to 128K tokens.
+      context_window: 128K
       tags: [cluster]
       # If a provider rejects json_object, set: json_response_format: json_schema
       connect_timeout_ms: 60000
@@ -24,6 +26,7 @@ llm:
     #   api_key: ${LOCAL_OPENAI_API_KEY}
     #   base_url: ${LOCAL_OPENAI_BASE_URL}
     #   model: ${LOCAL_OPENAI_MODEL}
+    #   context_window: 128K
     #   connect_timeout_ms: 60000
     #   request_timeout_ms: 900000
     #   stream_first_token_timeout_ms: 300000
@@ -34,6 +37,7 @@ llm:
     #   type: ollama
     #   base_url: ${OLLAMA_BASE_URL}
     #   model: ${OLLAMA_DESIGN_MODEL}
+    #   context_window: 128K
     #   request_timeout_ms: 900000
     #   stream_idle_timeout_ms: 300000
     #   think: false
@@ -41,6 +45,7 @@ llm:
     #   type: ollama
     #   base_url: ${OLLAMA_BASE_URL}
     #   model: ${OLLAMA_CODE_MODEL}
+    #   context_window: 128K
     #   request_timeout_ms: 900000
     #   stream_idle_timeout_ms: 300000
     #   think: false
@@ -79,9 +84,10 @@ agent:
   # EditGuard 单 Step 累计行数预算。auto 会按 phase/tools/outputs/prompt 上下文自适应；
   # 如需固定硬上限，可设为数字，例如 400。
   # max_edit_lines_per_step: auto
-  # write_file / append_file 单次 content 字节预算。auto 会按 phase/tools/outputs/context 自适应；
-  # 大型工程仍应拆成模块/函数/类边界增量写入，而不是单次写巨型文件。
-  # max_write_chunk_bytes: auto
+  # write_file / append_file 的单次 content 窗口无需配置：Runtime 会根据当前 Provider 的
+  # context_window、实际 prompt 占用和响应安全预留自动更新；仅当单个逻辑文件超过当前窗口时
+  # 才需要 append_file。兼容场景如确需固定硬上限，可在 agent 下手动设置
+  # max_write_chunk_bytes 为正整数字节数；通常不建议覆盖自动窗口。
   # 目标工程语言由 topic / 现有工程基线判定：明确写 Python/TS 时自动选择；
   # 无法判断时在澄清阶段询问；非交互或 topic 模式仍无法判断则默认 Python。
   sandboxes:

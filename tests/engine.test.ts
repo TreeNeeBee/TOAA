@@ -1373,6 +1373,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     integrationStep.tools = ['write_file', 'run_tests'];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
+    await ws.writeFile('docs/06-integration-test.md', '# Integration\n');
+    await ws.writeFile('tests/test_integration.py', 'def test_contract():\n    assert True\n');
     await fs.mkdir(path.join(tmp, '.xcompiler'), { recursive: true });
     await fs.writeFile(
       path.join(tmp, '.xcompiler/debug_cache.json'),
@@ -1395,6 +1397,15 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       'utf8',
     );
 
+    const debuggerLlm = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'repair detailed design from cached integration failure',
+        actions: [
+          { tool: 'write_file', args: { path: 'docs/03-detailed-design.md', content: '# Detail\nfixed-detail-contract\n' } },
+        ],
+        done: true,
+      }),
+    ]);
     const router = new FakeRouter({
       Tester: new ScriptedLLM([
         JSON.stringify({
@@ -1406,15 +1417,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           done: true,
         }),
       ]),
-      Debugger: new ScriptedLLM([
-        JSON.stringify({
-          thoughts: 'repair detailed design from cached integration failure',
-          actions: [
-            { tool: 'write_file', args: { path: 'docs/03-detailed-design.md', content: '# Detail\nfixed-detail-contract\n' } },
-          ],
-          done: true,
-        }),
-      ]),
+      Debugger: debuggerLlm,
     });
     const engine = new PhaseEngine({
       ws,
@@ -1433,6 +1436,69 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(issueLog).toContain('"targetStepId":"S003"');
     expect(issueLog).toContain('"targetPhase":"DETAILED_DESIGN"');
     expect(issueLog).not.toContain('"targetStepId":"S006"');
+    expect(debuggerLlm.lastUser).toContain('integration contract failed: expected fixed detailed design');
+  });
+
+  it('revalidates a cached test failure and clears it without rollback when the current gate passes', async () => {
+    const plan = fakePlan();
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
+    codeStep.dependsOn = [];
+    codeStep.status = 'DONE';
+    unitStep.dependsOn = [codeStep.id];
+    unitStep.status = 'FAILED';
+    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    plan.steps = [codeStep, unitStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    await ws.writeFile('src/hello.py', 'def hi():\n    return "fixed"\n');
+    await ws.writeFile('docs/05-unit-test.md', '# Unit\n');
+    await ws.writeFile('tests/test_hello.py', 'def test_hi():\n    assert True\n');
+    await fs.mkdir(path.join(tmp, '.xcompiler'), { recursive: true });
+    await fs.writeFile(
+      path.join(tmp, '.xcompiler/debug_cache.json'),
+      JSON.stringify({
+        version: 1,
+        steps: {
+          [unitStep.id]: {
+            lastUpdated: new Date().toISOString(),
+            lastStatus: 'FAILED',
+            lastReason: 'UNIT_TEST tool verification failed; rolling back to paired V-model source phase.',
+            attempts: [{
+              attempt: 0,
+              ts: new Date().toISOString(),
+              reason: 'UNIT_TEST tool verification failed; rolling back to paired V-model source phase.',
+              failureLogTail: 'FAILED tests/test_hello.py::test_hi - expected fixed implementation',
+            }],
+          },
+        },
+      }),
+      'utf8',
+    );
+    const debuggerLlm = new ThrowingLLM(new Error('stale cached test failure must not invoke Debugger'));
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox: new UnitRollbackSandbox(ws),
+      router: new FakeRouter({ Debugger: debuggerLlm }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+      maxDebugRetries: 1,
+    });
+
+    const result = await engine.run(plan);
+
+    expect(result.failedStepId).toBeUndefined();
+    expect(unitStep.status).toBe('DONE');
+    expect(debuggerLlm.calls).toBe(0);
+    const cache = JSON.parse(await ws.readFile('.xcompiler/debug_cache.json')) as {
+      steps: Record<string, unknown>;
+    };
+    expect(cache.steps[unitStep.id]).toBeUndefined();
+    const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
+    expect(auditLog).toContain('engine.rollback_validation_passed');
+    expect(auditLog).not.toContain('engine.test_phase_rollback');
   });
 
   it('routes full functional regression failures to the owner test phase rollback target', async () => {

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import 'dotenv/config';
 import { xcEnv } from './env.js';
 import { ROLES } from '../core/plan.js';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../llm/window.js';
 
 const ProviderStringScalarSchema = z.union([z.string(), z.number(), z.boolean()]);
 const OptionalProviderStringSchema = ProviderStringScalarSchema.nullish().transform((v) =>
@@ -18,6 +19,22 @@ const JsonResponseFormatSchema = z.enum(['json_object', 'json_schema', 'none']);
 const ProviderTagsSchema = z.array(z.string().min(1)).optional().transform((tags) =>
   tags?.map((tag) => tag.trim().toLowerCase()).filter(Boolean),
 );
+const ContextWindowSchema = z.preprocess((value) => {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return value;
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  const match = /^(\d+(?:\.\d+)?)\s*([km])?$/iu.exec(normalized);
+  if (!match) return value;
+  const amount = Number(match[1]);
+  const multiplier = match[2]?.toLowerCase() === 'm'
+    ? 1024 * 1024
+    : match[2]?.toLowerCase() === 'k'
+      ? 1024
+      : 1;
+  return Math.floor(amount * multiplier);
+}, z.number().int().positive().default(DEFAULT_CONTEXT_WINDOW_TOKENS));
 
 const ProviderSchema = z.object({
   /**
@@ -29,6 +46,8 @@ const ProviderSchema = z.object({
   api_key: OptionalProviderStringSchema,
   base_url: OptionalProviderStringSchema,
   model: RequiredProviderStringSchema,
+  /** Model input+output context capacity. Empty or omitted values default to 128K tokens. */
+  context_window: ContextWindowSchema,
   /**
    * Provider labels used by runtime policy.
    * - cluster: aggregated/route provider such as OpenRouter free routes. These are

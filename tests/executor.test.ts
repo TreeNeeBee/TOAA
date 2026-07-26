@@ -74,6 +74,64 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastSystem).toContain('禁止触碰其它文件');
   });
 
+  it('injects required path contracts and current Step path candidates into tool docs', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
+    const r = await exec.run({
+      step: { ...baseStep, inputs: ['docs/topic.md'], tools: ['read_file', 'write_file', 'replace_in_file'] },
+      tools: [readFileTool, writeFileTool, replaceInFileTool],
+      ctx,
+    });
+
+    expect(r.success).toBe(true);
+    expect(llm.lastUser).toContain('read_file:');
+    expect(llm.lastUser).toContain('args.path is required');
+    expect(llm.lastUser).toContain('inputs=[docs/topic.md]');
+    expect(llm.lastUser).toContain('outputs=[src/x.py]');
+    expect(llm.lastUser).toContain('writable=[src/]');
+    expect(llm.lastUser).toContain('The target must already exist');
+  });
+
+  it('updates skill operation windows when the active LLM provider switches', async () => {
+    class SwitchingWindowLLM implements LLMClient {
+      readonly name = 'switching-window';
+      prompts: string[] = [];
+      maxTokens: number[] = [];
+
+      async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        options?.onProviderStart?.('small', 'small-model', {
+          contextWindowTokens: 32 * 1024,
+          switched: false,
+        });
+        this.prompts.push(messages[1]?.content ?? '');
+        this.maxTokens.push(options?.maxTokens ?? 0);
+        options?.onProviderStart?.('large', 'large-model', {
+          contextWindowTokens: 256 * 1024,
+          switched: true,
+        });
+        this.prompts.push(messages[1]?.content ?? '');
+        this.maxTokens.push(options?.maxTokens ?? 0);
+        return JSON.stringify({
+          thoughts: 'write after provider switch',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }],
+          done: true,
+        });
+      }
+    }
+
+    const llm = new SwitchingWindowLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1, maxWriteChunkBytes: 'auto' });
+    const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
+
+    expect(r.success).toBe(true);
+    expect(llm.prompts[0]).toContain('context_window_tokens: 32768');
+    expect(llm.prompts[1]).toContain('context_window_tokens: 262144');
+    const readWindow = (prompt: string) =>
+      Number(/write_content_chunk_bytes: (\d+)/u.exec(prompt)?.[1] ?? 0);
+    expect(readWindow(llm.prompts[1]!)).toBeGreaterThan(readWindow(llm.prompts[0]!));
+    expect(llm.maxTokens[1]).toBeGreaterThan(llm.maxTokens[0]!);
+  });
+
   it('records executor.turn audit events with thoughts + actions', async () => {
     const { AuditLogger } = await import('../src/audit/audit.js');
     const audit = new AuditLogger({ root: tmp, command: 'test' });
@@ -496,6 +554,66 @@ describe('StepExecutor system prompt assembly', () => {
     await expect(fs.readFile(path.join(tmp, 'src/x.py'), 'utf8')).resolves.toBe('x = 1\n');
   });
 
+  it('rejects a pathless replace before permission or execution and feeds back a concrete correction', async () => {
+    class MissingPathThenValidReplaceLLM implements LLMClient {
+      readonly name = 'missing-path-then-valid-replace';
+      calls = 0;
+      secondUser = '';
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'attempt a replacement but accidentally omit the target',
+            actions: [{ tool: 'replace_in_file', args: { find: 'old', replace: 'new' } }],
+            done: false,
+          });
+        }
+        this.secondUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        return JSON.stringify({
+          thoughts: 'retry with the declared concrete target',
+          actions: [{ tool: 'replace_in_file', args: { path: 'src/x.py', find: 'old', replace: 'new' } }],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('src/x.py', 'value = "old"\n');
+    const llm = new MissingPathThenValidReplaceLLM();
+    const permissionTargets: string[] = [];
+    const startedTargets: Array<string | undefined> = [];
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const r = await exec.run({
+      step: { ...baseStep, tools: ['replace_in_file'] },
+      tools: [replaceInFileTool],
+      ctx: {
+        ...ctx,
+        requestPermission: async (request) => {
+          permissionTargets.push(request.target);
+          return { approved: true };
+        },
+        onToolEvent: (event) => {
+          if (event.status === 'started') startedTargets.push(event.target);
+        },
+      },
+    });
+
+    expect(r.success).toBe(true);
+    expect(r.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'replace_in_file',
+        ok: false,
+        error: expect.stringContaining('path must be a non-empty string'),
+      }),
+      expect.objectContaining({ tool: 'replace_in_file', ok: true }),
+    ]);
+    expect(permissionTargets).toEqual(['src/x.py']);
+    expect(startedTargets).toEqual(['src/x.py']);
+    expect(llm.secondUser).toContain('Tool contract violation');
+    expect(llm.secondUser).toContain('current Step inputs, outputs, or writable allowlist');
+    await expect(ws.readFile('src/x.py')).resolves.toBe('value = "new"\n');
+  });
+
   it('allows completion when a bad edit target is superseded by rewrite plus tests', async () => {
     class BadEditThenRewriteAndTestLLM implements LLMClient {
       readonly name = 'bad-edit-then-rewrite-and-test';
@@ -792,6 +910,7 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('invalid no-progress output');
+    expect(result.error).toContain('missing outputs: src/x.py');
     expect(llm.calls).toBe(2);
     expect(llm.sawWarning).toBe(true);
   });

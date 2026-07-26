@@ -1,4 +1,5 @@
 import type { XCompilerConfig } from '../config/config.js';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS } from './window.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
 import { fetchOllamaTags, isOllamaProvider, normalizeBaseUrl } from './health.js';
@@ -130,6 +131,7 @@ export async function preflightProviders(
         api_key: '',
         base_url: sourceUrl,
         model,
+        context_window: DEFAULT_CONTEXT_WINDOW_TOKENS,
         tags: undefined,
       };
       result.autoAdded[synthName] = model;

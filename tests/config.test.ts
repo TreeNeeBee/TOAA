@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import YAML from 'yaml';
 import { getXCompilerPath, loadConfigWithPath } from '../src/config/config.js';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../src/llm/window.js';
 
 function allRoles(provider: string): Record<string, string[]> {
   return {
@@ -73,6 +74,25 @@ describe('config locale', () => {
     const cfgPath = await writeConfig(cfg);
     const { config } = await loadConfigWithPath(cfgPath);
     expect(config.llm.providers.ollama_code!.think).toBe(false);
+  });
+
+  it('defaults missing or empty provider context_window to 128K tokens', async () => {
+    const missing = await loadConfigWithPath(await writeConfig(baseConfig()));
+    expect(missing.config.llm.providers.ollama_code!.context_window).toBe(DEFAULT_CONTEXT_WINDOW_TOKENS);
+
+    const cfg = baseConfig();
+    const providers = (cfg.llm as Record<string, unknown>).providers as Record<string, Record<string, unknown>>;
+    providers.ollama_code!.context_window = '';
+    const empty = await loadConfigWithPath(await writeConfig(cfg));
+    expect(empty.config.llm.providers.ollama_code!.context_window).toBe(DEFAULT_CONTEXT_WINDOW_TOKENS);
+  });
+
+  it('accepts K/M shorthand for provider context_window', async () => {
+    const cfg = baseConfig();
+    const providers = (cfg.llm as Record<string, unknown>).providers as Record<string, Record<string, unknown>>;
+    providers.ollama_code!.context_window = '64K';
+    const { config } = await loadConfigWithPath(await writeConfig(cfg));
+    expect(config.llm.providers.ollama_code!.context_window).toBe(64 * 1024);
   });
 
   it('defaults edit guard line budget to auto', async () => {

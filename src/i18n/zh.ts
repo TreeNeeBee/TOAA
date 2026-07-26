@@ -616,6 +616,10 @@ const messages: Messages = {
     sandboxStatus: (r) => `沙盒：${r}`,
     autoFixedSrcImports: (n, files) => `  ⚠ auto-fixed sys.path bootstrap in ${n} 个入口文件：${files}`,
     debugResumeNotice: (id, n) => `  ↻ ${id} 检测到上次会话以 FAILED 结束（已累积 ${n} 次尝试），本次首轮直接进入 Debugger 模式。`,
+    cachedTestRevalidationNotice: (id, n) =>
+      `  ↻ ${id} 检测到历史 FAILED 结果（已累积 ${n} 次尝试），先重新执行当前测试门禁，再决定是否按 V 模型回退。`,
+    testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
+      `  ↳ ${testId} ${testPhase} 门禁失败；按 V 模型回退 → ${sourceId} ${sourcePhase} Debugger。`,
     debugResumeInfraRetry: (id, n) => `  ↻ ${id} 上次会话仅留下 LLM 断连/限流等基础设施错误（${n} 次），已清理陈旧 debug 缓存，本次按正常流程重新执行该 Step。`,
     spinDebugRetry: (id, attempt, budget, cap, reason) => `🛠  ${id} DEBUG retry ${attempt}/${budget} (cap=${cap}) — ${reason}`,
     retryException: (a, b, msg) => `retry ${a}/${b} 抛出异常：${msg}`,
@@ -864,10 +868,14 @@ ${opts.phasePlan}
       'DEBUG issue 完成无效：issueResolutionPlan 是 issue resolved 的必要字段。请返回包含简明处理方案的 JSON，并同时给出必要修复或验证动作。',
   },
   skills: {
-    patcher: '通过 apply_patch / replace_in_file 对已有文件做小改动，禁止整文件覆盖。',
-    author: '通过 write_file 创建新文件；优先放在当前 Step writable allowlist 内。',
+    patcher:
+      '通过 apply_patch / replace_in_file 对已有文件做小改动，禁止整文件覆盖。' +
+      'replace_in_file 必须同时提供 args.path、args.find、args.replace；path 使用当前 Step writable allowlist 内的具体 workspace 相对文件路径，内容不确定时先 read_file 同一路径。',
+    author:
+      '通过 write_file 创建新文件；必须提供非空 args.path 和字符串 args.content，path 使用当前 Step outputs 或 writable allowlist 中的具体 workspace 相对路径。',
     tester:
       '编写并运行 pytest 测试，验证函数行为；失败时通过 analyze_error 解析。' +
+      '【路径契约】所有 read_file/write_file/append_file/replace_in_file 调用都必须提供具体的 workspace 相对 args.path，不得省略、使用项目外路径或把目录当文件。' +
       '【fixture 自包含】测试**严禁**直接 open() 磁盘上不存在的样例文件。' +
       '若被测函数需要文件输入，优先复用用户/工作区真实样例；没有样例时用 http_fetch 获取官方文档、上游仓库或公开标准中的小型参考样例，' +
       '保存到 tests/fixtures/<name> 并记录来源；只有 CSV/JSON/INI 等简单文本格式才可在 pytest tmp_path 中构造最小样例并立刻 run_tests。' +
@@ -878,8 +886,10 @@ ${opts.phasePlan}
       '复杂领域格式连续失败后必须停止凭记忆生成，改为请求用户样例或网络参考；严禁去改被测模块或断言。',
     dep_resolver: '当出现 ModuleNotFoundError 时，用 add_dependency 写回 requirements.txt 并重建沙盒。',
     debugger:
-      '先 run_tests / run_python 复现错误 → analyze_error → patch/replace_in_file/add_dependency 修复 → 再次 run_tests。每次只做最小修改。【依赖缺失】必须添加真实依赖或改用设计选定的真实库，禁止在 src/ 生产代码里伪造 module、fake class/function、空实现或 fallback mock。【Fixture 纪律】如果测试失败是行为断言失败，不要持续重写 fixture；只有明确缺文件、fixture 格式错误或 fixture 解析错误时才改 fixture，否则修源码、契约、依赖或错误断言。【网络/API 失败】定位失败 URL 后，只允许少量探测替代 API，随后必须 patch 源码并用 run_program 证明入口不再输出 API 失败。【重要】同一文件上 replace_in_file 连续失败 2 次以上请立即 read_file，再用 patch 或在当前运行时 chunk limit 内整文件重写，不要反复猜测 find 字符串。【禁止 no-op】replace_in_file 的 find 与 replace 必须不同——若你只是想"确认"某段代码，请用 read_file，不要提交相同字符串的替换。',
-    refactorer: '重构必须保证行为不变；先跑回归测试 → 修改 → 再跑回归测试。',
+      '先 run_tests / run_python 复现错误 → analyze_error → patch/replace_in_file/add_dependency 修复 → 再次 run_tests。每次只做最小修改。【路径契约】文件工具必须提供具体的 workspace 相对 args.path；replace_in_file 必须同时提供 path/find/replace，path 取自当前 Step writable allowlist。【依赖缺失】必须添加真实依赖或改用设计选定的真实库，禁止在 src/ 生产代码里伪造 module、fake class/function、空实现或 fallback mock。【Fixture 纪律】如果测试失败是行为断言失败，不要持续重写 fixture；只有明确缺文件、fixture 格式错误或 fixture 解析错误时才改 fixture，否则修源码、契约、依赖或错误断言。【网络/API 失败】定位失败 URL 后，只允许少量探测替代 API，随后必须 patch 源码并用 run_program 证明入口不再输出 API 失败。【重要】同一文件上 replace_in_file 连续失败 2 次以上请立即 read_file，再用 patch 或在当前运行时 chunk limit 内整文件重写，不要反复猜测 find 字符串。【禁止 no-op】replace_in_file 的 find 与 replace 必须不同——若你只是想"确认"某段代码，请用 read_file，不要提交相同字符串的替换。',
+    refactorer:
+      '重构必须保证行为不变；先跑回归测试 → 修改 → 再跑回归测试。' +
+      '所有文件工具必须提供具体的 workspace 相对 args.path；局部替换前先 read_file 确认同一路径和当前字节。',
   },
   doctor: {
     cliDescription: '检查 config / LLM / sandbox / skills 是否就绪',

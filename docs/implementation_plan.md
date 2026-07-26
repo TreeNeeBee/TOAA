@@ -150,7 +150,8 @@
 ### S3.2 编辑约束守门
 
 - `EditGuard`：拒绝 `outputs` 白名单外的写入；统计行数，默认按当前 Step 上下文自适应预算，显式配置数字时超限报错。
-- `write_file` / `append_file`：单次 content 字节预算默认按当前 Step 上下文自适应；大型文件必须按模块 / 函数 / 类边界分块，避免单轮 JSON payload 失稳。
+- `write_file` / `append_file`：单次 content 字节预算默认按活动 Provider 的 `context_window`、当前 prompt 占用和响应预留自适应；仅当单个逻辑文件超过活动窗口时才按模块 / 函数 / 类边界分块，避免单轮 JSON payload 失稳。
+- `read_file`：按活动 Provider 的工具反馈窗口分块读取，使用 `nextOffset` 继续，不允许先载入完整大文件后再截断。
 - 每次底层写 Tool 调用产生一条 `EditRecord` 追加到 `logs/edits-<step-id>.jsonl`；Skill 不另建可绕过 Tool 审计的执行通道。
 
 ### S3.3 Debugger 闭环

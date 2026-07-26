@@ -483,6 +483,66 @@ describe('LLMRouter fallback chain', () => {
     expect(firstCalls).toBe(1);
     expect(secondCalls).toBe(1);
   });
+
+  it('publishes and applies the active context window on cold start and provider switch', async () => {
+    const cfg = mkCfg({
+      providers: {
+        small: {
+          type: 'ollama',
+          api_key: '',
+          base_url: 'http://small',
+          model: 'small-model',
+          context_window: 32 * 1024,
+        },
+        large: {
+          type: 'openai',
+          api_key: '',
+          base_url: 'http://large',
+          model: 'large-model',
+          context_window: 256 * 1024,
+        },
+      },
+      roles: { Coder: ['small', 'large'] },
+      fallbacks: [],
+    });
+    const router = new LLMRouter(cfg, undefined, undefined, undefined, undefined, stubProbe);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clientsMap: Map<string, LLMClient> = (router as any).clients;
+    const maxTokens: number[] = [];
+    clientsMap.set('small', {
+      name: 'small-model',
+      async chat(_messages, options) {
+        maxTokens.push(options?.maxTokens ?? 0);
+        throw new Error('small provider failed');
+      },
+    });
+    clientsMap.set('large', {
+      name: 'large-model',
+      async chat(_messages, options) {
+        maxTokens.push(options?.maxTokens ?? 0);
+        return 'ok';
+      },
+    });
+    const starts: Array<{ name: string; context: number; switched: boolean }> = [];
+
+    const result = await router.for('Coder').chat([{ role: 'user', content: 'work' }], {
+      onProviderStart(name, _model, window) {
+        starts.push({
+          name,
+          context: window.contextWindowTokens,
+          switched: window.switched,
+        });
+      },
+    });
+
+    expect(result).toBe('ok');
+    expect(starts).toEqual([
+      { name: 'small', context: 32 * 1024, switched: false },
+      { name: 'large', context: 256 * 1024, switched: true },
+    ]);
+    expect(maxTokens[1]).toBeGreaterThan(maxTokens[0]!);
+    expect(router.primaryContextWindow('Coder')).toBe(32 * 1024);
+  });
 });
 
 describe('LLMRouter score-sorted chain', () => {

@@ -67,6 +67,14 @@ export interface ToolContext {
   language?: Language;
   /** 当前 Step 的 write_file / append_file 单次 content 字节预算。 */
   writeChunkBytes?: number;
+  /** 当前活动模型的 input+output context window。 */
+  contextWindowTokens?: number;
+  /** 当前模型调用可用于生成 JSON/tool actions 的响应 token 预算。 */
+  responseTokenBudget?: number;
+  /** 下一轮可回传给模型的工具详情字符预算。 */
+  feedbackCharBudget?: number;
+  /** read_file 单次读取并回传的动态字节预算。 */
+  readChunkBytes?: number;
   /** run_tests 未提供有效过滤参数时使用的当前阶段默认测试范围。 */
   defaultTestArgs?: string[];
   /** Optional protocol/UI permission hook for sensitive tool operations. */

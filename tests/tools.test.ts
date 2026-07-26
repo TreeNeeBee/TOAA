@@ -145,6 +145,27 @@ describe('write_file tool', () => {
       contextChars: 20_000,
     });
     expect(dynamic).toBeGreaterThan(DEFAULT_WRITE_CHUNK_BYTES);
+    const smallerModel = resolveWriteChunkBytes('auto', {
+      contextWindowTokens: 32 * 1024,
+      contextChars: 20_000,
+    });
+    const largerModel = resolveWriteChunkBytes('auto', {
+      contextWindowTokens: 256 * 1024,
+      contextChars: 20_000,
+    });
+    expect(largerModel).toBeGreaterThan(smallerModel);
+  });
+
+  it('reduces the automatic write window as the current prompt consumes context', () => {
+    const shortPrompt = resolveWriteChunkBytes('auto', {
+      contextWindowTokens: 128 * 1024,
+      contextChars: 3_000,
+    });
+    const longPrompt = resolveWriteChunkBytes('auto', {
+      contextWindowTokens: 128 * 1024,
+      contextChars: 340_000,
+    });
+    expect(shortPrompt).toBeGreaterThan(longPrompt);
   });
 });
 
@@ -163,6 +184,27 @@ describe('read_file & list_dir', () => {
     const r = await readFileTool.run({} as never, ctx);
     expect(r.ok).toBe(false);
     expect(r.error).toContain('path must be a non-empty string');
+  });
+
+  it('reads large files incrementally using the active read window and nextOffset', async () => {
+    await ws.writeFile('src/large.txt', '0123456789abcdefghij');
+    ctx.readChunkBytes = 8;
+
+    const first = await readFileTool.run({ path: 'src/large.txt', maxBytes: 100 }, ctx);
+    expect(first.ok).toBe(true);
+    expect(first.data).toMatchObject({
+      offset: 0,
+      bytes: 8,
+      totalBytes: 20,
+      truncated: true,
+      nextOffset: 8,
+    });
+    expect(first.data?.content).toContain('01234567');
+
+    const second = await readFileTool.run({ path: 'src/large.txt', offset: first.data?.nextOffset }, ctx);
+    expect(second.ok).toBe(true);
+    expect(second.data).toMatchObject({ offset: 8, bytes: 8, nextOffset: 16 });
+    expect(second.data?.content).toContain('89abcdef');
   });
 
   it('rejects reads, writes, and listings outside the project directory', async () => {

@@ -2,14 +2,37 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
+import {
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  resolveSkillOperationWindow,
+} from '../llm/window.js';
 
-export const readFileTool: Tool<{ path: string; maxBytes?: number }, { content: string }> = {
+interface ReadFileData {
+  content: string;
+  offset: number;
+  bytes: number;
+  totalBytes: number;
+  truncated: boolean;
+  nextOffset?: number;
+}
+
+export const readFileTool: Tool<
+  { path: string; offset?: number; maxBytes?: number },
+  ReadFileData
+> = {
   name: 'read_file',
-  description: '读取 workspace 内的文本文件。',
-  argsSchema: { path: 'string', maxBytes: 'number?' },
+  description:
+    '分块读取 workspace 内的文本文件。必须提供非空 args.path；args.offset 是可选字节偏移，使用上次结果的 nextOffset 可继续读取后续内容。',
+  argsSchema: { path: 'string', offset: 'number?', maxBytes: 'number?' },
   async run(args, ctx) {
     if (!args || typeof args.path !== 'string' || args.path.trim() === '') {
       return { ok: false, error: 'invalid read_file args: path must be a non-empty string' };
+    }
+    if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) {
+      return { ok: false, error: 'invalid read_file args: offset must be a non-negative integer' };
+    }
+    if (args.maxBytes !== undefined && (!Number.isInteger(args.maxBytes) || args.maxBytes <= 0)) {
+      return { ok: false, error: 'invalid read_file args: maxBytes must be a positive integer' };
     }
     try {
       const resolved = await resolveWorkspacePath(ctx.ws, args.path, 'read_file', { mustExist: true });
@@ -17,13 +40,42 @@ export const readFileTool: Tool<{ path: string; maxBytes?: number }, { content: 
       const abs = resolved.abs;
       const stat = await fs.stat(abs);
       if (!stat.isFile()) return { ok: false, error: 'not a file' };
-      const buf = await fs.readFile(abs);
-      const limit = args.maxBytes ?? 200_000;
-      const content =
-        buf.byteLength > limit
-          ? buf.subarray(0, limit).toString('utf8') + `\n... [truncated ${buf.byteLength - limit} bytes]`
-          : buf.toString('utf8');
-      return { ok: true, data: { content }, summary: `read ${resolved.rel} (${buf.byteLength}B)` };
+      const offset = args.offset ?? 0;
+      const operationLimit = ctx.readChunkBytes ??
+        resolveSkillOperationWindow({ contextWindowTokens: ctx.contextWindowTokens }).readChunkBytes;
+      const limit = Math.min(args.maxBytes ?? operationLimit, operationLimit);
+      const requestedBytes = Math.max(0, Math.min(limit, stat.size - offset));
+      const buffer = Buffer.alloc(requestedBytes);
+      let bytesRead = 0;
+      if (requestedBytes > 0) {
+        const handle = await fs.open(abs, 'r');
+        try {
+          const result = await handle.read(buffer, 0, requestedBytes, offset);
+          bytesRead = utf8SafeEnd(buffer.subarray(0, result.bytesRead));
+        } finally {
+          await handle.close();
+        }
+      }
+      const nextOffset = offset + bytesRead;
+      const truncated = nextOffset < stat.size;
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      const content = truncated
+        ? `${text}\n... [read window ended at byte ${nextOffset}/${stat.size}; continue with offset=${nextOffset}]`
+        : text;
+      return {
+        ok: true,
+        data: {
+          content,
+          offset,
+          bytes: bytesRead,
+          totalBytes: stat.size,
+          truncated,
+          nextOffset: truncated ? nextOffset : undefined,
+        },
+        summary:
+          `read ${resolved.rel} bytes ${offset}-${nextOffset}/${stat.size}` +
+          (truncated ? ` (continue offset=${nextOffset})` : ''),
+      };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }
@@ -40,50 +92,48 @@ export interface WriteChunkBudgetContext {
   outputs?: string[];
   allowedWrites?: string[];
   contextChars?: number;
+  contextWindowTokens?: number;
 }
 
-/** 单次写入默认字节预算：保护 JSON 工具调用稳定性；大工程应靠模块/函数边界增量写入。 */
+/** Legacy public baseline; auto budgets are now derived from the active model context window. */
 export const DEFAULT_WRITE_CHUNK_BYTES = 6000;
-const AUTO_WRITE_CHUNK_HARD_CAP_BYTES = 18_000;
 
 export function resolveWriteChunkBytes(
   configured: WriteChunkBytes | undefined,
   ctx: WriteChunkBudgetContext = {},
 ): number {
-  if (typeof configured === 'number') return configured;
+  return resolveSkillOperationWindow({
+    contextWindowTokens: ctx.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+    promptChars: ctx.contextChars,
+    configuredWriteChunkBytes: configured,
+  }).writeChunkBytes;
+}
 
-  const phaseBonus: Record<string, number> = {
-    REQUIREMENT_ANALYSIS: 500,
-    HIGH_LEVEL_DESIGN: 1500,
-    DETAILED_DESIGN: 1500,
-    CODE: 2500,
-    UNIT_TEST: 2000,
-    INTEGRATION_TEST: 2000,
-    MODULE_TEST: 2200,
-    FUNCTIONAL_TEST: 1800,
-    DEBUG: 2500,
-  };
-  const tools = new Set(ctx.tools ?? []);
-  const outputBonus = Math.min((ctx.outputs?.length ?? 0) * 500, 3000);
-  const contextBonus = Math.min(Math.ceil((ctx.contextChars ?? 0) / 6000) * 1000, 4000);
-  const appendBonus = tools.has('append_file') ? 1500 : 0;
-  const debugBonus = ctx.debug ? 1500 : 0;
-
-  const dynamic =
-    DEFAULT_WRITE_CHUNK_BYTES +
-    (phaseBonus[ctx.phase ?? ''] ?? 0) +
-    outputBonus +
-    contextBonus +
-    appendBonus +
-    debugBonus;
-
-  return Math.min(dynamic, AUTO_WRITE_CHUNK_HARD_CAP_BYTES);
+function utf8SafeEnd(buffer: Buffer): number {
+  if (buffer.length === 0) return 0;
+  let lead = buffer.length - 1;
+  while (lead >= 0 && (buffer[lead]! & 0xc0) === 0x80) lead--;
+  if (lead < 0) return 0;
+  const first = buffer[lead]!;
+  const expectedLength =
+    (first & 0x80) === 0
+      ? 1
+      : (first & 0xe0) === 0xc0
+        ? 2
+        : (first & 0xf0) === 0xe0
+          ? 3
+          : (first & 0xf8) === 0xf0
+            ? 4
+            : 1;
+  return buffer.length - lead < expectedLength ? lead : buffer.length;
 }
 
 export const writeFileTool: Tool<{ path: string; content: string }, { bytes: number }> = {
   name: 'write_file',
   description:
-    '在当前 Step writable allowlist 内创建或覆盖文件（单次 content 受运行时 chunk limit 限制；大文件按模块/函数/类边界用 write_file 首段 + append_file 续写）。注意：runtime 管理的依赖清单请用 add_dependency 维护。',
+    '在当前 Step writable allowlist 内创建或覆盖文件。必须提供非空 args.path 和字符串 args.content；path 使用具体的 workspace 相对路径。' +
+    '单次 content 受运行时 chunk limit 限制；大文件按模块/函数/类边界用 write_file 首段 + append_file 续写。' +
+    '注意：runtime 管理的依赖清单请用 add_dependency 维护。',
   argsSchema: { path: 'string', content: 'string' },
   async run(args, ctx) {
     const argError = validateTextFileArgs('write_file', args);
@@ -138,7 +188,8 @@ export const writeFileTool: Tool<{ path: string; content: string }, { bytes: num
 export const appendFileTool: Tool<{ path: string; content: string }, { bytes: number; total: number }> = {
   name: 'append_file',
   description:
-    '把一段内容追加到当前 Step writable allowlist 内文件末尾（单次 content 受运行时 chunk limit 限制，用于配合 write_file 分块写出大文件）。',
+    '把一段内容追加到当前 Step writable allowlist 内文件末尾。必须提供非空 args.path 和字符串 args.content；path 使用具体的 workspace 相对路径。' +
+    '单次 content 受运行时 chunk limit 限制，用于配合 write_file 分块写出大文件。',
   argsSchema: { path: 'string', content: 'string' },
   async run(args, ctx) {
     const argError = validateTextFileArgs('append_file', args);
@@ -197,7 +248,7 @@ function validateTextFileArgs(tool: string, args: unknown): string | undefined {
 
 export const listDirTool: Tool<{ path?: string }, { entries: string[] }> = {
   name: 'list_dir',
-  description: '列出指定目录下的条目（仅文件名）。',
+  description: '列出指定目录下的条目（仅文件名）。args.path 可选；提供时必须是具体的 workspace 相对目录路径。',
   argsSchema: { path: 'string?' },
   async run(args, ctx) {
     try {

@@ -5,6 +5,11 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface LLMProviderWindow {
+  contextWindowTokens: number;
+  switched: boolean;
+}
+
 export interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
@@ -43,7 +48,7 @@ export interface ChatOptions {
    * 每次开始尝试候选 provider 时触发。用于 CLI 在等待首个 token 前显示
    * 当前 provider 与模型；fallback 切换时会再次触发。
    */
-  onProviderStart?: (name: string, model: string) => void;
+  onProviderStart?: (name: string, model: string, window: LLMProviderWindow) => void;
 }
 
 export interface LLMClient {

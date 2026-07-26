@@ -303,7 +303,8 @@ Skill 是若干 Tool 的命名编排，对 LLM 暴露更高层语义，Coder / D
 
 - 改动只能落在当前 Step `outputs` 白名单（`add_dependency` 例外，可写 `requirements.txt`）。
 - 单 Step 改动行数默认按当前 Step 上下文自适应预算；显式配置数字时作为固定硬上限。
-- `write_file` / `append_file` 单次 content 字节预算默认按当前 Step 上下文自适应；复杂工程应按模块 / 函数 / 类边界拆分，而不是一次写入巨型文件。
+- Runtime 使用统一 Operation Window：根据活动 Provider 的 `context_window`、实际 prompt 占用和安全预留，动态更新 response、`read_file`、write content 与 tool feedback 窗口；Provider fallback 切换时立即重算。
+- `append_file` 是超过当前模型输出窗口时的可选增量能力；能够在单次 write window 内完整表达的文件不要求拆分。
 - 每次 Skill 调用产出一条审计记录（who / why / diff / 测试结果）写入 `logs/edits-<step-id>.jsonl`。
 - 每个 Step 开始前自动 `git commit` 快照，失败可 `revert_change`。
 
@@ -482,10 +483,12 @@ llm:
       api_key: ${OPENROUTER_API_KEY}
       base_url: ${OPENROUTER_BASE_URL}
       model: ${OPENROUTER_MODEL}
+      context_window: 128K
     local_ollama:
       type: ollama
       base_url: ${OLLAMA_BASE_URL}
       model: ${OLLAMA_CODE_MODEL}
+      context_window: 128K
   roles:
     Planner:   [openrouter_free]
     Architect: [openrouter_free]

@@ -114,6 +114,17 @@ describe('SkillRegistry', () => {
     }
   });
 
+  it('includes explicit workspace-relative path contracts in every file-editing skill', () => {
+    const reg = buildDefaultSkills();
+    for (const skill of ['skill:patcher', 'skill:author', 'skill:tester', 'skill:debugger', 'skill:refactorer']) {
+      const hints = reg.resolve([skill]).hints.join('\n');
+      expect(hints).toContain('args.path');
+      expect(hints).toMatch(/workspace-relative|workspace 相对/u);
+    }
+    expect(reg.resolve(['skill:patcher']).hints.join('\n')).toContain('args.find');
+    expect(reg.resolve(['skill:debugger']).hints.join('\n')).toContain('replace_in_file');
+  });
+
   it('ignores unknown skill but keeps bare tools', () => {
     const reg = new SkillRegistry();
     const { resolvedToolNames } = reg.resolve(['skill:nope', 'read_file']);

@@ -14,7 +14,8 @@ import { resolveWorkspacePath } from './path_guard.js';
  */
 export const applyPatchTool: Tool<{ patch: string }, { changedFiles: string[] }> = {
   name: 'apply_patch',
-  description: '应用 unified diff 补丁；目标文件必须在当前 Step writable allowlist 内。',
+  description:
+    '应用 unified diff 补丁；每个 +++ 文件头必须包含具体的 workspace 相对目标路径，且目标必须在当前 Step writable allowlist 内。',
   argsSchema: { patch: 'string' },
   async run(args, ctx) {
     const fileDiffs = parseUnifiedDiff(args.patch);

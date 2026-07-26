@@ -2,7 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { jsonrepair } from 'jsonrepair';
-import type { LLMClient } from '../llm/types.js';
+import type { ChatOptions, LLMClient } from '../llm/types.js';
 import type { Step } from '../core/plan.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
 import type {
@@ -13,6 +13,7 @@ import type {
 } from '../tools/types.js';
 import { makeStreamReporter } from '../llm/stream.js';
 import { t } from '../i18n/index.js';
+import { updateOperationWindow } from '../llm/window.js';
 
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
 
@@ -43,6 +44,8 @@ export interface ExecutorOptions {
   advisoryFailureTools?: string[];
   /** Fine-grained failed calls that should be treated as diagnostics instead of blocking completion. */
   advisoryFailureRules?: AdvisoryFailureRule[];
+  /** Explicit bytes remain a hard override; auto follows the active provider context window. */
+  maxWriteChunkBytes?: number | 'auto';
 }
 
 export interface ExecutorRunInput {
@@ -141,7 +144,7 @@ export class StepExecutor {
     const role = inp.executionRole ?? inp.step.role;
     const toolMap = new Map(inp.tools.map((t) => [t.name, t]));
     const toolDocs = inp.tools
-      .map((t) => `- ${t.name}: ${describeToolForStep(t, inp.ctx)} args=${JSON.stringify(t.argsSchema)}`)
+      .map((t) => `- ${t.name}: ${describeToolForStep(t, inp.ctx, inp.step)} args=${JSON.stringify(t.argsSchema)}`)
       .join('\n');
     const skillBlock =
       inp.skillHints && inp.skillHints.length > 0
@@ -207,9 +210,10 @@ export class StepExecutor {
       let text: string;
       try {
         const chatMessages = compactMessagesForChat(messages, !!inp.debugContext);
-        text = await this.opts.llm.chat(chatMessages, {
+        const chatOptions: ChatOptions = {
           responseFormat: 'json',
           temperature: 0.1,
+          maxTokens: inp.ctx.responseTokenBudget,
           scoreSuccess: false,
           validate:
             role === 'Debugger' && (
@@ -219,9 +223,21 @@ export class StepExecutor {
               ? (text) => validateDebuggerRecoveryTurn(text, toolMap)
               : undefined,
           onProvider: (name) => { provider = name; },
-          onProviderStart: (name, model) => {
+          onProviderStart: (name, model, providerWindow) => {
             provider = name;
             rawAggregate = '';
+            updateOperationWindow(inp.ctx, {
+              contextWindowTokens: providerWindow?.contextWindowTokens ?? inp.ctx.contextWindowTokens,
+              promptChars: chatMessages.reduce((sum, message) => sum + message.content.length, 0),
+              configuredWriteChunkBytes: this.opts.maxWriteChunkBytes ?? 'auto',
+            });
+            const refreshedToolDocs = inp.tools
+              .map((tool) =>
+                `- ${tool.name}: ${describeToolForStep(tool, inp.ctx, inp.step)} args=${JSON.stringify(tool.argsSchema)}`,
+              )
+              .join('\n');
+            if (messages[1]) messages[1].content = renderUserPrompt(inp, refreshedToolDocs);
+            chatOptions.maxTokens = inp.ctx.responseTokenBudget;
             rep.reset();
             rep.setModel(`${name}/${model}`);
           },
@@ -232,7 +248,8 @@ export class StepExecutor {
             }
             rep.onToken(chunk);
           },
-        });
+        };
+        text = await this.opts.llm.chat(chatMessages, chatOptions);
       } catch (err) {
         rep.done('failed');
         const errMsg = (err as Error).message;
@@ -296,7 +313,7 @@ export class StepExecutor {
       const turn = parseTurn(text);
       finalThought = turn.thoughts;
       issueResolutionPlan = extractIssueResolutionPlan(turn) ?? issueResolutionPlan;
-      const normalizedActions = normalizeActions(turn.actions);
+      const normalizedActions = normalizeActions(turn.actions, toolMap);
       const actions = normalizedActions.actions;
       if (normalizedActions.invalid.length > 0) {
         parseFailures++;
@@ -590,14 +607,25 @@ export class StepExecutor {
           initialMissing,
           currentMissing: verify.missing.length,
         });
+        const blockers = [
+          verify.missing.length > 0
+            ? `missing outputs: ${verify.missing.join(', ')}`
+            : '',
+          unresolvedToolFailures.size > 0
+            ? `unresolved tool failures: ${[...unresolvedToolFailures.values()].join('; ')}`
+            : '',
+        ].filter(Boolean);
         const error =
           `model returned actions=[] and done=false for ${consecutiveNoProgressRounds} consecutive rounds; ` +
-          'this is invalid no-progress output, so the attempt is stopping before it becomes a token-consuming loop.';
+          'this is invalid no-progress output, so the attempt is stopping before it becomes a token-consuming loop.' +
+          (blockers.length > 0 ? ` Current blockers: ${blockers.join('. ')}.` : '');
         await inp.ctx.audit?.event('note', error, {
           messageId: 'audit.executor_no_progress_guard',
           stepId: inp.step.id,
           round,
           consecutiveNoProgressRounds,
+          missingOutputs: verify.missing,
+          unresolvedToolFailures: [...unresolvedToolFailures.values()],
         });
         return { success: false, rounds: round, toolCalls: calls, finalThought, issueResolutionPlan, error, metrics };
       }
@@ -626,7 +654,7 @@ export class StepExecutor {
         });
         roundLimit = nextLimit;
       }
-      messages.push({ role: 'assistant', content: compactTurnForHistory(turn) });
+      messages.push({ role: 'assistant', content: compactTurnForHistory(turn, toolMap) });
       messages.push({
         role: 'user',
         content: renderFeedback(turnResults, verify, {
@@ -661,6 +689,9 @@ export class StepExecutor {
             verify.ok &&
             unresolvedToolFailures.size === 0 &&
             !issueResolutionPlanOk,
+        }, {
+          feedbackCharBudget: inp.ctx.feedbackCharBudget,
+          readChunkBytes: inp.ctx.readChunkBytes,
         }),
       });
     }
@@ -768,7 +799,7 @@ function isOutputCompletionFailure(reason = '', failureLog = ''): boolean {
 
 function validateDebuggerRecoveryTurn(text: string, toolMap: Map<string, Tool>): void {
   const turn = parseTurn(text);
-  const normalized = normalizeActions(turn.actions);
+  const normalized = normalizeActions(turn.actions, toolMap);
   const actions = normalized.actions;
   const allowedActions = actions.filter((action) => toolMap.has(action.tool));
   const emptyOrUnparsed =
@@ -872,8 +903,8 @@ function hasUnverifiedSuccessfulMutation(calls: ExecutorRunResult['toolCalls']):
   return mutationPendingVerification;
 }
 
-function compactTurnForHistory(turn: LLMTurn): string {
-  const normalized = normalizeActions(turn.actions);
+function compactTurnForHistory(turn: LLMTurn, toolMap?: Map<string, Tool>): string {
+  const normalized = normalizeActions(turn.actions, toolMap);
   const omittedPayloadActions = normalized.actions.filter(hasReplayUnsafePayload);
   const safeActions = normalized.actions.filter((action) => !hasReplayUnsafePayload(action));
   const omittedSummary = omittedPayloadActions.length > 0
@@ -1147,7 +1178,7 @@ function changedFilesForAction(tool: string, args: unknown, result: ToolResult):
   return actionTargetPaths(tool, args);
 }
 
-function normalizeActions(raw: unknown): {
+function normalizeActions(raw: unknown, toolMap?: Map<string, Tool>): {
   actions: LLMAction[];
   invalid: Array<{ index: number; raw: unknown; result: ToolResult & { tool: string } }>;
 } {
@@ -1194,9 +1225,75 @@ function normalizeActions(raw: unknown): {
       });
       return;
     }
+    const selectedTool = toolMap?.get(item.tool);
+    const schemaError = selectedTool
+      ? validateToolArgsAgainstSchema(selectedTool, normalizedArgs.args)
+      : undefined;
+    if (schemaError) {
+      invalid.push({
+        index,
+        raw: item,
+        result: { tool: item.tool, ok: false, error: schemaError },
+      });
+      return;
+    }
     actions.push({ tool: item.tool, args: normalizedArgs.args });
   });
   return { actions, invalid };
+}
+
+function validateToolArgsAgainstSchema(tool: Tool, args: Record<string, unknown>): string | undefined {
+  for (const [key, rawDescriptor] of Object.entries(tool.argsSchema)) {
+    if (typeof rawDescriptor !== 'string') continue;
+    const token = rawDescriptor.trim().split(/\s+/, 1)[0] ?? '';
+    const optional = token.endsWith('?');
+    const expectedType = optional ? token.slice(0, -1) : token;
+    const value = args[key];
+
+    if (value === undefined || value === null) {
+      if (optional) continue;
+      return formatToolArgError(tool, key, expectedType);
+    }
+    if (expectedType === 'string' && typeof value !== 'string') {
+      return formatToolArgError(tool, key, expectedType);
+    }
+    if (expectedType === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) {
+      return formatToolArgError(tool, key, expectedType);
+    }
+    if (expectedType === 'boolean' && typeof value !== 'boolean') {
+      return formatToolArgError(tool, key, expectedType);
+    }
+    if (
+      expectedType === 'string[]' &&
+      (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))
+    ) {
+      return formatToolArgError(tool, key, expectedType);
+    }
+    if (
+      expectedType.startsWith('Record<') &&
+      (!isPlainRecord(value))
+    ) {
+      return formatToolArgError(tool, key, expectedType);
+    }
+    if (key === 'path' && typeof value === 'string' && value.trim().length === 0) {
+      return formatToolArgError(tool, key, expectedType);
+    }
+  }
+  return undefined;
+}
+
+function formatToolArgError(tool: Tool, key: string, expectedType: string): string {
+  const expected = JSON.stringify(tool.argsSchema);
+  if (key === 'path' && expectedType === 'string') {
+    return `invalid ${tool.name} args: path must be a non-empty string; expected args=${expected}`;
+  }
+  const label =
+    expectedType === 'string[]'
+      ? 'a string array'
+      : expectedType.startsWith('Record<')
+        ? 'an object'
+        : `a ${expectedType || 'valid'} value`;
+  return `invalid ${tool.name} args: ${key} must be ${label}; expected args=${expected}`;
 }
 
 function normalizeActionArgs(
@@ -1239,11 +1336,54 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function describeToolForStep(tool: Tool, ctx: ToolContext): string {
-  if ((tool.name === 'write_file' || tool.name === 'append_file') && ctx.writeChunkBytes) {
-    return `${tool.description} 当前 Step content chunk limit: ${ctx.writeChunkBytes}B.`;
+function describeToolForStep(tool: Tool, ctx: ToolContext, step: Step): string {
+  const details = [tool.description];
+  const inputs = compactPathCandidates(step.inputs);
+  const outputs = compactPathCandidates(step.outputs);
+  const writable = compactPathCandidates(ctx.allowedWrites);
+
+  if (tool.name === 'read_file') {
+    details.push(
+      `args.path is required: use one concrete workspace-relative file path; never omit it. ` +
+      `Step path hints: inputs=[${inputs}], outputs=[${outputs}]. ` +
+      `Current read window: ${ctx.readChunkBytes ?? '(runtime default)'}B; when truncated, continue with args.offset=nextOffset.`,
+    );
+  } else if (tool.name === 'write_file' || tool.name === 'append_file' || tool.name === 'replace_in_file') {
+    details.push(
+      `args.path is required and must be a concrete workspace-relative path allowed by this Step. ` +
+      `Path candidates: outputs=[${outputs}], writable=[${writable}].`,
+    );
+    if (tool.name === 'replace_in_file') {
+      details.push('The target must already exist; use read_file on that exact path before replacing when current bytes are uncertain.');
+    }
+  } else if (tool.name === 'apply_patch') {
+    details.push(
+      `Every target in the unified diff +++ header must be workspace-relative and allowed by this Step. ` +
+      `Path candidates: outputs=[${outputs}], writable=[${writable}].`,
+    );
+  } else if (tool.name === 'list_dir') {
+    details.push('args.path is optional; when present, use a concrete workspace-relative directory path.');
+  } else if (tool.name === 'code_search') {
+    details.push('args.root is optional; when present, use a concrete workspace-relative directory path.');
+  } else if (tool.name === 'http_fetch') {
+    details.push(
+      `args.saveAs is optional; when present, it must be a concrete workspace-relative path in writable=[${writable}].`,
+    );
+  } else if (tool.name === 'run_program' || tool.name === 'run_python' || tool.name === 'run_tests') {
+    details.push('args.cwd is optional; when present, it must be a concrete workspace-relative directory path.');
   }
-  return tool.description;
+
+  if ((tool.name === 'write_file' || tool.name === 'append_file') && ctx.writeChunkBytes) {
+    details.push(`Current Step content chunk limit: ${ctx.writeChunkBytes}B.`);
+  }
+  return details.join(' ');
+}
+
+function compactPathCandidates(paths: string[], limit = 10): string {
+  if (paths.length === 0) return '(none declared)';
+  const visible = paths.slice(0, limit);
+  const omitted = paths.length - visible.length;
+  return `${visible.join(', ')}${omitted > 0 ? `, ... (+${omitted})` : ''}`;
 }
 
 async function safeRunTool(t: Tool, args: unknown, ctx: ToolContext): Promise<ToolResult> {
@@ -1328,6 +1468,13 @@ function renderUserPrompt(inp: ExecutorRunInput, toolDocs: string): string {
     '## writable paths (tool allowlist)',
     inp.ctx.allowedWrites.map((o) => `- ${o}`).join('\n'),
     '',
+    '## active model operation window',
+    `context_window_tokens: ${inp.ctx.contextWindowTokens ?? '(runtime default)'}`,
+    `response_token_budget: ${inp.ctx.responseTokenBudget ?? '(runtime default)'}`,
+    `read_file_chunk_bytes: ${inp.ctx.readChunkBytes ?? '(runtime default)'}`,
+    `write_content_chunk_bytes: ${inp.ctx.writeChunkBytes ?? '(runtime default)'}`,
+    `tool_feedback_chars: ${inp.ctx.feedbackCharBudget ?? '(runtime default)'}`,
+    '',
     inp.step.subTasks && inp.step.subTasks.length > 0
       ? `## step subtasks (execute inside this macro Step)\n${renderStepSubTasks(inp.step.subTasks, 0)}\n`
       : '',
@@ -1377,13 +1524,21 @@ function renderFeedback(
   results: Array<ToolResult & { tool: string }>,
   verify: { ok: boolean; missing: string[] },
   turn: TurnFeedbackContext,
+  operationWindow: {
+    feedbackCharBudget?: number;
+    readChunkBytes?: number;
+  } = {},
 ): string {
   const M = t().prompts;
   const lines: string[] = [M.executorFeedbackHeader];
-  let detailBudget = 12_000;
+  const failureDetails = [
+    ...results.filter((result) => !result.ok).map((result) => result.error ?? result.summary ?? ''),
+    ...(turn.unresolvedFailures ?? []),
+  ];
+  let detailBudget = operationWindow.feedbackCharBudget ?? 12_000;
   for (const r of results) {
     lines.push(`- ${r.tool}: ${r.ok ? 'OK' : 'FAIL'} — ${truncate(r.summary ?? r.error ?? '', 1800)}`);
-    const detail = renderToolResultDetail(r, detailBudget);
+    const detail = renderToolResultDetail(r, detailBudget, operationWindow.readChunkBytes);
     if (detail) {
       lines.push(detail.text);
       detailBudget -= detail.used;
@@ -1438,6 +1593,12 @@ function renderFeedback(
   if (turn.issueResolutionPlanMissing) {
     lines.push(M.executorFeedbackIssueResolutionPlanMissing);
   }
+  if (failureDetails.some((failure) => /path must be a non-empty string/i.test(failure))) {
+    lines.push(
+      'Tool contract violation: file write/read tools require args.path to be a non-empty relative workspace path. ' +
+      'Retry with an explicit path from the current Step inputs, outputs, or writable allowlist.',
+    );
+  }
   if (turn.unresolvedFailures && turn.unresolvedFailures.length > 0) {
     lines.push(
       `Unresolved tool failures remain: ${turn.unresolvedFailures.map((failure) => truncate(failure, 1200)).join('; ')}`,
@@ -1453,12 +1614,6 @@ function renderFeedback(
       lines.push(
         'Tool contract violation: write_file/append_file require args.content to be a literal string. ' +
         'Do not send contentBytes, arrays, objects, or omitted content; retry the same target with a valid content string.',
-      );
-    }
-    if (turn.unresolvedFailures.some((failure) => /path must be a non-empty string/i.test(failure))) {
-      lines.push(
-        'Tool contract violation: file write/read tools require args.path to be a non-empty relative workspace path. ' +
-        'Retry with an explicit path from the current Step outputs or writable allowlist.',
       );
     }
     if (turn.unresolvedFailures.some((failure) => /invalid add_dependency args/i.test(failure))) {
@@ -1480,9 +1635,13 @@ function renderFeedback(
 function renderToolResultDetail(
   result: ToolResult & { tool: string },
   remainingBudget: number,
+  readChunkBytes?: number,
 ): { text: string; used: number } | undefined {
   if (!result.ok || remainingBudget <= 200) return undefined;
-  const budget = Math.min(remainingBudget, result.tool === 'read_file' ? 6000 : 3000);
+  const budget = Math.min(
+    remainingBudget,
+    result.tool === 'read_file' ? (readChunkBytes ?? 6000) : 3000,
+  );
   const data = isPlainRecord(result.data) ? result.data : undefined;
   if (result.tool === 'read_file' && typeof data?.content === 'string') {
     const content = truncate(data.content, budget);

@@ -71,6 +71,7 @@ import {
   type ProjectMemory,
 } from './project_memory.js';
 import { PluginHost } from '../plugins/host.js';
+import { resolveSkillOperationWindow } from '../llm/window.js';
 
 export interface EngineOptions {
   ws: Workspace;
@@ -1049,6 +1050,9 @@ export class PhaseEngine {
         : '',
     ].filter(Boolean).join('\n');
 
+    this.log(chalk.yellow(
+      t().engine.testRollbackNotice(routedTest.id, routedTest.phase, sourceStep.id, sourcePhase),
+    ));
     await this.routeIssueToStep(issue, sourceStep, reason);
 
     await this.opts.audit.event('note', reason, {
@@ -1119,8 +1123,8 @@ export class PhaseEngine {
 
     await this.debugCache.markDone(routedTest.id);
     if (routedTest.id !== failedTest.id) await this.debugCache.markDone(failedTest.id);
-    const repairedTestValid = await this.validateRepairedTestPhaseWithoutRegeneration(plan, routedTest);
-    const restartFrom = repairedTestValid ? routedTest : sourceStep;
+    const repairedTestValidation = await this.validateTestPhaseWithoutRegeneration(plan, routedTest);
+    const restartFrom = repairedTestValidation.status === 'passed' ? routedTest : sourceStep;
     const restartIndex = Math.max(0, order.findIndex((step) => step.id === restartFrom.id));
     return {
       ok: true,
@@ -1130,8 +1134,11 @@ export class PhaseEngine {
     };
   }
 
-  private async validateRepairedTestPhaseWithoutRegeneration(plan: Plan, step: Step): Promise<boolean> {
-    if (!this.isVModelTestPhase(step.phase)) return false;
+  private async validateTestPhaseWithoutRegeneration(
+    plan: Plan,
+    step: Step,
+  ): Promise<{ status: 'passed' | 'failed' | 'skipped'; failureLog?: string }> {
+    if (!this.isVModelTestPhase(step.phase)) return { status: 'skipped' };
     const missing: string[] = [];
     for (const out of step.outputs) {
       if (out.endsWith('/')) continue;
@@ -1144,7 +1151,7 @@ export class PhaseEngine {
         phase: step.phase,
         missing,
       });
-      return false;
+      return { status: 'skipped' };
     }
 
     await this.profile.ensureTestBootstrap?.(this.opts.ws, this.opts.audit);
@@ -1167,7 +1174,7 @@ export class PhaseEngine {
         phase: step.phase,
         reason: testPermission.reason,
       });
-      return false;
+      return { status: 'skipped' };
     }
 
     const testArgs = this.testGateArgsForStep(step);
@@ -1183,7 +1190,10 @@ export class PhaseEngine {
         stdout: tests.stdout,
         stderr: tests.stderr,
       });
-      return false;
+      return {
+        status: 'failed',
+        failureLog: renderTestValidationFailure(step, testArgs, tests),
+      };
     }
 
     if (step.phase === 'FUNCTIONAL_TEST') {
@@ -1204,7 +1214,7 @@ export class PhaseEngine {
           phase: step.phase,
           reason: probePermission.reason,
         });
-        return false;
+        return { status: 'skipped' };
       }
       const probe = await this.profile.probeEntry(this.opts.ws, this.opts.sandbox);
       if (!probe.ok) {
@@ -1218,25 +1228,34 @@ export class PhaseEngine {
           stdoutTail: probe.stdoutTail,
           stderrTail: probe.stderrTail,
         });
-        return false;
+        return {
+          status: 'failed',
+          failureLog: [
+            `${step.phase} cached validation entrypoint probe failed for ${step.id}.`,
+            `command: ${probe.command}`,
+            `exit=${probe.exitCode} timedOut=${probe.timedOut}`,
+            probe.stdoutTail ? `stdout:\n${probe.stdoutTail}` : '',
+            probe.stderrTail ? `stderr:\n${probe.stderrTail}` : '',
+          ].filter(Boolean).join('\n'),
+        };
       }
     }
 
     step.status = 'DONE';
     step.retries = 0;
     await this.refreshCurrentProjectMemory(plan);
-    await this.opts.git.snapshot(step.id, step.retries, 'validated after rollback repair');
-    await this.opts.audit.event('phase.end', `${step.id} rollback validation passed`, {
+    await this.opts.git.snapshot(step.id, step.retries, 'validated without test regeneration');
+    await this.opts.audit.event('phase.end', `${step.id} current test validation passed`, {
       messageId: 'engine.rollback_validation_passed',
       stepId: step.id,
       phase: step.phase,
     });
-    return true;
+    return { status: 'passed' };
   }
 
   /** 主入口：先正常执行；若失败则进入 Debugger 重试循环（滑动窗口式自适应）。
    *  跨 xcompiler run 记忆：若普通 step 上次以 FAILED 结束，本次首轮直接进入 Debugger 模式。
-   *  V 模型测试阶段的历史失败不在同阶段恢复 Debugger，而是直接回退到配对左侧阶段。 */
+   *  V 模型测试阶段的历史失败先复验当前门禁，仍失败才回退到配对左侧阶段。 */
   private async executeStepWithDebug(
     plan: Plan,
     step: Step,
@@ -1259,8 +1278,12 @@ export class PhaseEngine {
         ? composeDebugRetryFailureLog(rootDebugFailureLog, failureLog, reason)
         : failureLog;
     let activeIssueId = initialDebug?.issueId;
+    const hadUnresolved = this.debugCache.hasUnresolvedFailure(step.id);
+    const preserveCachedTestOutputs =
+      !initialDebug && hadUnresolved && this.isVModelTestPhase(step.phase);
     // 阶段产物归档：在首次尝试前，将本 Step outputs 中已存在的 docs/* 文件移至 docs/history/
-    if (!opts.skipOutputArchive) {
+    // 历史测试失败恢复必须先复验当前产物；归档会让 required outputs 暂时缺失并绕过复验。
+    if (!opts.skipOutputArchive && !preserveCachedTestOutputs) {
       for (const out of step.outputs) {
         await archiveIfExists(this.opts.ws, out, this.opts.audit);
       }
@@ -1284,7 +1307,6 @@ export class PhaseEngine {
     step.retries = 0;
 
     // 跨会话记忆：上次以 FAILED 结束 → 首轮直接用 Debugger 模式，告诉它历史尝试
-    const hadUnresolved = this.debugCache.hasUnresolvedFailure(step.id);
     let priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(step.id);
     let initial: Awaited<ReturnType<PhaseEngine['runOneAttempt']>>;
     try {
@@ -1318,16 +1340,66 @@ export class PhaseEngine {
           priorPrompt = '';
           initial = await this.runOneAttempt(plan, step);
         } else {
-        this.log(
-          chalk.yellow(
-            t().engine.debugResumeNotice(step.id, attempts.length),
-          ),
-        );
-        if (this.isVModelTestPhase(step.phase)) {
-          if (
-            !shouldRollbackTestPhaseFailure(resume.reason, resumeFailureLog) ||
-            isCachedTestArtifactRegressionAfterPassingVerification(step, resumeFailureLog)
-          ) {
+          if (this.isVModelTestPhase(step.phase)) {
+            if (
+              !shouldRollbackTestPhaseFailure(resume.reason, resumeFailureLog) ||
+              isCachedTestArtifactRegressionAfterPassingVerification(step, resumeFailureLog)
+            ) {
+              this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
+              initial = await this.runOneAttempt(plan, step, {
+                asDebugger: true,
+                failureLog: resumeFailureLog,
+                reason: resume.reason,
+                priorAttemptsPrompt: priorPrompt,
+                extraAllowedWrites: inheritedExtraAllowedWrites,
+                contextMode: cachedContextMode,
+                testScopeArgs: cachedTestScopeArgs,
+                issueId: activeIssueId,
+                completedBeforeDebug,
+              });
+            } else {
+              this.log(chalk.yellow(t().engine.cachedTestRevalidationNotice(step.id, attempts.length)));
+              const validation = await this.validateTestPhaseWithoutRegeneration(plan, step);
+              if (validation.status === 'passed') {
+                await this.debugCache.markDone(step.id);
+                initial = {
+                  ok: true,
+                  failureLog: '',
+                  reason: `${step.phase} cached failure was stale; the current test gate passed.`,
+                  evidence: {
+                    stage: 'cached-test-revalidation',
+                    role: 'Tester',
+                    attempts: attempts.length,
+                    staleFailureCleared: true,
+                  },
+                };
+              } else {
+                const reason =
+                  validation.status === 'failed'
+                    ? `${step.phase} cached failure was reproduced by the current test gate; ` +
+                      'rolling back to the paired V-model source phase.'
+                    : `${step.phase} had an unresolved failure from a previous run; ` +
+                      'rolling back to the paired V-model source phase instead of resuming same-phase Debugger.';
+                const currentFailureLog = validation.failureLog ?? resumeFailureLog;
+                const ownerTestStep = this.findOwningTestStepForFailure(plan, step, currentFailureLog);
+                initial = {
+                  ok: false,
+                  failureLog: [t().engine.reasonLine(reason), currentFailureLog, priorPrompt].filter(Boolean).join('\n'),
+                  reason,
+                  rollbackToPairedSource: true,
+                  rollbackTestStepId: ownerTestStep?.id,
+                  issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
+                  evidence: {
+                    stage: 'cached-test-failure',
+                    role: 'Debugger',
+                    attempts: attempts.length,
+                    rollbackTestStepId: ownerTestStep?.id,
+                  },
+                };
+              }
+            }
+          } else {
+            this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
             initial = await this.runOneAttempt(plan, step, {
               asDebugger: true,
               failureLog: resumeFailureLog,
@@ -1339,39 +1411,7 @@ export class PhaseEngine {
               issueId: activeIssueId,
               completedBeforeDebug,
             });
-          } else {
-            const reason =
-              `${step.phase} had an unresolved failure from a previous run; ` +
-              'rolling back to the paired V-model source phase instead of resuming same-phase Debugger.';
-            const ownerTestStep = this.findOwningTestStepForFailure(plan, step, resumeFailureLog);
-            initial = {
-              ok: false,
-              failureLog: [t().engine.reasonLine(reason), priorPrompt, resumeFailureLog].filter(Boolean).join('\n'),
-              reason,
-              rollbackToPairedSource: true,
-              rollbackTestStepId: ownerTestStep?.id,
-              issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
-              evidence: {
-                stage: 'cached-test-failure',
-                role: 'Debugger',
-                attempts: attempts.length,
-                rollbackTestStepId: ownerTestStep?.id,
-              },
-            };
           }
-        } else {
-          initial = await this.runOneAttempt(plan, step, {
-            asDebugger: true,
-            failureLog: resumeFailureLog,
-            reason: resume.reason,
-            priorAttemptsPrompt: priorPrompt,
-            extraAllowedWrites: inheritedExtraAllowedWrites,
-            contextMode: cachedContextMode,
-            testScopeArgs: cachedTestScopeArgs,
-            issueId: activeIssueId,
-            completedBeforeDebug,
-          });
-        }
         }
       } else {
         initial = await this.runOneAttempt(plan, step);
@@ -1990,12 +2030,18 @@ export class PhaseEngine {
       outputs: step.outputs,
       allowedWrites: augmentedWrites,
       contextChars: this.stepContextChars(plan, step),
+      contextWindowTokens: this.opts.router.primaryContextWindow?.(role),
     };
     const guard = new EditGuard({
       ws: this.opts.ws,
       stepId: step.id,
       maxLines: this.opts.maxEditLinesPerStep ?? 'auto',
       budgetContext,
+    });
+    const operationWindow = resolveSkillOperationWindow({
+      contextWindowTokens: budgetContext.contextWindowTokens,
+      promptChars: budgetContext.contextChars,
+      configuredWriteChunkBytes: this.opts.maxWriteChunkBytes ?? 'auto',
     });
     const writeChunkBytes = resolveWriteChunkBytes(this.opts.maxWriteChunkBytes ?? 'auto', budgetContext);
     const guardedTools = baseTools.map((tool) => {
@@ -2010,6 +2056,10 @@ export class PhaseEngine {
       allowedWrites: augmentedWrites,
       stepId: step.id,
       language: plan.language,
+      contextWindowTokens: operationWindow.contextWindowTokens,
+      responseTokenBudget: operationWindow.responseTokenBudget,
+      feedbackCharBudget: operationWindow.feedbackCharBudget,
+      readChunkBytes: operationWindow.readChunkBytes,
       writeChunkBytes,
       defaultTestArgs: debug?.testScopeArgs?.length ? debug.testScopeArgs : this.testGateArgsForStep(step),
       requestPermission: this.opts.requestPermission,
@@ -2046,6 +2096,7 @@ export class PhaseEngine {
         maxFailedTestRuns,
         advisoryFailureTools,
         advisoryFailureRules,
+        maxWriteChunkBytes: this.opts.maxWriteChunkBytes ?? 'auto',
       });
 
       // 加载 inputs + outputs 已存在文件 作为上下文（debug 时尤其重要）
@@ -3112,6 +3163,30 @@ function isRepairEvidenceMissingFailure(reason?: string): boolean {
   return /without repair evidence/u.test(reason ?? '') ||
     /without a successful repair mutation/u.test(reason ?? '') ||
     /without a successful repair mutation or verification tool call/u.test(reason ?? '');
+}
+
+function renderTestValidationFailure(
+  step: Step,
+  testArgs: string[],
+  result: { exitCode: number; timedOut: boolean; stdout: string; stderr: string },
+): string {
+  const reason = `${step.phase} current test gate failed for ${step.id}.`;
+  const rawOutput = [
+    result.stdout ? `stdout:\n${result.stdout}` : '',
+    result.stderr ? `stderr:\n${result.stderr}` : '',
+  ].filter(Boolean).join('\n');
+  const evidence = compactFailureEvidence({
+    reason,
+    failureLog: rawOutput,
+    phase: step.phase,
+    maxChars: 10_000,
+    maxLines: 120,
+  });
+  return [
+    reason,
+    `run_tests args=${testArgs.join(' ')} exit=${result.exitCode} timedOut=${result.timedOut}`,
+    evidence,
+  ].filter(Boolean).join('\n');
 }
 
 export function shouldRollbackTestPhaseFailure(reason?: string, failureLog?: string): boolean {

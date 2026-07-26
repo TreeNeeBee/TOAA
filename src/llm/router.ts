@@ -14,6 +14,10 @@ import {
   probeLLMProviderAvailability,
   type LLMProbeResult,
 } from './health.js';
+import {
+  normalizeContextWindowTokens,
+  resolveSkillOperationWindow,
+} from './window.js';
 
 // 兼容旧导入路径：这些 helper 已下沉到通用可用性模块 health.ts。
 export { isOllamaProvider, isOpenAICompatibleProvider, normalizeBaseUrl } from './health.js';
@@ -88,13 +92,17 @@ export class LLMRouter {
       );
     }
     const clients = ranked
-      .map((name) => ({ name, client: this.clients.get(name) }))
-      .filter((x): x is { name: string; client: LLMClient } => !!x.client);
+      .map((name) => ({
+        name,
+        client: this.clients.get(name),
+        contextWindowTokens: normalizeContextWindowTokens(this.cfg.llm.providers[name]?.context_window),
+      }))
+      .filter((x): x is { name: string; client: LLMClient; contextWindowTokens: number } => !!x.client);
     if (clients.length === 0) {
       throw new Error(`No usable LLM provider in chain for role ${role}: [${ranked.join(', ')}]`);
     }
     const composite = new FallbackClient(
-      clients.map((c) => ({ name: c.name, client: c.client })),
+      clients,
       this.audit,
       String(role),
       this.scores,
@@ -116,6 +124,13 @@ export class LLMRouter {
       if (config && this.clients.has(provider)) return { provider, model: config.model };
     }
     return undefined;
+  }
+
+  /** Context window for the currently ranked primary provider. */
+  primaryContextWindow(role: Role): number {
+    const ranked = this.rankByScore(this.resolveChain(role));
+    const provider = ranked.find((name) => this.clients.has(name));
+    return normalizeContextWindowTokens(provider ? this.cfg.llm.providers[provider]?.context_window : undefined);
   }
 
   private resolveChain(role: Role): string[] {
@@ -155,7 +170,7 @@ class FallbackClient implements LLMClient {
   private static readonly RETRY_GATE_PROBE_MAX_AGE_MS = 5_000;
 
   constructor(
-    private readonly chain: { name: string; client: LLMClient }[],
+    private readonly chain: { name: string; client: LLMClient; contextWindowTokens: number }[],
     private readonly audit: AuditLogger | undefined,
     private readonly role: string,
     private readonly scores?: ScoreStore,
@@ -206,9 +221,43 @@ class FallbackClient implements LLMClient {
       let attemptOptions = options;
       for (let providerAttempt = 1; providerAttempt <= FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS; providerAttempt++) {
         let out: string;
-        try { options?.onProviderStart?.(c.name, c.client.name); } catch { /* display only */ }
         try {
-          out = await c.client.chat(messages, attemptOptions);
+          options?.onProviderStart?.(c.name, c.client.name, {
+            contextWindowTokens: c.contextWindowTokens,
+            switched: isSwitch,
+          });
+        } catch { /* display only */ }
+        const operationWindow = resolveSkillOperationWindow({
+          contextWindowTokens: c.contextWindowTokens,
+          promptChars: messages.reduce((sum, message) => sum + message.content.length, 0),
+        });
+        if (providerAttempt === 1) {
+          await this.audit?.event(
+            'note',
+            `${this.role} operation window updated for ${c.name}: context=${operationWindow.contextWindowTokens} tokens`,
+            {
+              messageId: 'llm.operation_window_updated',
+              provider: c.name,
+              model: c.client.name,
+              switched: isSwitch,
+              contextWindowTokens: operationWindow.contextWindowTokens,
+              promptTokens: operationWindow.promptTokens,
+              responseTokenBudget: operationWindow.responseTokenBudget,
+              readChunkBytes: operationWindow.readChunkBytes,
+              writeChunkBytes: operationWindow.writeChunkBytes,
+              feedbackCharBudget: operationWindow.feedbackCharBudget,
+            },
+          );
+        }
+        const providerOptions: ChatOptions = {
+          ...attemptOptions,
+          maxTokens:
+            typeof attemptOptions?.maxTokens === 'number'
+              ? Math.min(attemptOptions.maxTokens, operationWindow.responseTokenBudget)
+              : operationWindow.responseTokenBudget,
+        };
+        try {
+          out = await c.client.chat(messages, providerOptions);
         } catch (err) {
           lastErr = err;
           const retryDelayMs = retryDelayForLLMError(err);
