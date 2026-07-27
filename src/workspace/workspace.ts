@@ -18,6 +18,12 @@ export class Workspace {
     await fs.writeFile(full, content, 'utf8');
   }
 
+  async appendFile(rel: string, content: string): Promise<void> {
+    const full = this.abs(rel);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.appendFile(full, content, 'utf8');
+  }
+
   async readFile(rel: string): Promise<string> {
     return fs.readFile(this.abs(rel), 'utf8');
   }

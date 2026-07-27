@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import type { Workspace } from '../workspace/workspace.js';
-import { DEFAULT_PLAN_FILE, PlanSchema, type Language, type PlanIntent } from './plan.js';
+import { PlanSchema, type Language, type PlanIntent } from './plan.js';
 import { DEFAULT_PHASE_PLAN_FILE, PhasePlanSchema } from './phase_plan.js';
 import { PROJECT_MEMORY_PATH, refreshProjectMemory } from './project_memory.js';
 import { loadPlanTarget } from './storage.js';
@@ -160,18 +160,7 @@ async function loadPlanSummary(
 }
 
 async function defaultBaselinePlanPath(root: string): Promise<string> {
-  const phasePlanPath = path.join(root, DEFAULT_PHASE_PLAN_FILE);
-  if (await fileExists(phasePlanPath)) return phasePlanPath;
-  return path.join(root, DEFAULT_PLAN_FILE);
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.stat(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+  return path.join(root, DEFAULT_PHASE_PLAN_FILE);
 }
 
 async function loadManifestSummary(

@@ -39,8 +39,6 @@ import { buildDefaultSkills, SkillRegistry } from '../skills/skill.js';
 import { archiveIfExists } from '../workspace/doc_archive.js';
 import {
   DebugCache,
-  sanitizeDebugFailureLogForPrompt,
-  stripNestedLatestDebuggerFailures,
   type DebugAttemptEntry,
 } from './debug_cache.js';
 import {
@@ -72,6 +70,34 @@ import {
 } from './project_memory.js';
 import { PluginHost } from '../plugins/host.js';
 import { resolveSkillOperationWindow } from '../llm/window.js';
+import {
+  downstreamStepsForRerun,
+  incompleteTransitiveDependencies,
+  resetStepForRerun,
+  stepStateSummary,
+  stepTransitivelyDependsOn,
+  transitionStep,
+  validateExecutionSelection,
+} from './workflow_state.js';
+import {
+  adjustDebugRetryWindow,
+  classifyDebugFailure,
+  cleanFailureLogForDebugContext,
+  composeDebugRetryFailureLog,
+  isNonDebuggableInfrastructureFailure,
+  isReadOnlyProbeLoopFailure,
+  latestActionableDebugAttempt,
+  latestActionableSourceFailureLog,
+  shouldRollbackTestPhaseFailure,
+} from './debug_policy.js';
+import { transitionIssue, type IssueStatus } from './issue_state.js';
+import { IssueJournal } from './issue_journal.js';
+import {
+  affectedStepContract,
+  ChangeRequestStore,
+  isDesignChangeRequestPhase,
+  type EngineeringChangeRequest,
+} from './change_request.js';
 
 export interface EngineOptions {
   ws: Workspace;
@@ -142,6 +168,11 @@ type DebugAttemptContext = {
   issueResolutionPlan?: string;
 };
 
+type AttemptOptions = {
+  archiveOutputs?: boolean;
+  changeRequest?: EngineeringChangeRequest;
+};
+
 type AttemptOutcome = {
   ok: boolean;
   failureLog: string;
@@ -157,7 +188,7 @@ type AttemptOutcome = {
 };
 
 type TestPhaseValidationResult =
-  | { status: 'passed' }
+  | { status: 'passed'; commit: string }
   | { status: 'failed'; failureLog: string }
   | { status: 'incomplete'; failureLog: string; missingOutputs: string[] }
   | { status: 'denied'; failureLog: string };
@@ -178,13 +209,11 @@ type EngineIssueKind =
   | 'infrastructure'
   | 'exception';
 
-type EngineIssueStatus = 'recorded' | 'routed' | 'repairing' | 'resolved' | 'unresolved';
-
 interface EngineIssue {
   id: string;
   createdAt: string;
   updatedAt: string;
-  status: EngineIssueStatus;
+  status: IssueStatus;
   kind: EngineIssueKind;
   severity: 'error';
   language: Plan['language'];
@@ -204,6 +233,8 @@ interface EngineIssue {
   evidence?: Record<string, unknown>;
   targetStepId?: string;
   targetPhase?: Step['phase'];
+  verificationStepId?: string;
+  verificationPhase?: Step['phase'];
   routedAt?: string;
   resolvedAt?: string;
   issueResolutionPlan?: string;
@@ -222,8 +253,13 @@ interface EngineIssue {
     patchPath?: string;
     summaryPath?: string;
     changedFiles?: string[];
+    baselineCommit?: string;
+    commit?: string;
   };
   debugWikiEntryIds?: string[];
+  changeRequestIds?: string[];
+  activeChangeRequestId?: string;
+  causedByChangeRequestId?: string;
 }
 
 /** Phase Engine：拓扑顺序执行 Plan 的每个 Step；失败时自动调用 Debugger 重试。 */
@@ -244,6 +280,8 @@ export class PhaseEngine {
   private lastFailure?: LastFailure;
   /** 当前 run 内记录的结构化 issue，持久化到 `.xcompiler/issues/`。 */
   private readonly issues: EngineIssue[] = [];
+  private readonly issueJournal: IssueJournal;
+  private readonly changeRequests: ChangeRequestStore;
   private issueSeq = 0;
   private lastIssue?: EngineIssue;
 
@@ -253,6 +291,8 @@ export class PhaseEngine {
     this.plugins = opts.plugins ?? new PluginHost();
     this.debugCache = new DebugCache(opts.ws.abs('.xcompiler/debug_cache.json'));
     this.debugWiki = new DebugWiki(opts.debugWikiPath ?? defaultDebugWikiPath(opts.ws.root));
+    this.issueJournal = new IssueJournal(opts.ws);
+    this.changeRequests = new ChangeRequestStore(opts.ws);
   }
 
   private get terminalOutput(): boolean {
@@ -312,6 +352,7 @@ export class PhaseEngine {
   async run(plan: Plan): Promise<EngineResult> {
     await this.plugins.initialize();
     await this.withDebugWiki('load', () => this.debugWiki.load(), undefined);
+    await this.changeRequests.load();
     if (!this.pluginExtensionsApplied) {
       this.plugins.applyExtensions({ tools: this.registry, skills: this.skills });
       this.pluginExtensionsApplied = true;
@@ -340,13 +381,13 @@ export class PhaseEngine {
       : `project audit failed (${auditResult.errors} error(s), ${auditResult.warnings} warning(s))`;
     if (!step) {
       this.lastFailure = { reason, failureLog };
-      await this.recordIssue(plan, undefined, {
+      const issue = await this.recordIssue(plan, undefined, {
         kind: opts.contextMode === 'iteration-gate' ? 'iteration-gate' : 'project-audit',
         reason,
         failureLog,
         evidence: { checks: auditResult.checks, iterationId: opts.iterationId },
-        status: 'unresolved',
       });
+      await this.markIssueUnresolved(issue.id, 'no completed phase can own this audit repair');
       return {
         totalSteps: order.length,
         executedSteps: 0,
@@ -387,21 +428,10 @@ export class PhaseEngine {
 
     if (ok) {
       const repairedIndex = order.findIndex((candidate) => candidate.id === step.id);
-      const iterationId = step.iterationId ?? 'P1';
-      const stepById = new Map(order.map((candidate) => [candidate.id, candidate] as const));
-      const downstream = order.filter(
-        (candidate) =>
-          (candidate.iterationId ?? 'P1') === iterationId &&
-          candidate.id !== step.id &&
-          (
-            PHASE_ORDER[candidate.phase] > PHASE_ORDER[step.phase] ||
-            stepTransitivelyDependsOn(candidate, step.id, stepById)
-          ),
-      );
+      const downstream = downstreamStepsForRerun(order, step);
       if (downstream.length > 0) {
         for (const candidate of downstream) {
-          candidate.status = 'PENDING';
-          candidate.retries = 0;
+          resetStepForRerun(candidate, 'downstream-rerun');
         }
         await this.persistPlan(plan);
         await this.opts.audit.event(
@@ -461,33 +491,18 @@ export class PhaseEngine {
       }
       return { totalSteps: order.length, executedSteps: 0 };
     }
-    const fromIndex = this.opts.fromStepId
-      ? order.findIndex((step) => step.id === this.opts.fromStepId)
-      : 0;
-    if (this.opts.fromStepId && fromIndex < 0) {
+    const selection = validateExecutionSelection(order, {
+      fromStepId: this.opts.fromStepId,
+      onlyPhase: this.opts.onlyPhase,
+    });
+    if (!selection.ok) {
       return stopForInvalidTransition(
-        this.opts.fromStepId,
-        `cannot start from unknown step ${this.opts.fromStepId}`,
+        selection.failedStepId,
+        selection.reason,
+        selection.data,
       );
     }
-    if (this.opts.fromStepId) {
-      const bypassed = order.slice(0, fromIndex).filter((step) => step.status !== 'DONE');
-      if (bypassed.length > 0) {
-        return stopForInvalidTransition(
-          bypassed[0]!.id,
-          `cannot start from ${this.opts.fromStepId}: earlier required steps are incomplete: ` +
-            bypassed.map((step) => `${step.id}=${step.status}`).join(', '),
-          { fromStepId: this.opts.fromStepId, incompleteSteps: bypassed.map(stepStateSummary) },
-        );
-      }
-    }
-    if (this.opts.onlyPhase && !order.some((step) => step.phase === this.opts.onlyPhase)) {
-      return stopForInvalidTransition(
-        `PHASE_${this.opts.onlyPhase}`,
-        `cannot run unknown or absent phase ${this.opts.onlyPhase}`,
-        { onlyPhase: this.opts.onlyPhase },
-      );
-    }
+    const fromIndex = selection.fromIndex;
 
     await this.requireEnginePermission({
       operationType: 'git_operation',
@@ -560,10 +575,14 @@ export class PhaseEngine {
         continue;
       }
 
+      const activeChangeRequest = this.changeRequests.activeForStep(step);
       await this.plugins.emit('step.before', { plan, step });
       let ok: boolean;
       try {
-        ok = await this.executeStepWithDebug(plan, step);
+        ok = await this.executeStepWithDebug(plan, step, {
+          changeRequest: activeChangeRequest,
+          skipOutputArchive: !!activeChangeRequest,
+        });
       } catch (error) {
         await this.plugins.emit('step.error', { plan, step, error });
         throw error;
@@ -572,17 +591,27 @@ export class PhaseEngine {
       executed++;
       await this.persistPlan(plan);
       if (!ok) {
-        const nonDebuggableInfrastructureFailure = isNonDebuggableInfrastructureFailure(
+        const failedIssue = await this.openIssueForFailedStep(step.id);
+        if (activeChangeRequest) {
+          await this.recordChangeRequestFailure(activeChangeRequest, failedIssue, step);
+        }
+        const failureRoute = classifyDebugFailure(
+          this.isVModelTestPhase(step.phase) ? 'test' : 'development',
           this.lastFailure?.reason,
           this.lastFailure?.failureLog,
         );
         if (
-          !nonDebuggableInfrastructureFailure &&
+          failureRoute === 'rollback-paired-source' &&
           !this.opts.onlyPhase &&
-          this.isVModelTestPhase(step.phase) &&
-          shouldRollbackTestPhaseFailure(this.lastFailure?.reason, this.lastFailure?.failureLog)
+          this.isVModelTestPhase(step.phase)
         ) {
-          const rollback = await this.rollbackFailedTestPhase(plan, order, step, this.lastIssue);
+          const rollback = await this.rollbackFailedTestPhase(
+            plan,
+            order,
+            step,
+            failedIssue,
+            activeChangeRequest,
+          );
           executed += rollback.executedSteps;
           await this.persistPlan(plan);
           if (rollback.ok && rollback.restartIndex !== undefined) {
@@ -605,6 +634,10 @@ export class PhaseEngine {
           failureReason: this.lastFailure?.reason,
         };
       }
+      if (activeChangeRequest) {
+        await this.maybeCloseChangeRequest(plan, activeChangeRequest, step);
+      }
+      await this.resolveIssuesVerifiedByStep(step);
 
       if (step.phase === 'HIGH_LEVEL_DESIGN' && step.outputs.includes(this.profile.manifestFile)) {
         await this.requireEnginePermission({
@@ -687,7 +720,6 @@ export class PhaseEngine {
       failureLog: string;
       metrics?: ExecutorRunMetrics;
       evidence?: Record<string, unknown>;
-      status?: EngineIssueStatus;
     },
   ): Promise<EngineIssue> {
     const now = new Date().toISOString();
@@ -713,7 +745,7 @@ export class PhaseEngine {
       id,
       createdAt: now,
       updatedAt: now,
-      status: input.status ?? 'recorded',
+      status: 'recorded',
       kind: input.kind,
       severity: 'error',
       language: plan.language,
@@ -744,7 +776,8 @@ export class PhaseEngine {
 
   private async routeIssueToStep(issue: EngineIssue | undefined, target: Step, reason: string): Promise<void> {
     if (!issue) return;
-    issue.status = 'routed';
+    const routedAt = new Date().toISOString();
+    transitionIssue(issue, 'routed', routedAt);
     issue.targetStepId = target.id;
     issue.targetPhase = target.phase;
     issue.debugBrief = buildDebugBrief({
@@ -753,8 +786,7 @@ export class PhaseEngine {
       phase: issue.phase,
       targetPhase: target.phase,
     });
-    issue.routedAt = new Date().toISOString();
-    issue.updatedAt = issue.routedAt;
+    issue.routedAt = routedAt;
     await this.persistIssue(issue, 'routed', { routingReason: reason });
     await this.opts.audit.event('issue.route', `${issue.id} -> ${target.id} ${target.phase}`, {
       messageId: 'engine.issue_routed',
@@ -766,10 +798,9 @@ export class PhaseEngine {
   }
 
   private async markIssueUnresolved(issueId: string | undefined, reason: string): Promise<void> {
-    const issue = issueId ? this.findIssue(issueId) : undefined;
+    const issue = issueId ? await this.getIssue(issueId) : undefined;
     if (!issue) return;
-    issue.status = 'unresolved';
-    issue.updatedAt = new Date().toISOString();
+    transitionIssue(issue, 'unresolved');
     await this.persistIssue(issue, 'unresolved', { reason });
   }
 
@@ -779,18 +810,58 @@ export class PhaseEngine {
     repair?: EngineIssue['repair'],
     issueResolutionPlan?: string,
   ): Promise<void> {
-    const issue = issueId ? this.findIssue(issueId) : undefined;
+    const issue = issueId ? await this.getIssue(issueId) : undefined;
     if (!issue) return;
-    issue.status = 'resolved';
-    issue.resolvedAt = new Date().toISOString();
-    issue.updatedAt = issue.resolvedAt;
+    if (issue.status === 'resolved') return;
+    const resolvedAt = new Date().toISOString();
+    transitionIssue(issue, 'resolved', resolvedAt);
+    issue.resolvedAt = resolvedAt;
+    if (repair) issue.repair = repair;
+    const effectiveRepair = repair ?? issue.repair;
+    if (issueResolutionPlan?.trim()) {
+      issue.issueResolutionPlan = issueResolutionPlan.trim();
+      const latestPlan = issue.resolutionPlanHistory?.at(-1)?.plan;
+      if (latestPlan !== issue.issueResolutionPlan) {
+        issue.resolutionPlanHistory = [
+          ...(issue.resolutionPlanHistory ?? []),
+          {
+            at: issue.resolvedAt,
+            stepId: step.id,
+            phase: step.phase,
+            plan: issue.issueResolutionPlan,
+            outcome: 'accepted' as const,
+          },
+        ].slice(-8);
+      }
+    }
+    await this.recordDebugWikiResolution(issue, step, effectiveRepair);
+    await this.persistIssue(issue, 'resolved');
+    const repairedStepId = effectiveRepair?.repairedStepId ?? step.id;
+    const repairedPhase = effectiveRepair?.repairedPhase ?? step.phase;
+    await this.opts.audit.event('issue.resolve', `${issue.id} resolved by ${repairedStepId} ${repairedPhase}`, {
+      messageId: 'engine.issue_resolved',
+      issueId: issue.id,
+      repairedStepId,
+      repairedPhase,
+      repair: effectiveRepair,
+    });
+  }
+
+  private async recordIssueRepairReady(
+    issueId: string,
+    step: Step,
+    repair: EngineIssue['repair'] | undefined,
+    issueResolutionPlan: string | undefined,
+  ): Promise<void> {
+    const issue = await this.getIssue(issueId);
+    if (!issue) return;
     if (repair) issue.repair = repair;
     if (issueResolutionPlan?.trim()) {
       issue.issueResolutionPlan = issueResolutionPlan.trim();
       issue.resolutionPlanHistory = [
         ...(issue.resolutionPlanHistory ?? []),
         {
-          at: issue.resolvedAt,
+          at: new Date().toISOString(),
           stepId: step.id,
           phase: step.phase,
           plan: issue.issueResolutionPlan,
@@ -798,15 +869,35 @@ export class PhaseEngine {
         },
       ].slice(-8);
     }
-    await this.recordDebugWikiResolution(issue, step, repair);
-    await this.persistIssue(issue, 'resolved');
-    await this.opts.audit.event('issue.resolve', `${issue.id} resolved by ${step.id} ${step.phase}`, {
-      messageId: 'engine.issue_resolved',
-      issueId: issue.id,
+    issue.updatedAt = new Date().toISOString();
+    await this.persistIssue(issue, 'repair-ready', {
       repairedStepId: step.id,
       repairedPhase: step.phase,
       repair,
     });
+  }
+
+  private async markIssueChangePending(
+    issue: EngineIssue,
+    request: EngineeringChangeRequest,
+  ): Promise<void> {
+    transitionIssue(issue, 'change_pending');
+    issue.activeChangeRequestId = request.id;
+    issue.changeRequestIds = dedup([...(issue.changeRequestIds ?? []), request.id]);
+    await this.persistIssue(issue, 'change-pending', {
+      changeRequestId: request.id,
+      changeRequestRevision: request.revision,
+    });
+    await this.opts.audit.event(
+      'note',
+      `${issue.id} waits for ${request.id} downstream implementation`,
+      {
+        messageId: 'engine.issue_change_pending',
+        issueId: issue.id,
+        changeRequestId: request.id,
+        changeRequestRevision: request.revision,
+      },
+    );
   }
 
   private async recordDebugWikiFailure(
@@ -859,8 +950,10 @@ export class PhaseEngine {
       targetPhase: issue.targetPhase,
     });
     const repairFiles = repair?.changedFiles?.length ? repair.changedFiles : step.outputs;
+    const repairedStepId = repair?.repairedStepId ?? step.id;
+    const repairedPhase = repair?.repairedPhase ?? step.phase;
     const evidenceSummary = [
-      `Resolved ${issue.kind} by Debugger in ${step.id}/${step.phase}.`,
+      `Resolved ${issue.kind} by Debugger in ${repairedStepId}/${repairedPhase}.`,
       `Mode: ${repair?.mode ?? 'verification'}.`,
       repairFiles.length > 0 ? `Changed/verified files: ${repairFiles.join(', ')}.` : '',
       repair?.patchPath ? `Patch: ${repair.patchPath}.` : '',
@@ -900,32 +993,99 @@ export class PhaseEngine {
     return this.issues.find((issue) => issue.id === issueId);
   }
 
+  private async getIssue(issueId: string): Promise<EngineIssue | undefined> {
+    const current = this.findIssue(issueId);
+    if (current) return current;
+    const raw = await this.opts.ws.readFile(`.xcompiler/issues/${issueId}.json`).catch(() => '');
+    if (!raw.trim()) return undefined;
+    const issue = JSON.parse(raw) as EngineIssue;
+    this.issues.push(issue);
+    return issue;
+  }
+
+  private async findLatestOpenIssueForStep(stepId: string): Promise<EngineIssue | undefined> {
+    const raw = await this.opts.ws.readFile('.xcompiler/issues/issues.jsonl').catch(() => '');
+    const seen = new Set<string>();
+    const entries = raw.split(/\r?\n/u).filter(Boolean).reverse();
+    for (const line of entries) {
+      let entry: { issueId?: string; stepId?: string; status?: IssueStatus };
+      try {
+        entry = JSON.parse(line) as typeof entry;
+      } catch {
+        continue;
+      }
+      if (!entry.issueId || seen.has(entry.issueId)) continue;
+      seen.add(entry.issueId);
+      if (entry.stepId !== stepId || entry.status === 'resolved') continue;
+      const issue = await this.getIssue(entry.issueId);
+      if (issue && issue.status !== 'resolved') return issue;
+    }
+    return undefined;
+  }
+
+  private async openIssueForFailedStep(stepId: string): Promise<EngineIssue | undefined> {
+    if (
+      this.lastIssue?.stepId === stepId &&
+      this.lastIssue.status !== 'resolved'
+    ) {
+      return this.lastIssue;
+    }
+    return this.findLatestOpenIssueForStep(stepId);
+  }
+
+  private async findOpenIssuesVerifiedByStep(stepId: string): Promise<EngineIssue[]> {
+    const found = new Map<string, EngineIssue>();
+    for (const issue of this.issues) {
+      if (
+        issue.status !== 'resolved' &&
+        issue.verificationStepId === stepId
+      ) {
+        found.set(issue.id, issue);
+      }
+    }
+    const raw = await this.opts.ws.readFile('.xcompiler/issues/issues.jsonl').catch(() => '');
+    const seen = new Set<string>();
+    for (const line of raw.split(/\r?\n/u).filter(Boolean).reverse()) {
+      let entry: { issueId?: string; status?: IssueStatus };
+      try {
+        entry = JSON.parse(line) as typeof entry;
+      } catch {
+        continue;
+      }
+      if (!entry.issueId || seen.has(entry.issueId)) continue;
+      seen.add(entry.issueId);
+      if (entry.status === 'resolved' || found.has(entry.issueId)) continue;
+      const issue = await this.getIssue(entry.issueId);
+      if (
+        issue &&
+        issue.status !== 'resolved' &&
+        issue.verificationStepId === stepId
+      ) {
+        found.set(issue.id, issue);
+      }
+    }
+    return [...found.values()];
+  }
+
+  private async resolveIssuesVerifiedByStep(step: Step): Promise<void> {
+    for (const issue of await this.findOpenIssuesVerifiedByStep(step.id)) {
+      if (issue.activeChangeRequestId) continue;
+      await this.markIssueResolved(
+        issue.id,
+        step,
+        issue.repair,
+        issue.issueResolutionPlan ??
+          `Repair ${issue.targetStepId ?? issue.stepId ?? 'the paired source phase'} and pass ${step.id} ${step.phase}.`,
+      );
+    }
+  }
+
   private async persistIssue(
     issue: EngineIssue,
     event: string,
     extra: Record<string, unknown> = {},
   ): Promise<void> {
-    await this.opts.ws.writeFile(`.xcompiler/issues/${issue.id}.json`, `${JSON.stringify(issue, null, 2)}\n`);
-    const eventPath = '.xcompiler/issues/issues.jsonl';
-    const existing = await this.opts.ws.readFile(eventPath).catch(() => '');
-    const line = JSON.stringify({
-      event,
-      at: new Date().toISOString(),
-      issueId: issue.id,
-      status: issue.status,
-      kind: issue.kind,
-      stepId: issue.stepId,
-      phase: issue.phase,
-      targetStepId: issue.targetStepId,
-      targetPhase: issue.targetPhase,
-      reason: issue.reason,
-      debugSummary: issue.debugBrief?.summary,
-      debugDemand: issue.debugBrief?.debugDemand,
-      debugWikiEntryIds: issue.debugWikiEntryIds,
-      issueResolutionPlan: issue.issueResolutionPlan,
-      ...extra,
-    });
-    await this.opts.ws.writeFile(eventPath, `${existing}${line}\n`);
+    await this.issueJournal.persist(issue, event, extra);
   }
 
   private classifyIssueKind(step: Step, outcome: AttemptOutcome): EngineIssueKind {
@@ -1116,11 +1276,37 @@ export class PhaseEngine {
     return (V_MODEL_TEST_PHASES as readonly string[]).includes(phase);
   }
 
+  /**
+   * A failed right-side V-model phase is still valuable evidence. Keep its
+   * declared test artifacts readable by the paired source-phase Debugger.
+   * Tool write guards already restrict the attempt to the phase allowlist.
+   */
+  private async preserveFailedTestArtifacts(step: Step, reason: string): Promise<void> {
+    const snapshot = await this.opts.git.snapshot(
+      step.id,
+      step.retries,
+      'failed test artifacts preserved',
+    );
+    await this.opts.audit.event(
+      'note',
+      `preserved failed test artifacts for ${step.id}`,
+      {
+        messageId: 'engine.failed_test_artifacts_preserved',
+        stepId: step.id,
+        phase: step.phase,
+        reason,
+        outputs: step.outputs,
+        snapshot,
+      },
+    );
+  }
+
   private async rollbackFailedTestPhase(
     plan: Plan,
     order: Step[],
     failedTest: Step,
     issue?: EngineIssue,
+    activeChangeRequest?: EngineeringChangeRequest,
   ): Promise<EngineResult & { ok: boolean; restartIndex?: number }> {
     const ownerStep = this.lastFailure?.rollbackTestStepId
       ? order.find((step) =>
@@ -1185,6 +1371,14 @@ export class PhaseEngine {
       t().engine.testRollbackNotice(routedTest.id, routedTest.phase, sourceStep.id, sourcePhase),
     ));
     await this.routeIssueToStep(issue, sourceStep, reason);
+    if (issue) {
+      issue.verificationStepId = routedTest.id;
+      issue.verificationPhase = routedTest.phase;
+      await this.persistIssue(issue, 'verification-required', {
+        verificationStepId: routedTest.id,
+        verificationPhase: routedTest.phase,
+      });
+    }
 
     await this.opts.audit.event('note', reason, {
       messageId: 'engine.test_phase_rollback',
@@ -1197,20 +1391,27 @@ export class PhaseEngine {
       sourcePhase,
     });
 
+    const affectedSteps: Step[] = [];
     for (const step of order) {
       if ((step.iterationId ?? 'P1') !== iterationId) continue;
       if (step.id === sourceStep.id) continue;
       const isLaterPhase = PHASE_ORDER[step.phase] > PHASE_ORDER[sourcePhase];
       const dependsOnSource = stepTransitivelyDependsOn(step, sourceStep.id, stepById);
       if (!isLaterPhase && !dependsOnSource) continue;
+      affectedSteps.push(step);
       if (step.status === 'PENDING') continue;
-      step.status = 'PENDING';
-      step.retries = 0;
+      resetStepForRerun(step, 'v-model-rollback');
     }
     await this.persistPlan(plan);
 
     await this.plugins.emit('step.before', { plan, step: sourceStep });
     let ok: boolean;
+    const sourceChangeRequest = activeChangeRequest && (
+      activeChangeRequest.designSource.stepId === sourceStep.id ||
+      activeChangeRequest.affectedSteps.some((affected) => affected.stepId === sourceStep.id)
+    )
+      ? activeChangeRequest
+      : undefined;
     try {
       ok = await this.executeStepWithDebug(plan, sourceStep, {
         initialDebug: {
@@ -1236,6 +1437,7 @@ export class PhaseEngine {
           completedBeforeDebug: sourceStep.status === 'DONE',
         },
         skipOutputArchive: true,
+        changeRequest: sourceChangeRequest,
       });
     } catch (error) {
       await this.plugins.emit('step.error', { plan, step: sourceStep, error });
@@ -1255,6 +1457,18 @@ export class PhaseEngine {
       };
     }
 
+    let designChangeRequest: EngineeringChangeRequest | undefined;
+    if (issue && isDesignChangeRequestPhase(sourceStep.phase)) {
+      designChangeRequest = await this.establishDesignChangeRequest({
+        plan,
+        issue,
+        sourceStep,
+        failedTest: routedTest,
+        affectedSteps,
+        activeChangeRequest,
+      });
+    }
+
     await this.debugCache.markDone(routedTest.id);
     if (routedTest.id !== failedTest.id) await this.debugCache.markDone(failedTest.id);
     const sourceIndex = order.findIndex((step) => step.id === sourceStep.id);
@@ -1266,6 +1480,37 @@ export class PhaseEngine {
       : [];
     if (interveningSteps.length === 0) {
       const repairedTestValidation = await this.validateTestPhaseWithoutRegeneration(plan, routedTest);
+      const validationChangeRequest = designChangeRequest ?? activeChangeRequest;
+      if (repairedTestValidation.status === 'passed' && validationChangeRequest) {
+        const hasVerification = validationChangeRequest.applications.some(
+          (application) =>
+            application.stepId === routedTest.id &&
+            application.commit === repairedTestValidation.commit,
+        );
+        if (!hasVerification) {
+          await this.changeRequests.recordApplication(validationChangeRequest, {
+            stepId: routedTest.id,
+            phase: routedTest.phase,
+            kind: 'verification',
+            commit: repairedTestValidation.commit,
+            changedFiles: [],
+            summary: `Revalidated ${routedTest.id} ${routedTest.phase} without regenerating accepted test artifacts.`,
+          });
+        }
+        await this.maybeCloseChangeRequest(plan, validationChangeRequest, routedTest);
+      }
+      if (
+        repairedTestValidation.status === 'passed' &&
+        issue &&
+        !validationChangeRequest
+      ) {
+        await this.markIssueResolved(
+          issue.id,
+          routedTest,
+          issue.repair,
+          issue.issueResolutionPlan,
+        );
+      }
       if (repairedTestValidation.status === 'denied') {
         const failureReason = `${routedTest.phase} revalidation was denied after ${sourceStep.id} repair`;
         this.lastFailure = {
@@ -1300,6 +1545,310 @@ export class PhaseEngine {
       executedSteps: 1,
       restartIndex,
     };
+  }
+
+  private async recordChangeRequestFailure(
+    request: EngineeringChangeRequest,
+    issue: EngineIssue | undefined,
+    step: Step,
+  ): Promise<void> {
+    if (!issue) return;
+    issue.causedByChangeRequestId = request.id;
+    issue.changeRequestIds = dedup([...(issue.changeRequestIds ?? []), request.id]);
+    await this.persistIssue(issue, 'change-request-failure', {
+      changeRequestId: request.id,
+      failedChangeStepId: step.id,
+      failedChangeStepPhase: step.phase,
+    });
+    if (!request.relatedIssueIds.includes(issue.id)) {
+      await this.changeRequests.requestRework(
+        request,
+        issue.id,
+        `${step.id} ${step.phase} failed while applying ${request.id}: ${issue.reason}`,
+      );
+    }
+    await this.opts.audit.event(
+      'note',
+      `${request.id} revision ${request.revision} requires rework after ${step.id}`,
+      {
+        messageId: 'engine.change_request_rework',
+        changeRequestId: request.id,
+        revision: request.revision,
+        issueId: issue.id,
+        stepId: step.id,
+        phase: step.phase,
+      },
+    );
+  }
+
+  private async establishDesignChangeRequest(input: {
+    plan: Plan;
+    issue: EngineIssue;
+    sourceStep: Step;
+    failedTest: Step;
+    affectedSteps: Step[];
+    activeChangeRequest?: EngineeringChangeRequest;
+  }): Promise<EngineeringChangeRequest> {
+    const issue = await this.getIssue(input.issue.id) ?? input.issue;
+    const current = input.activeChangeRequest;
+    const currentCoversSource = current && (
+      current.designSource.stepId === input.sourceStep.id ||
+      current.affectedSteps.some((step) => step.stepId === input.sourceStep.id)
+    );
+    if (current && currentCoversSource) {
+      if (!current.relatedIssueIds.includes(issue.id)) {
+        await this.changeRequests.requestRework(
+          current,
+          issue.id,
+          `${input.failedTest.id} requires a design correction in ${input.sourceStep.id}`,
+        );
+      }
+      await this.ensureDesignApplication(current, issue, input.sourceStep);
+      await this.markIssueChangePending(issue, current);
+      return current;
+    }
+
+    const repairCommit = issue.repair?.commit ?? await this.currentHead();
+    const baselineCommit = issue.repair?.baselineCommit ?? repairCommit;
+    const changedArtifacts = dedup(
+      issue.repair?.changedFiles?.length
+        ? issue.repair.changedFiles
+        : input.sourceStep.outputs,
+    );
+    const affectedSteps = input.affectedSteps.map(affectedStepContract);
+    const affectedArtifacts = dedup([
+      ...changedArtifacts,
+      ...input.affectedSteps.flatMap((step) => step.outputs),
+    ]);
+    const resolutionPlan = issue.issueResolutionPlan ??
+      `Apply the repaired ${input.sourceStep.phase} contract incrementally through the affected downstream steps.`;
+    const request = await this.changeRequests.create({
+      iterationId: input.sourceStep.iterationId ?? 'P1',
+      issueId: issue.id,
+      relatedIssueIds: [issue.id],
+      parentChangeRequestId: current?.id,
+      title: `${input.sourceStep.phase} correction after ${input.failedTest.phase} failure`,
+      objective: resolutionPlan,
+      scope: {
+        in: dedup([
+          `${input.sourceStep.id} design correction`,
+          ...affectedSteps.map((step) => `${step.stepId} ${step.phase}`),
+          ...affectedArtifacts,
+        ]),
+        out: ['Unrelated requirements, modules, files, and already accepted behavior'],
+      },
+      trigger: {
+        failedStepId: input.failedTest.id,
+        failedPhase: input.failedTest.phase,
+        failedAcceptance: input.failedTest.acceptance,
+        reason: issue.reason,
+        failureSummary: issue.debugBrief?.summary ?? issue.failureLog.slice(0, 1200),
+        failureEvidencePath: issue.rawFailureLogPath,
+      },
+      designSource: {
+        stepId: input.sourceStep.id,
+        phase: input.sourceStep.phase as 'HIGH_LEVEL_DESIGN' | 'DETAILED_DESIGN',
+        baselineCommit,
+        repairCommit,
+        changedArtifacts,
+        patchPath: issue.repair?.patchPath,
+      },
+      contractChange: {
+        summary: resolutionPlan,
+        before: [
+          `Rejected acceptance: ${input.failedTest.acceptance}`,
+          `Observed failure: ${issue.debugBrief?.summary ?? issue.reason}`,
+        ],
+        after: [
+          `Accepted repair plan: ${resolutionPlan}`,
+          `Repaired artifacts: ${changedArtifacts.join(', ')}`,
+        ],
+        interfaces: input.sourceStep.outputs.map((output) => `Contract artifact: ${output}`),
+        dependencies: input.plan.dependencies ?? [],
+        constraints: [
+          'Apply only this contract delta; preserve unrelated accepted behavior.',
+          `Re-run the affected V-model chain through ${input.failedTest.id} ${input.failedTest.phase}.`,
+        ],
+      },
+      implementationPlan: [
+        resolutionPlan,
+        `Apply in order: ${affectedSteps.map((step) => `${step.stepId}/${step.phase}`).join(' -> ')}.`,
+      ].join('\n'),
+      affectedSteps,
+      affectedArtifacts,
+      verification: {
+        targetStepId: input.failedTest.id,
+        targetPhase: input.failedTest.phase,
+        testArgs: this.testGateArgsForStep(input.failedTest),
+        checks: [
+          input.failedTest.acceptance,
+          ...input.failedTest.outputs.map((output) => `Required output exists: ${output}`),
+        ],
+        failurePolicy:
+          'Record a linked issue, return this CR to rework, and resume from the paired V-model source. ' +
+          'Create a child CR only when the correction expands the design contract or scope.',
+        rollbackTargetStepId: input.sourceStep.id,
+        rollbackTargetPhase: input.sourceStep.phase,
+      },
+      execution: {
+        completedStepIds: [],
+        blockedBy: [],
+      },
+    });
+    await this.ensureDesignApplication(request, issue, input.sourceStep);
+    if (current) {
+      await this.changeRequests.blockOnChild(
+        current,
+        request.id,
+        issue.id,
+        `${request.id} expands ${current.id} to upstream ${input.sourceStep.phase} scope`,
+      );
+    }
+    await this.markIssueChangePending(issue, request);
+    await this.opts.audit.event(
+      'note',
+      `${request.id} opened for ${issue.id}`,
+      {
+        messageId: 'engine.change_request_opened',
+        changeRequestId: request.id,
+        parentChangeRequestId: request.parentChangeRequestId,
+        issueId: issue.id,
+        sourceStepId: input.sourceStep.id,
+        sourcePhase: input.sourceStep.phase,
+        affectedStepIds: affectedSteps.map((step) => step.stepId),
+      },
+    );
+    return request;
+  }
+
+  private async ensureDesignApplication(
+    request: EngineeringChangeRequest,
+    issue: EngineIssue,
+    sourceStep: Step,
+  ): Promise<void> {
+    const commit = issue.repair?.commit ?? await this.currentHead();
+    const alreadyRecorded = request.applications.some(
+      (application) =>
+        application.revision === request.revision &&
+        application.stepId === sourceStep.id &&
+        application.kind === 'design-change' &&
+        application.commit === commit,
+    );
+    if (alreadyRecorded) return;
+    await this.changeRequests.recordApplication(request, {
+      stepId: sourceStep.id,
+      phase: sourceStep.phase,
+      kind: 'design-change',
+      commit,
+      changedFiles: issue.repair?.changedFiles ?? sourceStep.outputs,
+      summary: issue.issueResolutionPlan ??
+        `Repair ${sourceStep.id} ${sourceStep.phase} contract for ${issue.id}.`,
+    });
+  }
+
+  private async maybeCloseChangeRequest(
+    plan: Plan,
+    request: EngineeringChangeRequest,
+    completedStep: Step,
+  ): Promise<void> {
+    if (request.status === 'closed' || request.status === 'cancelled' || request.status === 'failed') return;
+    if (request.execution.blockedBy.length > 0) return;
+    const byId = new Map(plan.steps.map((step) => [step.id, step]));
+    if (!request.affectedSteps.every((affected) => byId.get(affected.stepId)?.status === 'DONE')) return;
+    const applied = new Set(request.applications.map((application) => application.stepId));
+    if (!request.affectedSteps.every((affected) => applied.has(affected.stepId))) return;
+
+    await this.changeRequests.close(request);
+    for (const issueId of request.relatedIssueIds) {
+      const issue = await this.getIssue(issueId);
+      if (!issue || issue.status === 'resolved') continue;
+      issue.activeChangeRequestId = undefined;
+      await this.markIssueResolved(issue.id, completedStep, issue.repair, issue.issueResolutionPlan);
+    }
+    await this.opts.audit.event(
+      'note',
+      `${request.id} closed after all affected V-model gates passed`,
+      {
+        messageId: 'engine.change_request_closed',
+        changeRequestId: request.id,
+        revision: request.revision,
+        applications: request.applications,
+      },
+    );
+
+    const parent = await this.changeRequests.unblockParent(request);
+    if (parent) {
+      const parentSteps = new Set(parent.affectedSteps.map((affected) => affected.stepId));
+      for (const application of request.applications) {
+        if (!parentSteps.has(application.stepId)) continue;
+        const alreadyRecorded = parent.applications.some(
+          (candidate) =>
+            candidate.stepId === application.stepId &&
+            candidate.commit === application.commit,
+        );
+        if (alreadyRecorded) continue;
+        await this.changeRequests.recordApplication(parent, {
+          stepId: application.stepId,
+          phase: application.phase,
+          kind: application.kind,
+          commit: application.commit,
+          changedFiles: application.changedFiles,
+          summary: `Satisfied by child ${request.id}: ${application.summary}`,
+        });
+      }
+      await this.maybeCloseChangeRequest(plan, parent, completedStep);
+    }
+  }
+
+  private async currentHead(): Promise<string> {
+    return (await this.opts.git.raw().revparse(['HEAD'])).trim();
+  }
+
+  private async recordChangeRequestApplicationFromAttempt(
+    request: EngineeringChangeRequest,
+    step: Step,
+    debug: DebugAttemptContext | undefined,
+    beforeCommit: string,
+    completionCommit: string,
+    summary: string | undefined,
+  ): Promise<void> {
+    const changedFiles = (await this.opts.git.raw().diff([
+      '--name-only',
+      beforeCommit,
+      completionCommit,
+      '--',
+    ]).catch(() => ''))
+      .split(/\r?\n/u)
+      .map(normalizeGitPath)
+      .filter(Boolean);
+    const kind = debug && isDesignChangeRequestPhase(step.phase)
+      ? 'design-change' as const
+      : this.isVModelTestPhase(step.phase)
+        ? 'verification' as const
+        : 'implementation-change' as const;
+    await this.changeRequests.recordApplication(request, {
+      stepId: step.id,
+      phase: step.phase,
+      kind,
+      commit: completionCommit,
+      changedFiles,
+      summary: summary?.trim() ||
+        `${kind === 'verification' ? 'Verified' : 'Applied'} ${request.id} in ${step.id} ${step.phase}.`,
+    });
+    await this.opts.audit.event(
+      'note',
+      `${request.id} ${kind} recorded for ${step.id}`,
+      {
+        messageId: 'engine.change_request_application',
+        changeRequestId: request.id,
+        revision: request.revision,
+        stepId: step.id,
+        phase: step.phase,
+        kind,
+        commit: completionCommit,
+        changedFiles,
+      },
+    );
   }
 
   private async validateTestPhaseWithoutRegeneration(
@@ -1456,16 +2005,21 @@ export class PhaseEngine {
       return { status: 'incomplete', failureLog, missingOutputs: missing };
     }
 
-    step.status = 'DONE';
+    transitionStep(step, 'DONE', 'cached-gate-passed');
     step.retries = 0;
+    await this.persistPlan(plan);
     await this.refreshCurrentProjectMemory(plan);
-    await this.opts.git.snapshot(step.id, step.retries, 'validated without test regeneration');
+    const commit = await this.opts.git.snapshot(
+      step.id,
+      step.retries,
+      'validated without test regeneration',
+    );
     await this.opts.audit.event('phase.end', `${step.id} current test validation passed`, {
       messageId: 'engine.rollback_validation_passed',
       stepId: step.id,
       phase: step.phase,
     });
-    return { status: 'passed' };
+    return { status: 'passed', commit };
   }
 
   /** 主入口：先正常执行；若失败则进入 Debugger 重试循环（滑动窗口式自适应）。
@@ -1477,6 +2031,7 @@ export class PhaseEngine {
     opts: {
       initialDebug?: Omit<DebugAttemptContext, 'asDebugger'>;
       skipOutputArchive?: boolean;
+      changeRequest?: EngineeringChangeRequest;
     } = {},
   ): Promise<boolean> {
     await this.debugCache.load();
@@ -1492,8 +2047,11 @@ export class PhaseEngine {
       rootDebugFailureLog
         ? composeDebugRetryFailureLog(rootDebugFailureLog, failureLog, reason)
         : failureLog;
-    let activeIssueId = initialDebug?.issueId;
     const hadUnresolved = this.debugCache.hasUnresolvedFailure(step.id);
+    let activeIssueId = initialDebug?.issueId;
+    if (!activeIssueId && hadUnresolved) {
+      activeIssueId = (await this.findLatestOpenIssueForStep(step.id))?.id;
+    }
     const preserveCachedTestOutputs =
       !initialDebug && hadUnresolved && this.isVModelTestPhase(step.phase);
     // 归档属于一次尝试的工作区事务：快照必须先于归档。若该尝试回滚，
@@ -1515,20 +2073,20 @@ export class PhaseEngine {
         )
       ).some(Boolean);
       archiveOutputsOnNextAttempt = false;
-      const outcome = await this.runOneAttempt(plan, step, debug, { archiveOutputs });
+      const outcome = await this.runOneAttempt(plan, step, debug, {
+        archiveOutputs,
+        changeRequest: opts.changeRequest,
+      });
       if (hadArchivableOutput && outcome.workspaceReverted) {
         archiveOutputsOnNextAttempt = true;
       }
       return outcome;
     };
-    // 测试 / DEBUG 阶段：语言相关的测试前置（Python 写 tests/conftest.py 注入 sys.path；
-    // TypeScript 无需）。解决 LLM 反复生成无法被测试框架解析的 import 问题。
-    if (this.isVModelTestPhase(step.phase) || step.phase === 'DEBUG') {
+    // Test phases and explicit DEBUG mode share the language-specific test bootstrap.
+    if (this.isVModelTestPhase(step.phase) || initialDebug) {
       await this.profile.ensureTestBootstrap?.(this.opts.ws, this.opts.audit);
     }
-    // 在测试 / 功能验收阶段进入前，顺手修复入口 import 路径这类通用低级错误
-    // （Python 的 `from src.xxx` sys.path 问题；其他语言可为 no-op），避免反复进 DEBUG。
-    if (this.isVModelTestPhase(step.phase) || step.phase === 'DEBUG') {
+    if (this.isVModelTestPhase(step.phase) || initialDebug) {
       const fixed = (await this.profile.autoFixImports?.(this.opts.ws, this.opts.audit)) ?? [];
       if (fixed.length > 0) {
         this.log(
@@ -1689,6 +2247,15 @@ export class PhaseEngine {
     }
     if (initial.ok) {
       await this.debugCache.markDone(step.id);
+      if (hadUnresolved && activeIssueId) {
+        await this.markIssueResolved(
+          activeIssueId,
+          step,
+          undefined,
+          initial.issueResolutionPlan ??
+            'Restore the failed execution dependency or provider, retry the same Step, and accept it only after its declared outputs pass.',
+        );
+      }
       return true;
     }
     const nonDebuggableInfrastructureFailure = isNonDebuggableInfrastructureFailure(
@@ -1704,6 +2271,9 @@ export class PhaseEngine {
         evidence: initial.evidence,
       });
       activeIssueId = issue.id;
+      if (opts.changeRequest) {
+        await this.recordChangeRequestFailure(opts.changeRequest, issue, step);
+      }
       if (
         !nonDebuggableInfrastructureFailure &&
         !(initial.rollbackToPairedSource && this.isVModelTestPhase(step.phase))
@@ -1735,7 +2305,7 @@ export class PhaseEngine {
     });
     if (nonDebuggableInfrastructureFailure) {
       const reason = initial.reason ?? 'infrastructure failure';
-      step.status = 'FAILED';
+      transitionStep(step, 'FAILED', 'attempt-failed');
       this.lastFailure = {
         reason,
         failureLog: initial.failureLog,
@@ -1754,7 +2324,7 @@ export class PhaseEngine {
       return false;
     }
     if (initial.rollbackToPairedSource && this.isVModelTestPhase(step.phase)) {
-      step.status = 'FAILED';
+      transitionStep(step, 'FAILED', 'cached-gate-failed');
       this.lastFailure = {
         reason: initial.reason ?? 'test phase failed',
         failureLog: initial.failureLog,
@@ -1874,7 +2444,7 @@ export class PhaseEngine {
               }
             : undefined,
         });
-        step.status = 'FAILED';
+        transitionStep(step, 'FAILED', 'attempt-failed');
         this.lastFailure = {
           reason: rollbackReason,
           failureLog: recordedFailureLog,
@@ -1883,46 +2453,39 @@ export class PhaseEngine {
         await this.debugCache.markFailed(step.id, rollbackReason);
         return false;
       }
-	      const m = r.metrics;
-	      const readOnlyProbeLoop = isReadOnlyProbeLoopFailure(r.reason);
-	      const missingOutputStall = isMissingOutputStallFailure(r.reason);
-	      const lowQualityDebuggerResponse = isLowQualityDebuggerResponseFailure(r.reason);
-	      const repairEvidenceMissing = isRepairEvidenceMissingFailure(r.reason);
-	      const healthy =
-	        !readOnlyProbeLoop &&
-	        !missingOutputStall &&
-	        !lowQualityDebuggerResponse &&
-	        !repairEvidenceMissing &&
-	        !!m &&
-	        m.parseFailures === 0 &&
-	        m.repeatedTurns <= 1 &&
-	        m.healthScore >= 0.6;
-	      const bad =
-	        readOnlyProbeLoop ||
-	        missingOutputStall ||
-	        lowQualityDebuggerResponse ||
-	        repairEvidenceMissing ||
-	        (!!m &&
-	          (m.healthScore < 0.3 ||
-	            m.parseFailures + m.repeatedTurns >= Math.max(2, Math.ceil(m.rounds / 2))));
-      const tag = m
-        ? `health=${m.healthScore.toFixed(2)} parseFail=${m.parseFailures} repeat=${m.repeatedTurns} progress=${m.progressRatio.toFixed(2)}`
-        : '';
-      if (healthy) {
-        const before = budget;
-        budget = Math.min(absoluteCap, budget + 2);
-        consecutiveBad = 0;
+      const m = r.metrics;
+      const retryDecision = adjustDebugRetryWindow({
+        attempt,
+        budget,
+        cap: absoluteCap,
+        consecutiveBad,
+        reason: r.reason,
+        metrics: m,
+      });
+      const before = budget;
+      budget = retryDecision.budget;
+      consecutiveBad = retryDecision.consecutiveBad;
+      if (retryDecision.quality === 'healthy') {
         spin?.fail(
-          t().engine.retryHealthyButFailed(attempt, before, budget, tag, r.reason ?? ''),
+          t().engine.retryHealthyButFailed(
+            attempt,
+            before,
+            budget,
+            retryDecision.metricsTag,
+            r.reason ?? '',
+          ),
         );
-      } else if (bad) {
-        consecutiveBad++;
-        const before = budget;
-        budget = Math.max(attempt + 1, Math.ceil(budget / 2));
+      } else if (retryDecision.quality === 'bad') {
         spin?.fail(
-          t().engine.retryLowQuality(attempt, before, budget, tag, r.reason ?? ''),
+          t().engine.retryLowQuality(
+            attempt,
+            before,
+            budget,
+            retryDecision.metricsTag,
+            r.reason ?? '',
+          ),
         );
-        if (consecutiveBad >= 2) {
+        if (retryDecision.earlyAbort) {
           this.log(
             chalk.yellow(
               t().engine.earlyAbortLowQuality(step.id, consecutiveBad),
@@ -1940,8 +2503,14 @@ export class PhaseEngine {
           break;
         }
       } else {
-        consecutiveBad = 0;
-        spin?.fail(t().engine.retryStillFailed(attempt, budget, tag, r.reason ?? ''));
+        spin?.fail(
+          t().engine.retryStillFailed(
+            attempt,
+            budget,
+            retryDecision.metricsTag,
+            r.reason ?? '',
+          ),
+        );
       }
       lastReason = r.reason ?? lastReason;
       lastFailureLog = r.failureLog;
@@ -1972,7 +2541,7 @@ export class PhaseEngine {
       });
       priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(step.id);
     }
-    step.status = 'FAILED';
+    transitionStep(step, 'FAILED', 'attempt-failed');
     this.lastFailure = {
       reason: lastResult.reason ?? lastReason,
       failureLog: lastResult.failureLog ?? lastFailureLog,
@@ -2073,7 +2642,7 @@ export class PhaseEngine {
     if (failedNames.has('build') || failedNames.has('lint') || failedNames.has('package-json')) {
       return latest(['CODE', 'HIGH_LEVEL_DESIGN']);
     }
-    return latest(['FUNCTIONAL_TEST', 'MODULE_TEST', 'INTEGRATION_TEST', 'UNIT_TEST', 'CODE', 'DEBUG']) ??
+    return latest(['FUNCTIONAL_TEST', 'MODULE_TEST', 'INTEGRATION_TEST', 'UNIT_TEST', 'CODE']) ??
       (iterationId ? this.selectAuditRepairStep(order, auditResult) : undefined);
   }
 
@@ -2205,7 +2774,7 @@ export class PhaseEngine {
     plan: Plan,
     step: Step,
     debug?: DebugAttemptContext,
-    attemptOpts: { archiveOutputs?: boolean } = {},
+    attemptOpts: AttemptOptions = {},
   ): Promise<AttemptOutcome> {
     const role = debug ? 'Debugger' : step.role;
     await this.plugins.emit('step.attempt.before', {
@@ -2254,7 +2823,7 @@ export class PhaseEngine {
     plan: Plan,
     step: Step,
     debug?: DebugAttemptContext,
-    attemptOpts: { archiveOutputs?: boolean } = {},
+    attemptOpts: AttemptOptions = {},
   ): Promise<AttemptOutcome> {
     const role = debug ? 'Debugger' : step.role;
     // 解析 step.tools 中的 skill: 引用为底层工具名
@@ -2275,9 +2844,9 @@ export class PhaseEngine {
     const allowedWrites = debug
       ? dedup([...this.computeDebugAllowedWrites(plan, step), ...(debug.extraAllowedWrites ?? [])])
       : this.computeStepAllowedWrites(plan, step);
-    // 测试 / DEBUG 阶段始终额外放开 tests/fixtures/ —— 测试 fixture 不必逐文件登记到 outputs，
+    // Test phases and DEBUG mode grant tests/fixtures/ as a scoped writable root.
     // 否则 LLM 想 write_file 创建样例输入文件时只能死循环。
-    const augmentedWrites = this.isVModelTestPhase(step.phase) || step.phase === 'DEBUG' || debug
+    const augmentedWrites = this.isVModelTestPhase(step.phase) || debug
       ? dedup([...allowedWrites, 'tests/fixtures'])
       : allowedWrites;
 
@@ -2360,9 +2929,9 @@ export class PhaseEngine {
       });
 
       // 加载 inputs + outputs 已存在文件 作为上下文（debug 时尤其重要）
-      ctxSnippets = await this.buildContextSnippets(plan, step, debug);
+      ctxSnippets = await this.buildContextSnippets(plan, step, debug, attemptOpts.changeRequest);
 
-      step.status = 'RUNNING';
+      transitionStep(step, 'RUNNING', 'attempt-started');
       await this.persistPlan(plan);
       sha = await this.opts.git.snapshot(step.id, step.retries, debug ? 'debug retry' : 'before');
       if (attemptOpts.archiveOutputs) {
@@ -2429,6 +2998,7 @@ export class PhaseEngine {
         tools: guardedTools,
         ctx,
         contextSnippets: ctxSnippets,
+        changeRequest: attemptOpts.changeRequest,
         skillHints: hints,
         debugContext: debug
           ? {
@@ -2475,12 +3045,12 @@ export class PhaseEngine {
           metrics: r.metrics,
           rollbackToPairedSource: true,
         });
-        await this.opts.git.revertTo(sha);
+        await this.preserveFailedTestArtifacts(step, reason);
         return {
           ok: false,
           failureLog,
           reason,
-          workspaceReverted: true,
+          workspaceReverted: false,
           metrics: r.metrics,
           rollbackToPairedSource: true,
           issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
@@ -2619,12 +3189,12 @@ export class PhaseEngine {
               permission.reason ?? '',
             ].filter(Boolean).join('\n');
             spin?.fail(t().engine.phaseFailed(step.id, !!debug, reason));
-            await this.opts.git.revertTo(sha);
+            await this.preserveFailedTestArtifacts(step, reason);
             return {
               ok: false,
               failureLog,
               reason,
-              workspaceReverted: true,
+              workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
@@ -2653,12 +3223,12 @@ export class PhaseEngine {
               reason,
               retry: step.retries,
             });
-            await this.opts.git.revertTo(sha);
+            await this.preserveFailedTestArtifacts(step, reason);
             return {
               ok: false,
               failureLog,
               reason,
-              workspaceReverted: true,
+              workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               rollbackTestStepId: ownerTestStep?.id,
@@ -2698,12 +3268,12 @@ export class PhaseEngine {
               permission.reason ?? '',
             ].filter(Boolean).join('\n');
             spin?.fail(t().engine.phaseFailed(step.id, !!debug, reason));
-            await this.opts.git.revertTo(sha);
+            await this.preserveFailedTestArtifacts(step, reason);
             return {
               ok: false,
               failureLog,
               reason,
-              workspaceReverted: true,
+              workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               issueKind: 'functional-gate',
@@ -2732,12 +3302,12 @@ export class PhaseEngine {
               reason,
               retry: step.retries,
             });
-            await this.opts.git.revertTo(sha);
+            await this.preserveFailedTestArtifacts(step, reason);
             return {
               ok: false,
               failureLog,
               reason,
-              workspaceReverted: true,
+              workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               issueKind: 'functional-gate',
@@ -2781,7 +3351,7 @@ export class PhaseEngine {
             };
           }
         }
-        step.status = 'DONE';
+        transitionStep(step, 'DONE', 'attempt-passed');
         await this.refreshCurrentProjectMemory(plan);
         const repair = debug?.issueId
           ? await this.createCompletedPhaseRepairArtifact(
@@ -2792,10 +3362,34 @@ export class PhaseEngine {
               r.toolCalls,
             )
           : undefined;
-        if (debug?.issueId) {
-          await this.markIssueResolved(debug.issueId, step, repair, r.issueResolutionPlan);
+        const completionCommit = await this.opts.git.snapshot(
+          step.id,
+          step.retries,
+          attemptOpts.changeRequest
+            ? `${attemptOpts.changeRequest.id} ${debug ? 'debug done' : 'done'}`
+            : debug ? 'debug done' : 'done',
+        );
+        if (repair) {
+          repair.baselineCommit = sha;
+          repair.commit = completionCommit;
         }
-        await this.opts.git.snapshot(step.id, step.retries, debug ? 'debug done' : 'done');
+        if (attemptOpts.changeRequest) {
+          await this.recordChangeRequestApplicationFromAttempt(
+            attemptOpts.changeRequest,
+            step,
+            debug,
+            sha,
+            completionCommit,
+            r.issueResolutionPlan ?? r.finalThought,
+          );
+        }
+        if (debug?.issueId) {
+          if (debug.contextMode === 'test-rollback') {
+            await this.recordIssueRepairReady(debug.issueId, step, repair, r.issueResolutionPlan);
+          } else {
+            await this.markIssueResolved(debug.issueId, step, repair, r.issueResolutionPlan);
+          }
+        }
         spin?.succeed(t().engine.phaseDone(step.id, r.rounds));
         await this.opts.audit.event('phase.end', t().engine.phaseDone(step.id, r.rounds), {
           messageId: 'engine.phase_done', rounds: r.rounds, retry: step.retries,
@@ -2895,8 +3489,15 @@ export class PhaseEngine {
     plan: Plan,
     step: Step,
     debug?: DebugAttemptContext,
+    changeRequest?: EngineeringChangeRequest,
   ): Promise<Array<{ path: string; content: string }>> {
     const out = new Map<string, string>();
+    if (changeRequest) {
+      out.set(
+        `.xcompiler/change-requests/${changeRequest.id}.json`,
+        JSON.stringify(changeRequest, null, 2),
+      );
+    }
     if ((plan.architectureModules?.length ?? 0) > 0) {
       out.set(
         '.xcompiler/architecture-contract.json',
@@ -2905,6 +3506,9 @@ export class PhaseEngine {
     }
     const interesting = debug?.contextPaths ?? (debug ? [...step.inputs, ...step.outputs] : step.inputs);
     for (const p of interesting) {
+      await this.pushWorkspaceSnippet(out, p);
+    }
+    for (const p of this.testSubjectContextPaths(plan, step, debug)) {
       await this.pushWorkspaceSnippet(out, p);
     }
 
@@ -2955,6 +3559,47 @@ export class PhaseEngine {
       out.set(`.xcompiler/downstream/${step.id}.md`, downstream);
     }
     return [...out.entries()].map(([path, content]) => ({ path, content }));
+  }
+
+  /**
+   * Test phases need the implementation under test, not only their design-plan
+   * inputs. Bound the preload by the active model window so small-context models
+   * still receive a focused subset while larger models can cover more modules.
+   */
+  private testSubjectContextPaths(
+    plan: Plan,
+    step: Step,
+    debug?: DebugAttemptContext,
+  ): string[] {
+    if (!this.isVModelTestPhase(step.phase)) return [];
+    const iterationId = step.iterationId ?? 'P1';
+    const declaredRuntimePaths = (plan.architectureModules ?? []).flatMap((module) => [
+      ...module.sourcePaths,
+      ...(module.assetPaths ?? []),
+    ]);
+    const codeOutputs = plan.steps
+      .filter((candidate) =>
+        (candidate.iterationId ?? 'P1') === iterationId &&
+        candidate.phase === 'CODE')
+      .flatMap((candidate) => candidate.outputs)
+      .filter((output) =>
+        this.profile.codeExtensions.some((extension) => output.endsWith(extension)) ||
+        declaredRuntimePaths.includes(output));
+    const candidates = dedup([...declaredRuntimePaths, ...codeOutputs])
+      .filter((candidate) => candidate && !candidate.endsWith('/'));
+    const contextWindowTokens =
+      this.opts.router.primaryContextWindow?.(debug ? 'Debugger' : step.role) ??
+      128 * 1024;
+    const renderedCharsPerSnippet = debug ? 900 : 2200;
+    const sourceContextBudgetChars = Math.max(
+      renderedCharsPerSnippet * 4,
+      Math.floor(contextWindowTokens * 3 * 0.2),
+    );
+    const maxFiles = Math.min(
+      64,
+      Math.max(4, Math.floor(sourceContextBudgetChars / renderedCharsPerSnippet)),
+    );
+    return candidates.slice(0, maxFiles);
   }
 
   private findOwningTestStepForFailure(plan: Plan, currentStep: Step, failureText: string): Step | undefined {
@@ -3038,7 +3683,7 @@ export class PhaseEngine {
   /**
    * DEBUG 模式下扩展 allowedWrites：
    *   - 当前 Step 的 outputs（永远可写）
-   *   - 依赖链（dependsOn 闭包）上 CODE / 测试 / DEBUG 步骤的 outputs
+   *   - outputs owned by CODE/test steps in the dependency closure
    *   不放开依赖清单（renderer/HIGH_LEVEL_DESIGN 拥有）以外的非源码产物。
    */
   private computeDebugAllowedWrites(plan: Plan, step: Step): string[] {
@@ -3056,7 +3701,7 @@ export class PhaseEngine {
     for (const id of seen) {
       const s = byId.get(id);
       if (!s) continue;
-      if (s.phase !== 'CODE' && s.phase !== 'DEBUG' && !this.isVModelTestPhase(s.phase)) {
+      if (s.phase !== 'CODE' && !this.isVModelTestPhase(s.phase)) {
         if (hasTypeScriptConfigOutput(s.outputs, this.profile.id)) out.add('tsconfig.json');
         continue;
       }
@@ -3187,7 +3832,6 @@ function hasSuccessfulRepairMutation(
 
 const REPAIR_VERIFICATION_TOOLS = new Set([
   'run_program',
-  'run_python',
   'run_tests',
 ]);
 
@@ -3424,28 +4068,6 @@ function sandboxBuildFailureReason(message: string): string {
   return `sandbox dependency install failed: ${firstLine.slice(0, 300)}`;
 }
 
-function isNonDebuggableInfrastructureFailure(reason?: string, failureLog?: string): boolean {
-  const text = `${reason ?? ''}\n${failureLog ?? ''}`.toLowerCase();
-  if (/low-quality debugger response/u.test(text)) return false;
-  return (
-    /sandbox dependency install failed|npm dependency install failed|pip install failed/u.test(text) ||
-    /permission denied for code validation/u.test(text) ||
-    /permission denied for (?:test|functional probe) revalidation/u.test(text) ||
-    /typeerror:\s*fetch failed/u.test(text) ||
-	    /(?:openai|ollama) http (?:401|403|408|409|429|5\d\d)\b/u.test(text) ||
-    /rate limit exceeded|free-models-per-day|retry_after_seconds|retry-after/u.test(text) ||
-	    /(?:openai|ollama|llm|provider)[^\n]{0,180}(?:rate[- ]?limit|rate limited|rate-limited|retry-after|retry_after_seconds)/u.test(text) ||
-	    /(?:response_format|json_object|json_schema)[^\n]{0,220}(?:not support|unsupported|invalid_request_body|supported formats)/u.test(text) ||
-	    /openai stream (?:wall-clock|idle)/u.test(text) ||
-    /ollama stream (?:wall-clock|idle)/u.test(text) ||
-    /request timed out after \d+ms/u.test(text) ||
-    /prefill_memory_exceeded|prefill memory guard|dynamic ceiling/u.test(text) ||
-    /context (?:length|window)|token limit|too many tokens|prompt too long|max(?:imum)? context/u.test(text) ||
-    /input[^\n]{0,80}tokens[^\n]{0,120}(?:exceed|limit|ceiling)/u.test(text) ||
-    /llm provider|provider_call_failed|all llm providers failed/u.test(text)
-	  );
-}
-
 function isSupersededNetworkBrief(root: DebugBrief, current: DebugBrief): boolean {
   return root.category === 'network_api_failure' && current.category === 'test_failure';
 }
@@ -3460,25 +4082,6 @@ function testRollbackTriageGuidance(brief: DebugBrief): string {
     'Test outputs in allowedWrites may be repaired even when the paired rollback step is a requirement/design phase. Do not add product APIs solely to satisfy a test that calls a nonexistent helper.',
     `Patch the actual defect, then run the inherited scoped test command before done=true.${failedTests}`,
   ].join('\n');
-}
-
-function isReadOnlyProbeLoopFailure(reason?: string): boolean {
-  return /repeated read-only\/probe actions without progress/u.test(reason ?? '') ||
-    /read-only recovery mode repeated probe actions/u.test(reason ?? '');
-}
-
-function isMissingOutputStallFailure(reason?: string): boolean {
-  return /write\/progress actions did not reduce missing outputs/u.test(reason ?? '');
-}
-
-function isLowQualityDebuggerResponseFailure(reason?: string): boolean {
-  return /low-quality debugger response/u.test(reason ?? '');
-}
-
-function isRepairEvidenceMissingFailure(reason?: string): boolean {
-  return /without repair evidence/u.test(reason ?? '') ||
-    /without a successful repair mutation/u.test(reason ?? '') ||
-    /without a successful repair mutation or verification tool call/u.test(reason ?? '');
 }
 
 function renderTestValidationFailure(
@@ -3511,19 +4114,6 @@ function renderIncompleteTestPhaseFailure(step: Step, missingOutputs: string[]):
     `missing outputs: ${missingOutputs.join(', ')}`,
     'Repair the missing test-phase artifacts in the current step. Do not change source implementation unless a current test gate reproduces a source failure.',
   ].join('\n');
-}
-
-export function shouldRollbackTestPhaseFailure(reason?: string, failureLog?: string): boolean {
-  const text = `${reason ?? ''}\n${failureLog ?? ''}`.toLowerCase();
-  if (isReadOnlyProbeLoopFailure(reason) || isRepairEvidenceMissingFailure(reason)) return false;
-  if (/tool verification failed.*rolling back to paired/u.test(text)) return true;
-  if (isCachedTestArtifactDiscoveryFailure(text)) return false;
-  if (/missing outputs|outputs? 校验|verify outputs|declared outputs|产物/u.test(text)) return false;
-  if (/invalid action|args must be an object|invalid json|parse failure/u.test(text)) return false;
-  if (/test gate|functional gate|functional entry probe|entry probe|delivery gate|测试门禁|功能门禁|功能入口探测|入口探测|交付门禁/u.test(text)) return true;
-  if (/pytest exit=\s*[1-9]\d*|exit code\s*[1-9]\d*|failed tests?|test failures?/u.test(text)) return true;
-  if (/assertionerror|failed:\s+did not|traceback \(most recent call last\)/u.test(text)) return true;
-  return false;
 }
 
 function inferCachedTestScopeArgs(entry: DebugAttemptEntry): string[] {
@@ -3559,83 +4149,6 @@ function extractRunTestsArgs(text: string): string[] {
     }
   }
   return dedup(out);
-}
-
-function isCachedTestArtifactDiscoveryFailure(text: string): boolean {
-  return /no test files? found|no tests? found/u.test(text) ||
-    /filter:\s+tests?\//u.test(text) ||
-    /(?:enoent|no such file or directory|not a file)[^\n]{0,240}tests?\//u.test(text);
-}
-
-function latestActionableDebugAttempt<T extends { reason?: string }>(attempts: T[]): T | undefined {
-  const newest = [...attempts].reverse();
-  return newest.find((attempt) =>
-    !isReadOnlyProbeLoopFailure(attempt.reason) &&
-    !isNonDebuggableInfrastructureFailure(attempt.reason),
-  ) ??
-    newest.find((attempt) => !isNonDebuggableInfrastructureFailure(attempt.reason)) ??
-    attempts.at(-1);
-}
-
-function latestActionableSourceFailureLog<T extends { reason?: string; failureLogTail?: string }>(attempts: T[]): string | undefined {
-  const actionable = [...attempts].reverse().find((attempt) => {
-    const log = cleanFailureLogForDebugContext(attempt.failureLogTail ?? '');
-    return log.length > 0 &&
-      !isReadOnlyProbeLoopFailure(attempt.reason) &&
-      !isRepairEvidenceMissingFailure(attempt.reason) &&
-      !isNonDebuggableInfrastructureFailure(attempt.reason, log);
-  });
-  return actionable?.failureLogTail;
-}
-
-function composeDebugRetryFailureLog(rootFailureLog: string, latestFailureLog: string, latestReason: string): string {
-  const root = cleanFailureLogForDebugContext(rootFailureLog).trim();
-  const latest = cleanFailureLogForDebugContext(latestFailureLog).trim();
-  if (!latest || latest === root || root.includes(latest)) return root;
-  return [
-    root,
-    '',
-    '## latest Debugger attempt failure',
-    t().engine.reasonLine(latestReason),
-    latest,
-  ].filter(Boolean).join('\n');
-}
-
-function cleanFailureLogForDebugContext(log: string): string {
-  return stripNestedLatestDebuggerFailures(
-    sanitizeDebugFailureLogForPrompt(log),
-  );
-}
-
-function stepTransitivelyDependsOn(
-  step: Step,
-  targetId: string,
-  byId: Map<string, Step>,
-): boolean {
-  const seen = new Set<string>();
-  const stack = [...step.dependsOn];
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    if (current === targetId) return true;
-    if (seen.has(current)) continue;
-    seen.add(current);
-    const dep = byId.get(current);
-    if (dep) stack.push(...dep.dependsOn);
-  }
-  return false;
-}
-
-function incompleteTransitiveDependencies(step: Step, byId: Map<string, Step>): Step[] {
-  const found: Step[] = [];
-  for (const candidate of byId.values()) {
-    if (candidate.status === 'DONE') continue;
-    if (stepTransitivelyDependsOn(step, candidate.id, byId)) found.push(candidate);
-  }
-  return found;
-}
-
-function stepStateSummary(step: Step): Pick<Step, 'id' | 'phase' | 'status'> {
-  return { id: step.id, phase: step.phase, status: step.status };
 }
 
 function inferRepairMode(

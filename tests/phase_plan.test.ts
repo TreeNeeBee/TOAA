@@ -88,8 +88,8 @@ describe('phase plan persistence', () => {
     expect(loaded.plan.steps).toHaveLength(plan.steps.length);
   });
 
-  it('migrates legacy V-model source/test-plan mappings before linting', async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-phase-plan-legacy-'));
+  it('rejects obsolete V-model source/test-plan mappings instead of rewriting the plan', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-phase-plan-obsolete-'));
     const plan = buildPlan(
       {
         requirementDigest: 'Build a small CLI utility.',
@@ -128,13 +128,7 @@ describe('phase plan persistence', () => {
     const planPath = path.join(workspace, 'plan.P1.json');
     await savePlan(planPath, plan);
 
-    const loaded = await loadPlanTarget(planPath);
-
-    expect(loaded.migrations).toHaveLength(2);
-    expect(loaded.plan.steps.find((step) => step.phase === 'HIGH_LEVEL_DESIGN')?.outputs)
-      .toEqual(['docs/02-high-level-design.md', 'package.json', 'docs/tests/module-test-plan.md']);
-    expect(loaded.plan.steps.find((step) => step.phase === 'DETAILED_DESIGN')?.outputs)
-      .toEqual(['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md']);
+    await expect(loadPlanTarget(planPath)).rejects.toThrow(/must synchronously output paired/);
   });
 
   it('accepts a materialized follow-up phase whose current status matches phaseId', async () => {

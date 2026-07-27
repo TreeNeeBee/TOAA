@@ -306,7 +306,8 @@ describe('LLMRouter fallback chain', () => {
 
   it('can disable success score boosts for workflow-level LLM calls', async () => {
     const cfg = mkCfg({});
-    const scores = new ScoreStore('/tmp/x/config.yaml', { ollama_code: 0.4 });
+    const scores = new ScoreStore('/tmp/x/config.yaml');
+    scores.set('ollama_code', 0.4, 'test seed');
     const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const clientsMap: Map<string, LLMClient> = (router as any).clients;
@@ -576,7 +577,7 @@ describe('LLMRouter score-sorted chain', () => {
       },
       roles: { Coder: ['ollama_code', 'openrouter_free'] },
     });
-    const scores = new ScoreStore('/tmp/x/config.yaml', {}, undefined, scoreStoreOptionsFromConfig(cfg.llm));
+    const scores = new ScoreStore('/tmp/x/config.yaml', undefined, scoreStoreOptionsFromConfig(cfg.llm));
     const router = new LLMRouter(cfg, undefined, scores);
     expect(router.for('Coder').name).toBe('chain[ollama:qwen>openai:openrouter/free]');
   });
@@ -638,8 +639,7 @@ describe('LLMRouter score-sorted chain', () => {
     expect(scores.get('openai')).toBe(ScoreStore.DEFAULT);
   });
 
-  it('accepts string roles[role] (backward-compat) and treats as single-element array', () => {
-    // Schema would normalize this at load time; we simulate a legacy-ish cfg.
+  it('accepts the canonical single-element role array', () => {
     const cfg = mkCfg({ roles: { Coder: ['ollama_code'] } });
     const router = new LLMRouter(cfg);
     const client = router.for('Coder');

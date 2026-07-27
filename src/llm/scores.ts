@@ -27,8 +27,7 @@ export interface ScoreStoreOptions {
  *  - `llm_scores.yaml` 是 XCompiler 维护的动态快照；它不是用户策略文件。
  *  - 用户手动覆盖写在 `llm_scores_user.yaml`；其中 score=0 表示禁用，并且优先生效。
  *  - preflight 检测到 ollama 服务器上**模型不存在**会在当前运行跳过该 provider，并把评分降到 0.1。
- *  - 动态评分持久化到 config 同目录的 sidecar 文件 `llm_scores.yaml`，避免改写用户的 config.yaml
- *    （会丢注释）。配置里 `llm.scores` 段仅作为兼容初值；旧配置中显式 0 仍视为用户禁用。
+ *  - 动态评分持久化到 config 同目录的 sidecar 文件 `llm_scores.yaml`，避免改写用户的 config.yaml。
  */
 export class ScoreStore {
   static readonly DEFAULT = 1.0;
@@ -52,7 +51,6 @@ export class ScoreStore {
 
   constructor(
     configPath: string,
-    initial: Record<string, number> = {},
     private readonly audit?: AuditLogger,
     opts: ScoreStoreOptions = {},
   ) {
@@ -63,16 +61,9 @@ export class ScoreStore {
     const bounds = normalizeClusterBounds(opts.clusterScoreMin, opts.clusterScoreMax);
     this.clusterMin = bounds.min;
     this.clusterMax = bounds.max;
-    for (const [k, v] of Object.entries(initial)) {
-      if (v === ScoreStore.DISABLED) {
-        this.userScores.set(k, ScoreStore.DISABLED);
-      } else {
-        this.dynamicScores.set(k, this.clampDynamic(k, v));
-      }
-    }
   }
 
-  /** 异步加载动态 sidecar 与用户覆盖文件；失败/不存在不抛错，使用 ctor 提供的初值。 */
+  /** Load XCompiler-maintained dynamic scores and explicit user overrides. */
   async load(): Promise<void> {
     await this.loadDynamicScores();
     await this.loadUserScores();

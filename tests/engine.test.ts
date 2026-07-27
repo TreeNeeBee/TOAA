@@ -12,9 +12,9 @@ import {
   collectRollbackRepairOutputs,
   hasPendingTestArtifactRepair,
   shouldRunCodeValidation,
-  shouldRollbackTestPhaseFailure,
   type EngineResult,
 } from '../src/core/engine.js';
+import { shouldRollbackTestPhaseFailure } from '../src/core/debug_policy.js';
 import { savePlan } from '../src/core/storage.js';
 import { buildDebugBrief } from '../src/core/debug_brief.js';
 import { DebugWiki } from '../src/core/debug_wiki.js';
@@ -357,6 +357,40 @@ class IntegrationRollbackSandbox implements Sandbox {
   }
 }
 
+class ChangeRequestReworkSandbox implements Sandbox {
+  readonly kind = 'subprocess' as const;
+  private unitFailureReported = false;
+
+  constructor(private readonly workspace: Workspace) {}
+
+  async build(): Promise<{ rebuilt: boolean; reason: string }> {
+    return { rebuilt: false, reason: 'stubbed' };
+  }
+
+  async exec(): Promise<ExecResult> {
+    return okExec();
+  }
+
+  async runProgram(): Promise<ExecResult> {
+    return okExec({ stdout: 'usage: CR rework app\n' });
+  }
+
+  async runTests(args: string[] = []): Promise<ExecResult> {
+    if (args.some((arg) => arg.includes('test_hello')) && !this.unitFailureReported) {
+      this.unitFailureReported = true;
+      return okExec({ exitCode: 1, stderr: 'unit change implementation mismatch\n' });
+    }
+    const detail = await this.workspace.readFile('docs/03-detailed-design.md').catch(() => '');
+    return detail.includes('fixed-detail-contract')
+      ? okExec({ stdout: 'change request tests passed\n' })
+      : okExec({ exitCode: 1, stderr: 'integration contract failed: expected fixed detailed design\n' });
+  }
+
+  async installDeps(): Promise<ExecResult> {
+    return okExec();
+  }
+}
+
 class FunctionalGateOwnerSandbox implements Sandbox {
   readonly kind = 'subprocess' as const;
   constructor(private readonly workspace: Workspace) {}
@@ -515,6 +549,28 @@ function fakePlan(): Plan {
     baselineSummary: '',
     userAddenda: '',
     dependencies: ['pytest'],
+    complexityAssessment: {
+      level: 'simple',
+      rationale: 'Single V-model test fixture.',
+      splitRecommended: false,
+      userForcedPhaseSplit: false,
+    },
+    implementationPhases: [
+      {
+        id: 'P1',
+        title: 'Core',
+        objective: 'Complete the test V-model.',
+        status: 'current',
+        scope: ['test fixture'],
+        deliverables: ['verified fixture'],
+        dependsOn: [],
+        verificationGate: {
+          summary: 'Fixture passes.',
+          checks: ['run tests'],
+          failurePolicy: 'Return to the paired V-model source phase.',
+        },
+      },
+    ],
     steps: [
       step('S001', 'REQUIREMENT_ANALYSIS', 'Planner', ['docs/01-requirement-analysis.md', 'docs/tests/functional-test-plan.md']),
       step('S002', 'HIGH_LEVEL_DESIGN', 'Architect', ['docs/02-high-level-design.md', 'docs/tests/module-test-plan.md'], ['S001']),
@@ -586,7 +642,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(shouldRunCodeValidation(plan, code)).toBe(false);
     code.status = 'DONE';
     expect(shouldRunCodeValidation(plan, laterCode)).toBe(true);
-    code.status = 'SKIPPED';
+    code.status = 'FAILED';
     expect(shouldRunCodeValidation(plan, laterCode)).toBe(false);
   });
 
@@ -615,7 +671,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(result.failedStepId).toBe(codeStep.id);
     expect(result.failureReason).toContain(`cannot start from ${unitStep.id}`);
     expect(codeStep.status).toBe('FAILED');
-    expect(plan.steps.some((step) => step.status === 'SKIPPED')).toBe(false);
+    expect(unitStep.status).toBe('PENDING');
   });
 
   it('does not let --phase execute a test phase with incomplete dependencies', async () => {
@@ -744,26 +800,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(await ws.readFile('.xcompiler/issues/issues.jsonl')).toContain('permission denied for CODE validation');
   });
 
-  it('allows DEBUG to edit dependency-chain src/tests outputs while keeping design docs scoped', async () => {
+  it('allows DEBUG mode to edit dependency-chain src/tests outputs while keeping design docs scoped', async () => {
     const plan = fakePlan();
-    const debugStep = {
-      id: 'S009',
-      iterationId: 'P1',
-      phase: 'DEBUG' as const,
-      title: 'Debug',
-      description: 'repair failed tests using dependency outputs',
-      systemPrompt: '本 Step 专属提示词：根据失败日志修复依赖链上的源码和测试产物。',
-      role: 'Debugger' as const,
-      tools: ['replace_in_file', 'write_file'],
-      inputs: ['src/hello.py', 'tests/test_hello.py', 'docs/03-detailed-design.md'],
-      outputs: ['logs/debug-S009.md'],
-      dependsOn: ['S005'],
-      acceptance: 'debug report written',
-      status: 'PENDING' as const,
-      retries: 0,
-      maxRetries: 3,
-    };
-    plan.steps.push(debugStep);
+    const debugSourceStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     const engine = new PhaseEngine({
       ws,
       git,
@@ -774,9 +813,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       maxRoundsPerStep: 1,
     });
     const allowed = (engine as unknown as {
-      computeDebugAllowedWrites(p: Plan, s: typeof debugStep): string[];
-    }).computeDebugAllowedWrites(plan, debugStep);
-    expect(allowed).toContain('logs/debug-S009.md');
+      computeDebugAllowedWrites(p: Plan, s: typeof debugSourceStep): string[];
+    }).computeDebugAllowedWrites(plan, debugSourceStep);
+    expect(allowed).toEqual(expect.arrayContaining(debugSourceStep.outputs));
     expect(allowed).toContain('src/hello.py');
     expect(allowed).toContain('tests/test_hello.py');
     expect(allowed).not.toContain('docs/03-detailed-design.md');
@@ -1324,6 +1363,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     expect(result.failedStepId).toBeUndefined();
     expect(await ws.readFile('src/hello.py')).toContain('fixed');
+    expect(await ws.readFile('tests/test_hello.py')).toContain('assert hi() == "fixed"');
     expect(unitStep.status).toBe('DONE');
     expect(debuggerLlm.lastUser).toContain('test_hi');
     expect(debuggerLlm.lastUser).not.toContain('paired source phase latest failure');
@@ -1331,6 +1371,80 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(debuggerLlm.lastUser).not.toContain('stale provider noise');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.test_phase_rollback');
+    expect(auditLog).toContain('engine.failed_test_artifacts_preserved');
+    expect(await ws.exists('.xcompiler/change-requests/index.json')).toBe(false);
+    const issueEvents = (await ws.readFile('.xcompiler/issues/issues.jsonl'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as {
+        event: string;
+        issueId: string;
+        status: string;
+        stepId?: string;
+        targetStepId?: string;
+        verificationStepId?: string;
+      });
+    const testIssueId = issueEvents.find((event) =>
+      event.event === 'recorded' && event.stepId === unitStep.id)?.issueId;
+    expect(testIssueId).toBeTruthy();
+    expect(issueEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: 'verification-required',
+        issueId: testIssueId,
+        targetStepId: codeStep.id,
+        verificationStepId: unitStep.id,
+      }),
+      expect.objectContaining({
+        event: 'repair-ready',
+        issueId: testIssueId,
+        status: 'routed',
+      }),
+      expect.objectContaining({
+        event: 'resolved',
+        issueId: testIssueId,
+        status: 'resolved',
+      }),
+    ]));
+    const repairReadyIndex = issueEvents.findIndex((event) =>
+      event.event === 'repair-ready' && event.issueId === testIssueId);
+    const resolvedIndex = issueEvents.findIndex((event) =>
+      event.event === 'resolved' && event.issueId === testIssueId);
+    expect(repairReadyIndex).toBeGreaterThanOrEqual(0);
+    expect(resolvedIndex).toBeGreaterThan(repairReadyIndex);
+  });
+
+  it('preloads implementation files into test-phase context within the model window budget', async () => {
+    const plan = fakePlan();
+    const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    plan.steps = [codeStep, unitStep];
+    codeStep.outputs = ['src/hello.py', 'src/support.py', 'docs/tests/unit-test-plan.md'];
+    unitStep.inputs = ['docs/tests/unit-test-plan.md'];
+    await ws.writeFile('src/hello.py', 'def hi():\n    return "hello"\n');
+    await ws.writeFile('src/support.py', 'VALUE = 1\n');
+    await ws.writeFile('docs/tests/unit-test-plan.md', '# Unit plan\n');
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: {
+        primaryContextWindow: () => 16 * 1024,
+      } as unknown as LLMRouter,
+      audit,
+      planPath: path.join(tmp, 'plan.json'),
+    });
+
+    const snippets = await (engine as unknown as {
+      buildContextSnippets: (
+        p: Plan,
+        s: Plan['steps'][number],
+      ) => Promise<Array<{ path: string; content: string }>>;
+    }).buildContextSnippets(plan, unitStep);
+
+    expect(snippets).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'src/hello.py', content: expect.stringContaining('return "hello"') }),
+      expect.objectContaining({ path: 'src/support.py', content: expect.stringContaining('VALUE = 1') }),
+    ]));
   });
 
   it('clears infra-only cached debug history and reruns the step normally instead of exiting', async () => {
@@ -1418,6 +1532,25 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
 
+    const testerLlm = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'write integration test and verify',
+        actions: [
+          { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration\n' } },
+          { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
+          { tool: 'run_tests', args: { args: ['tests/test_integration.py'] } },
+        ],
+        done: false,
+      }),
+      JSON.stringify({
+        thoughts: 'apply and verify only the detailed design change',
+        actions: [
+          { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration fixed\n' } },
+          { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
+        ],
+        done: true,
+      }),
+    ]);
     const router = new FakeRouter({
       Architect: new ScriptedLLM([
         JSON.stringify({
@@ -1428,25 +1561,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           done: true,
         }),
       ]),
-      Tester: new ScriptedLLM([
-        JSON.stringify({
-          thoughts: 'write integration test and verify',
-          actions: [
-            { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
-            { tool: 'run_tests', args: { args: ['tests/test_integration.py'] } },
-          ],
-          done: false,
-        }),
-        JSON.stringify({
-          thoughts: 'rerun integration after detailed design repair',
-          actions: [
-            { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration fixed\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
-          ],
-          done: true,
-        }),
-      ]),
+      Tester: testerLlm,
       Debugger: new ScriptedLLM([
         JSON.stringify({
           thoughts: 'repair the paired detailed design contract',
@@ -1475,6 +1590,28 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(issueLog).toContain('"targetStepId":"S003"');
     expect(issueLog).toContain('"targetPhase":"DETAILED_DESIGN"');
     expect(issueLog).not.toContain('"targetStepId":"S002"');
+    const requests = JSON.parse(await ws.readFile('.xcompiler/change-requests/index.json')) as Array<{
+      status: string;
+      issueId: string;
+      affectedSteps: Array<{ stepId: string }>;
+      applications: Array<{ stepId: string; kind: string; commit: string }>;
+    }>;
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      status: 'closed',
+      affectedSteps: [{ stepId: integrationStep.id }],
+    });
+    expect(requests[0]?.applications).toEqual(expect.arrayContaining([
+      expect.objectContaining({ stepId: detailedStep.id, kind: 'design-change' }),
+      expect.objectContaining({ stepId: integrationStep.id, kind: 'verification' }),
+    ]));
+    const issue = JSON.parse(await ws.readFile(
+      `.xcompiler/issues/${requests[0]!.issueId}.json`,
+    )) as { status: string };
+    expect(issue.status).toBe('resolved');
+    expect(issueLog.indexOf('"event":"change-pending"')).toBeLessThan(
+      issueLog.indexOf('"event":"resolved"'),
+    );
   });
 
   it('resumes cached INTEGRATION_TEST failures by rolling back to DETAILED_DESIGN instead of same-phase Debugger', async () => {
@@ -1613,6 +1750,16 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       'utf8',
     );
 
+    const coderLlm = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'apply only the detailed design change to code',
+        actions: [
+          { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "fresh"\n' } },
+          { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# Unit plan rerun\n' } },
+        ],
+        done: true,
+      }),
+    ]);
     const router = new FakeRouter({
       Debugger: new ScriptedLLM([
         JSON.stringify({
@@ -1622,25 +1769,24 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           ],
           done: true,
         }),
-      ]),
-      Coder: new ScriptedLLM([
         JSON.stringify({
-          thoughts: 'rerun code after detailed design repair',
+          thoughts: 'repair the CR implementation without expanding design scope',
           actions: [
-            { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "fresh"\n' } },
-            { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# Unit plan rerun\n' } },
+            { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "reworked"\n' } },
           ],
           done: true,
         }),
       ]),
+      Coder: coderLlm,
       Tester: new ScriptedLLM([
         JSON.stringify({
-          thoughts: 'rerun unit tests',
+          thoughts: 'apply unit verification for the design CR',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit rerun\n' } },
             { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
+            { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
           ],
-          done: true,
+          done: false,
         }),
         JSON.stringify({
           thoughts: 'rerun integration tests',
@@ -1663,7 +1809,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const engine = new PhaseEngine({
       ws,
       git,
-      sandbox: new IntegrationRollbackSandbox(ws),
+      sandbox: new ChangeRequestReworkSandbox(ws),
       router: router as unknown as LLMRouter,
       audit,
       planPath,
@@ -1694,6 +1840,34 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       .toBeLessThan(phaseStarts.findIndex((message) => message.includes('S006 INTEGRATION_TEST')));
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.rollback_validation_deferred');
+    expect(coderLlm.lastUser).toContain('## active engineering change request');
+    expect(coderLlm.lastUser).toContain('Apply only the affected contract');
+    expect(coderLlm.lastUser).toContain('.xcompiler/change-requests/CR-P1-001.json');
+    const requests = JSON.parse(await ws.readFile('.xcompiler/change-requests/index.json')) as Array<{
+      status: string;
+      revision: number;
+      parentChangeRequestId?: string;
+      relatedIssueIds: string[];
+      applications: Array<{ revision: number; stepId: string }>;
+    }>;
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.applications.map((application) => application.stepId))
+      .toEqual(expect.arrayContaining([
+        detailedStep.id,
+        codeStep.id,
+        unitStep.id,
+        integrationStep.id,
+        moduleStep.id,
+      ]));
+    expect(requests[0]).toMatchObject({
+      status: 'closed',
+      revision: 2,
+    });
+    expect(requests[0]?.relatedIssueIds).toHaveLength(2);
+    expect(requests[0]?.applications).toEqual(expect.arrayContaining([
+      expect.objectContaining({ revision: 2, stepId: codeStep.id }),
+      expect.objectContaining({ revision: 2, stepId: unitStep.id }),
+    ]));
   });
 
   it('revalidates a cached test failure and clears it without rollback when the current gate passes', async () => {
@@ -2260,6 +2434,73 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(issueLog).toContain('"event":"recorded"');
     expect(issueLog).toContain('"event":"unresolved"');
     expect(issueLog).not.toContain('"event":"routed"');
+  });
+
+  it('relinks and resolves the prior issue when a provider-failed declarative Step succeeds on resume', async () => {
+    const plan = fakePlan();
+    const designStep = plan.steps.find((step) => step.phase === 'DETAILED_DESIGN')!;
+    designStep.dependsOn = [];
+    plan.steps = [designStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    (sandbox as unknown as { build: () => Promise<{ rebuilt: boolean; reason: string }> }).build =
+      async () => ({ rebuilt: false, reason: 'stubbed' });
+
+    const providerError = new Error(
+      'all LLM providers failed for role Architect: deepseek_paid/openai:deepseek/deepseek-v4-flash: ' +
+      'OpenAI-compatible provider request failed provider=deepseek_paid model=deepseek/deepseek-v4-flash ' +
+      'base_url=https://openrouter.ai/api/v1: fetch failed; cause=getaddrinfo ENOTFOUND openrouter.ai',
+    );
+    const failedEngine = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: new FakeRouter({ Architect: new ThrowingLLM(providerError) }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+    });
+    const failed = await failedEngine.run(plan);
+    expect(failed.failedStepId).toBe(designStep.id);
+
+    const resumedEngine = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: new FakeRouter({
+        Architect: new ScriptedLLM([
+          JSON.stringify({
+            thoughts: 'write the complete declarative design outputs after provider recovery',
+            actions: [
+              {
+                tool: 'write_file',
+                args: { path: 'docs/03-detailed-design.md', content: '# Detailed Design\n' },
+              },
+              {
+                tool: 'write_file',
+                args: { path: 'docs/tests/integration-test-plan.md', content: '# Integration Test Plan\n' },
+              },
+            ],
+            done: false,
+          }),
+        ]),
+      }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 2,
+    });
+    const resumed = await resumedEngine.run(plan);
+    expect(resumed.failedStepId).toBeUndefined();
+
+    const issueFiles = (await fs.readdir(path.join(tmp, '.xcompiler/issues')))
+      .filter((file) => /^ISSUE-.*\.json$/u.test(file));
+    expect(issueFiles).toHaveLength(1);
+    const issue = JSON.parse(
+      await fs.readFile(path.join(tmp, '.xcompiler/issues', issueFiles[0]!), 'utf8'),
+    ) as { status: string; debugBrief?: { category?: string }; issueResolutionPlan?: string };
+    expect(issue.status).toBe('resolved');
+    expect(issue.debugBrief?.category).toBe('llm_provider');
+    expect(issue.issueResolutionPlan).toContain('retry the same Step');
   });
 
   it('does not route LLM provider rate limits from test phases into Debugger retries', async () => {
@@ -3817,7 +4058,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(auditLog).toContain('engine.audit_repair_downstream_reset');
   });
 
-  it('auto-adds chunked author tools for doc-producing steps from older plans', async () => {
+  it('auto-adds chunked author tools when a doc-producing step omits them', async () => {
     const plan = fakePlan();
     plan.steps = [
       {

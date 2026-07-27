@@ -18,7 +18,9 @@ describe('language-specific planner/executor prompts', () => {
 
   it('keeps TypeScript StepPlan output ownership explicit in the two-level planner prompt', () => {
     const prompt = t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile('typescript'));
-    expect(prompt).toContain('CODE outputs may include only product source files under src/');
+    expect(prompt).toContain('CODE outputs may include only product source files and runtime assets under src/');
+    expect(prompt).toContain('assetPaths is optional and may contain only non-code files under src/');
+    expect(prompt).toContain('Do not put test fixtures, sample inputs, temporary outputs, or documentation there.');
     expect(prompt).toContain('MODULE_TEST owns architectureModules.testPaths');
     expect(prompt).toContain('HIGH_LEVEL_DESIGN Step must output package.json');
     expect(prompt).toContain('CODE must not output package.json');

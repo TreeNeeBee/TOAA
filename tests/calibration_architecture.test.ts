@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { calibrateArchitectureStepMappings } from '../src/agents/calibration.js';
+import {
+  calibrateArchitectureModulePaths,
+  calibrateArchitectureStepMappings,
+} from '../src/agents/calibration.js';
 import { validateArchitectureContract, type ArchitectureDemand } from '../src/core/architecture.js';
 import type { ArchitectureModule, Step } from '../src/core/plan.js';
 
@@ -24,6 +27,46 @@ function step(overrides: Partial<Step> & Pick<Step, 'id' | 'phase'>): Step {
 }
 
 describe('calibrateArchitectureStepMappings', () => {
+  it('tracks product runtime assets separately from target-language source files', () => {
+    const rawModules: ArchitectureModule[] = [
+      {
+        id: 'M001',
+        name: 'Brief template',
+        responsibility: 'Provide the runtime template used to render a briefing.',
+        sourcePaths: ['src/templates/brief.md.hbs'],
+        testPaths: ['tests/brief-template.test.ts'],
+        dependencies: [],
+      },
+    ];
+    const modules = calibrateArchitectureModulePaths(rawModules, 'typescript');
+    expect(modules[0]?.sourcePaths).toEqual([]);
+    expect(modules[0]?.assetPaths).toEqual(['src/templates/brief.md.hbs']);
+
+    const steps = calibrateArchitectureStepMappings([
+      step({
+        id: 'S001',
+        phase: 'CODE',
+        outputs: ['src/templates/brief.md.hbs'],
+      }),
+      step({
+        id: 'S002',
+        phase: 'MODULE_TEST',
+        role: 'Tester',
+        outputs: ['tests/brief-template.test.ts'],
+        dependsOn: ['S001'],
+      }),
+    ], modules);
+
+    expect(steps[0]?.subTasks?.[0]?.outputs).toEqual(['src/templates/brief.md.hbs']);
+    expect(validateArchitectureContract(modules, steps, 'typescript', {
+      nonTrivial: true,
+      surfaces: ['io'],
+      baselineModules: 0,
+      minModules: 1,
+      reasonLabel: 'runtime-asset-test',
+    })).toEqual([]);
+  });
+
   it('keeps CODE and MODULE_TEST macro steps while adding module subtasks', () => {
     const modules: ArchitectureModule[] = [
       {

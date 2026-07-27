@@ -63,12 +63,13 @@ export function renderPlanMarkdown(plan: Plan): string {
   if ((plan.architectureModules?.length ?? 0) > 0) {
     lines.push('## Architecture contract');
     lines.push('');
-    lines.push('| Module | Responsibility | Source paths | Test paths | Depends on |');
-    lines.push('| --- | --- | --- | --- | --- |');
+    lines.push('| Module | Responsibility | Source paths | Runtime assets | Test paths | Depends on |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
     for (const module of plan.architectureModules ?? []) {
       lines.push(
         `| ${module.id} ${escapePipe(module.name)} | ${escapePipe(module.responsibility)} | ` +
-        `${module.sourcePaths.join(', ')} | ${module.testPaths.join(', ')} | ${module.dependencies.join(', ') || '—'} |`,
+        `${module.sourcePaths.join(', ') || '—'} | ${(module.assetPaths ?? []).join(', ') || '—'} | ` +
+        `${module.testPaths.join(', ')} | ${module.dependencies.join(', ') || '—'} |`,
       );
     }
     lines.push('');

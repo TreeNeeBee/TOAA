@@ -10,7 +10,7 @@ import { resolveWorkspacePath } from './path_guard.js';
  *   - 行级 +/-/" "（空格上下文）
  *   - 不支持二进制 / 重命名 / 模式变更
  *
- * 设计目标：覆盖 LLM 在 CODE/DEBUG 阶段最常产生的差异格式；不为了通用 git apply 兼容性而过度复杂化。
+ * 设计目标：覆盖 LLM 在 CODE 阶段和 DEBUG 模式最常产生的差异格式；不追求完整 git apply 语法。
  */
 export const applyPatchTool: Tool<{ patch: string }, { changedFiles: string[] }> = {
   name: 'apply_patch',

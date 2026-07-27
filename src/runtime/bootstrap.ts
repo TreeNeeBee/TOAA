@@ -105,7 +105,6 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
       workspace: prepared.worktree,
       configPath,
       force: !!opts.force,
-      setProcessExitCode: false,
       terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
       io,
     });

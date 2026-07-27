@@ -3,10 +3,8 @@ import { readFileTool, writeFileTool, appendFileTool, listDirTool } from './fs.j
 import { applyPatchTool } from './patch.js';
 import {
   runProgramTool,
-  runPythonTool,
   runTestsTool,
   installDepsTool,
-  pipInstallTool,
 } from './sandbox.js';
 import { replaceInFileTool, codeSearchTool, analyzeErrorTool } from './edit.js';
 import { addDependencyTool } from './deps.js';
@@ -41,12 +39,10 @@ export function buildDefaultRegistry(): ToolRegistry {
   reg.register(applyPatchTool);
   reg.register(replaceInFileTool);
   reg.register(addDependencyTool);
-  // 运行（语言中立名 + 兼容旧名）
+  // Runtime tools use language-neutral names.
   reg.register(runProgramTool);
-  reg.register(runPythonTool);
   reg.register(runTestsTool);
   reg.register(installDepsTool);
-  reg.register(pipInstallTool);
   // 网络
   reg.register(httpFetchTool);
   // 分析

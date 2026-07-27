@@ -12,7 +12,7 @@ function tailLines(text: string, n: number): string {
   return lines.slice(-n).join('\n');
 }
 
-/** 为 run_python / run_tests 失败结果构造可见的 summary：基础行 + stderr/stdout 最后 N 行。
+/** Build a compact failure summary for run_program / run_tests.
  * 把硬截断写成单字节计数避免极端 case 把 prompt 撑爆（默认 4KB）。 */
 function buildRunSummary(
   base: string,
@@ -63,12 +63,6 @@ export const runProgramTool: Tool<
     };
   },
 };
-
-/** @deprecated 旧工具名 run_python；等价于 run_program，保留以兼容历史 plan。 */
-export const runPythonTool: Tool<
-  { args: string[]; cwd?: string; timeoutMs?: number },
-  { exitCode: number; stdout: string; stderr: string; timedOut: boolean }
-> = { ...runProgramTool, name: 'run_python' };
 
 export const runTestsTool: Tool<
   { args?: string[]; cwd?: string; timeoutMs?: number },
@@ -146,10 +140,4 @@ export const installDepsTool: Tool<{ packages: string[] }, { exitCode: number; s
       summary: ok ? base : buildRunSummary(base, r),
     };
   },
-};
-
-/** @deprecated 旧工具名 pip_install；等价于 install_deps，保留以兼容历史 plan。 */
-export const pipInstallTool: Tool<{ packages: string[] }, { exitCode: number; stdout: string; stderr: string }> = {
-  ...installDepsTool,
-  name: 'pip_install',
 };

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { xcEnv } from '../config/env.js';
+import { assertStateTransition, type StateTransitions } from '../util/state_machine.js';
 import type { DebugBrief, DebugFailureCategory } from './debug_brief.js';
 import type { Phase } from './plan.js';
 
@@ -12,6 +13,12 @@ export const DEBUG_WIKI_VERSION = 1;
 
 export type DebugWikiLayer = 'system' | 'agent' | 'external';
 export type DebugWikiEntryStatus = 'active' | 'needs_review' | 'superseded';
+
+const DEBUG_WIKI_STATUS_TRANSITIONS: StateTransitions<DebugWikiEntryStatus> = {
+  active: ['needs_review', 'superseded'],
+  needs_review: ['active', 'superseded'],
+  superseded: [],
+};
 
 export interface DebugWikiEntry {
   id: string;
@@ -187,7 +194,7 @@ export class DebugWiki {
       const entry = this.byId(item.entryId);
       if (!entry) continue;
       entry.stats.failures += 1;
-      entry.status = 'needs_review';
+      transitionDebugWikiEntry(entry, 'needs_review');
       entry.updatedAt = now;
       pushFeedback(entry, item);
     }
@@ -239,7 +246,7 @@ export class DebugWiki {
       const entry = this.byId(item.entryId);
       if (!entry) continue;
       entry.stats.successes += 1;
-      entry.status = 'active';
+      transitionDebugWikiEntry(entry, 'active');
       entry.updatedAt = now;
       pushFeedback(entry, item);
     }
@@ -315,11 +322,11 @@ export class DebugWiki {
       if (item.kind === 'used') entry.stats.uses += 1;
       if (item.kind === 'failure') {
         entry.stats.failures += 1;
-        entry.status = 'needs_review';
+        transitionDebugWikiEntry(entry, 'needs_review');
       }
       if (item.kind === 'success' || item.kind === 'corrected') {
         entry.stats.successes += 1;
-        if (item.kind === 'corrected') entry.status = 'active';
+        if (item.kind === 'corrected') transitionDebugWikiEntry(entry, 'active');
       }
       entry.updatedAt = item.at;
       pushFeedback(entry, item);
@@ -332,7 +339,7 @@ export class DebugWiki {
     now: string,
     kind: DebugWikiFeedback['kind'],
   ): void {
-    entry.status = 'active';
+    transitionDebugWikiEntry(entry, 'active');
     entry.updatedAt = now;
     entry.summary = input.brief.summary;
     entry.primaryError = input.brief.primaryError;
@@ -716,6 +723,22 @@ function renderMarkdownList(items: string[]): string {
 
 function escapeTable(text: string): string {
   return text.replace(/\|/gu, '\\|').replace(/\r?\n/gu, ' ');
+}
+
+function transitionDebugWikiEntry(
+  entry: DebugWikiEntry,
+  next: DebugWikiEntryStatus,
+): boolean {
+  const changed = assertStateTransition(
+    'debug wiki entry',
+    entry.id,
+    entry.status,
+    next,
+    DEBUG_WIKI_STATUS_TRANSITIONS,
+  );
+  if (!changed) return false;
+  entry.status = next;
+  return true;
 }
 
 function confidenceFor(entry: DebugWikiEntry): number {

@@ -34,7 +34,7 @@ export interface PreflightResult {
  *     全量 tags，把每个模型注册为合成 provider `auto_<sanitized>`，加入到所有现存角色的
  *     候选数组里。完成后再次校验：若仍有角色为空，抛错让 CLI 退出（exit code 7）。
  *
- * 该函数会**就地修改** cfg.llm.providers 与 cfg.llm.roles（保留旧字段不动）。
+ * 该函数会**就地更新** cfg.llm.providers 与 cfg.llm.roles 中的当前运行候选。
  */
 export async function preflightProviders(
   cfg: XCompilerConfig,

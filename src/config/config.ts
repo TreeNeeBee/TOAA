@@ -75,7 +75,6 @@ const ProviderSchema = z.object({
 });
 
 const LocaleSchema = z.enum(['en', 'zh']);
-const TargetLanguageSchema = z.enum(['python', 'typescript']);
 const SandboxModeSchema = z.enum(['subprocess', 'docker', 'firejail']);
 
 const SandboxLimitsSchema = z
@@ -87,12 +86,10 @@ const SandboxLimitsSchema = z
      * Sandbox network policy.
      *  - `off`            — no network at all (`docker --network none`).
      *  - `download-only`  — outbound traffic allowed, no inbound port publishing.
-     *  - `pypi-only`      — legacy value; rejected at sandbox creation rather than silently
-     *                       allowing unrestricted outbound traffic.
      *  - `full`           — outbound + every port in `expose_ports` is published
      *                       to `127.0.0.1` so host-side tests can reach the app.
      */
-    network: z.enum(['off', 'pypi-only', 'download-only', 'full']).default('download-only'),
+    network: z.enum(['off', 'download-only', 'full']).default('download-only'),
     /** Container ports to publish to 127.0.0.1 when `network=full`. */
     expose_ports: z.array(z.number().int().min(1).max(65535)).default([]),
   })
@@ -156,54 +153,37 @@ const SandboxesSchema = z
     python: LanguageSandboxSchema.optional(),
     typescript: LanguageSandboxSchema.optional(),
   })
-  .default({});
+  .default({})
+  .transform((sandboxes) => ({
+    python: mergeLanguageSandbox(
+      defaultLanguageSandbox('python', 'subprocess', defaultSandboxLimits()),
+      sandboxes.python,
+    ),
+    typescript: mergeLanguageSandbox(
+      defaultLanguageSandbox('typescript', 'subprocess', defaultSandboxLimits()),
+      sandboxes.typescript,
+    ),
+  }));
 
 const LlmSchema = z.object({
-  /** @removed `llm.default` 已移除：模型选择必须通过 llm.roles 手动指定。保留字段仅用于给出明确的迁移报错。 */
-  default: z.unknown().optional(),
   providers: z.record(z.string(), ProviderSchema),
   /**
    * 角色 → provider 数组的映射。
-   * 兼容旧格式：单字符串 `Coder: ollama_code` 自动归一化为 `[ollama_code]`。
    * 数组形式 `Coder: [ollama_code, openai]` 表示该角色的候选 LLM 池；
    * 实际选择顺序由 ScoreStore 有效评分降序决定；有效评分为用户覆盖优先，否则使用动态评分。
    */
-  roles: z
-    .record(z.string(), z.union([z.string(), z.array(z.string())]))
-    .default({})
-    .transform((obj) => {
-      const out: Record<string, string[]> = {};
-      for (const [k, v] of Object.entries(obj)) {
-        out[k] = Array.isArray(v) ? [...v] : [v];
-      }
-      return out;
-    }),
+  roles: z.record(z.string(), z.array(z.string())).default({}),
   /** 全局 fallback 链：当主 provider 调用报错时依次尝试 */
   fallbacks: z.array(z.string()).default([]),
   /** 可选：按角色指定 fallback 链（覆盖全局） */
   role_fallbacks: z.record(z.string(), z.array(z.string())).default({}),
-  /**
-   * Provider 兼容初值。运行时动态评分由 ScoreStore 写入 llm_scores.yaml；
-   * 用户手动覆盖应写入 llm_scores_user.yaml。旧配置里显式 0 仍表示用户禁用。
-   */
-  scores: z.record(z.string(), z.number().min(0)).default({}),
   /**
    * Providers tagged `cluster` (for example aggregated free routes) use this
    * narrower dynamic score range so they naturally remain backup choices.
    */
   cluster_score_min: z.number().min(0.1).max(1).optional(),
   cluster_score_max: z.number().min(0.1).max(1).optional(),
-}).superRefine((llm, ctx) => {
-  if (llm.default !== undefined) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['default'],
-      message:
-        'llm.default has been removed: model selection must be specified manually. ' +
-        'Delete llm.default and assign providers to every role via llm.roles ' +
-        '(optionally llm.role_fallbacks / llm.fallbacks).',
-    });
-  }
+}).strict().superRefine((llm, ctx) => {
   for (const role of ROLES) {
     const explicit = llm.role_fallbacks[role] ?? [];
     const pool = llm.roles[role] ?? [];
@@ -226,12 +206,9 @@ const LlmSchema = z.object({
       message: 'cluster_score_min must be less than or equal to cluster_score_max',
     });
   }
-}).transform(({ default: _removedDefault, ...rest }) => rest);
+});
 
-const AgentSchema = z
-  .object({
-    /** @deprecated Target project language is inferred from topic/baseline. Kept for legacy configs only. */
-    language: TargetLanguageSchema.optional(),
+const AgentSchema = z.object({
     max_steps: z.number().int().positive().default(50),
     max_debug_retries: z.number().int().positive().default(3),
     /** Debugger 滑动窗口的硬上限（默认 = max(max_debug_retries*4, 10)）。 */
@@ -240,55 +217,15 @@ const AgentSchema = z
     max_debug_rounds_per_step: z.number().int().positive().optional(),
     max_edit_lines_per_step: z.union([z.literal('auto'), z.number().int().positive()]).default('auto'),
     max_write_chunk_bytes: z.union([z.literal('auto'), z.number().int().positive()]).default('auto'),
-    /** @deprecated Use agent.sandboxes.<language>.mode. */
-    sandbox: SandboxModeSchema.optional(),
-    /** @deprecated Use agent.sandboxes.<language>.<local|docker>.limits. */
-    sandbox_limits: SandboxLimitsSchema.optional(),
-    /** @deprecated Use agent.sandboxes.<language>.docker. */
-    sandbox_docker: DockerSandboxSchema.optional(),
     sandboxes: SandboxesSchema,
-  })
-  .transform((agent) => {
-    const legacyLanguage = agent.language ?? 'python';
-    const legacyMode = agent.sandbox ?? 'subprocess';
-    const legacyLimits = agent.sandbox_limits ?? defaultSandboxLimits();
-    const defaults = {
-      python: defaultLanguageSandbox('python', legacyMode, legacyLimits),
-      typescript: defaultLanguageSandbox('typescript', legacyMode, legacyLimits),
-    };
-    const sandboxes = {
-      python: mergeLanguageSandbox(
-        defaults.python,
-        agent.sandboxes.python,
-        legacyLanguage === 'python' ? agent.sandbox_docker : undefined,
-      ),
-      typescript: mergeLanguageSandbox(
-        defaults.typescript,
-        agent.sandboxes.typescript,
-        legacyLanguage === 'typescript' ? agent.sandbox_docker : undefined,
-      ),
-    };
-    return {
-      ...agent,
-      language: legacyLanguage,
-      sandbox: sandboxes.python.mode,
-      sandbox_limits: sandboxes.python.local.limits,
-      sandbox_docker: sandboxes.python.docker,
-      sandboxes,
-    };
-  });
+  }).strict();
 
 const ConfigSchema = z.object({
   /** CLI / prompt locale. Accepts 'en' (default) or 'zh'. */
-  locale: LocaleSchema.optional(),
-  /** @deprecated use `locale` instead. Kept as a backwards-compatible alias. */
-  ui_language: LocaleSchema.optional(),
+  locale: LocaleSchema.default('en'),
   llm: LlmSchema,
   agent: AgentSchema,
-}).transform(({ locale, ui_language, ...rest }) => ({
-  locale: locale ?? ui_language ?? 'en',
-  ...rest,
-}));
+}).strict();
 
 export type XCompilerConfig = z.infer<typeof ConfigSchema>;
 
@@ -332,9 +269,8 @@ function defaultLanguageSandbox(
 function mergeLanguageSandbox(
   defaults: NormalizedLanguageSandbox,
   override?: NormalizedLanguageSandbox,
-  legacyDocker?: NormalizedLanguageSandbox['docker'],
 ): NormalizedLanguageSandbox {
-  const dockerOverride = legacyDocker ?? override?.docker;
+  const dockerOverride = override?.docker;
   return {
     mode: override?.mode ?? defaults.mode,
     local: {

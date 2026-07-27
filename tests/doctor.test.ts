@@ -30,14 +30,14 @@ async function writeCfg(overrides: Record<string, unknown>): Promise<string> {
       roles: allRoles('ollama_code'),
       fallbacks: [],
       role_fallbacks: {},
-      scores: {},
     },
     agent: {
-      language: 'python',
       max_steps: 1,
       max_debug_retries: 1,
-      sandbox: 'subprocess',
-      sandbox_limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'off' },
+      sandboxes: {
+        python: { mode: 'subprocess' },
+        typescript: { mode: 'subprocess' },
+      },
     },
     ...overrides,
   };
@@ -74,7 +74,6 @@ describe('doctor', () => {
         roles: allRoles('openai'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: {},
       },
     });
     const r = await runDoctor({ configPath: cfgPath, skipNetwork: true });
@@ -96,7 +95,6 @@ describe('doctor', () => {
         roles: allRoles('openrouter_free'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: {},
       },
     });
     const r = await runDoctor({ configPath: cfgPath, skipNetwork: true });
@@ -119,7 +117,6 @@ describe('doctor', () => {
         roles: allRoles('local_openai'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: {},
       },
     });
     const r = await runDoctor({ configPath: cfgPath, skipNetwork: true });
@@ -138,7 +135,6 @@ describe('doctor', () => {
         roles: allRoles('ollama_code'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: {},
       },
     });
     const r = await runDoctor({ configPath: cfgPath, skipNetwork: true });
@@ -156,9 +152,13 @@ describe('doctor', () => {
         roles: allRoles('ollama_code'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: { ollama_code: 0 },
       },
     });
+    await fs.writeFile(
+      path.join(path.dirname(cfgPath), 'llm_scores_user.yaml'),
+      'ollama_code: 0\n',
+      'utf8',
+    );
     const r = await runDoctor({ configPath: cfgPath, skipNetwork: true });
     const llm = r.sections.find((s) => s.title === '[LLM]')!;
     expect(llm.items.some((i) => i.level === 'fail' && /no live provider/i.test(i.message))).toBe(true);
@@ -167,11 +167,12 @@ describe('doctor', () => {
   it('checks node/npm/npx prerequisites for TypeScript subprocess sandbox', async () => {
     const cfgPath = await writeCfg({
       agent: {
-        language: 'typescript',
         max_steps: 1,
         max_debug_retries: 1,
-        sandbox: 'subprocess',
-        sandbox_limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'off' },
+        sandboxes: {
+          python: { mode: 'subprocess' },
+          typescript: { mode: 'subprocess' },
+        },
       },
     });
     const r = await runDoctor({ configPath: cfgPath, skipNetwork: true });

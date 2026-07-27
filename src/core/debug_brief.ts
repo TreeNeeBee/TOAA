@@ -183,6 +183,8 @@ function classify(
     return 'test_failure';
   }
 
+  if (hasExplicitLLMProviderFailure(lower)) return 'llm_provider';
+
   if (hasConcreteNetworkFailure(lower)) return 'network_api_failure';
 
   if (
@@ -199,6 +201,10 @@ function classify(
   if (toolFailures.length > 0) return 'exception';
   if (lines.some((line) => /error|exception|traceback|failed/i.test(line))) return 'exception';
   return 'unknown';
+}
+
+function hasExplicitLLMProviderFailure(lower: string): boolean {
+  return /all llm providers failed|openai-compatible provider request failed|provider_call_failed|llm provider|prefill_memory_exceeded|context window|token limit|prompt too long|openai stream (?:wall-clock|idle)|provider=\S+[^\n]*model=\S+[^\n]*base_url=/u.test(lower);
 }
 
 function hasConcreteNetworkFailure(lower: string): boolean {
@@ -288,7 +294,7 @@ function buildDebugDemand(category: DebugFailureCategory, phase?: Phase, statusC
     case 'permission_denied':
       return `Treat the denied operation as a real blocker unless an allowed alternative exists; do not bypass the permission gate.`;
     case 'llm_provider':
-      return `This is provider/context infrastructure, not a project code bug. Reduce prompt/debug context or fix provider config before retrying.`;
+      return `This is LLM provider/context infrastructure, not a project code bug. Restore provider connectivity/configuration or reduce context as indicated, then retry the current Step without modifying generated project code.`;
     case 'exception':
       return `Localize the exception to a file or tool call, make the smallest allowed repair, then verify.`;
     case 'unknown':

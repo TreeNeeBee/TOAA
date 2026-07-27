@@ -14,7 +14,7 @@ N 在本轮结束前始终是可信执行器。
         ├── base commit ──► 隔离 worktree / 候选分支
         │                         │
         │                         ├── intent=self 编译 V 模型计划
-        │                         ├── 执行 CODE / TEST / DEBUG / DELIVERY
+        │                         ├── 执行完整 V 模型与按需 Debug 修复
         │                         └── 确定性质量门
         │
         └── 人工晋级门 ──► git merge --ff-only ──► XCompiler-N+1
@@ -31,14 +31,14 @@ N 在本轮结束前始终是可信执行器。
 ## Self 计划约束
 
 `self` 属于增量意图，加载已有 plan、项目记忆、源码/测试树、manifest，以及
-`XCompiler_design.md`、本设计、实施计划和插件 API。
+`XCompiler_design.md`、本设计和插件 API。
 
 Planner 必须遵守：
 
 - 保留现有 `package.json`、`tsconfig`、bin、CLI 入口、模块布局和公共导出。
 - 不得为了满足新建工程规则创建 `src/main.ts`。
 - 未涉及依赖或脚本时，不得把 `package.json` / `tsconfig.json` 列为 Step 输出。
-- 每个 CODE / REFACTOR Step 只覆盖本次增量，并保留 ARCH → CODE → TEST 可追踪性。
+- 每个 V 模型 Step 只覆盖本次增量，并保留需求、设计、编码、测试之间的可追踪性。
 
 ## 质量门
 

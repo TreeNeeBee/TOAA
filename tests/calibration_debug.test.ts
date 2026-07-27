@@ -148,6 +148,16 @@ it('requires patch and run_program verification for network API failures', () =>
     expect(infra.hint).toMatch(/不要.*业务代码/);
   });
 
+  it('does not add project API guidance for a long OpenRouter stream transport failure', () => {
+    const sugs = calibrateDebugSuggestions(
+      'all LLM providers failed for role Debugger: deepseek_paid/openai:deepseek/deepseek-v4-flash: ' +
+      'OpenAI-compatible provider request failed provider=deepseek_paid model=deepseek/deepseek-v4-flash ' +
+      'base_url=https://openrouter.ai/api/v1 mode=stream: OpenAI error: Network connection lost.',
+    );
+    expect(sugs.find((s) => s.code === 'llm-transport-failure')).toBeTruthy();
+    expect(sugs.find((s) => s.code === 'network-api-failure')).toBeUndefined();
+  });
+
   it('does not misclassify OpenRouter rate limits as project API failures', () => {
     const sugs = calibrateDebugSuggestions(
       `OpenAI HTTP 429: {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"openrouter/free is temporarily rate-limited upstream","retry_after_seconds":8}}}`,

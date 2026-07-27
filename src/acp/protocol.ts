@@ -60,13 +60,6 @@ export const AcpMethod = {
   SessionSetMode: 'session/set_mode',
   SessionUpdate: 'session/update',
   SessionRequestPermission: 'session/request_permission',
-  LegacySessionCreate: 'xcompiler/session/create',
-  LegacySessionClose: 'xcompiler/session/close',
-  LegacyTaskStart: 'xcompiler/task/start',
-  LegacyTaskCancel: 'xcompiler/task/cancel',
-  LegacyConfirmationRespond: 'xcompiler/confirmation/respond',
-  LegacyPermissionRespond: 'xcompiler/permission/respond',
-  LegacyEvent: 'xcompiler/event',
 } as const;
 
 export function request(id: JsonRpcId, method: string, params?: unknown): JsonRpcRequest {

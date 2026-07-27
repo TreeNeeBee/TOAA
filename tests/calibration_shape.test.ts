@@ -29,12 +29,12 @@ describe('calibrateStepShape', () => {
     const raw = [
       { id: 'S001', phase: 'DETAILED_DESIGN', title: '任务拆解', description: '编写任务清单', systemPrompt: 'x'.repeat(30), role: 'Planner', outputs: ['docs/03-detailed-design.md'] },
       { id: 'S002', phase: 'UNIT_TEST', title: '补测试', description: '写测试并执行', systemPrompt: 'x'.repeat(30), role: 'Tester', outputs: ['tests/test_app.py'] },
-      { id: 'S003', phase: 'DEBUG', title: '调试修复', description: '修复失败测试', systemPrompt: 'x'.repeat(30), role: 'Debugger', outputs: ['src/app.py'] },
+      { id: 'S003', phase: 'CODE', title: '实现代码', description: '编写实现', systemPrompt: 'x'.repeat(30), role: 'Coder', outputs: ['src/app.py'] },
     ] as unknown as Step[];
     const out = calibrateStepShape(raw);
     expect(out[0]!.tools).toEqual(['skill:author']);
     expect(out[1]!.tools).toEqual(['skill:tester']);
-    expect(out[2]!.tools).toEqual(['skill:debugger']);
+    expect(out[2]!.tools).toEqual(['skill:author']);
   });
 
   it('preserves tester capabilities when a test phase already has a write tool', () => {

@@ -27,7 +27,7 @@ XCompiler 是一个可复用的 AI 软件工厂运行时。它先把产品需求
 | 命令 | 定位 | 输入 | 输出 |
 |---|---|---|---|
 | `xcompiler build` | 把需求编译成 `phasePlan.json` 和当前阶段计划，例如 `plan.P1.json` | 需求文本（`-i req.md`、`-t topic.md` 或交互输入） | `topic.md`、`phasePlan.json`、`plan.P1.json`、`plan.md`、`<name>.xc` |
-| `xcompiler run` | 按 V 模型执行当前阶段 | `phasePlan.json` 或历史 `plan.json` | 可运行工程、测试、文档、审计、更新后的进度 |
+| `xcompiler run` | 按 V 模型执行当前阶段 | `phasePlan.json` | 可运行工程、测试、文档、审计、更新后的进度 |
 | `xcompiler load` | 从工程文件恢复 | `<name>.xc` | 继续保存的阶段/任务状态 |
 | `xcompiler append` / `xcompiler evolve` | 在已有工程上追加需求 | 现有 workspace/工程文件 + 新需求 | 增量计划和实现 |
 | `xcompiler acp` | 作为 ACP Code Agent Adapter 运行 | IDE/Editor 通过 stdio JSON-RPC 调用 | 基于 Runtime 的代码代理事件和结果 |
@@ -50,6 +50,8 @@ V 模型行为：
 - `HIGH_LEVEL_DESIGN` 定义系统级接口、外部 API、第三方库选型和依赖确认。
 - `DETAILED_DESIGN` 定义模块内部结构和具体实现方案。
 - 测试失败先记录为 issue，再路由回匹配的上游阶段交给 Debugger 修复。
+- 回退到 `HIGH_LEVEL_DESIGN` 或 `DETAILED_DESIGN` 的修复会创建工程 CR。Issue 保持 `change_pending`，下游阶段只实施 CR 增量，并记录变更/验证提交。
+- 下游失败使同一 CR 进入 `rework`；只有契约或范围实质扩大时才创建子 CR。全部受影响门禁通过后，CR 和 Issue 才关闭。
 - 已完成阶段的 Debug 必须提供真实 patch/rewrite 或成功验证证据。
 - 网络/API 调用失败是正式门禁：项目 API 失败时必须修复或切换可用 API，不能跳过或掩盖。
 
@@ -66,10 +68,11 @@ V 模型行为：
 - **Adapters**：参数/协议解析、配置加载、用户交互、输出渲染、Exit Code。
 - **Runtime**：Runtime API、Build Service、Run Service、Event Stream、Permission Broker，是唯一业务入口。
 - **Workflow and planning**：Phase 迭代、V 模型调度、回退/Debug 路由、迭代门禁、断点恢复。
+- **State policy**：Step、Phase、Issue、CR 使用各自的迁移表并共享统一迁移守卫；Adapter 和 Agent 不得直接修改持久化流程状态。
 - **Agents / Skills**：每个阶段的角色化 prompt 与工具白名单。
 - **Tools**：文件编辑、程序/测试执行、API fetch、依赖修改、git 快照，全部受门禁约束。
 - **LLM Router**：角色链、动态评分、cluster fallback、OpenAI-compatible/Ollama 客户端、审计。
-- **Workspace**：`phasePlan.json`、`plan.P<N>.json`、`<name>.xc`、`.xcompiler/audit.jsonl`、Debug cache、Project memory。
+- **Workspace**：`phasePlan.json`、`plan.P<N>.json`、`<name>.xc`、`.xcompiler/audit.jsonl`、`.xcompiler/issues/`、`.xcompiler/change-requests/`、Debug cache、Project memory。
 
 ---
 
@@ -177,7 +180,7 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 | 字段 | 默认 | 作用 |
 |---|---|---|
 | `roles.<Role>` | 按角色不同 | Planner、Architect、Coder、Tester、Debugger 的 provider 候选链 |
-| `scores.<provider>` | `1.0` | 向后兼容的初始评分；手动覆盖优先使用 `llm_scores_user.yaml` |
+| `providers.<name>.context_window` | `128K` | Provider 的上下文容量；为空时使用默认值，模型切换后会重新计算工具窗口 |
 | `llm_scores_user.yaml` | 不存在 | 本地用户评分覆盖；`0` 禁用 provider，`0.1..1` 固定有效优先级 |
 | `cluster_score_min/max` | `0.2..0.5` | `cluster` provider 的动态评分范围；用户覆盖仍可使用 `0.1..1` |
 | `agent.sandboxes.python.mode` | `subprocess` | Python 工程沙盒后端：本地 subprocess 或 Docker |
@@ -217,7 +220,7 @@ npm test
 npm run build
 ```
 
-最近本地 release gate：53 个测试文件 / 537 个测试通过。
+最近本地 release gate：60 个测试文件 / 616 个测试通过。
 
 ---
 

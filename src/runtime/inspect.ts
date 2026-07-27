@@ -1,13 +1,12 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { DEFAULT_PLAN_FILE } from '../core/plan.js';
 import { DEFAULT_PHASE_PLAN_FILE } from '../core/phase_plan.js';
 import { loadPlanTarget } from '../core/storage.js';
 import type { Plan, Step } from '../core/plan.js';
 
 export interface LsOptions {
   workspace: string;
-  /** Maximum depth for recursively finding phasePlan.json / legacy plan.json files. Defaults to 4. */
+  /** Maximum depth for recursively finding phasePlan.json files. Defaults to 4. */
   maxDepth?: number;
 }
 
@@ -17,7 +16,6 @@ export interface PlanSummary {
   failed: number;
   pending: number;
   running: number;
-  skipped: number;
 }
 
 export interface LsPlanEntry {
@@ -127,12 +125,11 @@ export async function runShowCommand(opts: ShowOptions): Promise<ShowResult> {
 }
 
 export function summarizePlan(plan: Plan): PlanSummary {
-  const acc: PlanSummary = { total: plan.steps.length, done: 0, failed: 0, pending: 0, running: 0, skipped: 0 };
+  const acc: PlanSummary = { total: plan.steps.length, done: 0, failed: 0, pending: 0, running: 0 };
   for (const s of plan.steps) {
     if (s.status === 'DONE') acc.done++;
     else if (s.status === 'FAILED') acc.failed++;
     else if (s.status === 'RUNNING') acc.running++;
-    else if (s.status === 'SKIPPED') acc.skipped++;
     else acc.pending++;
   }
   return acc;
@@ -163,15 +160,11 @@ export async function findPlans(root: string, maxDepth: number): Promise<string[
 }
 
 async function defaultInspectPlanPath(root: string): Promise<string> {
-  const phasePlanPath = path.join(root, DEFAULT_PHASE_PLAN_FILE);
-  if (await fileExists(phasePlanPath)) return phasePlanPath;
-  const legacyPlanPath = path.join(root, DEFAULT_PLAN_FILE);
-  if (await fileExists(legacyPlanPath)) return legacyPlanPath;
-  return phasePlanPath;
+  return path.join(root, DEFAULT_PHASE_PLAN_FILE);
 }
 
 function isInspectablePlanFile(fileName: string): boolean {
-  return fileName === DEFAULT_PHASE_PLAN_FILE || fileName === DEFAULT_PLAN_FILE;
+  return fileName === DEFAULT_PHASE_PLAN_FILE;
 }
 
 export async function readAuditFor(file: string, stepId: string, tail: number): Promise<AuditLine[]> {

@@ -362,4 +362,21 @@ describe('V-model architecture contract', () => {
     expect(missing).toContain('tests/test_api.py');
     expect(missing).not.toContain('M003');
   });
+
+  it('requires runtime asset paths in the HIGH_LEVEL_DESIGN document', () => {
+    const modules: ArchitectureModule[] = [
+      {
+        id: 'M001',
+        name: 'Template',
+        responsibility: 'Own the product runtime template used by the renderer.',
+        sourcePaths: [],
+        assetPaths: ['src/templates/brief.md.hbs'],
+        testPaths: ['tests/brief-template.test.ts'],
+        dependencies: [],
+      },
+    ];
+    expect(missingArchitectureDocumentTokens('M001\nTemplate', modules)).toContain(
+      'src/templates/brief.md.hbs',
+    );
+  });
 });

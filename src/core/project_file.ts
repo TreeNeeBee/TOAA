@@ -35,7 +35,6 @@ const ProjectProgressSchema = z.object({
   pending: z.number().int().nonnegative(),
   running: z.number().int().nonnegative(),
   failed: z.number().int().nonnegative(),
-  skipped: z.number().int().nonnegative(),
   percent: z.number().int().min(0).max(100),
   currentStepId: z.string().optional(),
   failedStepId: z.string().optional(),
@@ -232,7 +231,6 @@ export function buildProjectProgress(plan: Plan): XCompilerProjectProgress {
     RUNNING: 0,
     DONE: 0,
     FAILED: 0,
-    SKIPPED: 0,
   };
   const steps = plan.steps.map((step) => {
     counts[step.status]++;
@@ -259,7 +257,7 @@ export function buildProjectProgress(plan: Plan): XCompilerProjectProgress {
         ? 'running'
         : total > 0 && counts.DONE === total
           ? 'complete'
-          : counts.DONE > 0 || counts.SKIPPED > 0
+          : counts.DONE > 0
             ? 'partial'
             : 'planned';
   return {
@@ -269,7 +267,6 @@ export function buildProjectProgress(plan: Plan): XCompilerProjectProgress {
     pending: counts.PENDING,
     running: counts.RUNNING,
     failed: counts.FAILED,
-    skipped: counts.SKIPPED,
     percent: total === 0 ? 0 : Math.round((counts.DONE / total) * 100),
     currentStepId: currentStep?.id,
     failedStepId: failedStep?.id,

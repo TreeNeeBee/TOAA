@@ -68,7 +68,6 @@ export interface AcpTask {
   status: AcpTaskStatus;
   workspace: string;
   userTask: string;
-  protocol: 'acp' | 'legacy';
   phase: 'build' | 'run' | 'complete';
   planPath?: string;
   changedFiles: string[];

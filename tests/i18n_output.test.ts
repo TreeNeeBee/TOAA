@@ -16,12 +16,12 @@ describe('user-visible output i18n catalog', () => {
     expect(tFor('zh').audit.toolDenied('write_file')).toBe('拒绝调用工具 write_file');
     expect(tFor('en').llm.scoreFileHeader).toContain('score snapshot');
     expect(tFor('zh').llm.scoreFileHeader).toContain('评分快照');
+    expect(tFor('en').prompts.executorSkillBlock(['inspect'])).toContain('Available skill');
+    expect(tFor('zh').prompts.executorSkillBlock(['检查'])).toContain('可用 Skill');
   });
 
-  it('localizes interactive Gate 1 labels and sandbox failures', async () => {
+  it('localizes interactive Gate 1 labels', async () => {
     expect(tFor('en').compile.gate1Confirm).not.toBe(tFor('zh').compile.gate1Confirm);
-    expect(tFor('en').system.unsupportedPypiOnlyNetwork).toContain('pypi-only');
-    expect(tFor('zh').system.unsupportedPypiOnlyNetwork).toContain('pypi-only');
 
     const source = await fs.readFile(new URL('../src/runtime/build.ts', import.meta.url), 'utf8');
     expect(source).toContain('message: M.compile.gate1Confirm');

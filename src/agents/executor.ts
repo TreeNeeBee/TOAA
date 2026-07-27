@@ -4,6 +4,7 @@ import { promises as fs } from 'node:fs';
 import { jsonrepair } from 'jsonrepair';
 import type { ChatOptions, LLMClient } from '../llm/types.js';
 import type { Step } from '../core/plan.js';
+import type { EngineeringChangeRequest } from '../core/change_request.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
 import type {
   Tool,
@@ -14,6 +15,7 @@ import type {
 import { makeStreamReporter } from '../llm/stream.js';
 import { t } from '../i18n/index.js';
 import { updateOperationWindow } from '../llm/window.js';
+import { renderExecutionPromptPolicy } from './prompt_policy.js';
 
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
 
@@ -57,6 +59,8 @@ export interface ExecutorRunInput {
   ctx: ToolContext;
   /** 注入到 user prompt 的额外上下文（如已有 inputs 内容）。 */
   contextSnippets?: Array<{ path: string; content: string }>;
+  /** Active engineering CR. The Step must apply only this delta to the existing baseline. */
+  changeRequest?: EngineeringChangeRequest;
   /** 来自 Skill 的提示词，拼接到 system prompt 后。 */
   skillHints?: string[];
   /** debug 模式下传入上一轮失败记录（错误文本 / 失败测试 / 上下文）。 */
@@ -150,7 +154,7 @@ export class StepExecutor {
     const initialMissingOutputs = initialVerify.missing;
     const skillBlock =
       inp.skillHints && inp.skillHints.length > 0
-        ? '\n\n可用 Skill 提示:\n' + inp.skillHints.map((h) => '- ' + h).join('\n')
+        ? t().prompts.executorSkillBlock(inp.skillHints)
         : '';
     const debugBlock = inp.debugContext
       ? t().prompts.executorDebugBlock(inp.debugContext.reason, inp.debugContext.suggestions)
@@ -160,11 +164,24 @@ export class StepExecutor {
         ? t().prompts.executorGlobalBlock(inp.globalPrompt.trim())
         : '';
     const stepBlock = t().prompts.executorStepBlock(inp.step.systemPrompt.trim());
+    const policyBlock = renderExecutionPromptPolicy({
+      debug: !!inp.debugContext,
+      changeRequest: !!inp.changeRequest,
+    });
     const userPrompt = renderUserPrompt(inp, toolDocs, initialMissingOutputs);
     const profile = inp.languageProfile ?? getLanguageProfile('python');
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-      { role: 'system', content: t().prompts.executorSystem(profile) + globalBlock + stepBlock + skillBlock + debugBlock },
+      {
+        role: 'system',
+        content:
+          t().prompts.executorSystem(profile) +
+          policyBlock +
+          globalBlock +
+          stepBlock +
+          skillBlock +
+          debugBlock,
+      },
       { role: 'user', content: userPrompt },
     ];
     const calls: ExecutorRunResult['toolCalls'] = [];
@@ -317,7 +334,24 @@ export class StepExecutor {
       finalThought = turn.thoughts;
       issueResolutionPlan = extractIssueResolutionPlan(turn) ?? issueResolutionPlan;
       const normalizedActions = normalizeActions(turn.actions, toolMap);
-      const actions = normalizedActions.actions;
+      let actions = normalizedActions.actions;
+      if (role === 'Debugger' && (readOnlyRecoveryMode || directRepairMode)) {
+        const bounded = boundRecoveryProbeActions(actions);
+        actions = bounded.actions;
+        if (bounded.omitted > 0) {
+          await inp.ctx.audit?.event(
+            'note',
+            `bounded Debugger recovery probes to ${bounded.kept} read-only action(s); omitted ${bounded.omitted}`,
+            {
+              messageId: 'audit.executor_recovery_probe_bound',
+              stepId: inp.step.id,
+              round,
+              keptReadOnlyActions: bounded.kept,
+              omittedReadOnlyActions: bounded.omitted,
+            },
+          );
+        }
+      }
       if (normalizedActions.invalid.length > 0) {
         parseFailures++;
         await inp.ctx.audit?.event(
@@ -502,6 +536,11 @@ export class StepExecutor {
       const issueResolutionPlanOk = !issueResolutionPlanRequired || !!issueResolutionPlan?.trim();
       const verifiedCompletion = !turn.done && hasSuccessfulCompletionVerification(calls);
       const outputCompletionRecovery = verify.ok && canAcceptOutputCompletionRecovery(inp, initialMissing);
+      const declarativeOutputCompletion =
+        !turn.done &&
+        verify.ok &&
+        isDeclarativeOutputPhase(inp.step.phase) &&
+        turnResults.some((result) => result.ok && isOutputMutationTool(result.tool));
       const supersededContractFailures =
         repairEvidence &&
         hasSuccessfulCompletionVerification(calls) &&
@@ -510,7 +549,11 @@ export class StepExecutor {
         unresolvedToolFailures.size === 0 ||
         (outputCompletionRecovery && hasOnlyUntargetedToolContractFailures(unresolvedToolFailures)) ||
         supersededContractFailures;
-      const completionSignal = turn.done || verifiedCompletion || outputCompletionRecovery;
+      const completionSignal =
+        turn.done ||
+        verifiedCompletion ||
+        outputCompletionRecovery ||
+        declarativeOutputCompletion;
       if (
         completionSignal &&
         verify.ok &&
@@ -518,6 +561,19 @@ export class StepExecutor {
         repairGateOk &&
         issueResolutionPlanOk
       ) {
+        if (declarativeOutputCompletion) {
+          await inp.ctx.audit?.event(
+            'note',
+            `accepted ${inp.step.phase} completion after successful output mutation and output verification`,
+            {
+              messageId: 'audit.executor_declarative_output_completion',
+              stepId: inp.step.id,
+              round,
+              phase: inp.step.phase,
+              outputs: inp.step.outputs,
+            },
+          );
+        }
         const metrics = computeMetrics({
           rounds: actualRounds,
           parseFailures,
@@ -741,6 +797,24 @@ function isReadOnlyOrProbeAction(action: LLMAction): boolean {
   return action.tool === 'http_fetch' && typeof action.args.saveAs !== 'string';
 }
 
+function boundRecoveryProbeActions(
+  actions: LLMAction[],
+  maxReadOnlyActions = 4,
+): { actions: LLMAction[]; kept: number; omitted: number } {
+  let kept = 0;
+  let omitted = 0;
+  const bounded = actions.filter((action) => {
+    if (!isReadOnlyOrProbeAction(action)) return true;
+    if (kept < maxReadOnlyActions) {
+      kept++;
+      return true;
+    }
+    omitted++;
+    return false;
+  });
+  return { actions: bounded, kept, omitted };
+}
+
 function isReadOnlyLoopFailure(reason: string): boolean {
   return /repeated read-only\/probe actions without progress/i.test(reason) ||
     /read-only recovery mode repeated probe actions/i.test(reason);
@@ -852,8 +926,15 @@ const REPAIR_EVIDENCE_TOOLS = new Set([
   'apply_patch',
   'replace_in_file',
   'run_program',
-  'run_python',
   'run_tests',
+  'write_file',
+]);
+
+const OUTPUT_MUTATION_TOOLS = new Set([
+  'add_dependency',
+  'append_file',
+  'apply_patch',
+  'replace_in_file',
   'write_file',
 ]);
 
@@ -861,9 +942,18 @@ function isRepairEvidenceTool(tool: string): boolean {
   return REPAIR_EVIDENCE_TOOLS.has(tool);
 }
 
+function isOutputMutationTool(tool: string): boolean {
+  return OUTPUT_MUTATION_TOOLS.has(tool);
+}
+
+function isDeclarativeOutputPhase(phase: Step['phase']): boolean {
+  return phase === 'REQUIREMENT_ANALYSIS' ||
+    phase === 'HIGH_LEVEL_DESIGN' ||
+    phase === 'DETAILED_DESIGN';
+}
+
 const COMPLETION_VERIFICATION_TOOLS = new Set([
   'run_program',
-  'run_python',
   'run_tests',
 ]);
 
@@ -1093,7 +1183,7 @@ function buildPermissionRequest(
       metadata: { args },
     };
   }
-  if (tool === 'install_deps' || tool === 'pip_install') {
+  if (tool === 'install_deps') {
     return {
       operationType: 'install_dependency',
       target: Array.isArray(argRecord.packages) ? argRecord.packages.join(', ') : '(packages)',
@@ -1121,7 +1211,7 @@ function buildPermissionRequest(
       metadata: { args },
     };
   }
-  if (tool === 'run_program' || tool === 'run_python') {
+  if (tool === 'run_program') {
     return {
       operationType: 'shell_command',
       target: `${runtime} ${Array.isArray(argRecord.args) ? argRecord.args.join(' ') : ''}`.trim(),
@@ -1373,7 +1463,7 @@ function describeToolForStep(tool: Tool, ctx: ToolContext, step: Step): string {
     details.push(
       `args.saveAs is optional; when present, it must be a concrete workspace-relative path in writable=[${writable}].`,
     );
-  } else if (tool.name === 'run_program' || tool.name === 'run_python' || tool.name === 'run_tests') {
+  } else if (tool.name === 'run_program' || tool.name === 'run_tests') {
     details.push('args.cwd is optional; when present, it must be a concrete workspace-relative directory path.');
   }
 
@@ -1433,9 +1523,23 @@ export async function verifyOutputs(inp: ExecutorRunInput): Promise<{ ok: boolea
   for (const out of inp.step.outputs) {
     if (out.endsWith('/')) continue; // 目录约束跳过显式文件检查
     const exists = await inp.ctx.ws.exists(out);
-    if (!exists) missing.push(out);
+    if (!exists || !(await hasSubstantiveOutputContent(inp, out))) missing.push(out);
   }
   return { ok: missing.length === 0, missing };
+}
+
+async function hasSubstantiveOutputContent(inp: ExecutorRunInput, output: string): Promise<boolean> {
+  if (output.endsWith('/__init__.py') || output.endsWith('/.gitkeep')) return true;
+  const stat = await fs.stat(inp.ctx.ws.abs(output)).catch(() => undefined);
+  if (!stat?.isFile() || stat.size === 0) return false;
+  if (!isTextOutput(output)) return true;
+  const content = await fs.readFile(inp.ctx.ws.abs(output), 'utf8').catch(() => '');
+  return content.trim().length > 0;
+}
+
+function isTextOutput(output: string): boolean {
+  return /(?:^|\/)(?:README|LICENSE)(?:\.[A-Za-z0-9]+)?$/iu.test(output) ||
+    /\.(?:cjs|css|csv|hbs|html?|ini|json|jsx?|md|mjs|py|toml|tsx?|txt|xml|ya?ml)$/iu.test(output);
 }
 
 function renderUserPrompt(
@@ -1450,7 +1554,13 @@ function renderUserPrompt(
   const failureLogLimit = compactContext ? 2200 : 4000;
   const ctxBlock = (inp.contextSnippets ?? [])
     .map((s) =>
-      `### ${s.path}\n\`\`\`\n${truncate(s.content, s.path === '.xcompiler/architecture-contract.json' ? architectureLimit : snippetLimit)}\n\`\`\``,
+      `### ${s.path}\n\`\`\`\n${truncate(
+        s.content,
+        s.path === '.xcompiler/architecture-contract.json' ||
+          s.path.startsWith('.xcompiler/change-requests/')
+          ? architectureLimit
+          : snippetLimit,
+      )}\n\`\`\``,
     )
     .join('\n\n');
   const dbg = inp.debugContext
@@ -1471,6 +1581,20 @@ function renderUserPrompt(
         '',
       ].join('\n')
     : '';
+  const changeRequestBlock = inp.changeRequest
+    ? [
+        '## active engineering change request',
+        `id: ${inp.changeRequest.id}`,
+        `revision: ${inp.changeRequest.revision}`,
+        `status: ${inp.changeRequest.status}`,
+        `objective: ${inp.changeRequest.objective}`,
+        `contract delta: ${inp.changeRequest.contractChange.summary}`,
+        'This is incremental CR execution against the existing project baseline.',
+        'Apply only the affected contract and artifacts for this Step. Preserve unrelated files and accepted behavior.',
+        'Do not regenerate the whole phase, project, design, or test suite.',
+        '',
+      ].join('\n')
+    : '';
   return [
     `# Step ${inp.step.id} — ${inp.step.title}`,
     `phase: ${inp.step.phase}`,
@@ -1478,6 +1602,7 @@ function renderUserPrompt(
     `acceptance: ${inp.step.acceptance}`,
     '',
     missingOutputPriority,
+    changeRequestBlock,
     '## description',
     inp.step.description,
     '',
@@ -1750,7 +1875,7 @@ function parseJsonStringLiteral(value: string): string | undefined {
   }
 }
 
-function isCompleteTurnJson(text: string): boolean {
+export function isCompleteTurnJson(text: string): boolean {
   const cleaned = stripFence(text).trim();
   if (!/"done"\s*:/.test(cleaned)) return false;
   const last = cleaned.at(-1);
@@ -1759,7 +1884,10 @@ function isCompleteTurnJson(text: string): boolean {
   const end = cleaned.lastIndexOf('}');
   if (start < 0 || end <= start) return false;
   const candidate = cleaned.slice(start, end + 1);
-  const turn = tryParseTurnCandidate(candidate);
+  // Streaming must stop only on strict JSON. Applying jsonrepair here can turn a
+  // prefix such as `content":"import` into a seemingly complete action and
+  // truncate the provider stream before the file payload arrives.
+  const turn = isTurnObject(tryParseJson(candidate));
   return !!turn && typeof turn.done === 'boolean' && Array.isArray(turn.actions);
 }
 

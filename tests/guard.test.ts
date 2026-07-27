@@ -7,6 +7,7 @@ import { writeFileTool, appendFileTool, readFileTool } from '../src/tools/fs.js'
 import { EditGuard, resolveEditGuardMaxLines } from '../src/tools/guard.js';
 import type { ToolContext } from '../src/tools/types.js';
 import { SkillRegistry, buildDefaultSkills } from '../src/skills/skill.js';
+import { renderExecutionPromptPolicy } from '../src/agents/prompt_policy.js';
 
 let tmp: string;
 let ws: Workspace;
@@ -69,7 +70,7 @@ describe('EditGuard', () => {
   });
 
   it('keeps explicit numeric caps strict', async () => {
-    expect(resolveEditGuardMaxLines(12, { phase: 'DEBUG', tools: ['write_file'] })).toBe(12);
+    expect(resolveEditGuardMaxLines(12, { phase: 'CODE', debug: true, tools: ['write_file'] })).toBe(12);
   });
 
   it('auto-scales line budget from step context', async () => {
@@ -114,15 +115,17 @@ describe('SkillRegistry', () => {
     }
   });
 
-  it('includes explicit workspace-relative path contracts in every file-editing skill', () => {
+  it('centralizes the path contract while keeping edit-specific skill guidance', () => {
     const reg = buildDefaultSkills();
-    for (const skill of ['skill:patcher', 'skill:author', 'skill:tester', 'skill:debugger', 'skill:refactorer']) {
+    const policy = renderExecutionPromptPolicy({ debug: true });
+    expect(policy).toMatch(/workspace-relative|workspace 相对/u);
+    for (const skill of ['skill:patcher', 'skill:author', 'skill:tester', 'skill:refactorer']) {
       const hints = reg.resolve([skill]).hints.join('\n');
       expect(hints).toContain('args.path');
       expect(hints).toMatch(/workspace-relative|workspace 相对/u);
     }
     expect(reg.resolve(['skill:patcher']).hints.join('\n')).toContain('args.find');
-    expect(reg.resolve(['skill:debugger']).hints.join('\n')).toContain('replace_in_file');
+    expect(reg.resolve(['skill:debugger']).hints.join('\n')).toContain('run_tests');
   });
 
   it('ignores unknown skill but keeps bare tools', () => {

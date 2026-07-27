@@ -46,12 +46,9 @@ export function createSandbox(
   audit?: AuditLogger,
   language: Language = 'python',
 ): Sandbox {
-  const languageSandbox = cfg.agent.sandboxes?.[language] ?? legacyLanguageSandbox(cfg, language);
+  const languageSandbox = cfg.agent.sandboxes[language];
   const kind = languageSandbox.mode;
   const activeLimits = kind === 'docker' ? languageSandbox.docker.limits : languageSandbox.local.limits;
-  if (activeLimits.network === 'pypi-only') {
-    throw new Error(t().system.unsupportedPypiOnlyNetwork);
-  }
   if (kind === 'subprocess' && activeLimits.network === 'off') {
     throw new Error(t().system.unsupportedSubprocessNetworkOff);
   }
@@ -85,41 +82,4 @@ export function createSandbox(
     pythonBin: languageSandbox.local.python_bin,
     inheritEnv: languageSandbox.local.inherit_env,
   });
-}
-
-function legacyLanguageSandbox(
-  cfg: XCompilerConfig,
-  language: Language,
-): XCompilerConfig['agent']['sandboxes'][Language] {
-  const legacyAgent = cfg.agent as XCompilerConfig['agent'] & {
-    sandbox?: 'subprocess' | 'docker' | 'firejail';
-    sandbox_limits?: XCompilerConfig['agent']['sandboxes'][Language]['local']['limits'];
-    sandbox_docker?: Partial<XCompilerConfig['agent']['sandboxes'][Language]['docker']>;
-    language?: Language;
-  };
-  const limits = legacyAgent.sandbox_limits ?? {
-    cpu: 1,
-    memory_mb: 1024,
-    wall_seconds: 60,
-    network: 'download-only',
-    expose_ports: [],
-  };
-  const useLegacyDocker = legacyAgent.language === language ? legacyAgent.sandbox_docker : undefined;
-  return {
-    mode: legacyAgent.sandbox ?? 'subprocess',
-    local: {
-      sandbox_dir: `.sandbox/${language}`,
-      inherit_env: false,
-      limits,
-    },
-    docker: {
-      image: useLegacyDocker?.image ?? getLanguageProfile(language).defaultDockerImage,
-      workdir: useLegacyDocker?.workdir ?? '/workspace',
-      pull: useLegacyDocker?.pull ?? false,
-      docker_bin: useLegacyDocker?.docker_bin ?? 'docker',
-      extra_run_args: useLegacyDocker?.extra_run_args ?? [],
-      sandbox_dir: useLegacyDocker?.sandbox_dir ?? `.sandbox/${language}`,
-      limits: useLegacyDocker?.limits ?? limits,
-    },
-  };
 }

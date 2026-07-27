@@ -252,7 +252,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   const topicMode = !!opts.topicFile;
   const intent = opts.intent ?? 'greenfield';
   await pluginHost.emit('compile.start', { workspace: ws.root, intent, topicMode });
-  scoreStore = new ScoreStore(cfgPath, cfg.llm.scores, audit, scoreStoreOptionsFromConfig(cfg.llm));
+  scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
   let unavailableProviders = new Set<string>();
   try {

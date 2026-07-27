@@ -15,7 +15,7 @@ import {
   phaseDocForIteration,
   testPlanDocForIteration,
 } from '../core/docs.js';
-import { pathCoveredByOutputs } from '../core/architecture.js';
+import { architectureImplementationPaths, pathCoveredByOutputs } from '../core/architecture.js';
 import { getLanguageProfile } from '../core/language.js';
 import {
   isLoopbackNetworkFailureLine,
@@ -81,7 +81,7 @@ export const HALLUCINATED_PACKAGE_MAP: Record<string, string> = {
 const REQUIRED_PACKAGES = ['pytest'];
 
 /**
- * 清洗 plan.pythonRequirements：
+ * 清洗 Plan 顶层 Python `dependencies`：
  *  - 去掉 markdown 列表前缀 / 引号 / 空行 / 注释行；
  *  - 把 LLM 常见幻觉包名重写为真实 pip 包；
  *  - **剥离所有版本约束**：LLM 经常臆造不存在的版本号（如 `pandas==1.5.*`
@@ -279,6 +279,37 @@ export function calibrateArchitectureModuleDependencies(
   };
 }
 
+/**
+ * Move product runtime assets that an LLM placed in sourcePaths into assetPaths.
+ *
+ * Invalid paths outside src/ remain in sourcePaths so the architecture validator
+ * can reject them instead of silently laundering an unsafe or misplaced output.
+ */
+export function calibrateArchitectureModulePaths(
+  modules: ArchitectureModule[] | undefined | null,
+  language: Language,
+): ArchitectureModule[] {
+  const extensions = getLanguageProfile(language).codeExtensions;
+  return (modules ?? []).map((module) => {
+    const sourcePaths: string[] = [];
+    const assetPaths = [...(module.assetPaths ?? [])];
+    for (const path of module.sourcePaths) {
+      const isCode = path.startsWith('src/') && extensions.some((extension) => path.endsWith(extension));
+      const isRuntimeAsset = path.startsWith('src/') && !path.endsWith('/');
+      if (!isCode && isRuntimeAsset) {
+        assetPaths.push(path);
+      } else {
+        sourcePaths.push(path);
+      }
+    }
+    return {
+      ...module,
+      sourcePaths: dedup(sourcePaths),
+      assetPaths: assetPaths.length > 0 ? dedup(assetPaths) : undefined,
+    };
+  });
+}
+
 // =============================================================================
 // 3. 语言级产物归属校准
 // =============================================================================
@@ -453,7 +484,6 @@ const PHASE_DEFAULT_ROLE: Record<string, string> = {
   INTEGRATION_TEST: 'Tester',
   MODULE_TEST: 'Tester',
   FUNCTIONAL_TEST: 'Tester',
-  DEBUG: 'Debugger',
 };
 
 /** 把 LLM 偶尔写错的 role 别名规范到合法白名单。 */
@@ -488,7 +518,6 @@ const PHASE_ALIASES: Record<string, string> = {
   module: 'MODULE_TEST', module_test: 'MODULE_TEST', 'module-test': 'MODULE_TEST',
   functional: 'FUNCTIONAL_TEST', functional_test: 'FUNCTIONAL_TEST', 'functional-test': 'FUNCTIONAL_TEST',
   verify: 'FUNCTIONAL_TEST', verification: 'FUNCTIONAL_TEST',
-  debug: 'DEBUG', debugging: 'DEBUG', fix: 'DEBUG', bugfix: 'DEBUG',
   refactor: 'CODE', refactoring: 'CODE', cleanup: 'CODE',
   delivery: 'FUNCTIONAL_TEST', deliver: 'FUNCTIONAL_TEST', release: 'FUNCTIONAL_TEST', package: 'FUNCTIONAL_TEST', packaging: 'FUNCTIONAL_TEST', deploy: 'FUNCTIONAL_TEST',
 };
@@ -510,7 +539,6 @@ const PHASE_BY_ROLE: Record<string, string> = {
   Architect: 'HIGH_LEVEL_DESIGN',
   Coder: 'CODE',
   Tester: 'UNIT_TEST',
-  Debugger: 'DEBUG',
 };
 
 const WRITE_CAPABLE_TOOL_REFS = new Set([
@@ -534,7 +562,6 @@ const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
   INTEGRATION_TEST: ['skill:tester'],
   MODULE_TEST: ['skill:tester'],
   FUNCTIONAL_TEST: ['skill:tester'],
-  DEBUG: ['skill:debugger'],
 };
 
 const PHASE_DEFAULT_TOOLS_REQUIRED = new Set([
@@ -542,7 +569,6 @@ const PHASE_DEFAULT_TOOLS_REQUIRED = new Set([
   'INTEGRATION_TEST',
   'MODULE_TEST',
   'FUNCTIONAL_TEST',
-  'DEBUG',
 ]);
 
 export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'outputs'>): string[] {
@@ -731,7 +757,7 @@ export function calibrateArchitectureStepMappings(
   const modulesByCodeStep = new Map<string, ArchitectureModule[]>();
   for (const step of steps.filter((item) => item.phase === 'CODE')) {
     const ownedModules = modules.filter((module) =>
-      module.sourcePaths.every((sourcePath) => pathCoveredByOutputs(sourcePath, step.outputs)),
+      architectureImplementationPaths(module).every((path) => pathCoveredByOutputs(path, step.outputs)),
     );
     modulesByCodeStep.set(step.id, ownedModules);
     for (const module of ownedModules) {
@@ -866,13 +892,13 @@ function withModuleSubTasks(
       title: `${kind} ${module.name}`,
       description:
         kind === 'CODE'
-          ? `${module.responsibility} Source paths: ${module.sourcePaths.join(', ')}.`
+          ? `${module.responsibility} Implementation paths: ${architectureImplementationPaths(module).join(', ')}.`
           : `${module.responsibility} Test paths: ${module.testPaths.join(', ')}.`,
       acceptance:
         kind === 'CODE'
-          ? `All source paths for ${module.id} are implemented and importable.`
+          ? `All implementation paths for ${module.id} are complete and usable at runtime.`
           : `Tests for ${module.id} cover the declared module behaviour and pass.`,
-      outputs: kind === 'CODE' ? [...module.sourcePaths] : [...module.testPaths],
+      outputs: kind === 'CODE' ? architectureImplementationPaths(module) : [...module.testPaths],
     }));
   if (generated.length === 0) return step;
   return { ...step, subTasks: [...existing, ...generated] };
@@ -1503,7 +1529,8 @@ function collectDebugSuggestions(text: string): DebugSuggestion[] {
 }
 
 function isLlmProviderFailureText(text: string): boolean {
-  return /(?:OpenAI|Ollama|OpenRouter|LLM|provider|response_format|json_object|json_schema)[^\n]{0,260}(?:HTTP\s+(?:401|403|408|409|429|5\d\d)|rate[- ]?limit|rate limited|rate-limited|retry-after|retry_after_seconds|fetch failed|stream (?:wall-clock|idle)|context (?:length|window)|token limit|prompt too long|prefill_memory_exceeded|not support|unsupported|invalid_request_body|supported formats)/i.test(text);
+  return /all llm providers failed|openai-compatible provider request failed|provider_call_failed/i.test(text) ||
+    /(?:OpenAI|Ollama|OpenRouter|LLM|provider|response_format|json_object|json_schema)[^\n]{0,420}(?:HTTP\s+(?:401|403|408|409|429|5\d\d)|rate[- ]?limit|rate limited|rate-limited|retry-after|retry_after_seconds|fetch failed|network connection lost|stream (?:wall-clock|idle)|context (?:length|window)|token limit|prompt too long|prefill_memory_exceeded|not support|unsupported|invalid_request_body|supported formats)/i.test(text);
 }
 
 function lineAtIndex(text: string, index: number): string {

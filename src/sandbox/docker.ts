@@ -43,7 +43,7 @@ export interface DockerSandboxOptions {
  *
  * 网络策略：
  *   - `off`        → `--network none`
- *   - `pypi-only`  → 拒绝启动；Docker 本身无法可靠提供域名级白名单，禁止静默降级
+ *   - `download-only` → 允许出站，但不发布端口
  *   - `full`       → 默认网络
  *   build 阶段必须能联网拉取依赖；exec 阶段若设 `off` 则完全断网。
  */
@@ -61,9 +61,6 @@ export class DockerSandbox implements Sandbox {
   private readonly venvName: string;
 
   constructor(private readonly opts: DockerSandboxOptions) {
-    if (opts.limits.network === 'pypi-only') {
-      throw new Error(t().system.unsupportedPypiOnlyNetwork);
-    }
     this.language = opts.language ?? 'python';
     this.image = opts.image ?? (this.language === 'typescript' ? 'node:24-slim' : 'python:3.11-slim');
     this.workdir = opts.workdir ?? '/workspace';

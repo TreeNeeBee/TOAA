@@ -9,14 +9,22 @@ const baseCfg = (sandbox: 'subprocess' | 'docker'): XCompilerConfig =>
   ({
     llm: { providers: {}, roles: {}, fallbacks: [] },
     agent: {
-      language: 'python',
       max_steps: 10,
       max_rounds_per_step: 6,
       max_debug_retries: 3,
       max_edit_lines_per_step: 400,
-      sandbox,
-      sandbox_limits: { cpu: 1, memory_mb: 512, wall_seconds: 60, network: 'download-only' },
-      sandbox_docker: { image: 'python:3.11-slim', workdir: '/workspace', pull: false, docker_bin: 'docker', extra_run_args: [] },
+      sandboxes: {
+        python: {
+          mode: sandbox,
+          local: { inherit_env: false, limits: { cpu: 1, memory_mb: 512, wall_seconds: 60, network: 'download-only', expose_ports: [] } },
+          docker: { image: 'python:3.11-slim', workdir: '/workspace', pull: false, docker_bin: 'docker', extra_run_args: [], limits: { cpu: 1, memory_mb: 512, wall_seconds: 60, network: 'download-only', expose_ports: [] } },
+        },
+        typescript: {
+          mode: sandbox,
+          local: { inherit_env: false, limits: { cpu: 1, memory_mb: 512, wall_seconds: 60, network: 'download-only', expose_ports: [] } },
+          docker: { image: 'node:24-slim', workdir: '/workspace', pull: false, docker_bin: 'docker', extra_run_args: [], limits: { cpu: 1, memory_mb: 512, wall_seconds: 60, network: 'download-only', expose_ports: [] } },
+        },
+      },
     },
   }) as unknown as XCompilerConfig;
 
@@ -72,17 +80,10 @@ describe('sandbox factory — container detection', () => {
     expect(() => createSandbox(baseCfg('docker'), ws)).not.toThrow();
   });
 
-  it('任何 sandbox 都拒绝无法兑现的 pypi-only 策略', () => {
-    const ws = new Workspace('/tmp/xcompiler-factory-test');
-    const cfg = baseCfg('subprocess');
-    cfg.agent.sandbox_limits.network = 'pypi-only';
-    expect(() => createSandbox(cfg, ws)).toThrow(/pypi-only/);
-  });
-
   it('subprocess 拒绝无法兑现的 network=off 策略', () => {
     const ws = new Workspace('/tmp/xcompiler-factory-test');
     const cfg = baseCfg('subprocess');
-    cfg.agent.sandbox_limits.network = 'off';
+    cfg.agent.sandboxes.python.local.limits.network = 'off';
     expect(() => createSandbox(cfg, ws)).toThrow(/cannot be enforced in subprocess mode/);
   });
 
@@ -90,7 +91,7 @@ describe('sandbox factory — container detection', () => {
     process.env.XC_IN_CONTAINER = '0';
     const ws = new Workspace('/tmp/xcompiler-factory-test');
     const cfg = baseCfg('docker');
-    cfg.agent.sandbox_docker.image = 'python:3.12-slim';
+    cfg.agent.sandboxes.python.docker.image = 'python:3.12-slim';
     const sb = createSandbox(cfg, ws, undefined, 'typescript') as DockerSandbox & { image?: string };
     expect(sb).toBeInstanceOf(DockerSandbox);
     expect((sb as { image?: string }).image).toBe('node:24-slim');

@@ -1,34 +1,18 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import {
-  PlanSchema,
-  V_MODEL_SOURCE_TO_TEST_PHASE,
-  type Phase,
-  type Plan,
-  type Step,
-} from './plan.js';
+import { PlanSchema, type Plan } from './plan.js';
 import { assertPlanValid } from './lint.js';
 import { PhasePlanSchema, type PhasePlan } from './phase_plan.js';
-import { testPlanDocForIteration } from './docs.js';
 
-export interface PlanMigration {
-  stepId: string;
-  phase: Step['phase'];
-  reason: string;
-  before: string[];
-  after: string[];
-}
-
-function parseLoadedPlan(json: unknown): { plan: Plan; migrations: PlanMigration[] } {
-  const parsed = PlanSchema.parse(json);
-  const migrated = normalizePlanForCurrentVModel(parsed);
-  assertPlanValid(migrated.plan);
-  return migrated;
+function parseLoadedPlan(json: unknown): Plan {
+  const plan = PlanSchema.parse(json);
+  assertPlanValid(plan);
+  return plan;
 }
 
 export async function loadPlan(planPath: string): Promise<Plan> {
   const raw = await fs.readFile(planPath, 'utf8');
-  return parseLoadedPlan(JSON.parse(raw)).plan;
+  return parseLoadedPlan(JSON.parse(raw));
 }
 
 export async function savePlan(planPath: string, plan: Plan): Promise<void> {
@@ -58,8 +42,6 @@ export interface LoadedPlanTarget {
   /** Top-level phasePlan.json when the caller supplied one. */
   phasePlan?: PhasePlan;
   phasePlanPath?: string;
-  /** Compatibility migrations applied while loading older plan files. */
-  migrations?: PlanMigration[];
 }
 
 export async function loadPlanTarget(inputPath: string): Promise<LoadedPlanTarget> {
@@ -77,59 +59,15 @@ export async function loadPlanTarget(inputPath: string): Promise<LoadedPlanTarge
       throw new Error(`phasePlan ${requestedPath} has no planPath for current phase ${phasePlan.currentPhaseId}`);
     }
     const planPath = path.resolve(path.dirname(requestedPath), phase.planPath);
-    const loaded = parseLoadedPlan(JSON.parse(await fs.readFile(planPath, 'utf8')));
+    const plan = parseLoadedPlan(JSON.parse(await fs.readFile(planPath, 'utf8')));
     return {
-      plan: loaded.plan,
+      plan,
       planPath,
       requestedPath,
       phasePlan,
       phasePlanPath: requestedPath,
-      migrations: loaded.migrations,
     };
   }
 
-  const loaded = parseLoadedPlan(json);
-  return { plan: loaded.plan, planPath: requestedPath, requestedPath, migrations: loaded.migrations };
-}
-
-export function normalizePlanForCurrentVModel(plan: Plan): { plan: Plan; migrations: PlanMigration[] } {
-  const migrations: PlanMigration[] = [];
-  const steps = plan.steps.map((step) => {
-    const pairedTestPhase =
-      V_MODEL_SOURCE_TO_TEST_PHASE[step.phase as keyof typeof V_MODEL_SOURCE_TO_TEST_PHASE];
-    if (!pairedTestPhase) return step;
-
-    const iterationId = step.iterationId ?? 'P1';
-    const expected = testPlanDocForIteration(pairedTestPhase, iterationId);
-    if (!expected) return step;
-
-    const currentTestPlanDocs = new Set<string>();
-    for (const testPhase of Object.values(V_MODEL_SOURCE_TO_TEST_PHASE) as Phase[]) {
-      const doc = testPlanDocForIteration(testPhase, iterationId);
-      if (doc) currentTestPlanDocs.add(doc);
-    }
-
-    const before = step.outputs;
-    const withoutWrongTestPlans = before.filter((out) => !currentTestPlanDocs.has(out) || out === expected);
-    const after = withoutWrongTestPlans.includes(expected)
-      ? withoutWrongTestPlans
-      : [...withoutWrongTestPlans, expected];
-    if (arrayEqual(before, after)) return step;
-
-    migrations.push({
-      stepId: step.id,
-      phase: step.phase,
-      reason: `normalized paired ${pairedTestPhase} test-plan output`,
-      before,
-      after,
-    });
-    return { ...step, outputs: after };
-  });
-
-  if (migrations.length === 0) return { plan, migrations };
-  return { plan: { ...plan, steps }, migrations };
-}
-
-function arrayEqual(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((value, index) => value === b[index]);
+  return { plan: parseLoadedPlan(json), planPath: requestedPath, requestedPath };
 }

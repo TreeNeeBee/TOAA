@@ -27,7 +27,7 @@ XCompiler is a reusable AI software factory runtime. It compiles a product reque
 | Command | Role | Input | Output |
 |---|---|---|---|
 | `xcompiler build` | Compile requirements into a `phasePlan.json` plus the current phase plan, such as `plan.P1.json` | Requirement text (`-i req.md`, `-t topic.md`, or interactive input) | `topic.md`, `phasePlan.json`, `plan.P1.json`, `plan.md`, `<name>.xc` |
-| `xcompiler run` | Execute the current phase through the V-model workflow | `phasePlan.json` or legacy `plan.json` | Runnable project, tests, docs, audit trail, updated progress |
+| `xcompiler run` | Execute the current phase through the V-model workflow | `phasePlan.json` | Runnable project, tests, docs, audit trail, updated progress |
 | `xcompiler load` | Resume from a project file | `<name>.xc` | Continue the saved phase/task state |
 | `xcompiler append` / `xcompiler evolve` | Add new requirements to an existing project | Existing workspace/project file plus new requirement | Incremental plan and implementation |
 | `xcompiler acp` | Run as an ACP code-agent adapter | stdio JSON-RPC from an IDE/editor | Runtime-backed code-agent events and results |
@@ -50,6 +50,8 @@ V-model behavior:
 - `HIGH_LEVEL_DESIGN` defines system-level interfaces, external APIs, third-party libraries, and dependencies.
 - `DETAILED_DESIGN` defines internal module structure and implementation details.
 - Test failures are first recorded as issues, then routed back to the matching upstream stage for Debugger repair.
+- A repair routed to `HIGH_LEVEL_DESIGN` or `DETAILED_DESIGN` opens an engineering CR. The issue stays `change_pending`; downstream stages apply only the CR delta and record change/verification commits.
+- A downstream failure returns the same CR to `rework`. A child CR is created only when the correction materially expands contract or scope. CR and issue close only after every affected gate passes.
 - Completed-phase debug must provide a real patch/rewrite or successful verification evidence.
 - Network/API failures are treated as real gates: if the project API fails, the run must repair or switch API instead of hiding the failure.
 
@@ -66,10 +68,11 @@ Layer responsibilities:
 - **Adapters**: argument/protocol parsing, config loading, user interaction, output rendering, exit codes.
 - **Runtime**: Runtime API, Build Service, Run Service, Event Stream, and Permission Broker; the only business entry point.
 - **Workflow and planning**: phase iteration, V-model scheduling, rollback/debug routing, iteration gates, resume.
+- **State policy**: one transition guard with separate Step, Phase, Issue, and CR transition tables; no adapter or agent mutates persisted workflow state directly.
 - **Agents / Skills**: role-specific prompts plus allowed tools for each stage.
 - **Tools**: guarded file edits, program/test execution, API fetches, dependency edits, git snapshots.
 - **LLM Router**: role chains, provider scores, cluster fallbacks, OpenAI-compatible/Ollama clients, audit.
-- **Workspace**: `phasePlan.json`, `plan.P<N>.json`, `<name>.xc`, `.xcompiler/audit.jsonl`, debug cache, project memory.
+- **Workspace**: `phasePlan.json`, `plan.P<N>.json`, `<name>.xc`, `.xcompiler/audit.jsonl`, `.xcompiler/issues/`, `.xcompiler/change-requests/`, debug cache, project memory.
 
 ---
 
@@ -179,7 +182,6 @@ LLM routing is configured under `config.yaml -> llm.*`.
 |---|---|---|
 | `roles.<Role>` | role dependent | Ordered/scored provider chain for Planner, Architect, Coder, Tester, Debugger |
 | `providers.<name>.context_window` | `128K` | Model input+output context capacity; accepts token counts such as `131072`, `128K`, or an empty value for the default |
-| `scores.<provider>` | `1.0` | Backward-compatible initial score; prefer `llm_scores_user.yaml` for manual overrides |
 | `llm_scores_user.yaml` | absent | Local user score overrides; `0` disables, `0.1..1` fixes effective priority |
 | `cluster_score_min/max` | `0.2..0.5` | Dynamic score band for providers tagged `cluster`; user overrides may still use `0.1..1` |
 | `agent.sandboxes.python.mode` | `subprocess` | Python project sandbox backend: local subprocess or Docker |
@@ -219,7 +221,7 @@ npm test
 npm run build
 ```
 
-Recent local release gate: 53 test files / 537 tests passed.
+Recent local release gate: 60 test files / 616 tests passed.
 
 ---
 

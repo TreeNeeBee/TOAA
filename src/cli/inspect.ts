@@ -29,7 +29,7 @@ export async function runLs(opts: LsOptions): Promise<void> {
       t().inspect.planHeader(chalk.cyan(plan.relativePath || plan.path), plan.language ?? ''),
     );
     console.log('  ' + t().inspect.planStatusSummary(
-      summary.total, summary.done, summary.pending, summary.failed, summary.skipped, summary.running,
+      summary.total, summary.done, summary.pending, summary.failed, summary.running,
     ));
     if (plan.requirementDigestLine) {
       console.log(`   ${chalk.gray(t().inspect.digestLabel)} ${plan.requirementDigestLine}`);
@@ -88,8 +88,6 @@ function statusBadge(status: InspectStep['status']): string {
       return chalk.red('[FAILED]');
     case 'RUNNING':
       return chalk.yellow('[RUNNING]');
-    case 'SKIPPED':
-      return chalk.gray('[SKIPPED]');
     default:
       return chalk.gray('[PENDING]');
   }

@@ -47,7 +47,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
 3. 每个宏 Step 的 \`subTasks\` 最多嵌套 2 层；不要为了内部细节拆出大量可执行 Step。
 4. dependsOn 必须按阶段顺序且无环。右侧测试阶段必须直接或间接依赖其对应左侧阶段。
 5. 每个 CODE Step 必须被同迭代的 UNIT_TEST Step 覆盖。
-6. 需求/设计阶段不得输出 src/ 或 tests/ 文件；CODE 产出 src/；测试阶段产出 tests/ 和报告文档；FUNCTIONAL_TEST 不得修改 src/。
+6. 需求/设计阶段不得输出 src/ 或 tests/ 文件；CODE 产出 src/ 下的产品源码和运行时资产；测试阶段产出 tests/ 和报告文档；FUNCTIONAL_TEST 不得修改 src/。
 7. outputs 路径全局唯一。DEBUG 运行时可修改依赖链文件，计划 Step 不要重复声明 outputs。
 8. id 形如 S001、S002；role 只能是 Planner / Architect / Coder / Tester / Debugger。
 9. 每个 Step 必须有 systemPrompt，明确范围、输入、产出、验收、禁令，以及左侧阶段的同步测试设计义务。
@@ -56,7 +56,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
 12. implementationPhases 必须包含 P1 current 和后续 planned 可执行迭代；verificationGate 的 failurePolicy 必须说明把失败日志传给 Debugger，回退到对应 V 模型阶段并重新执行后续阶段。
 13. dependencies 是 Python pip 依赖列表；必须包含 \`pytest\`；只写裸包名；任何 Step 都不要输出 \`requirements.txt\`。
 14. application/mixed 项目需要可直接运行的 Python 入口（\`src/main.py\` 或包 \`__main__.py\`）并复用 CODE 模块；library/mixed 项目需要稳定公开 API 和 \`docs/api-guide.md\`。
-15. 复杂需求必须返回 \`architectureModules\`：每个模块包含 id、name、responsibility、sourcePaths、testPaths、dependencies。CODE/MODULE_TEST Step 可覆盖多个模块，但必须在 subTasks 中列出模块级工作。
+15. 复杂需求必须返回 \`architectureModules\`：每个模块包含 id、name、responsibility、sourcePaths、可选 assetPaths、testPaths、dependencies。运行时非代码资产放入 assetPaths；CODE/MODULE_TEST Step 可覆盖多个模块，但必须在 subTasks 中列出模块级工作。
 16. 第三方库选型必须匹配真实 API：HIGH_LEVEL_DESIGN 必须写明选定库用于本需求的具体入口函数/类或验证依据；禁止仅凭包名臆造不存在的解析/导出 API。
 
 输出 JSON 形如：
@@ -70,7 +70,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
   ],
   "dependencies": ["pytest"],
   "architectureModules": [
-    { "id": "M001", "name": "模块名", "responsibility": "单一且明确的模块职责", "sourcePaths": ["src/example.py"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
+    { "id": "M001", "name": "模块名", "responsibility": "单一且明确的模块职责", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
     {
@@ -168,7 +168,7 @@ DETAILED_DESIGN 必须定义模块内部具体功能实现和架构，包括函�
 2. 每个 current/planned implementation phase 都必须包含完整 8 阶段 V 模型。
 3. 每个宏 Step 的 \`subTasks\` 最多嵌套 2 层。
 4. 每个 CODE Step 必须被同迭代 UNIT_TEST 覆盖；architectureModules 的 testPaths 必须由 MODULE_TEST 产出。
-   CODE outputs 只能包含 src/ 下的产品源码文件和 docs/tests/unit-test-plan.md；禁止把 tests/**/*.test.ts 或其他 tests/** 文件列为 CODE outputs。
+   CODE outputs 只能包含 src/ 下的产品源码/运行时资产和 docs/tests/unit-test-plan.md；禁止把 tests/**/*.test.ts 或其他 tests/** 文件列为 CODE outputs。
 5. 设计阶段不得输出 src/ 或 tests/ 文件；HIGH_LEVEL_DESIGN 是唯一可输出 \`package.json\` / \`tsconfig.json\` 的阶段。
 6. TypeScript greenfield 计划必须且只能有一个 HIGH_LEVEL_DESIGN Step 输出 \`package.json\`，并确保 one HIGH_LEVEL_DESIGN Step output \`package.json\`，包含 \`build\`、\`test\`、最好还有 \`lint\` 脚本。
 7. 本地 TypeScript 源码模块必须使用带显式 \`.ts\` 后缀的 ESM 相对导入；配置 \`allowImportingTsExtensions: true\`，build/lint 使用 \`tsc --noEmit\`。代码必须兼容 Node 原生 type stripping，避免 enum、namespace、参数属性等需转译语法。
@@ -262,7 +262,7 @@ REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TES
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 分别验证对应左侧阶段。
 
 严格产物归属：
-- CODE outputs 只能包含 src/ 下的产品源码文件和单元测试计划文档；不得把 tests/** 文件放到 CODE outputs。
+- CODE outputs 只能包含 src/ 下的产品源码、运行时资产和单元测试计划文档；不得把 tests/** 文件放到 CODE outputs。
 - UNIT_TEST 拥有单元测试文件；INTEGRATION_TEST 拥有集成测试文件；MODULE_TEST 拥有 architectureModules.testPaths；FUNCTIONAL_TEST 拥有端到端/功能测试文件和交付文档。
 - TypeScript greenfield 必须且只能有一个 HIGH_LEVEL_DESIGN Step 输出 package.json，包含 scripts、dependencies、devDependencies。CODE 不得输出 package.json。
 - TypeScript package.json 只能使用 Vitest："test": "vitest run"，"build": "tsc --noEmit"，devDependencies 包含 typescript/tsx/vitest/@types/node。禁止提及或要求 Jest、ts-jest、@types/jest、ts-node、nodemon。
@@ -271,6 +271,7 @@ REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TES
 
 architectureModules 只能描述当前 phase 的产品/业务源码模块：
 - sourcePaths 必须是 src/ 下的目标语言源码文件，不能是目录，不能是 tests/、docs/、README、fixtures、utils 或报告文件。
+- assetPaths 可选，只能包含 src/ 下随产品交付并在运行时使用的非代码文件（例如模板、schema、静态资源）；不得放测试 fixture、样例输入、临时输出或文档。
 - testPaths 必须是 tests/ 下的目标语言测试文件，不能是目录。
 - 测试 fixtures、测试工具、领域样例输入、临时输出文件应放在对应测试 Step 的 outputs 或 subTasks 中，不得登记为 architectureModules。
 
@@ -280,7 +281,7 @@ architectureModules 只能描述当前 phase 的产品/业务源码模块：
   "globalPrompt": "string",
   "dependencies": ["pytest"],
   "architectureModules": [
-    { "id": "M001", "name": "模块名", "responsibility": "单一明确职责", "sourcePaths": ["src/example.py"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
+    { "id": "M001", "name": "模块名", "responsibility": "单一明确职责", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
     { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
@@ -313,8 +314,6 @@ const messages: Messages = {
   system: {
     configEnvMissing: (names) => `[xcompiler] 配置中的环境变量未设置，已替换为空字符串：${names}`,
     unhandledError: (message) => `未处理错误：${message}`,
-    unsupportedPypiOnlyNetwork:
-      '拒绝 network=pypi-only：Docker 本身无法可靠执行“仅 PyPI”域名白名单。需要隔离请使用 network=off；明确允许任意出站下载时使用 network=download-only。',
     unsupportedSubprocessNetworkOff:
       'subprocess 模式无法兑现 sandbox network=off；请改用 mode=docker，或明确选择 download-only/full。',
     dockerInsideContainerUnsupported:
@@ -403,7 +402,7 @@ const messages: Messages = {
     runDescription: '执行已确认的 phasePlan.json（支持分阶段运行：--phase / --from）',
     loadDescription: '加载 XXX.xc 工程文件并继续当前 plan',
     appendDescription: '在已有 XXX.xc 工程基础上追加新需求，并重新走澄清与 V 模型执行',
-    lsDescription: '扫描 workspace 列出所有 phasePlan.json / 历史 plan.json 状态摘要',
+    lsDescription: '扫描 workspace 列出所有 phasePlan.json 状态摘要',
     showDescription: '打印 Step 定义 / 状态 / 产物 / 最近审计',
     optWorkspace: 'workspace 目录（同 --output，默认为当前目录）',
     optOutput: '工程/workspace 输出目录（优先级最高，等价于 -w）',
@@ -417,17 +416,17 @@ const messages: Messages = {
     optForce: '强制重新生成：覆写 workspace 锁、忽略旧计划文件',
     optDryRun: '仅打印拓扑顺序，不执行',
     optFrom: '从指定 Step 开始（之前的跳过）',
-    optPhase: '仅执行指定 phase（REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN/CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST/DEBUG）',
+    optPhase: '仅执行指定 V 模型 phase（REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN/CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST）',
     optReset: '重置所有 Step 状态为 PENDING',
     optMaxDepth: '递归最大深度',
     optTail: '最近审计条数',
     optPlan: 'phasePlan.json 路径，默认 <workspace>/phasePlan.json',
     optLang: 'UI / 提示词语言：EN | CN（ISO 3166-1 Alpha-2）',
     optIntent: '计划意图：greenfield | feature | refactor | self',
-    optBaselinePlan: '已有基线 phasePlan.json / plan.json 路径（默认 <workspace>/phasePlan.json）',
+    optBaselinePlan: '已有基线 phasePlan.json 路径（默认 <workspace>/phasePlan.json）',
     optProjectFile: 'XXX.xc 工程文件路径（默认 <workspace>/<name>.xc）',
     optDebugWikiPath: 'debug wiki 根目录路径（默认 <XCompiler path>/.xcompiler/debug-wiki）',
-    argPlan: 'phasePlan.json 或历史 plan.json 路径（默认 = <workspace>/phasePlan.json）',
+    argPlan: 'phasePlan.json 路径（默认 = <workspace>/phasePlan.json）',
     argProjectFile: 'XXX.xc 工程文件',
     argStepId: 'Step ID，如 S001',
     evolveDescription: '在现有 workspace 基础上生成并执行增量 feature/refactor 计划',
@@ -553,7 +552,7 @@ const messages: Messages = {
     topicSecBaseline: '## 现有工程基线',
   },
   inspect: {
-    noPlanFound: '未找到任何 phasePlan.json / plan.json',
+    noPlanFound: '未找到 phasePlan.json',
     digestLabel: 'digest:',
     stepNotFound: (id) => `Step ${id} 未找到`,
     secDescription: '— description —',
@@ -563,8 +562,8 @@ const messages: Messages = {
     secOutputs: '— outputs —',
     secRecentAudit: (n) => `— recent audit (${n}) —`,
     planHeader: (p, language) => `${p} 语言=${language}`,
-    planStatusSummary: (total, done, pending, failed, skipped, running) =>
-      `步骤=${total} 完成=${done} 待执行=${pending} 失败=${failed} 跳过=${skipped} 运行中=${running}`,
+    planStatusSummary: (total, done, pending, failed, running) =>
+      `步骤=${total} 完成=${done} 待执行=${pending} 失败=${failed} 运行中=${running}`,
     planReadFailed: (p, message) => `${p} — ${message}`,
     stepHeader: (id, phase, title, status, retries, maxRetries) => `${id} ${phase} ${title} ${status} 重试=${retries}/${maxRetries}`,
     stepRoleTools: (role, tools) => `角色=${role} 工具=[${tools}]`,
@@ -840,7 +839,7 @@ ${opts.phasePlan}
 - steps 中每个 Step.iterationId 必须等于 "${opts.phaseId}"。
 - 禁止输出其他 planned phase 的 Step；P2/P3 的详细计划留到它们成为 current phase 时再生成。
 - 如果 ${opts.phaseId} 横跨多个关注点（领域逻辑、CLI/API、文件 I/O、外部集成、流程编排、测试），必须在 architectureModules 中体现当前 phase 的模块边界，并在 CODE/MODULE_TEST 的 subTasks 下分解模块级工作。
-- architectureModules.sourcePaths 只能是 src/ 下的产品源码文件；不要把 tests/fixtures、tests/utils、样例文件、目录或文档登记为架构模块。
+- architectureModules.sourcePaths 只能是 src/ 下的产品源码文件；随产品交付的运行时非代码资产写入 assetPaths。不要把 tests/fixtures、tests/utils、样例输入、临时输出、目录或文档登记为架构模块。
 - dependencies 只写当前 phase 需要的包名；Python 必须包含 pytest；不要输出 requirements.txt。
 - 当前 phase 必须包含标准 V 模型 8 个宏 Step，并满足同步测试设计规则。
 
@@ -848,19 +847,14 @@ ${opts.phasePlan}
     executorSystem: (p) => buildExecutorSystem(p),
     executorDebugBlock: (reason: string, suggestions?: string) =>
       `\n\n正处于 DEBUG 重试模式。上一轮失败原因: ${reason}\n` +
-      '当本次 DEBUG 正在处理 issue 时，每一轮 JSON 都必须在修复前或修复过程中额外包含 issueResolutionPlan。该方案必须简洁且可执行：根因假设、要修改的文件/契约、验证命令或门禁，以及什么证据会推翻该方案。' +
-      'DEBUG 可以修改当前 allowedWrites 内的上游源码与测试文件；若失败暴露的是实现、契约或下游调用不一致，必须修真实缺陷，禁止通过削弱断言、跳过测试、删除失败用例或只迎合错误测试来过关。' +
-      '如果本次回退处于需求/设计阶段，而具体源码修改属于后续 V 模型 Step 且目标文件不在当前 allowedWrites 内，应更新当前契约、测试计划或诊断产物并完成当前 Step，让后续 CODE Step 实现；不要尝试被拒绝的越权写入。' +
-      '若失败是第三方依赖缺失或库选型错误，必须用 add_dependency 写入真实包名，或把源码改回 HIGH_LEVEL_DESIGN 选定的真实库；严禁在 src/ 生产代码里 try/except ImportError 后伪造 module、fake class/function、空实现或 fallback mock 来绕过错误。' +
-      '请包含 read_file/code_search 先定位问题，再以 apply_patch / replace_in_file / add_dependency 作最小修改，最后 run_tests 验证。' +
-      'DEBUG 重试不能只靠只读检查就标记完成：本次重试必须产生一次成功的修复动作，或一次成功的验证命令。' +
-      '如果上一轮失败原因包含 repeated read-only/probe actions，请把已有 failure log 视为足够上下文，下一步直接 patch/write/改依赖或执行验证命令。' +
-      '当测试已正常执行但失败点是返回行为断言时，禁止反复重写 fixture 或样例。只有证据明确是文件缺失、fixture 格式错误或 fixture 本身解析失败时才修改 fixture；否则应修实现、接口契约、依赖选型或确实错误的断言。' +
-      '如果失败日志显示网络/API 调用失败，不允许只停留在探测接口：最多连续执行 2 次 http_fetch 探测；HTTP 2xx 但 body 为空或格式不可用不算可用接口；随后必须 patch 真实集成代码，并用 run_program 和 run_tests 验证。入口仍输出网络/API 失败时不得 done=true。' +
+      '以 issue 和压缩后的失败证据为事实来源。若回退到需求/设计阶段，而实际源码属于后续 Step，只更新当前契约、测试计划或诊断产物，由后续 V 模型 Step 实现。' +
+      '如果上一轮停滞在只读探测，不要重复定位；直接执行下一项有依据的修改或验证动作。' +
       (suggestions ? `\n\n${suggestions}` : ''),
     executorGlobalBlock: (globalPrompt: string) => `\n\n## 项目全局约束\n${globalPrompt}`,
     executorStepBlock: (sp: string) =>
       `\n\n## 当前 Step 专属提示 (唯一使命，禁止跨 Step 发散)\n${sp}`,
+    executorSkillBlock: (hints: string[]) =>
+      `\n\n## 可用 Skill 提示\n${hints.map((hint) => `- ${hint}`).join('\n')}`,
     executorUserPromptOutro: '现在按协议返回第一轮 JSON。',
     executorFeedbackHeader: '本轮工具结果：',
     executorFeedbackVerifyOk: 'outputs 校验通过。如已完成，请把 done 设为 true 且 actions=[]。',
@@ -888,14 +882,14 @@ ${opts.phasePlan}
       '【fixture 自包含】测试**严禁**直接 open() 磁盘上不存在的样例文件。' +
       '若被测函数需要文件输入，优先复用用户/工作区真实样例；没有样例时用 http_fetch 获取官方文档、上游仓库或公开标准中的小型参考样例，' +
       '保存到 tests/fixtures/<name> 并记录来源；只有 CSV/JSON/INI 等简单文本格式才可在 pytest tmp_path 中构造最小样例并立刻 run_tests。' +
-      '测试/DEBUG 阶段 tests/fixtures/ 已默认放开写权限，子目录自动 mkdir -p，**无需**提前把 fixture 路径登记到 outputs。' +
+      '测试阶段和 DEBUG 模式已默认放开 tests/fixtures/ 写权限，子目录自动 mkdir -p，**无需**提前把 fixture 路径登记到 outputs。' +
       '生成测试时务必同时输出全部依赖资源，避免后续 Debugger 因 FileNotFoundError 反复重试。' +
       '【fixture 迭代】若测试运行中被测函数报"Invalid syntax / Parse error / Malformed"等解析错误，' +
       '说明你写出的 fixture 内容不合该格式 spec：read_file 看清后，优先使用用户样例或 http_fetch 拉取的权威参考样例重写，再 run_tests。' +
       '复杂领域格式连续失败后必须停止凭记忆生成，改为请求用户样例或网络参考；严禁去改被测模块或断言。',
     dep_resolver: '当出现 ModuleNotFoundError 时，用 add_dependency 写回 requirements.txt 并重建沙盒。',
     debugger:
-      '先 run_tests / run_python 复现错误 → analyze_error → patch/replace_in_file/add_dependency 修复 → 再次 run_tests。每次只做最小修改。【路径契约】文件工具必须提供具体的 workspace 相对 args.path；replace_in_file 必须同时提供 path/find/replace，path 取自当前 Step writable allowlist。【依赖缺失】必须添加真实依赖或改用设计选定的真实库，禁止在 src/ 生产代码里伪造 module、fake class/function、空实现或 fallback mock。【Fixture 纪律】如果测试失败是行为断言失败，不要持续重写 fixture；只有明确缺文件、fixture 格式错误或 fixture 解析错误时才改 fixture，否则修源码、契约、依赖或错误断言。【网络/API 失败】定位失败 URL 后，只允许少量探测替代 API，随后必须 patch 源码并用 run_program 证明入口不再输出 API 失败。【重要】同一文件上 replace_in_file 连续失败 2 次以上请立即 read_file，再用 patch 或在当前运行时 chunk limit 内整文件重写，不要反复猜测 find 字符串。【禁止 no-op】replace_in_file 的 find 与 replace 必须不同——若你只是想"确认"某段代码，请用 read_file，不要提交相同字符串的替换。',
+      '先用 run_tests/run_program 复现，必要时用 analyze_error，随后执行最小范围 patch 或依赖修改，并重跑失败门禁。同一文件替换连续失败两次后，先读取当前内容再切换编辑方式。',
     refactorer:
       '重构必须保证行为不变；先跑回归测试 → 修改 → 再跑回归测试。' +
       '所有文件工具必须提供具体的 workspace 相对 args.path；局部替换前先 read_file 确认同一路径和当前字节。',

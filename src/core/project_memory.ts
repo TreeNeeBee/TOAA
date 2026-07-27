@@ -3,7 +3,7 @@ import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import type { Workspace } from '../workspace/workspace.js';
 import { DOC_NAMES } from './docs.js';
-import { DEFAULT_PLAN_FILE, type Language, type PlanIntent, type Step } from './plan.js';
+import type { Language, PlanIntent, Step } from './plan.js';
 import { DEFAULT_PHASE_PLAN_FILE } from './phase_plan.js';
 import { loadPlanTarget } from './storage.js';
 
@@ -224,18 +224,7 @@ async function readPlanMetadata(
 }
 
 async function defaultPlanMetadataPath(root: string): Promise<string> {
-  const phasePlanPath = path.join(root, DEFAULT_PHASE_PLAN_FILE);
-  if (await fileExists(phasePlanPath)) return phasePlanPath;
-  return path.join(root, DEFAULT_PLAN_FILE);
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await fs.stat(filePath);
-    return true;
-  } catch {
-    return false;
-  }
+  return path.join(root, DEFAULT_PHASE_PLAN_FILE);
 }
 
 async function buildManifestMemory(ws: Workspace): Promise<ProjectMemoryFile | null> {
@@ -338,8 +327,8 @@ function scoreMemoryFile(
   }
   if (file.kind === 'manifest') score += step.phase === 'HIGH_LEVEL_DESIGN' ? 20 : 4;
   if (file.kind === 'doc') score += ['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'FUNCTIONAL_TEST'].includes(step.phase) ? 16 : 6;
-  if (file.kind === 'source') score += ['CODE', 'DEBUG', 'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 14 : 2;
-  if (file.kind === 'test') score += ['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST', 'DEBUG'].includes(step.phase) ? 14 : 2;
+  if (file.kind === 'source') score += ['CODE', 'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 14 : 2;
+  if (file.kind === 'test') score += ['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 14 : 2;
   if (step.inputs.includes(file.path)) score += 24;
   if (step.outputs.includes(file.path)) score += 20;
   if (module) {
@@ -359,10 +348,10 @@ function scoreContract(
   for (const token of tokens) {
     if (haystack.includes(token)) score += 4;
   }
-  if (contract.kind === 'api') score += ['CODE', 'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST', 'DEBUG'].includes(step.phase) ? 12 : 4;
-  if (contract.kind === 'invariant') score += ['DEBUG', 'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 12 : 6;
+  if (contract.kind === 'api') score += ['CODE', 'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 12 : 4;
+  if (contract.kind === 'invariant') score += ['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 12 : 6;
   if (contract.kind === 'extension-point') score += ['HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE'].includes(step.phase) ? 10 : 4;
-  if (contract.kind === 'limitation') score += ['FUNCTIONAL_TEST', 'DEBUG'].includes(step.phase) ? 10 : 3;
+  if (contract.kind === 'limitation') score += step.phase === 'FUNCTIONAL_TEST' ? 10 : 3;
   if (contract.kind === 'integration') score += ['HIGH_LEVEL_DESIGN', 'CODE', 'INTEGRATION_TEST', 'FUNCTIONAL_TEST'].includes(step.phase) ? 10 : 4;
   if (contract.path && (step.inputs.includes(contract.path) || step.outputs.includes(contract.path))) score += 16;
   return score;

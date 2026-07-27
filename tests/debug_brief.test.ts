@@ -81,6 +81,22 @@ describe('debug brief extraction', () => {
     expect(brief.debugDemand).not.toContain('provider/context infrastructure');
   });
 
+  it('keeps OpenAI-compatible provider DNS failures out of generated-project API debugging', () => {
+    const brief = buildDebugBrief({
+      reason: 'all LLM providers failed for role Architect',
+      failureLog:
+        'OpenAI-compatible provider request failed provider=deepseek_paid ' +
+        'model=deepseek/deepseek-v4-flash base_url=https://openrouter.ai/api/v1 ' +
+        'mode=non-stream: fetch failed; cause=getaddrinfo ENOTFOUND openrouter.ai',
+      phase: 'DETAILED_DESIGN',
+    });
+
+    expect(brief.category).toBe('llm_provider');
+    expect(brief.debugDemand).toContain('not a project code bug');
+    expect(brief.debugDemand).toContain('retry the current Step');
+    expect(brief.debugDemand).not.toContain('patch the real API integration');
+  });
+
   it('classifies generic test gates as test failures', () => {
     const brief = buildDebugBrief({
       reason: 'Test gate: tests exit=1',

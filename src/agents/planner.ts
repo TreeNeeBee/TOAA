@@ -16,6 +16,7 @@ import {
 import { getLanguageProfile } from '../core/language.js';
 import {
   analyzeArchitectureDemand,
+  architectureImplementationPaths,
   pathCoveredByOutputs,
   validateArchitectureContract,
 } from '../core/architecture.js';
@@ -33,10 +34,8 @@ import {
   calibratePlanCoverage,
   calibrateLanguageStepOwnership,
   calibrateArchitectureModuleDependencies,
+  calibrateArchitectureModulePaths,
 } from './calibration.js';
-
-/** @deprecated kept for back-compat; use `calibratePythonRequirements`. */
-export const normalizePythonRequirements = calibratePythonRequirements;
 
 // NOTE: SYSTEM_PROMPT, clarify, and decompose user-prompt strings now live in
 // src/i18n/{en,zh}.ts and are pulled at call time via t().prompts.*.
@@ -423,7 +422,7 @@ export function buildPlan(
     draft.steps.find((step) => step.iterationId)?.iterationId ??
     'P1';
   const architectureDependencyCalibration = calibrateArchitectureModuleDependencies(
-    draft.architectureModules ?? [],
+    calibrateArchitectureModulePaths(draft.architectureModules ?? [], language),
     draft.dependencies,
   );
   const architectureModules = architectureDependencyCalibration.architectureModules;
@@ -492,7 +491,7 @@ function injectArchitectureContractPrompts(
   if (modules.length === 0) return steps;
   const inventory = modules
     .map((module) =>
-      `${module.id} ${module.name}: sources=[${module.sourcePaths.join(', ')}], tests=[${module.testPaths.join(', ')}], deps=[${module.dependencies.join(', ') || 'none'}]`,
+      `${module.id} ${module.name}: sources=[${module.sourcePaths.join(', ')}], assets=[${(module.assetPaths ?? []).join(', ')}], tests=[${module.testPaths.join(', ')}], deps=[${module.dependencies.join(', ') || 'none'}]`,
     )
     .join('\n');
 
@@ -506,11 +505,11 @@ function injectArchitectureContractPrompts(
         `\n\nDETAILED_DESIGN 契约（强制）：docs/03-detailed-design.md 必须定义模块内部具体功能实现、内部架构、数据结构/控制流，并为以下每个模块保留独立 CODE/INTEGRATION_TEST 任务及验收映射：\n${inventory}`;
     } else if (step.phase === 'CODE') {
       const owned = modules.filter((module) =>
-        module.sourcePaths.every((sourcePath) => pathCoveredByOutputs(sourcePath, step.outputs)),
+        architectureImplementationPaths(module).every((path) => pathCoveredByOutputs(path, step.outputs)),
       );
       if (owned.length > 0) {
         contractBlock =
-          `\n\n本 CODE Step 仅实现架构模块：\n${owned.map((module) => `${module.id} ${module.name} — ${module.responsibility}; sourcePaths=${module.sourcePaths.join(', ')}`).join('\n')}`;
+          `\n\n本 CODE Step 仅实现架构模块：\n${owned.map((module) => `${module.id} ${module.name} — ${module.responsibility}; implementationPaths=${architectureImplementationPaths(module).join(', ')}`).join('\n')}`;
       }
     } else if (step.phase === 'MODULE_TEST') {
       const covered = modules.filter((module) =>
@@ -797,11 +796,7 @@ function parsePhaseStepPlanJson(
     throw new Error('Planner did not return a JSON object for phase Step planning.');
   }
   const obj = data as Record<string, unknown>;
-  const rawDeps = Array.isArray(obj.dependencies)
-    ? obj.dependencies
-    : Array.isArray(obj.pythonRequirements)
-      ? obj.pythonRequirements
-      : [];
+  const rawDeps = Array.isArray(obj.dependencies) ? obj.dependencies : [];
   const draft = {
     requirementDigest:
       typeof obj.requirementDigest === 'string' && obj.requirementDigest.trim()
@@ -860,11 +855,7 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     context?.userAddenda ?? '',
     context?.baselineSummary ?? '',
   ].join('\n'));
-  const rawDeps = Array.isArray(obj.dependencies)
-    ? obj.dependencies
-    : Array.isArray(obj.pythonRequirements)
-      ? obj.pythonRequirements
-      : [];
+  const rawDeps = Array.isArray(obj.dependencies) ? obj.dependencies : [];
   let dependencies = (rawDeps as unknown[]).filter((s): s is string => typeof s === 'string');
   if (context) {
     const validPhaseNames = new Set<string>(PHASES);
@@ -882,7 +873,8 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
         `Planner draft uses non-canonical phase(s): ` +
         `${nonCanonical.map((step) => `${step.id}:${step.phase || '(missing)'}`).join(', ')}. ` +
         `V-model phases must be exactly ${REQUIRED_V_MODEL_PHASES.join(' -> ')} ` +
-        `with DEBUG only for explicit rollback/repair; do not emit legacy REQUIREMENT, ARCH, TASK, TEST, REFACTOR, or DELIVERY.`,
+        `DEBUG is a runtime repair mode and must never be emitted as a Step; ` +
+        `do not emit REQUIREMENT, ARCH, TASK, TEST, REFACTOR, or DELIVERY aliases.`,
       );
     }
   }
@@ -910,7 +902,7 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     throw new Error(`Planner architectureModules invalid: ${architectureResult.error.issues.map((i) => i.message).join('; ')}`);
   }
   const architectureDependencyCalibration = calibrateArchitectureModuleDependencies(
-    architectureResult.data,
+    calibrateArchitectureModulePaths(architectureResult.data, context?.language ?? 'python'),
     dependencies,
   );
   const architectureModules = architectureDependencyCalibration.architectureModules;

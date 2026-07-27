@@ -42,6 +42,7 @@ import type {
   AcpSession,
   AcpTask,
 } from './types.js';
+import { transitionAcpTaskPhase, transitionAcpTaskStatus } from './task_state.js';
 import { ACP_PROTOCOL_VERSION } from './types.js';
 import type { AcpTransport } from './transport.js';
 
@@ -122,22 +123,13 @@ export class AcpServer {
         this.transport?.close();
         return { ok: true };
       case AcpMethod.SessionNew:
-      case AcpMethod.LegacySessionCreate:
         return this.createSession(message.params);
       case AcpMethod.SessionClose:
-      case AcpMethod.LegacySessionClose:
         return this.closeSession(message.params);
       case AcpMethod.SessionPrompt:
         return this.prompt(message.params);
-      case AcpMethod.LegacyTaskStart:
-        return this.startTask(message.params, 'legacy');
       case AcpMethod.SessionCancel:
-      case AcpMethod.LegacyTaskCancel:
         return this.cancelTask(message.params);
-      case AcpMethod.LegacyConfirmationRespond:
-        return this.respondConfirmation(message.params);
-      case AcpMethod.LegacyPermissionRespond:
-        return this.respondPermission(message.params);
       default:
         throw new AcpError(JsonRpcErrorCode.MethodNotFound, `unknown ACP method: ${message.method}`);
     }
@@ -146,14 +138,6 @@ export class AcpServer {
   private async dispatchNotification(method: string, params: unknown): Promise<void> {
     if (method === AcpMethod.SessionCancel) {
       this.cancelTask(params);
-      return;
-    }
-    if (method === AcpMethod.LegacyConfirmationRespond) {
-      await this.respondConfirmation(params);
-      return;
-    }
-    if (method === AcpMethod.LegacyPermissionRespond) {
-      await this.respondPermission(params);
       return;
     }
     throw new AcpError(JsonRpcErrorCode.MethodNotFound, `unknown ACP notification: ${method}`);
@@ -212,7 +196,7 @@ export class AcpServer {
     const p = parsePromptParams(params);
     const session = this.sessions.get(p.sessionId);
     const workspace = path.resolve(session.workspace || process.cwd());
-    const task = this.sessions.createTask(session, { workspace, userTask: p.task, protocol: 'acp' });
+    const task = this.sessions.createTask(session, { workspace, userTask: p.task });
     try {
       await this.runCodeTask(session, task, { ...p, workspace });
     } catch (err) {
@@ -221,17 +205,6 @@ export class AcpServer {
     return {
       stopReason: task.status === 'cancelled' || task.status === 'cancel_requested' ? 'cancelled' : 'end_turn',
     };
-  }
-
-  private startTask(params: unknown, protocol: 'acp' | 'legacy'): { taskId: string; status: string } {
-    const p = parseTaskParams(params);
-    const session = this.sessions.get(p.sessionId);
-    const workspace = path.resolve(p.workspace || session.workspace || process.cwd());
-    const task = this.sessions.createTask(session, { workspace, userTask: p.task, protocol });
-    this.runCodeTask(session, task, { ...p, workspace }).catch((err) => {
-      this.finishTaskFromError(session, task, err);
-    });
-    return { taskId: task.id, status: task.status };
   }
 
   private cancelTask(params: unknown): { cancelled: boolean; reason: string } {
@@ -247,7 +220,7 @@ export class AcpServer {
     }
     const task = this.sessions.getTask(sessionId, taskId);
     task.cancellationRequested = true;
-    task.status = 'cancel_requested';
+    transitionAcpTaskStatus(task, 'cancel_requested');
     task.abortController.abort(new Error('ACP task cancelled by client'));
     const rejectedIds = this.sessions.rejectPendingForTask(
       sessionId,
@@ -262,29 +235,6 @@ export class AcpServer {
       cancelled: true,
       reason: 'Cancellation accepted. An active non-interruptible operation may finish before the task closes.',
     };
-  }
-
-  private respondConfirmation(params: unknown): { ok: true } {
-    const p = asRecord(params);
-    this.pendingClientRequests.delete(requiredString(p, 'requestId'));
-    this.sessions.resolveInteraction(
-      requiredString(p, 'sessionId'),
-      requiredString(p, 'requestId'),
-      'value' in p ? p.value : p.answer,
-    );
-    return { ok: true };
-  }
-
-  private respondPermission(params: unknown): { ok: true } {
-    const p = asRecord(params);
-    this.pendingClientRequests.delete(requiredString(p, 'requestId'));
-    this.sessions.resolvePermission(
-      requiredString(p, 'sessionId'),
-      requiredString(p, 'requestId'),
-      Boolean(p.approved),
-      typeof p.reason === 'string' ? p.reason : undefined,
-    );
-    return { ok: true };
   }
 
   private async runCodeTask(session: AcpSession, task: AcpTask, params: AcpCodeTaskParams): Promise<void> {
@@ -308,10 +258,13 @@ export class AcpServer {
       status: task.lastBuildStatus,
     });
     if (!task.planPath) {
-      task.status = task.lastBuildStatus === 'cancelled' || task.lastBuildStatus === 'rejected'
-        ? 'cancelled'
-        : 'failed';
-      task.phase = 'complete';
+      transitionAcpTaskStatus(
+        task,
+        task.lastBuildStatus === 'cancelled' || task.lastBuildStatus === 'rejected'
+          ? 'cancelled'
+          : 'failed',
+      );
+      transitionAcpTaskPhase(task, 'complete');
       task.completedAt = new Date().toISOString();
       this.notifyTask(session, task, 'task_completed', `Task ${task.status}: build produced no runnable plan`, {
         status: task.status,
@@ -322,8 +275,8 @@ export class AcpServer {
       return;
     }
     if (params.autoRunAfterBuild === false) {
-      task.status = 'completed';
-      task.phase = 'complete';
+      transitionAcpTaskStatus(task, 'completed');
+      transitionAcpTaskPhase(task, 'complete');
       task.completedAt = new Date().toISOString();
       this.notifyTask(session, task, 'task_completed', 'Task completed after Build', {
         status: task.status,
@@ -333,7 +286,7 @@ export class AcpServer {
       return;
     }
 
-    task.phase = 'run';
+    transitionAcpTaskPhase(task, 'run');
     this.throwIfCancelled(task);
     this.notifyTask(session, task, 'run_started', 'Run started', { planPath: task.planPath });
     const runIo = this.createRuntimeIO(session, task, 'run');
@@ -347,8 +300,11 @@ export class AcpServer {
     };
     const run = await this.runtime.run(runOpts);
     this.throwIfCancelled(task);
-    task.status = run.status === 'ok' || run.status === 'dry-run' ? 'completed' : 'failed';
-    task.phase = 'complete';
+    transitionAcpTaskStatus(
+      task,
+      run.status === 'ok' || run.status === 'dry-run' ? 'completed' : 'failed',
+    );
+    transitionAcpTaskPhase(task, 'complete');
     task.completedAt = new Date().toISOString();
     this.notifyTask(session, task, 'task_completed', `Task ${task.status}`, {
       status: task.status,
@@ -369,7 +325,7 @@ export class AcpServer {
         }
         const mapped = mapRuntimeEventToAcpUpdates(event, { taskId: task.id, phase });
         for (const acpEvent of mapped) {
-          if (acpEvent.legacyType === 'file_changed' && typeof acpEvent.path === 'string') {
+          if (acpEvent.eventType === 'file_changed' && typeof acpEvent.path === 'string') {
             task.changedFiles.push(acpEvent.path);
           }
           this.notifyUpdate(session.id, acpEvent.update);
@@ -573,8 +529,8 @@ export class AcpServer {
 
   private finishTaskFromError(session: AcpSession, task: AcpTask, err: unknown): void {
     const cancelled = task.cancellationRequested || task.abortController.signal.aborted;
-    task.status = cancelled ? 'cancelled' : 'failed';
-    task.phase = 'complete';
+    transitionAcpTaskStatus(task, cancelled ? 'cancelled' : 'failed');
+    transitionAcpTaskPhase(task, 'complete');
     task.completedAt = new Date().toISOString();
     if (!cancelled) this.notifyTask(session, task, 'error', (err as Error).message);
     this.notifyTask(
@@ -638,20 +594,6 @@ function requiredString(params: Record<string, unknown>, key: string): string {
   const value = params[key];
   if (typeof value !== 'string' || !value.trim()) throw invalidParams(`params.${key} must be a non-empty string`);
   return value;
-}
-
-function parseTaskParams(value: unknown): AcpCodeTaskParams {
-  const params = asRecord(value);
-  return {
-    sessionId: requiredString(params, 'sessionId'),
-    workspace: requiredString(params, 'workspace'),
-    task: requiredString(params, 'task'),
-    configPath: typeof params.configPath === 'string' ? params.configPath : undefined,
-    intent: typeof params.intent === 'string' ? params.intent as AcpCodeTaskParams['intent'] : undefined,
-    requirePlanConfirmation: typeof params.requirePlanConfirmation === 'boolean' ? params.requirePlanConfirmation : true,
-    autoRunAfterBuild: typeof params.autoRunAfterBuild === 'boolean' ? params.autoRunAfterBuild : true,
-    force: typeof params.force === 'boolean' ? params.force : false,
-  };
 }
 
 function parsePromptParams(value: unknown): AcpCodeTaskParams {

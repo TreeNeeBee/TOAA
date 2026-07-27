@@ -1,19 +1,25 @@
 import {
   runExecute as runRuntimeExecute,
-  type ExecuteOptions,
+  type ExecuteOptions as RuntimeExecuteOptions,
   type ExecuteResult,
 } from '../runtime/run.js';
 import { createCliRuntimeIO } from './runtime_adapter.js';
 
-export type { ExecuteOptions, ExecuteResult };
+export interface ExecuteOptions extends RuntimeExecuteOptions {
+  /** CLI-only exit-code adapter switch; Runtime never mutates the host process. */
+  setProcessExitCode?: boolean;
+}
+
+export type { ExecuteResult };
 
 /** CLI adapter for the XCompiler run Runtime entrypoint. */
 export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
+  const { setProcessExitCode, ...runtimeOptions } = opts;
   const result = await runRuntimeExecute({
-    ...opts,
+    ...runtimeOptions,
     io: opts.io ?? createCliRuntimeIO(),
   });
-  if (opts.setProcessExitCode !== false) {
+  if (setProcessExitCode !== false) {
     const exitCode = exitCodeForExecuteResult(result);
     if (exitCode !== 0) process.exitCode = exitCode;
   }

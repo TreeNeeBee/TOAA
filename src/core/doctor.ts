@@ -79,7 +79,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorReport>
   }
   sections.push(cfgSection);
 
-  const scores = opts.scoreStore ?? new ScoreStore(cfgPath, cfg.llm.scores ?? {}, undefined, scoreStoreOptionsFromConfig(cfg.llm));
+  const scores = opts.scoreStore ?? new ScoreStore(cfgPath, undefined, scoreStoreOptionsFromConfig(cfg.llm));
   await scores.load().catch(() => undefined);
 
   // 2) LLM

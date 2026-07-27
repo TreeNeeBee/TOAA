@@ -15,9 +15,9 @@ import { acquireLock, LockError } from '../core/lock.js';
 import {
   Planner,
   buildPlan,
-  normalizePythonRequirements,
   type DraftPhasePlan,
 } from '../agents/planner.js';
+import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
 import { runProjectAudit, shouldRunProjectAudit } from '../core/project_audit.js';
 import { refreshProjectMemory } from '../core/project_memory.js';
@@ -40,6 +40,7 @@ import {
   silentRuntimeIO,
   type RuntimeIO,
 } from './io.js';
+import { resetStepForRerun } from '../core/workflow_state.js';
 
 export interface ExecuteOptions {
   planPath: string;
@@ -58,8 +59,6 @@ export interface ExecuteOptions {
   projectCommand?: string;
   /** Whether to append a history row when execution starts; defaults to true. */
   recordProjectHistory?: boolean;
-  /** @deprecated Runtime never mutates the host process. CLI adapters translate ExecuteResult to exit codes. */
-  setProcessExitCode?: boolean;
   /** 程序化插件入口；CLI 文件加载器后续基于该入口实现。 */
   plugins?: XCompilerPlugin[];
   pluginStrict?: boolean;
@@ -124,14 +123,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   const publicPlanPath = target.phasePlanPath ?? target.planPath;
   const plan = target.plan;
   const projectCommand = opts.projectCommand ?? 'run';
-  if (target.migrations && target.migrations.length > 0) {
-    await savePlan(planAbs, plan);
-    await audit.event('plan.persist', `normalized ${target.migrations.length} legacy V-model plan output mapping(s)`, {
-      messageId: 'execute.plan_migrated',
-      migrations: target.migrations,
-    });
-  }
-
   // --force 隐含重置所有 Step 状态、覆写锁，让整个 Plan 从头执行。
   if (opts.force) {
     await runtimeLog(io, 'warning', t().execute.forceReset);
@@ -140,8 +131,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
 
   if (opts.resetStatus) {
     for (const s of plan.steps) {
-      s.status = 'PENDING';
-      s.retries = 0;
+      resetStepForRerun(s, 'explicit-reset');
     }
     await savePlan(planAbs, plan);
     const debugCache = new DebugCache(ws.abs('.xcompiler/debug_cache.json'));
@@ -191,7 +181,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   const profile = getLanguageProfile(plan.language);
   if (profile.seedManifestFromDeps && plan.dependencies && plan.dependencies.length > 0) {
     const reqRel = profile.manifestFile;
-    const desired = [...normalizePythonRequirements(plan.dependencies)].sort().join('\n') + '\n';
+    const desired = [...calibratePythonRequirements(plan.dependencies)].sort().join('\n') + '\n';
     let existing = '';
     if (await ws.exists(reqRel)) {
       existing = await ws.readFile(reqRel);
@@ -233,7 +223,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     return { status: 'dry-run' };
   }
 
-  const scoreStore = new ScoreStore(cfgPath, cfg.llm.scores, audit, scoreStoreOptionsFromConfig(cfg.llm));
+  const scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
   let unavailableProviders: Set<string>;
   try {
@@ -598,8 +588,7 @@ export function resetInterruptedRunningSteps(
   const recovered: Array<{ stepId: string; status: 'PENDING'; reason: string }> = [];
   for (const step of plan.steps) {
     if (step.status !== 'RUNNING') continue;
-    step.status = 'PENDING';
-    step.retries = 0;
+    resetStepForRerun(step, 'interrupted');
     recovered.push({
       stepId: step.id,
       status: 'PENDING',

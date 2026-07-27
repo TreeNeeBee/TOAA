@@ -264,6 +264,11 @@ export interface ArchitectureContractIssue {
   message: string;
 }
 
+/** CODE-owned implementation outputs for one architecture module. */
+export function architectureImplementationPaths(module: ArchitectureModule): string[] {
+  return [...module.sourcePaths, ...(module.assetPaths ?? [])];
+}
+
 /** 校验 HIGH_LEVEL_DESIGN 模块契约到 CODE / MODULE_TEST 两侧的可追踪性。 */
 export function validateArchitectureContract(
   modules: ArchitectureModule[],
@@ -287,6 +292,7 @@ export function validateArchitectureContract(
 
   const moduleIds = new Set<string>();
   const allSourcePaths = new Set<string>();
+  const allAssetPaths = new Set<string>();
   const allTestPaths = new Set<string>();
   const modulesByCodeOwner = new Map<string, ArchitectureModule[]>();
   const stepIndex = new Map(steps.map((step, index) => [step.id, index]));
@@ -301,10 +307,19 @@ export function validateArchitectureContract(
       if (!isSourcePath(sourcePath, profile.codeExtensions)) {
         issues.push({ message: `${module.id} sourcePath must be a target-language file under src/: ${sourcePath}` });
       }
-      if (allSourcePaths.has(sourcePath)) {
-        issues.push({ message: `Architecture sourcePath ${sourcePath} is owned by more than one module.` });
+      if (allSourcePaths.has(sourcePath) || allAssetPaths.has(sourcePath)) {
+        issues.push({ message: `Architecture implementation path ${sourcePath} is owned by more than one module.` });
       }
       allSourcePaths.add(sourcePath);
+    }
+    for (const assetPath of module.assetPaths ?? []) {
+      if (!isRuntimeAssetPath(assetPath, profile.codeExtensions)) {
+        issues.push({ message: `${module.id} assetPath must be a non-code runtime file under src/: ${assetPath}` });
+      }
+      if (allAssetPaths.has(assetPath) || allSourcePaths.has(assetPath)) {
+        issues.push({ message: `Architecture implementation path ${assetPath} is owned by more than one module.` });
+      }
+      allAssetPaths.add(assetPath);
     }
     for (const testPath of module.testPaths) {
       if (!isTestPath(testPath, profile.codeExtensions)) {
@@ -313,8 +328,9 @@ export function validateArchitectureContract(
       allTestPaths.add(testPath);
     }
 
+    const implementationPaths = architectureImplementationPaths(module);
     const owners = codeSteps
-      .filter((step) => module.sourcePaths.every((path) => pathCoveredByOutputs(path, step.outputs)))
+      .filter((step) => implementationPaths.every((path) => pathCoveredByOutputs(path, step.outputs)))
       .sort((a, b) => (stepIndex.get(a.id) ?? 0) - (stepIndex.get(b.id) ?? 0));
     if (owners.length === 0) {
       issues.push({
@@ -406,7 +422,7 @@ function hasModuleSubTasks(step: Step, modules: ArchitectureModule[]): boolean {
     .join('\n');
   return modules.every((module) =>
     subTaskText.includes(module.id) ||
-    module.sourcePaths.some((sourcePath) => subTaskText.includes(sourcePath)),
+    architectureImplementationPaths(module).some((sourcePath) => subTaskText.includes(sourcePath)),
   );
 }
 
@@ -434,12 +450,24 @@ export function missingArchitectureDocumentTokens(
   content: string,
   modules: ArchitectureModule[],
 ): string[] {
-  const required = modules.flatMap((module) => [module.id, ...module.sourcePaths, ...module.testPaths]);
+  const required = modules.flatMap((module) => [
+    module.id,
+    ...architectureImplementationPaths(module),
+    ...module.testPaths,
+  ]);
   return [...new Set(required)].filter((token) => !content.includes(token));
 }
 
 function isSourcePath(path: string, extensions: string[]): boolean {
   return path.startsWith('src/') && extensions.some((extension) => path.endsWith(extension));
+}
+
+function isRuntimeAssetPath(path: string, extensions: string[]): boolean {
+  return (
+    path.startsWith('src/') &&
+    !path.endsWith('/') &&
+    !extensions.some((extension) => path.endsWith(extension))
+  );
 }
 
 function isTestPath(path: string, extensions: string[]): boolean {

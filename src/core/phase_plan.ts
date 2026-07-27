@@ -8,6 +8,7 @@ import {
   PROJECT_TYPES,
   type Plan,
 } from './plan.js';
+import { assertStateTransition, type StateTransitions } from '../util/state_machine.js';
 
 export const PHASE_PLAN_KIND = 'xcompiler.phasePlan';
 export const PHASE_PLAN_VERSION = '1';
@@ -33,10 +34,17 @@ export const PhasePlanSchema = z.object({
   phases: z.array(PhasePlanPhaseSchema).min(1),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
-});
+}).strict();
 
 export type PhasePlan = z.infer<typeof PhasePlanSchema>;
 export type PhasePlanPhase = z.infer<typeof PhasePlanPhaseSchema>;
+
+const IMPLEMENTATION_PHASE_TRANSITIONS: StateTransitions<PhasePlanPhase['status']> = {
+  deferred: ['planned'],
+  planned: ['current', 'deferred'],
+  current: ['complete'],
+  complete: [],
+};
 
 export interface PhasePlanAdvanceResult {
   phasePlan: PhasePlan;
@@ -84,12 +92,7 @@ export function buildPhasePlanFromCurrentPlan(args: {
     intent: args.plan.intent,
     projectType: args.plan.projectType,
     requirementDigest: args.plan.requirementDigest,
-    complexityAssessment: args.plan.complexityAssessment ?? {
-      level: 'simple',
-      rationale: 'legacy plan without complexity metadata',
-      splitRecommended: false,
-      userForcedPhaseSplit: false,
-    },
+    complexityAssessment: args.plan.complexityAssessment,
     currentPhaseId,
     globalPrompt: args.plan.globalPrompt ?? '',
     baselineSummary: args.plan.baselineSummary ?? '',
@@ -113,7 +116,7 @@ export function advancePhasePlan(input: PhasePlan): PhasePlanAdvanceResult {
   if (current.status !== 'current' && current.status !== 'complete') {
     throw new Error(`phasePlan current phase ${current.id} has invalid status ${current.status}`);
   }
-  current.status = 'complete';
+  transitionImplementationPhase(current, 'complete');
 
   const completeIds = new Set(phases.filter((phase) => phase.status === 'complete').map((phase) => phase.id));
   const planned = phases.filter((phase) => phase.status === 'planned');
@@ -124,7 +127,7 @@ export function advancePhasePlan(input: PhasePlan): PhasePlanAdvanceResult {
       .join('; ');
     throw new Error(`no planned phase is dependency-ready after ${current.id}: ${blocked}`);
   }
-  if (next) next.status = 'current';
+  if (next) transitionImplementationPhase(next, 'current');
 
   const phasePlan: PhasePlan = {
     ...input,
@@ -137,6 +140,21 @@ export function advancePhasePlan(input: PhasePlan): PhasePlanAdvanceResult {
     completedPhaseId: current.id,
     nextPhase: next,
   };
+}
+
+function transitionImplementationPhase(
+  phase: PhasePlanPhase,
+  next: PhasePlanPhase['status'],
+): void {
+  const changed = assertStateTransition(
+    'implementation phase',
+    phase.id,
+    phase.status,
+    next,
+    IMPLEMENTATION_PHASE_TRANSITIONS,
+  );
+  if (!changed) return;
+  phase.status = next;
 }
 
 function relativeFrom(base: string, target: string): string {

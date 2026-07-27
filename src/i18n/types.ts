@@ -36,7 +36,6 @@ export interface Messages {
   system: {
     configEnvMissing: (names: string) => string;
     unhandledError: (message: string) => string;
-    unsupportedPypiOnlyNetwork: string;
     unsupportedSubprocessNetworkOff: string;
     dockerInsideContainerUnsupported: string;
     firejailUnsupported: string;
@@ -297,7 +296,7 @@ export interface Messages {
     secOutputs: string;
     secRecentAudit: (n: number) => string;
     planHeader: (path: string, language: string) => string;
-    planStatusSummary: (total: number, done: number, pending: number, failed: number, skipped: number, running: number) => string;
+    planStatusSummary: (total: number, done: number, pending: number, failed: number, running: number) => string;
     planReadFailed: (path: string, message: string) => string;
     stepHeader: (id: string, phase: string, title: string, status: string, retries: number, maxRetries: number) => string;
     stepRoleTools: (role: string, tools: string) => string;
@@ -452,6 +451,7 @@ export interface Messages {
     executorDebugBlock: (reason: string, suggestions?: string) => string;
     executorGlobalBlock: (globalPrompt: string) => string;
     executorStepBlock: (stepSystemPrompt: string) => string;
+    executorSkillBlock: (hints: string[]) => string;
     executorUserPromptOutro: string;
     executorFeedbackHeader: string;
     executorFeedbackVerifyOk: string;

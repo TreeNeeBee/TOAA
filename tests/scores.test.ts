@@ -23,8 +23,12 @@ describe('ScoreStore', () => {
     expect(s.get('p1')).toBe(ScoreStore.MAX);
   });
 
-  it('allows explicit score=0 as a user disable', () => {
-    const s = new ScoreStore('/tmp/fake/config.yaml', { disabled: 0 });
+  it('allows llm_scores_user.yaml score=0 as a user disable', async () => {
+    const dir = await tmpDir();
+    const cfgPath = path.join(dir, 'config.yaml');
+    await fs.writeFile(path.join(dir, LLM_USER_SCORES_FILE), 'disabled: 0\n');
+    const s = new ScoreStore(cfgPath);
+    await s.load();
     expect(s.get('disabled')).toBe(0);
     expect(s.isUserDisabled('disabled')).toBe(true);
     s.boost('disabled', 'would otherwise recover');
@@ -52,28 +56,29 @@ describe('ScoreStore', () => {
     expect(s2.get('unset')).toBe(ScoreStore.DEFAULT);
   });
 
-  it('uses ctor initial when sidecar absent', async () => {
+  it('uses provider defaults when sidecar is absent', async () => {
     const dir = await tmpDir();
     const cfgPath = path.join(dir, 'config.yaml');
-    const s = new ScoreStore(cfgPath, { seed: 0.7 });
+    const s = new ScoreStore(cfgPath);
     await s.load();
-    expect(s.get('seed')).toBe(0.7);
+    expect(s.get('seed')).toBe(ScoreStore.DEFAULT);
   });
 
-  it('sidecar overrides ctor initial', async () => {
+  it('loads the maintained dynamic sidecar', async () => {
     const dir = await tmpDir();
     const cfgPath = path.join(dir, 'config.yaml');
     await fs.writeFile(path.join(dir, LLM_DYNAMIC_SCORES_FILE), YAML.stringify({ shared: 0.4 }));
-    const s = new ScoreStore(cfgPath, { shared: 1 });
+    const s = new ScoreStore(cfgPath);
     await s.load();
     expect(s.get('shared')).toBe(0.4);
   });
 
-  it('does not let sidecar override an explicit config disable', async () => {
+  it('does not let a dynamic sidecar override a user disable', async () => {
     const dir = await tmpDir();
     const cfgPath = path.join(dir, 'config.yaml');
     await fs.writeFile(path.join(dir, LLM_DYNAMIC_SCORES_FILE), YAML.stringify({ disabled: 1 }));
-    const s = new ScoreStore(cfgPath, { disabled: 0 });
+    await fs.writeFile(path.join(dir, LLM_USER_SCORES_FILE), YAML.stringify({ disabled: 0 }));
+    const s = new ScoreStore(cfgPath);
     await s.load();
     expect(s.get('disabled')).toBe(0);
   });
@@ -82,7 +87,7 @@ describe('ScoreStore', () => {
     const dir = await tmpDir();
     const cfgPath = path.join(dir, 'config.yaml');
     await fs.writeFile(path.join(dir, LLM_DYNAMIC_SCORES_FILE), YAML.stringify({ openrouter_free: 0 }));
-    const s = new ScoreStore(cfgPath, {}, undefined, {
+    const s = new ScoreStore(cfgPath, undefined, {
       clusterProviderNames: ['openrouter_free'],
     });
 
@@ -99,7 +104,7 @@ describe('ScoreStore', () => {
     const cfgPath = path.join(dir, 'config.yaml');
     await fs.writeFile(path.join(dir, LLM_DYNAMIC_SCORES_FILE), YAML.stringify({ openrouter_free: 0.2 }));
     await fs.writeFile(path.join(dir, LLM_USER_SCORES_FILE), YAML.stringify({ openrouter_free: 0.9 }));
-    const s = new ScoreStore(cfgPath, {}, undefined, {
+    const s = new ScoreStore(cfgPath, undefined, {
       clusterProviderNames: ['openrouter_free'],
     });
 
@@ -127,7 +132,7 @@ describe('ScoreStore', () => {
   });
 
   it('uses the narrower default score band for cluster providers', () => {
-    const s = new ScoreStore('/tmp/fake/config.yaml', {}, undefined, {
+    const s = new ScoreStore('/tmp/fake/config.yaml', undefined, {
       clusterProviderNames: ['openrouter_free'],
     });
     expect(s.get('openrouter_free')).toBe(ScoreStore.CLUSTER_MAX);
@@ -140,7 +145,7 @@ describe('ScoreStore', () => {
   });
 
   it('lets users widen the cluster score band within global limits', () => {
-    const s = new ScoreStore('/tmp/fake/config.yaml', {}, undefined, {
+    const s = new ScoreStore('/tmp/fake/config.yaml', undefined, {
       clusterProviderNames: ['openrouter_free'],
       clusterScoreMin: 0.1,
       clusterScoreMax: 1,

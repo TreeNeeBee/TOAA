@@ -296,6 +296,35 @@ describe('buildPlan — Step id 规整', () => {
     expect(plan.architectureModules?.[1]?.dependencies).toEqual([]);
   });
 
+  it('把误放在 sourcePaths 的产品运行时资产迁移到 assetPaths', () => {
+    const plan = buildPlan({
+      requirementDigest: 'TypeScript CLI renders a bundled text template.',
+      globalPrompt: 'Keep the template available at runtime.',
+      dependencies: ['handlebars'],
+      architectureModules: [
+        {
+          id: 'M001',
+          name: 'template',
+          responsibility: 'Own the bundled runtime template used by the renderer.',
+          sourcePaths: ['src/templates/brief.md.hbs'],
+          testPaths: ['tests/template.test.ts'],
+          dependencies: [],
+        },
+      ],
+      steps: [
+        baseStep({ id: 'S001', phase: 'HIGH_LEVEL_DESIGN', role: 'Architect', outputs: ['docs/02-high-level-design.md'] }),
+        baseStep({ id: 'S002', phase: 'CODE', role: 'Coder', outputs: ['src/templates/brief.md.hbs'], dependsOn: ['S001'] }),
+        baseStep({ id: 'S003', phase: 'MODULE_TEST', role: 'Tester', outputs: ['tests/template.test.ts'], dependsOn: ['S002'] }),
+      ],
+    }, { language: 'typescript' });
+
+    expect(plan.architectureModules?.[0]?.sourcePaths).toEqual([]);
+    expect(plan.architectureModules?.[0]?.assetPaths).toEqual(['src/templates/brief.md.hbs']);
+    expect(plan.steps.find((step) => step.phase === 'CODE')?.subTasks?.[0]?.outputs).toEqual([
+      'src/templates/brief.md.hbs',
+    ]);
+  });
+
   it('plan markdown 层级展示 V-model macro Step 与两层 subTasks', () => {
     const plan = buildPlan({
       requirementDigest: 'r',

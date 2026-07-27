@@ -1,11 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { normalizePythonRequirements } from '../src/agents/planner.js';
+import { calibratePythonRequirements } from '../src/agents/calibration.js';
 import { sanitizeVenvName } from '../src/sandbox/subprocess.js';
 import { normalizeTypeScriptTestArgs } from '../src/sandbox/test_args.js';
 
-describe('normalizePythonRequirements', () => {
+describe('calibratePythonRequirements', () => {
   it('rewrites common hallucinated Python package aliases and strips version pins', () => {
-    const out = normalizePythonRequirements(['sklearn==1.4.*', 'cv2==4.*']);
+    const out = calibratePythonRequirements(['sklearn==1.4.*', 'cv2==4.*']);
     expect(out).toContain('scikit-learn');
     expect(out).toContain('opencv-python');
     // 版本锁定被剥离
@@ -15,7 +15,7 @@ describe('normalizePythonRequirements', () => {
   });
 
   it('strips markdown bullets / quotes / blank lines and dedupes', () => {
-    const out = normalizePythonRequirements([
+    const out = calibratePythonRequirements([
       '- pytest',
       '"requests==2.*"',
       '',
@@ -29,12 +29,12 @@ describe('normalizePythonRequirements', () => {
   });
 
   it('always ensures pytest is present', () => {
-    const out = normalizePythonRequirements(['requests']);
+    const out = calibratePythonRequirements(['requests']);
     expect(out.some((r) => /^pytest$/.test(r))).toBe(true);
   });
 
   it('strips PEP 440 version specifiers from arbitrary packages', () => {
-    const out = normalizePythonRequirements([
+    const out = calibratePythonRequirements([
       'fastapi==0.110.*',
       'pandas>=1.5,<2',
       'numpy~=1.26',

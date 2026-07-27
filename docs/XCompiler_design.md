@@ -90,7 +90,7 @@ V 模型流程：
 | 命令 | 角色 | 输入 | 输出 |
 | --- | --- | --- | --- |
 | `xcompiler build` | 需求编译器 | 用户自然语言需求、`topic.md` 或增量需求 | `topic.md`、`phasePlan.json`、当前 `plan.P<N>.json`、`plan.md`、`<name>.xc` |
-| `xcompiler run` | 执行器 | `phasePlan.json`（兼容旧 `plan.json`） | `src/`、`tests/`、`docs/`、审计日志、更新后的工程进度 |
+| `xcompiler run` | 执行器 | `phasePlan.json` | `src/`、`tests/`、`docs/`、审计日志、更新后的工程进度 |
 | `xcompiler load` | 恢复入口 | `<name>.xc` | 载入 workspace/config/phase progress 并继续 |
 | `xcompiler append` / `xcompiler evolve` | 增量入口 | 现有 workspace/工程文件 + 新需求 | 新一轮澄清、阶段计划与实现 |
 | `xcompiler acp` | Code Agent Adapter | stdio JSON-RPC | Runtime-backed ACP 事件、授权请求和结果 |
@@ -124,10 +124,10 @@ export type Phase =
   | 'UNIT_TEST'
   | 'INTEGRATION_TEST'
   | 'MODULE_TEST'
-  | 'FUNCTIONAL_TEST'
-  | 'DEBUG';
+  | 'FUNCTIONAL_TEST';
 
-export type StepStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | 'SKIPPED';
+export type StepStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED';
+export type ExecutionMode = 'NORMAL' | 'DEBUG';
 
 export interface Step {
   id: string;                    // S001、S002 …
@@ -169,7 +169,7 @@ Plan Lint 规则：
 
 - `dependsOn` 指向必须存在；不允许环。
 - 同一 `outputs` 路径全局唯一。
-- 阶段顺序：`REQUIREMENT_ANALYSIS < HIGH_LEVEL_DESIGN < DETAILED_DESIGN < CODE < UNIT_TEST < INTEGRATION_TEST < MODULE_TEST < FUNCTIONAL_TEST`；`DEBUG` 是失败后的修复模式。
+- 阶段顺序：`REQUIREMENT_ANALYSIS < HIGH_LEVEL_DESIGN < DETAILED_DESIGN < CODE < UNIT_TEST < INTEGRATION_TEST < MODULE_TEST < FUNCTIONAL_TEST`；`DEBUG` 是运行期执行模式，不得写入 PhasePlan。
 - 每个 `CODE` Step 必须被 `UNIT_TEST` 覆盖，且每个执行阶段必须覆盖完整 V 模型核心阶段。
 - **每个 Step 必须携带非空 `systemPrompt`**；`REQUIREMENT_ANALYSIS` / `HIGH_LEVEL_DESIGN` / `DETAILED_DESIGN` Step 的 outputs 不得包含实现源码或测试源码（阶段纯度）。
 - Python 依赖由 Plan 顶层 `dependencies` 声明，`xcompiler run` 在执行前统一生成 `requirements.txt`；任何 Step 都不得把它声明为输出。TypeScript 的 `package.json` 由 `HIGH_LEVEL_DESIGN` 阶段维护。
@@ -186,14 +186,16 @@ async function xcompilerRun(phasePlanPath: string) {
   const plan = target.plan; // current plan.P<N>.json
   for (const step of topoSort(plan.steps)) {
     if (step.status === 'DONE') continue;     // 断点续跑
-    step.status = 'RUNNING'; await persist(plan);
+    transitionStep(step, 'RUNNING', 'attempt-started'); await persist(plan);
     try {
       await executeStep(step);                // role LLM + Skill
       await verifyAcceptance(step);           // outputs / acceptance
-      step.status = 'DONE';
+      transitionStep(step, 'DONE', 'attempt-passed');
     } catch (err) {
-      step.status = (await debugLoop(step, err)) ? 'DONE' : 'FAILED';
-      if (step.status === 'FAILED') { await persist(plan); throw err; }
+      transitionStep(step, 'FAILED', 'attempt-failed');
+      const route = classifyDebugFailure(step, err);
+      await recordAndRouteIssue(route, err);
+      if (!(await repairThroughVModel(route))) { await persist(plan); throw err; }
     }
     await persist(plan);
   }
@@ -204,7 +206,13 @@ async function xcompilerRun(phasePlanPath: string) {
 行为约定：
 
 - **断点续跑**：每次 Step 状态变更立即回写当前 `plan.P<N>.json` 和工程进度，中断后再次执行自动续跑。
-- **DEBUG 闭环**：失败先记录 issue，再按失败阶段路由到匹配上游阶段生成 patch/rewrite；Debugger 处理 issue 时必须输出 `issueResolutionPlan`，正确修复后写回 issue 并沉淀到 debug-wiki。
+- **DEBUG 闭环**：失败先记录 issue，再按失败阶段路由到匹配上游阶段生成 patch/rewrite；Debugger 处理 issue 时必须输出 `issueResolutionPlan`。CODE 等局部修复通过对应门禁后可关闭 issue；HIGH_LEVEL_DESIGN / DETAILED_DESIGN 修复必须先转为工程 CR，完成下游实施与验证后才关闭 issue 并沉淀到 debug-wiki。
+- **Issue / CR 关联**：设计回退生成的 CR 以 `issueId` 和 `relatedIssueIds` 反向关联触发问题；issue 保存 `activeChangeRequestId` 和历史 `changeRequestIds`。issue 在 CR 执行期间保持 `change_pending`，不得在上游设计 patch 完成时提前 `resolved`。
+- **状态边界**：Step、Implementation Phase、Issue、CR 分别拥有独立迁移表，统一由状态迁移守卫执行；恢复、缓存门禁、V 模型回退等特殊路径必须声明迁移原因，不允许直接赋值。
+- **Debug 决策**：基础设施/Provider 故障立即停止；测试执行失败回退到配对源阶段；测试产物或当前阶段质量问题留在本阶段修复。修复后从回退点重跑全部下游阶段，不得跳过中间门禁。
+- **CR 增量传导**：回退到概要/详细设计后，下游阶段进入 CR 模式，只实施 `contractChange`、`affectedSteps` 和 `affectedArtifacts` 声明的增量，不再全量重新开发。每个实施/验证阶段记录 commit、changed files 和验收摘要。
+- **CR 重做与子 CR**：普通下游失败记录关联 issue，并把同一 CR 置为 `rework`、revision 加一后从配对阶段继续；只有修复需要扩大既有契约或范围时才创建带 `parentChangeRequestId` 的子 CR。全部受影响阶段和门禁通过后 CR 才 `closed`，关联 issue 才 `resolved`。
+- **提示词策略**：工作区路径、真实修复、依赖真实性、fixture、外部 API 和完成证据由共享 Prompt Policy 注入；角色 Skill 只补充当前职责，避免重复规则在不同 prompt 中漂移。
 - **Debug-wiki**：默认复制并加载 XCompiler 自身路径的 `.xcompiler/debug-wiki/`（设置 `XC_PATH` 时使用 `$XC_PATH`），也可通过 `--debug-wiki-path <dir>` 指定。存储和处理参考 LLM-wiki：`wiki/system/*.md` 是系统级策略，`wiki/agent/*.md` 是 agent/calibration 级规则，`wiki/external/*.md` 是真实生成项目的 issue 修复条目，`index.md` 是可读目录，`index.json` 是检索索引，`log.md` 是追加式操作日志，`wiki/external/feedback.jsonl` 是对内置层的运行反馈 overlay。检索输入使用压缩后的 `DebugBrief`，输出采用 problem / priorPlan / confirmedSolution / feedback 摘要；复用失败的条目标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
 - **审计日志**：`.xcompiler/audit.jsonl`、LLM trace、debug cache、debug-wiki 反馈与 `docs/process_log.md` 同步记录关键事件和错误上下文。
 
@@ -224,9 +232,11 @@ async function xcompilerRun(phasePlanPath: string) {
 | INTEGRATION_TEST | 集成测试、依赖/API 联调结果 | 访问失败后跳过外部 API 门禁 |
 | MODULE_TEST | 模块级行为测试与契约验证 | 绕过 HIGH_LEVEL_DESIGN 中的模块契约 |
 | FUNCTIONAL_TEST | 功能验收、README、QuickStart、库项目 API Guide | 未通过入口/API 验证却交付 |
-| DEBUG | stage-aware issue、patch/rewrite、重跑验证证据 | 用空 patch、跳过错误或污染主工程规则来伪装修复 |
 
 > Plan Lint 会检查越阶产出、V 模型阶段完整性、Step 子任务深度和输出路径冲突，并拒绝写入可执行计划。
+>
+> DEBUG 不属于计划阶段。它是通用修复模式，产物为 stage-aware issue、处理方案、
+> patch/rewrite 与重跑验证证据；空 patch、跳过错误或弱化测试均不能关闭 issue。
 
 | V 模型配对 | 测试期望生成时机 | 失败回退目标 |
 | --- | --- | --- |
@@ -241,7 +251,7 @@ async function xcompilerRun(phasePlanPath: string) {
   `requirements.txt`；Step 不得直接把该文件列为输出，新增依赖通过 `add_dependency`。
 - TypeScript greenfield 由 `HIGH_LEVEL_DESIGN` 创建 `package.json`；feature / refactor / self 默认复用现有
   manifest，只有需求确实涉及依赖或脚本时才修改。
-- DEBUG 阶段缺包时通过 `add_dependency` Skill 安装并**回写**到 `requirements.txt`，确保声明与运行一致。
+- DEBUG 模式缺包时通过 `add_dependency` Skill 安装并**回写**到依赖清单，确保声明与运行一致。
 
 ---
 
@@ -276,8 +286,8 @@ export interface LLMClient {
 | -------- | ------------------------------------- |
 | 文件       | `read_file`、`write_file`、`append_file`、`apply_patch` |
 | 代码       | `code_search`、`symbol_search`          |
-| 执行       | `run_python`、`run_tests`（Sandbox 内）   |
-| 包管理      | `pip_install`                          |
+| 执行       | `run_program`、`run_tests`（Sandbox 内）  |
+| 包管理      | `install_deps`                        |
 | 版本控制     | `git_snapshot`、`git_revert`            |
 | Debug 辅助 | `analyze_error`                        |
 
@@ -294,9 +304,9 @@ Skill 是若干 Tool 的命名编排，对 LLM 暴露更高层语义，Coder / D
 | `replace_in_file` | `read_file` + 范围替换（含锚点）                       | 短片段安全替换                  |
 | `create_file`     | `write_file`                                | 新增模块 / 测试                |
 | `rename_symbol`   | `symbol_search` + `apply_patch`             | 跨文件重命名                   |
-| `add_dependency`  | `pip_install` + 回写 `requirements.txt`       | 补依赖并固化版本                 |
-| `run_tests`       | Sandbox 内 `pytest`（可指定用例）                    | 局部 / 全量回归                |
-| `run_python`      | Sandbox 内执行任意脚本                              | 复现 bug                   |
+| `add_dependency`  | 更新依赖清单 + `install_deps`                       | 补依赖并固化声明                 |
+| `run_tests`       | Sandbox 内执行语言对应测试命令                       | 局部 / 全量回归                 |
+| `run_program`     | Sandbox 内执行 Python 或 TypeScript 程序             | 复现 bug、验证入口              |
 | `revert_change`   | `git_revert` 或 `apply_patch -R`             | 回滚到上一个 DONE 快照           |
 
 约束：
@@ -342,7 +352,12 @@ Sandbox 失败 → 记录 issue + DebugBrief
              → 检索 debug-wiki system/agent/external 的历史问题/方案/反馈摘要
              → Debugger LLM 输出 issueResolutionPlan
              → 选 Skill 修改源码 (apply_patch / replace_in_file / add_dependency …)
-             → Sandbox 重跑失败子集 → 通过则写回 issue 并更新 debug-wiki
+             → CODE 等局部修复：重跑对应门禁 → 通过则关闭 issue
+             → HLD / DD 设计修复：创建 CR，issue = change_pending
+                → 下游按 CR 增量实施并记录 change / verification commit
+                → 门禁失败：关联新 issue，同一 CR = rework，revision + 1
+                → 契约/范围实质扩大：创建 parent-linked child CR
+                → 全部受影响门禁通过：CR = closed，issue = resolved，更新 debug-wiki
              → 失败则标记相关 wiki 条目 needs_review，并进入下一轮/终止
 ```
 
@@ -380,7 +395,9 @@ workspace/
 │   └── history/               # 阶段 + 时间戳归档
 ├── src/                       # Python / TypeScript 源码
 ├── tests/                     # pytest / Vitest
-├── .xcompiler/                # 锁、审计、项目记忆、debug cache、自举报告；debug-wiki 默认在 XCompiler 自身路径的分层目录
+├── .xcompiler/                # 锁、审计、项目记忆、debug cache、自举报告
+│   ├── issues/                # issue 快照、原始错误、repair patch 与生命周期日志
+│   └── change-requests/       # CR JSON/Markdown、revision、应用提交与验证证据
 ├── .sandbox/                  # venv / docker 缓存（gitignore）
 └── node_modules/              # TypeScript subprocess sandbox（按需）
 ```

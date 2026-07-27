@@ -8,6 +8,7 @@ import { loadIncrementalBaseline } from '../src/core/incremental.js';
 import { PROJECT_MEMORY_PATH, refreshProjectMemory } from '../src/core/project_memory.js';
 import { renderPlanMarkdown } from '../src/core/render.js';
 import { PlanSchema, type Step } from '../src/core/plan.js';
+import { buildPhasePlanFromCurrentPlan } from '../src/core/phase_plan.js';
 import { setLocale, t } from '../src/i18n/index.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
@@ -49,7 +50,13 @@ describe('incremental development support', () => {
       },
     );
 
-    await ws.writeFile('plan.json', `${JSON.stringify(plan, null, 2)}\n`);
+    const phasePlan = buildPhasePlanFromCurrentPlan({
+      plan,
+      phasePlanPath: path.join(root, 'phasePlan.json'),
+      currentPlanPath: path.join(root, 'plan.P1.json'),
+    });
+    await ws.writeFile('plan.P1.json', `${JSON.stringify(plan, null, 2)}\n`);
+    await ws.writeFile('phasePlan.json', `${JSON.stringify(phasePlan, null, 2)}\n`);
     await ws.writeFile('docs/topic.md', 'Current product manages invoices.');
     await ws.writeFile('package.json', JSON.stringify({
       name: 'sample-app',
@@ -63,7 +70,7 @@ describe('incremental development support', () => {
 
     const baseline = await loadIncrementalBaseline(ws);
 
-    expect(baseline.summary).toContain('## Existing plan summary');
+    expect(baseline.summary).toContain('## Existing phase plan summary');
     expect(baseline.summary).toContain('- language: typescript');
     expect(baseline.summary).toContain('- intent: feature');
     expect(baseline.summary).toContain('## Existing project memory');
@@ -74,9 +81,9 @@ describe('incremental development support', () => {
     expect(baseline.summary).toContain('src/main.ts');
     expect(baseline.summary).toContain('tests/main.test.ts');
     expect(baseline.language).toBe('typescript');
-    expect(baseline.languageSource).toBe('plan.json');
+    expect(baseline.languageSource).toBe('phasePlan.json');
     expect(baseline.sources).toEqual(
-      expect.arrayContaining(['plan.json', 'docs/topic.md', 'package.json', 'src/**', 'tests/**']),
+      expect.arrayContaining(['phasePlan.json', 'docs/topic.md', 'package.json', 'src/**', 'tests/**']),
     );
   });
 

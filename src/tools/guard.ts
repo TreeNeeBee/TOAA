@@ -73,7 +73,6 @@ export function resolveEditGuardMaxLines(
     INTEGRATION_TEST: 420,
     MODULE_TEST: 420,
     FUNCTIONAL_TEST: 360,
-    DEBUG: 560,
   };
 
   const writeTargets = [...(ctx.outputs ?? []), ...(ctx.allowedWrites ?? [])];

@@ -19,8 +19,6 @@ import {
   resolveSkillOperationWindow,
 } from './window.js';
 
-// 兼容旧导入路径：这些 helper 已下沉到通用可用性模块 health.ts。
-export { isOllamaProvider, isOpenAICompatibleProvider, normalizeBaseUrl } from './health.js';
 
 type ProviderConfig = XCompilerConfig['llm']['providers'][string];
 
@@ -499,7 +497,3 @@ function createClient(
   }
   return null;
 }
-
-/**
- * 规整 LLM provider base_url 等 helper 已移入 ./health.js（顶部 re-export 保持旧导入路径兼容）。
- */

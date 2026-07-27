@@ -3,7 +3,7 @@ import type { AcpSessionUpdate } from './types.js';
 
 export interface AcpMappedUpdate {
   update: AcpSessionUpdate;
-  legacyType: string;
+  eventType: string;
   path?: string;
 }
 
@@ -11,50 +11,50 @@ export function mapRuntimeEventToAcpUpdates(
   event: RuntimeEvent,
   ctx: { taskId: string; phase: 'build' | 'run' },
 ): AcpMappedUpdate[] {
-  const meta = (legacyType: string, extra: Record<string, unknown> = {}) => ({
-    xcompiler: { eventType: legacyType, taskId: ctx.taskId, phase: ctx.phase, ...extra },
+  const meta = (eventType: string, extra: Record<string, unknown> = {}) => ({
+    xcompiler: { eventType, taskId: ctx.taskId, phase: ctx.phase, ...extra },
   });
 
   if (event.type === 'log') {
-    const legacyType = event.level === 'warning'
+    const eventType = event.level === 'warning'
       ? 'warning'
       : event.level === 'error'
         ? 'error'
         : ctx.phase === 'build' ? 'build_progress' : 'run_progress';
     return [{
-      legacyType,
-      update: agentText(event.message, meta(legacyType, { level: event.level })),
+      eventType,
+      update: agentText(event.message, meta(eventType, { level: event.level })),
     }];
   }
 
   if (event.type === 'progress') {
-    const legacyType = ctx.phase === 'build' ? 'build_progress' : 'run_progress';
+    const eventType = ctx.phase === 'build' ? 'build_progress' : 'run_progress';
     return [{
-      legacyType,
-      update: agentText(event.message, meta(legacyType, { status: event.status })),
+      eventType,
+      update: agentText(event.message, meta(eventType, { status: event.status })),
     }];
   }
 
   if (event.type === 'result') {
-    const legacyType = event.command === 'build' ? 'build_completed' : 'run_completed';
+    const eventType = event.command === 'build' ? 'build_completed' : 'run_completed';
     return [{
-      legacyType,
+      eventType,
       update: agentText(
         `${event.command} ${event.status}`,
-        meta(legacyType, { status: event.status, data: event.data }),
+        meta(eventType, { status: event.status, data: event.data }),
       ),
     }];
   }
 
   if (event.type === 'tool_call') {
-    const legacyType =
+    const eventType =
       event.tool === 'run_tests'
         ? event.status === 'started' ? 'test_started' : 'test_completed'
         : event.status === 'started' ? 'tool_call_started' : 'run_progress';
     const toolCallId = event.callId;
     if (event.status === 'started') {
       return [{
-        legacyType,
+        eventType,
         update: {
           sessionUpdate: 'tool_call',
           toolCallId,
@@ -66,12 +66,12 @@ export function mapRuntimeEventToAcpUpdates(
             tool: event.tool,
             target: event.target,
           },
-          _meta: meta(legacyType, { stepId: event.stepId, tool: event.tool }),
+          _meta: meta(eventType, { stepId: event.stepId, tool: event.tool }),
         },
       }];
     }
     return [{
-      legacyType,
+      eventType,
       update: {
         sessionUpdate: 'tool_call_update',
         toolCallId,
@@ -88,15 +88,15 @@ export function mapRuntimeEventToAcpUpdates(
             text: event.summary ?? event.error ?? `${event.tool} completed`,
           },
         }],
-        _meta: meta(legacyType, { stepId: event.stepId, tool: event.tool }),
+        _meta: meta(eventType, { stepId: event.stepId, tool: event.tool }),
       },
     }];
   }
 
   if (event.type === 'file_changed') {
-    const legacyType = 'file_changed';
+    const eventType = 'file_changed';
     return [{
-      legacyType,
+      eventType,
       path: event.path,
       update: {
         sessionUpdate: 'tool_call_update',
@@ -107,7 +107,7 @@ export function mapRuntimeEventToAcpUpdates(
           type: 'content',
           content: { type: 'text', text: `Changed ${event.path}` },
         }],
-        _meta: meta(legacyType, {
+        _meta: meta(eventType, {
           stepId: event.stepId,
           tool: event.tool,
           path: event.path,
@@ -117,9 +117,9 @@ export function mapRuntimeEventToAcpUpdates(
   }
 
   if (event.type === 'patch_proposed') {
-    const legacyType = 'patch_proposed';
+    const eventType = 'patch_proposed';
     return [{
-      legacyType,
+      eventType,
       update: {
         sessionUpdate: 'tool_call_update',
         toolCallId: event.callId,
@@ -129,7 +129,7 @@ export function mapRuntimeEventToAcpUpdates(
           content: { type: 'text', text: `Patch proposed:\n\n${event.patch}` },
         }],
         rawOutput: { patch: event.patch },
-        _meta: meta(legacyType, {
+        _meta: meta(eventType, {
           stepId: event.stepId,
           tool: event.tool,
           patch: event.patch,
@@ -139,10 +139,10 @@ export function mapRuntimeEventToAcpUpdates(
   }
 
   if (event.type === 'permission') {
-    const legacyType = event.status === 'requested' ? 'permission_required' : `permission_${event.status}`;
+    const eventType = event.status === 'requested' ? 'permission_required' : `permission_${event.status}`;
     return [{
-      legacyType,
-      update: agentText(legacyType, meta(legacyType, { request: event.request })),
+      eventType,
+      update: agentText(eventType, meta(eventType, { request: event.request })),
     }];
   }
 

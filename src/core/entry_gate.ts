@@ -94,7 +94,7 @@ export async function autoFixSrcImports(
 }
 
 /**
- * 进入测试/DEBUG 阶段前确保 tests/conftest.py 存在并把 src/ 注入 sys.path。
+ * 进入测试阶段或 DEBUG 模式前确保 tests/conftest.py 存在并把 src/ 注入 sys.path。
  * 这样 LLM 写 `from <module> import ...` 在 pytest 下能直接找到，避免反复
  * 因 ModuleNotFoundError 进入 Debugger 死循环。仅在文件不存在时写入。
  */

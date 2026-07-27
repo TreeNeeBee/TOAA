@@ -111,11 +111,4 @@ describe('DockerSandbox', () => {
     expect(calls).not.toMatch(/--network none/);
   }, 15_000);
 
-  it('rejects legacy pypi-only instead of silently allowing unrestricted outbound traffic', () => {
-    expect(() => new DockerSandbox({
-      ws,
-      limits: { cpu: 1, memory_mb: 256, wall_seconds: 10, network: 'pypi-only' },
-      dockerBin: fakeDocker,
-    })).toThrow(/pypi-only/);
-  });
 });

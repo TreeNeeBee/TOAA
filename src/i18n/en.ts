@@ -47,7 +47,7 @@ Mandatory rules:
 3. Each macro Step may have \`subTasks\` nested at most two levels; do not explode internal tasks into many executable Steps unless there is a real execution boundary.
 4. dependsOn must follow the phase order and be acyclic. Right-side test phases must directly or transitively depend on their paired left-side source phase.
 5. Every CODE Step must be covered by a UNIT_TEST Step in the same iteration.
-6. Design phases must not output src/ or tests/ files. CODE owns src/. Test phases own tests/ and their report docs. FUNCTIONAL_TEST must not modify src/.
+6. Design phases must not output src/ or tests/ files. CODE owns product source and runtime assets under src/. Test phases own tests/ and their report docs. FUNCTIONAL_TEST must not modify src/.
 7. The same outputs path is globally unique. DEBUG may modify dependency-chain files at runtime; planned Steps should not duplicate outputs.
 8. id has the form S001, S002, ...; role is Planner / Architect / Coder / Tester / Debugger.
 9. Every Step needs a systemPrompt that pins scope, inputs, outputs, acceptance, forbidden actions, and the paired test-design obligation when applicable.
@@ -56,7 +56,7 @@ Mandatory rules:
 12. implementationPhases must include P1 current and any planned executable phases. Each phase has a verificationGate whose failurePolicy says to feed the failure log to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.
 13. dependencies is a Python pip dependency list. Include \`pytest\`; use bare package names only; never list \`requirements.txt\` in Step outputs.
 14. Application/mixed projects need a directly executable Python entry point (\`src/main.py\` or package \`__main__.py\`) that reuses CODE modules. Library/mixed projects need a stable public API and \`docs/api-guide.md\`.
-15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, testPaths, and dependencies. CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
+15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, optional assetPaths, testPaths, and dependencies. Put non-code runtime assets in assetPaths. CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
 16. Third-party library choices must match real APIs: HIGH_LEVEL_DESIGN must name the concrete entry point function/class or verification basis for the selected library in this requirement; do not invent parser/export APIs from package names alone.
 
 Output JSON shape:
@@ -70,7 +70,7 @@ Output JSON shape:
   ],
   "dependencies": ["pytest"],
   "architectureModules": [
-    { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
+    { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
     {
@@ -169,7 +169,7 @@ Mandatory rules:
 2. Every current/planned implementation phase is a complete V-model iteration containing all eight canonical phases.
 3. Each macro Step may contain \`subTasks\` nested at most two levels.
 4. Every CODE Step must be covered by a UNIT_TEST Step in the same iteration; module testPaths from architectureModules must be produced by MODULE_TEST.
-   CODE outputs must contain product source files under src/ plus docs/tests/unit-test-plan.md only; never list tests/**/*.test.ts or other tests/** files as CODE outputs.
+   CODE outputs must contain product source files and runtime assets under src/ plus docs/tests/unit-test-plan.md only; never list tests/**/*.test.ts or other tests/** files as CODE outputs.
 5. Design phases must not output src/ or tests/ files. HIGH_LEVEL_DESIGN is the only phase that may output \`package.json\` / \`tsconfig.json\`.
 6. Exactly one HIGH_LEVEL_DESIGN Step must output \`package.json\` for greenfield TypeScript plans; ensure one HIGH_LEVEL_DESIGN Step output \`package.json\`. It must include scripts for \`build\`, \`test\`, and preferably \`lint\`.
 7. Local TypeScript source imports must use explicit \`.ts\` ESM specifiers. Configure \`allowImportingTsExtensions: true\` and use \`tsc --noEmit\`. Generated TypeScript must be compatible with Node native type stripping: avoid enums, namespaces, parameter properties, and transform-required syntax.
@@ -178,7 +178,7 @@ Mandatory rules:
 10. Application/mixed projects need \`src/main.ts\` with a directly runnable \`main()\`; library/mixed projects need \`src/index.ts\` or equivalent public API plus API guide.
 11. complexityAssessment and implementationPhases follow the same rules as Python: simple => P1, moderate => at least P1+P2, complex => at least P1+P2+P3, forced phase split => set userForcedPhaseSplit=true.
 12. verificationGate failurePolicy must say: Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.
-13. For non-trivial work, return architectureModules with sourcePaths and testPaths; CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
+13. For non-trivial work, return architectureModules with sourcePaths, optional assetPaths, and testPaths; CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
 14. TypeScript tests must use Vitest only. Never request Jest, ts-jest, @types/jest, ts-node, or nodemon in Step prompts or package.json; package.json must use "test": "vitest run" and "build": "tsc --noEmit".
 
 Output JSON shape is identical to Python and must include \`"projectType": "application | library | mixed"\`, with TypeScript paths such as \`src/example.ts\` and \`tests/example.test.ts\`; the first Step phase must be \`REQUIREMENT_ANALYSIS\`, not \`REQUIREMENT\`. There is no CLI project-type override.`;
@@ -266,7 +266,7 @@ Phase responsibilities:
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST verify their paired left-side phases.
 
 Strict output ownership:
-- CODE outputs may include only product source files under src/ and the unit-test-plan document; do not put tests/** files in CODE outputs.
+- CODE outputs may include only product source files and runtime assets under src/ plus the unit-test-plan document; do not put tests/** files in CODE outputs.
 - UNIT_TEST owns unit test files; INTEGRATION_TEST owns integration test files; MODULE_TEST owns architectureModules.testPaths; FUNCTIONAL_TEST owns end-to-end/functional test files and delivery docs.
 - For greenfield TypeScript, exactly one HIGH_LEVEL_DESIGN Step must output package.json with scripts, dependencies, and devDependencies. CODE must not output package.json.
 - For TypeScript package.json, use Vitest only: "test": "vitest run", "build": "tsc --noEmit", devDependencies include typescript/tsx/vitest/@types/node. Do not mention or request Jest, ts-jest, @types/jest, ts-node, or nodemon.
@@ -275,6 +275,7 @@ Return only the current phase's dependencies, architectureModules, and steps. Co
 
 architectureModules may describe only product/business source modules for the current phase:
 - sourcePaths must be target-language source files under src/. They must not be directories, tests/, docs/, README, fixtures, utils, or report files.
+- assetPaths is optional and may contain only non-code files under src/ that ship with and are used by the product at runtime (for example templates, schemas, or static assets). Do not put test fixtures, sample inputs, temporary outputs, or documentation there.
 - testPaths must be target-language test files under tests/. They must not be directories.
 - Test fixtures, test helpers, sample inputs, and temporary output files belong in test Step outputs or subTasks, not in architectureModules.
 
@@ -284,7 +285,7 @@ Return strict JSON only:
   "globalPrompt": "string",
   "dependencies": ["pytest"],
   "architectureModules": [
-    { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
+    { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
     { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
@@ -316,8 +317,6 @@ const messages: Messages = {
   system: {
     configEnvMissing: (names) => `[xcompiler] unset config environment variables were replaced with empty strings: ${names}`,
     unhandledError: (message) => `Unhandled error: ${message}`,
-    unsupportedPypiOnlyNetwork:
-      'network=pypi-only is rejected because Docker cannot enforce a PyPI-only allowlist by itself. Use network=off for isolation or network=download-only for explicitly unrestricted outbound downloads.',
     unsupportedSubprocessNetworkOff:
       'sandbox network=off cannot be enforced in subprocess mode; use mode=docker or choose download-only/full explicitly.',
     dockerInsideContainerUnsupported:
@@ -406,7 +405,7 @@ const messages: Messages = {
     runDescription: 'Execute a confirmed phasePlan.json (supports phased runs: --phase / --from)',
     loadDescription: 'Load a XXX.xc project file and continue its current plan',
     appendDescription: 'Append a new requirement to an existing XXX.xc project through clarification and V-model execution',
-    lsDescription: 'Scan workspace and list every phasePlan.json / legacy plan.json status summary',
+    lsDescription: 'Scan workspace and list every phasePlan.json status summary',
     showDescription: 'Print Step definition / status / outputs / recent audit',
     optWorkspace: 'workspace directory (alias of --output, defaults to current directory)',
     optOutput: 'project / workspace output directory (highest priority, alias of -w)',
@@ -420,17 +419,17 @@ const messages: Messages = {
     optForce: 'force regenerate: override workspace lock and ignore existing plan files',
     optDryRun: 'print topology only, do not execute',
     optFrom: 'start from the given Step (earlier ones are skipped)',
-    optPhase: 'execute only the given phase (REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN/CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST/DEBUG)',
+    optPhase: 'execute only the given V-model phase (REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN/CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST)',
     optReset: 'reset all Step status to PENDING',
     optMaxDepth: 'maximum recursion depth',
     optTail: 'number of recent audit entries',
     optPlan: 'phasePlan.json path, default <workspace>/phasePlan.json',
     optLang: 'UI / prompt language: EN | CN (ISO 3166-1 Alpha-2)',
     optIntent: 'plan intent: greenfield | feature | refactor | self',
-    optBaselinePlan: 'existing baseline phasePlan.json / plan.json path (default <workspace>/phasePlan.json)',
+    optBaselinePlan: 'existing baseline phasePlan.json path (default <workspace>/phasePlan.json)',
     optProjectFile: 'XXX.xc project file path (default <workspace>/<name>.xc)',
     optDebugWikiPath: 'debug wiki root directory path (default <XCompiler path>/.xcompiler/debug-wiki)',
-    argPlan: 'phasePlan.json or legacy plan.json path (default = <workspace>/phasePlan.json)',
+    argPlan: 'phasePlan.json path (default = <workspace>/phasePlan.json)',
     argProjectFile: 'XXX.xc project file',
     argStepId: 'Step ID, e.g. S001',
     evolveDescription: 'Generate and execute an incremental feature/refactor plan on top of an existing workspace',
@@ -556,7 +555,7 @@ const messages: Messages = {
     topicSecBaseline: '## Existing project baseline',
   },
   inspect: {
-    noPlanFound: 'No phasePlan.json / plan.json found',
+    noPlanFound: 'No phasePlan.json found',
     digestLabel: 'digest:',
     stepNotFound: (id) => `Step ${id} not found`,
     secDescription: '— description —',
@@ -566,8 +565,8 @@ const messages: Messages = {
     secOutputs: '— outputs —',
     secRecentAudit: (n) => `— recent audit (${n}) —`,
     planHeader: (p, language) => `${p} lang=${language}`,
-    planStatusSummary: (total, done, pending, failed, skipped, running) =>
-      `steps=${total} done=${done} pending=${pending} failed=${failed} skipped=${skipped} running=${running}`,
+    planStatusSummary: (total, done, pending, failed, running) =>
+      `steps=${total} done=${done} pending=${pending} failed=${failed} running=${running}`,
     planReadFailed: (p, message) => `${p} — ${message}`,
     stepHeader: (id, phase, title, status, retries, maxRetries) => `${id} ${phase} ${title} ${status} retries=${retries}/${maxRetries}`,
     stepRoleTools: (role, tools) => `role=${role} tools=[${tools}]`,
@@ -844,7 +843,7 @@ Return a full V-model StepPlan only for ${opts.phaseId}:
 - Every Step.iterationId must equal "${opts.phaseId}".
 - Do not output Steps for any other planned phase; P2/P3 detailed plans are generated only when they become the current phase.
 - If ${opts.phaseId} spans multiple concerns (domain logic, CLI/API, file I/O, external integration, orchestration, tests), declare architectureModules for this phase and map module-level work under CODE/MODULE_TEST subTasks.
-- architectureModules.sourcePaths may only contain product source files under src/. Do not register tests/fixtures, tests/utils, sample files, directories, or docs as architecture modules.
+- architectureModules.sourcePaths may only contain product source files under src/. Put product runtime non-code files in assetPaths. Do not register tests/fixtures, tests/utils, sample inputs, temporary outputs, directories, or docs as architecture modules.
 - dependencies contains only packages required by this phase; Python must include pytest; never output requirements.txt.
 - This phase must contain the canonical eight V-model macro Steps and synchronous paired test-design outputs.
 
@@ -852,19 +851,14 @@ Return strict JSON StepPlan for the current phase only.`,
     executorSystem: (p) => buildExecutorSystem(p),
     executorDebugBlock: (reason: string, suggestions?: string) =>
       `\n\nYou are now in DEBUG retry mode. Previous failure reason: ${reason}\n` +
-      'When this retry is handling an issue, every JSON response must include issueResolutionPlan before or while fixing it. The plan must be concise and actionable: root cause hypothesis, files/contracts to change, validation command or gate, and what would disprove the plan. ' +
-      'DEBUG may edit upstream source files and tests within the current allowedWrites. If the failure reveals a real implementation, contract, or downstream integration mismatch, fix that real defect; do not pass by weakening assertions, skipping tests, deleting failing cases, or merely accommodating an incorrect test. ' +
-      'If this rollback is in a design/requirements step and the concrete code change belongs to a later V-model step outside the current allowedWrites, update the current contract, test plan, or diagnostic artifact and finish this step so the later CODE step can implement it; do not attempt denied writes. ' +
-      'If the failure is a missing third-party dependency or wrong library choice, use add_dependency with the real package name or change the source back to the real library selected by HIGH_LEVEL_DESIGN; never add try/except ImportError fake modules, fake classes/functions, empty implementations, or fallback mocks in production src/ code to bypass the error. ' +
-      'Begin with read_file / code_search to localise the issue, then make the smallest possible fix via apply_patch / replace_in_file / add_dependency, and finally run_tests to verify. ' +
-      'A DEBUG retry cannot be marked complete from read-only inspection alone: it must produce a successful repair action or a successful verification command in this retry. ' +
-      'If the previous failure reason mentions repeated read-only/probe actions, use the existing failure log as sufficient context and make the next action a patch/write/dependency change or a verification command. ' +
-      'When a test executes and fails an assertion about returned behaviour, do not repeatedly rewrite fixtures or samples. Only edit fixtures when the evidence is missing-file, malformed-fixture, or parse-error in the fixture itself; otherwise patch the implementation, interface contract, dependency choice, or test expectation that is actually wrong. ' +
-      'If the failure log shows a network/API failure, do not stop at probing endpoints: use at most two consecutive http_fetch probes, reject 2xx responses with empty or unusable bodies, then patch the real integration and verify with run_program plus run_tests. Do not set done=true while the entrypoint still reports a network/API failure.' +
+      'Use the issue and compact failure evidence as the source of truth. In a requirement/design rollback, update only the current contract, test plan, or diagnostic outputs when the concrete source file belongs to a later Step; that later V-model Step will implement it. ' +
+      'If the previous attempt stalled on read-only probes, do not repeat discovery: perform the next justified mutation or verification action.' +
       (suggestions ? `\n\n${suggestions}` : ''),
     executorGlobalBlock: (globalPrompt: string) => `\n\n## Project-wide constraints\n${globalPrompt}`,
     executorStepBlock: (sp: string) =>
       `\n\n## Current Step prompt (sole mission — do not drift across steps)\n${sp}`,
+    executorSkillBlock: (hints: string[]) =>
+      `\n\n## Available skill guidance\n${hints.map((hint) => `- ${hint}`).join('\n')}`,
     executorUserPromptOutro: 'Now return the first round of JSON per the protocol.',
     executorFeedbackHeader: 'Tool results this round:',
     executorFeedbackVerifyOk:
@@ -894,20 +888,14 @@ Return strict JSON StepPlan for the current phase only.`,
       '[Self-contained fixtures] Tests **must NOT** open() a sample file that does not exist on disk. ' +
       'When the target function needs file input, first reuse a real user/workspace sample; if none exists, use http_fetch to get a small reference sample from official docs, the upstream repository, or a public standard/example, ' +
       'save it under tests/fixtures/<name>, and record the source. Only for simple text formats such as CSV/JSON/INI may you construct a minimal pytest tmp_path sample and immediately run_tests. ' +
-      'Test/DEBUG phases already grant write permission to tests/fixtures/, sub-dirs are auto-mkdir\'d, and **fixture paths do NOT need to be pre-declared in outputs**. ' +
+      'Test phases and DEBUG mode already grant write permission to tests/fixtures/, sub-dirs are auto-mkdir\'d, and **fixture paths do NOT need to be pre-declared in outputs**. ' +
       'When generating tests, always emit every dependent resource so the Debugger does not loop on FileNotFoundError. ' +
       '[Fixture iteration] If a running test raises "Invalid syntax / Parse error / Malformed" from the target function, ' +
       'your fixture content does not match the format spec: read_file to inspect, then prefer a user sample or authoritative http_fetch reference before rewriting and running tests. ' +
       'After repeated failures on a complex domain format, stop inventing from memory and ask for a user sample or network reference. Never edit the implementation or assertions to "fix" a parse error.',
     dep_resolver: 'On ModuleNotFoundError, use add_dependency to write the package back into requirements.txt and rebuild the sandbox.',
     debugger:
-      'First run_tests / run_python to reproduce the error → analyze_error → patch / replace_in_file / add_dependency to fix → run_tests again. Make the smallest possible change each round. ' +
-      '[Path contract] File tools require a concrete workspace-relative args.path. replace_in_file requires path/find/replace together, and path must come from the current Step writable allowlist. ' +
-      '[Missing dependencies] Add the real dependency or use the real library selected by the design; never fake modules/classes/functions, empty implementations, or fallback mocks in production src/ code. ' +
-      '[Fixture discipline] If tests fail with behavioural assertions, do not keep rewriting fixtures. Only change fixtures for clear missing-file, malformed-fixture, or fixture parse errors; otherwise fix source code, contracts, dependencies, or the incorrect assertion. ' +
-      '[Network/API failures] Locate the failing URL, try only a small number of replacement API probes, then patch the source and run_program to prove the entrypoint no longer emits API failure. ' +
-      '[Important] If replace_in_file on the same file fails ≥ 2 times in a row, switch to read_file and then patch or rewrite within the current runtime chunk limit; stop guessing the find string. ' +
-      '[No no-ops] replace_in_file find and replace must differ — if you only want to "verify" a snippet, use read_file; do not submit identical-string replacements.',
+      'Reproduce with run_tests/run_program, use analyze_error when useful, apply the smallest scoped patch or dependency change, then rerun the failing gate. After two failed replacements on one file, read its current content and switch edit strategy.',
     refactorer:
       'Refactors must preserve behaviour: run regression tests → modify → run regression tests again. ' +
       'Every file tool requires a concrete workspace-relative args.path; read_file the same target before a local replacement to confirm its current bytes.',

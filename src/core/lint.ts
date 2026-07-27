@@ -10,6 +10,7 @@ import {
 import { DOC_NAMES, deliveryDocsForIteration, phaseDocForIteration, testPlanDocForIteration } from './docs.js';
 import { getLanguageProfile } from './language.js';
 import { analyzeArchitectureDemand, validateArchitectureContract } from './architecture.js';
+import { stepTransitivelyDependsOn } from './workflow_state.js';
 
 export interface LintIssue {
   level: 'error' | 'warn';
@@ -83,8 +84,7 @@ export function lintPlan(plan: Plan): LintIssue[] {
           level: 'error',
           message:
             `Plan must include a ${phase} macro Step for implementation phase ${iteration.id}. ` +
-            `Each iteration is a complete V-model cycle: ${REQUIRED_V_MODEL_PHASES.join(' -> ')}; ` +
-            `DEBUG is optional when explicit remediation work is planned.`,
+            `Each iteration is a complete V-model cycle: ${REQUIRED_V_MODEL_PHASES.join(' -> ')}.`,
         });
       }
     }
@@ -95,7 +95,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
     issues.push({ level: 'error', message: 'Plan contains a dependency cycle' });
   }
 
-  // 3. outputs unique（允许 DEBUG 阶段修改其依赖链上已存在的产物）
+  // 3. outputs unique. Runtime DEBUG repairs edit the source Step's allowed
+  //    dependency chain; they are not represented as duplicate-output Steps.
   const outputOwners = new Map<string, string>();
   const stepByIdEarly = new Map(plan.steps.map((s) => [s.id, s]));
   for (const s of plan.steps) {
@@ -103,15 +104,11 @@ export function lintPlan(plan: Plan): LintIssue[] {
       const prev = outputOwners.get(out);
       if (prev) {
         const prevStep = stepByIdEarly.get(prev);
-        const allowModify =
-          s.phase === 'DEBUG' &&
-          prevStep !== undefined &&
-          transitivelyDependsOn(s, prev, stepByIdEarly);
         const allowIterativeModify =
           prevStep !== undefined &&
           stepIterationOrder(prevStep) < stepIterationOrder(s) &&
-          transitivelyDependsOn(s, prev, stepByIdEarly);
-        if (!allowModify && !allowIterativeModify) {
+          stepTransitivelyDependsOn(s, prev, stepByIdEarly);
+        if (!allowIterativeModify) {
           issues.push({
             level: 'error',
             stepId: s.id,
@@ -158,7 +155,7 @@ export function lintPlan(plan: Plan): LintIssue[] {
       c.outputs.length > 0 && c.outputs.every((o) => o === '__init__.py' || o.endsWith('/__init__.py'));
     if (onlyInitFiles) continue;
     const covered = plan.steps.some(
-      (t) => t.phase === 'UNIT_TEST' && stepIterationId(t) === stepIterationId(c) && transitivelyDependsOn(t, c.id, stepById),
+      (t) => t.phase === 'UNIT_TEST' && stepIterationId(t) === stepIterationId(c) && stepTransitivelyDependsOn(t, c.id, stepById),
     );
     if (!covered) {
       const suggestedId = nextStepId(plan.steps);
@@ -311,7 +308,7 @@ export function lintPlan(plan: Plan): LintIssue[] {
           (candidate) =>
             candidate.phase === testPhase &&
             stepIterationId(candidate) === iteration.id &&
-            transitivelyDependsOn(candidate, sourceStep.id, stepById),
+            stepTransitivelyDependsOn(candidate, sourceStep.id, stepById),
         );
         if (!covered) {
           issues.push({
@@ -335,9 +332,9 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
-  // 11. 除 DEBUG 以外的所有阶段必须声明至少 1 个 output。
+  // 11. Every planned phase must declare at least one output.
   for (const s of plan.steps) {
-    if (s.phase !== 'DEBUG' && s.outputs.length === 0) {
+    if (s.outputs.length === 0) {
       issues.push({
         level: 'error',
         stepId: s.id,
@@ -370,9 +367,9 @@ export function lintPlan(plan: Plan): LintIssue[] {
   const architectureModules = plan.architectureModules ?? [];
   if (demand.nonTrivial && architectureModules.length === 0) {
     issues.push({
-      level: 'warn',
+      level: 'error',
       message:
-        'Legacy plan has no architectureModules contract; regenerate with `xcompiler build` to enable HIGH_LEVEL_DESIGN → CODE → MODULE_TEST traceability.',
+        'Non-trivial plans require architectureModules for HIGH_LEVEL_DESIGN → CODE → MODULE_TEST traceability.',
     });
   }
   if (architectureModules.length > 0) {
@@ -485,24 +482,6 @@ function hasCycle(steps: Step[]): boolean {
   };
 
   for (const s of steps) if (color.get(s.id) === WHITE && dfs(s.id)) return true;
-  return false;
-}
-
-function transitivelyDependsOn(
-  step: Step,
-  targetId: string,
-  byId: Map<string, Step>,
-): boolean {
-  const seen = new Set<string>();
-  const stack = [...step.dependsOn];
-  while (stack.length > 0) {
-    const cur = stack.pop()!;
-    if (cur === targetId) return true;
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-    const s = byId.get(cur);
-    if (s) stack.push(...s.dependsOn);
-  }
   return false;
 }
 

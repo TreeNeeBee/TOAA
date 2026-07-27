@@ -364,7 +364,7 @@ docker rmi xcompiler:latest
 ├── config.yaml              # 本次运行的配置
 ├── phasePlan.json           # 阶段总览与当前阶段指针
 ├── plan.P1.json             # 当前阶段的 V 模型执行计划
-├── requirements.txt         # 由 pythonRequirements 在 xcompiler run 启动时种入
+├── requirements.txt         # 由 Plan dependencies 在 xcompiler run 启动时种入
 ├── docs/
 │   ├── requirements.md
 │   ├── architecture.md

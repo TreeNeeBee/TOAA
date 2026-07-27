@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { preflightProviders } from '../src/llm/preflight.js';
 import { ScoreStore } from '../src/llm/scores.js';
 import type { XCompilerConfig } from '../src/config/config.js';
@@ -13,23 +16,25 @@ function mkCfg(overrides: Partial<XCompilerConfig['llm']> = {}): XCompilerConfig
       roles: { Coder: ['ollama_code'], Planner: ['ollama_design'] },
       fallbacks: [],
       role_fallbacks: {},
-      scores: {},
       ...overrides,
     },
     agent: {
-      language: 'python',
       max_steps: 1,
       max_debug_retries: 1,
       max_rounds_per_step: 6,
       max_edit_lines_per_step: 100,
-      sandbox: 'subprocess',
-      sandbox_limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'off' },
-      sandbox_docker: {
-        image: 'python:3.11-slim',
-        workdir: '/workspace',
-        pull: false,
-        docker_bin: 'docker',
-        extra_run_args: [],
+      max_write_chunk_bytes: 'auto',
+      sandboxes: {
+        python: {
+          mode: 'subprocess',
+          local: { inherit_env: false, limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'download-only', expose_ports: [] } },
+          docker: { image: 'python:3.11-slim', workdir: '/workspace', pull: false, docker_bin: 'docker', extra_run_args: [], limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'download-only', expose_ports: [] } },
+        },
+        typescript: {
+          mode: 'subprocess',
+          local: { inherit_env: false, limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'download-only', expose_ports: [] } },
+          docker: { image: 'node:24-slim', workdir: '/workspace', pull: false, docker_bin: 'docker', extra_run_args: [], limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'download-only', expose_ports: [] } },
+        },
       },
     },
   } as unknown as XCompilerConfig;
@@ -144,15 +149,17 @@ describe('preflightProviders', () => {
     expect(scores.get('openai')).toBe(1);
   });
 
-  it('respects an explicit config score=0 for non-Ollama providers', async () => {
+  it('respects an explicit user score=0 for non-Ollama providers', async () => {
     const cfg = mkCfg({
       providers: {
         openai: { type: 'openai', api_key: 'k', base_url: 'http://openai', model: 'gpt' },
       },
       roles: { Planner: ['openai'] },
-      scores: { openai: 0 },
     });
-    const scores = new ScoreStore('/tmp/x/config.yaml', cfg.llm.scores);
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-preflight-'));
+    await fs.writeFile(path.join(dir, 'llm_scores_user.yaml'), 'openai: 0\n');
+    const scores = new ScoreStore(path.join(dir, 'config.yaml'));
+    await scores.load();
 
     await expect(preflightProviders(cfg, scores)).rejects.toThrow(/没有可用的 provider|没有任何 ollama 服务器可达/);
     expect(scores.get('openai')).toBe(0);

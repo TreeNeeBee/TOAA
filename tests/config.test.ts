@@ -25,14 +25,14 @@ function baseConfig(extra: Record<string, unknown> = {}): Record<string, unknown
       roles: allRoles('ollama_code'),
       fallbacks: [],
       role_fallbacks: {},
-      scores: {},
     },
     agent: {
-      language: 'python',
       max_steps: 1,
       max_debug_retries: 1,
-      sandbox: 'subprocess',
-      sandbox_limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'off' },
+      sandboxes: {
+        python: { mode: 'subprocess' },
+        typescript: { mode: 'subprocess' },
+      },
     },
     ...extra,
   };
@@ -59,11 +59,9 @@ describe('config locale', () => {
     expect(config.locale).toBe('zh');
   });
 
-  it('keeps ui_language as a backwards-compatible alias', async () => {
+  it('rejects the removed ui_language alias', async () => {
     const cfgPath = await writeConfig(baseConfig({ ui_language: 'zh' }));
-    const { config } = await loadConfigWithPath(cfgPath);
-    expect(config.locale).toBe('zh');
-    expect(Object.prototype.hasOwnProperty.call(config, 'ui_language')).toBe(false);
+    await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/ui_language/);
   });
 
   it('parses the optional Ollama think flag', async () => {
@@ -129,17 +127,10 @@ llm:
     Debugger:  [openai]
   fallbacks: []
   role_fallbacks: {}
-  scores: {}
 agent:
-  language: python
   max_steps: 1
   max_debug_retries: 1
-  sandbox: subprocess
-  sandbox_limits:
-    cpu: 1
-    memory_mb: 256
-    wall_seconds: 30
-    network: off
+  sandboxes: {}
 `);
       const { config } = await loadConfigWithPath(cfgPath);
       expect(config.llm.providers.openai!.api_key).toBe('1111');
@@ -185,7 +176,6 @@ agent:
         roles: allRoles('openrouter_hy3'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: {},
       },
     });
     const cfgPath = await writeConfig(cfg);
@@ -210,7 +200,6 @@ agent:
         roles: allRoles('openrouter'),
         fallbacks: [],
         role_fallbacks: {},
-        scores: {},
       },
     });
     const { config } = await loadConfigWithPath(await writeConfig(cfg));
@@ -236,7 +225,6 @@ agent:
         role_fallbacks: {},
         cluster_score_min: 0.2,
         cluster_score_max: 0.5,
-        scores: {},
       },
     });
     const cfgPath = await writeConfig(cfg);
@@ -263,7 +251,6 @@ llm:
     Debugger:  [openrouter_free]
   fallbacks: []
   role_fallbacks: {}
-  scores: {}
 agent:
   max_steps: 1
   max_debug_retries: 1
@@ -326,11 +313,21 @@ agent:
     await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/cluster_score_min/);
   });
 
+  it('rejects unsupported sandbox network policies at the configuration boundary', async () => {
+    const cfg = baseConfig();
+    const agent = cfg.agent as unknown as {
+      sandboxes: { python: { local?: { limits: { network: string } } } };
+    };
+    agent.sandboxes.python.local = { limits: { network: 'pypi-only' } };
+    const cfgPath = await writeConfig(cfg);
+    await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/network/);
+  });
+
   it('rejects the removed llm.default option', async () => {
     const cfg = baseConfig();
     (cfg.llm as Record<string, unknown>).default = 'ollama_code';
     const cfgPath = await writeConfig(cfg);
-    await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/llm\.default has been removed/);
+    await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/default/);
   });
 
   it('rejects configs where a role has no manually specified provider', async () => {

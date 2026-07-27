@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { Workspace } from '../src/workspace/workspace.js';
-import { StepExecutor } from '../src/agents/executor.js';
+import { isCompleteTurnJson, StepExecutor } from '../src/agents/executor.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 import type { Step } from '../src/core/plan.js';
 import type { Tool, ToolContext } from '../src/tools/types.js';
@@ -423,9 +423,90 @@ describe('StepExecutor system prompt assembly', () => {
     // 第一轮就应该执行到 write_file，并产出 src/x.py。
     // 由于 done=false，executor 会到 maxRounds 才停；但 toolCalls 必须包含 write_file，
     // 文件也必须真的写出来——这正是修复前 actions=[] 时不会发生的事。
+    expect(r.success).toBe(false);
     expect(r.toolCalls.find((c) => c.tool === 'write_file' && c.ok)).toBeTruthy();
     const written = await fs.readFile(path.join(tmp, 'src/x.py'), 'utf8');
     expect(written).toBe('x = 1\n');
+  });
+
+  it('does not stop a provider stream on a repairable but incomplete file payload', () => {
+    expect(isCompleteTurnJson(
+      '{"thoughts":"write test","actions":[{"tool":"write_file","args":{"path":"tests/x.test.ts","content":"import',
+    )).toBe(false);
+    expect(isCompleteTurnJson(JSON.stringify({
+      thoughts: 'write test',
+      actions: [{ tool: 'write_file', args: { path: 'tests/x.test.ts', content: 'import { it } from "vitest";\n' } }],
+      done: false,
+    }))).toBe(true);
+  });
+
+  it('completes declarative design phases after verified output mutations without an extra handshake round', async () => {
+    class DeclarativeWriterLLM implements LLMClient {
+      readonly name = 'declarative-writer';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        return JSON.stringify({
+          thoughts: 'write both declared design artifacts',
+          actions: [
+            {
+              tool: 'write_file',
+              args: { path: 'docs/03-detailed-design.md', content: '# Detailed Design\n' },
+            },
+            {
+              tool: 'write_file',
+              args: { path: 'docs/tests/integration-test-plan.md', content: '# Integration Test Plan\n' },
+            },
+          ],
+          done: false,
+        });
+      }
+    }
+    const llm = new DeclarativeWriterLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 3 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'DETAILED_DESIGN',
+        role: 'Architect',
+        tools: ['write_file'],
+        outputs: ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'],
+      },
+      tools: [writeFileTool],
+      ctx: { ...ctx, allowedWrites: ['docs/'] },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(1);
+    expect(llm.calls).toBe(1);
+  });
+
+  it('keeps empty or whitespace-only declared artifacts in the missing-output set', async () => {
+    class EmptyArtifactLLM implements LLMClient {
+      readonly name = 'empty-artifact';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'incorrectly create an empty report',
+          actions: [{ tool: 'write_file', args: { path: 'docs/03-detailed-design.md', content: '\n' } }],
+          done: true,
+        });
+      }
+    }
+    const exec = new StepExecutor({ llm: new EmptyArtifactLLM(), maxRounds: 1 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'DETAILED_DESIGN',
+        role: 'Architect',
+        tools: ['write_file'],
+        outputs: ['docs/03-detailed-design.md'],
+      },
+      tools: [writeFileTool],
+      ctx: { ...ctx, allowedWrites: ['docs/'] },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('missing outputs: docs/03-detailed-design.md');
   });
 
   it('repairs common trailing-comma JSON mistakes so actions still run', async () => {
@@ -1112,6 +1193,52 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.sawRecoveryWarning).toBe(true);
   });
 
+  it('bounds the first recovery inspection round before requiring a mutation', async () => {
+    class BoundedRecoveryLLM implements LLMClient {
+      readonly name = 'bounded-recovery';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect too many files before repairing',
+            actions: Array.from({ length: 9 }, (_, index) => ({
+              tool: 'read_file',
+              args: { path: `src/probe-${index}.py` },
+            })),
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'write the missing output using the bounded evidence',
+          issueResolutionPlan: 'Inspect a bounded source sample, create the missing output, and verify its presence.',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }],
+          done: true,
+        });
+      }
+    }
+    for (let index = 0; index < 9; index++) {
+      await ws.writeFile(`src/probe-${index}.py`, `value = ${index}\n`);
+    }
+    const exec = new StepExecutor({ llm: new BoundedRecoveryLLM(), maxRounds: 2 });
+    const result = await exec.run({
+      step: baseStep,
+      executionRole: 'Debugger',
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        issueId: 'ISSUE-BOUNDED',
+        reason: 'repeated read-only/probe actions without progress for 3 rounds',
+        failureLog: 'previous attempt inspected the whole workspace without creating src/x.py',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.toolCalls.filter((call) => call.tool === 'read_file')).toHaveLength(4);
+    expect(await ws.readFile('src/x.py')).toBe('x = 1\n');
+  });
+
   it('asks the provider chain to reject read-only Debugger turns during recovery mode', async () => {
     class RecoveryValidationLLM implements LLMClient {
       readonly name = 'read-recovery-validation';
@@ -1222,6 +1349,7 @@ describe('StepExecutor system prompt assembly', () => {
           done: false,
         });
         if (this.calls === 1) {
+          expect(options?.validate).toBeUndefined();
           return readOnly;
         }
         this.sawDirectRepairTarget = messages.at(-1)?.content.includes('Direct repair target: required outputs are still missing: docs/05-unit-test.md') ?? false;

@@ -50,7 +50,7 @@ llm:
     #   stream_idle_timeout_ms: 300000
     #   think: false
 
-  # 角色 → provider 数组（兼容单字符串）。
+  # 角色 → provider 数组。即使只有一个 provider，也必须使用数组。
   # 数组里的 provider 按 ScoreStore 有效评分降序使用；有效评分为用户覆盖优先，否则使用动态评分。
   # 默认只启用 OpenRouter；如需本地备选，取消 providers 中对应块注释并加入各角色数组。
   roles:
@@ -63,13 +63,10 @@ llm:
   # 动态评分快照由 XCompiler 自动维护，落盘到同目录的 llm_scores.yaml，请勿手工编辑。
   # 用户手动指定 provider 分数时，请在 config.yaml 同目录创建 llm_scores_user.yaml；
   # 用户文件取值范围：0 表示禁用，0.1～1 表示固定覆盖动态优先级。
-  # 这里仅保留为兼容初始值；旧配置里显式写 0 仍表示用户禁用。
   # tags: [cluster] 的聚合/路由 provider 默认动态评分范围为 0.2～0.5；
   # 可按需调整动态上下限（min 最低 0.1，max 最高 1.0）。用户覆盖文件不受 cluster 动态上限限制。
   cluster_score_min: 0.2
   cluster_score_max: 0.5
-  scores: {}
-
   # 全局 fallback 链：默认不启用本地备选；如已取消 provider 注释，可设为 [local_openai] 或 [local_openai, ollama_code]。
   fallbacks: []
   role_fallbacks: {}
@@ -107,7 +104,6 @@ agent:
           # download-only (default) | full
           #   subprocess cannot enforce network=off; use mode: docker for hard isolation
           #   download-only — outbound HTTP/HTTPS allowed, no inbound port publishing
-          #   pypi-only     — legacy value, rejected because Docker cannot enforce a domain allowlist
           #   full          — also publishes expose_ports to 127.0.0.1 for host-side tests
           network: download-only
           # expose_ports: [8000]
