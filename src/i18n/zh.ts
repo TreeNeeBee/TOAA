@@ -585,6 +585,8 @@ const messages: Messages = {
     runReasonLabel: '  原因: ',
     runFailureLogHeader: '  --- 详细失败日志（tail 40 行） ---',
     runAllDone: (e, total) => `Plan 全部完成（${e}/${total}）`,
+    runPartialDone: (e, total, remaining) =>
+      `指定范围执行完成（${e}/${total}）；Plan 尚未完成，未执行阶段：${remaining}`,
     projectAuditSummary: (errors, warnings) => `项目审计：${errors} 个错误，${warnings} 个警告`,
     projectMemoryRefreshFailed: (message) => `项目记忆刷新失败：${message}`,
     projectAuditCheck: (name, summary) => `[审计:${name}] ${summary}`,
@@ -618,6 +620,13 @@ const messages: Messages = {
     debugResumeNotice: (id, n) => `  ↻ ${id} 检测到上次会话以 FAILED 结束（已累积 ${n} 次尝试），本次首轮直接进入 Debugger 模式。`,
     cachedTestRevalidationNotice: (id, n) =>
       `  ↻ ${id} 检测到历史 FAILED 结果（已累积 ${n} 次尝试），先重新执行当前测试门禁，再决定是否按 V 模型回退。`,
+    cachedTestGateStart: (id, testArgs) =>
+      `  [Engine Gate] ${id} 执行 run_tests${testArgs.length > 0 ? `：${testArgs.join(', ')}` : '：完整测试集'}`,
+    cachedTestGatePassed: (id) => `  [Engine Gate] ${id} 当前测试门禁通过`,
+    cachedTestGateFailed: (id, exitCode, timedOut) =>
+      `  [Engine Gate] ${id} 当前测试门禁失败（exit=${exitCode}${timedOut ? '，超时' : ''}）`,
+    cachedTestArtifactsIncomplete: (id, missing) =>
+      `  [Engine Gate] ${id} 阶段产物不完整，留在当前测试阶段修复：${missing.join(', ')}`,
     testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
       `  ↳ ${testId} ${testPhase} 门禁失败；按 V 模型回退 → ${sourceId} ${sourcePhase} Debugger。`,
     debugResumeInfraRetry: (id, n) => `  ↻ ${id} 上次会话仅留下 LLM 断连/限流等基础设施错误（${n} 次），已清理陈旧 debug 缓存，本次按正常流程重新执行该 Step。`,

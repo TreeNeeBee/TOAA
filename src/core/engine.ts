@@ -84,9 +84,9 @@ export interface EngineOptions {
   skills?: SkillRegistry;
   /** 程序化插件入口；CLI 动态加载器后续只需向该 Host 注入插件。 */
   plugins?: PluginHost;
-  /** 从指定 stepId 开始（之前的 Step 标记为 SKIPPED 并不执行）。 */
+  /** 从指定 stepId 开始；仅允许之前所有必需 Step 已完成，禁止借此跳过失败或未完成阶段。 */
   fromStepId?: string;
-  /** 仅执行指定 phase。 */
+  /** 仅执行指定 phase；该阶段的所有传递依赖仍必须已完成。 */
   onlyPhase?: string;
   /** 仅打印拓扑顺序，不执行。 */
   dryRun?: boolean;
@@ -120,6 +120,8 @@ export interface EngineResult {
   totalSteps: number;
   executedSteps: number;
   failedStepId?: string;
+  /** Internal continuation cursor used when a repaired upstream phase requires downstream V-model reruns. */
+  restartIndex?: number;
   /** 失败 Step 的最终详细日志（reason + tool calls + 健康度）。 */
   failureLog?: string;
   failureReason?: string;
@@ -144,6 +146,8 @@ type AttemptOutcome = {
   ok: boolean;
   failureLog: string;
   reason?: string;
+  /** True when this attempt restored its pre-attempt Git snapshot. */
+  workspaceReverted?: boolean;
   metrics?: ExecutorRunMetrics;
   rollbackToPairedSource?: boolean;
   rollbackTestStepId?: string;
@@ -151,6 +155,12 @@ type AttemptOutcome = {
   evidence?: Record<string, unknown>;
   issueResolutionPlan?: string;
 };
+
+type TestPhaseValidationResult =
+  | { status: 'passed' }
+  | { status: 'failed'; failureLog: string }
+  | { status: 'incomplete'; failureLog: string; missingOutputs: string[] }
+  | { status: 'denied'; failureLog: string };
 
 type LastFailure = {
   reason: string;
@@ -376,6 +386,40 @@ export class PhaseEngine {
     await this.persistPlan(plan);
 
     if (ok) {
+      const repairedIndex = order.findIndex((candidate) => candidate.id === step.id);
+      const iterationId = step.iterationId ?? 'P1';
+      const stepById = new Map(order.map((candidate) => [candidate.id, candidate] as const));
+      const downstream = order.filter(
+        (candidate) =>
+          (candidate.iterationId ?? 'P1') === iterationId &&
+          candidate.id !== step.id &&
+          (
+            PHASE_ORDER[candidate.phase] > PHASE_ORDER[step.phase] ||
+            stepTransitivelyDependsOn(candidate, step.id, stepById)
+          ),
+      );
+      if (downstream.length > 0) {
+        for (const candidate of downstream) {
+          candidate.status = 'PENDING';
+          candidate.retries = 0;
+        }
+        await this.persistPlan(plan);
+        await this.opts.audit.event(
+          'note',
+          `audit repair in ${step.id} requires downstream V-model rerun`,
+          {
+            messageId: 'engine.audit_repair_downstream_reset',
+            repairedStepId: step.id,
+            repairedPhase: step.phase,
+            downstream: downstream.map(stepStateSummary),
+          },
+        );
+        return {
+          totalSteps: order.length,
+          executedSteps: 1,
+          restartIndex: Math.max(0, repairedIndex),
+        };
+      }
       return { totalSteps: order.length, executedSteps: 1 };
     }
     return {
@@ -391,11 +435,58 @@ export class PhaseEngine {
     this.profile = getLanguageProfile(plan.language);
     await this.refreshCurrentProjectMemory(plan);
     const order = topoSort(plan.steps);
+    const stepById = new Map(order.map((step) => [step.id, step] as const));
+    const stopForInvalidTransition = async (
+      failedStepId: string,
+      reason: string,
+      data: Record<string, unknown> = {},
+    ): Promise<EngineResult> => {
+      this.lastFailure = { reason, failureLog: reason };
+      await this.opts.audit.event('note', reason, {
+        messageId: 'engine.invalid_step_transition',
+        failedStepId,
+        ...data,
+      });
+      return {
+        totalSteps: order.length,
+        executedSteps: 0,
+        failedStepId,
+        failureReason: reason,
+        failureLog: reason,
+      };
+    };
     if (this.opts.dryRun) {
       for (const s of order) {
         this.log(`  ${chalk.cyan(s.id.padEnd(5))} ${chalk.yellow(s.phase.padEnd(11))} ${s.title}`);
       }
       return { totalSteps: order.length, executedSteps: 0 };
+    }
+    const fromIndex = this.opts.fromStepId
+      ? order.findIndex((step) => step.id === this.opts.fromStepId)
+      : 0;
+    if (this.opts.fromStepId && fromIndex < 0) {
+      return stopForInvalidTransition(
+        this.opts.fromStepId,
+        `cannot start from unknown step ${this.opts.fromStepId}`,
+      );
+    }
+    if (this.opts.fromStepId) {
+      const bypassed = order.slice(0, fromIndex).filter((step) => step.status !== 'DONE');
+      if (bypassed.length > 0) {
+        return stopForInvalidTransition(
+          bypassed[0]!.id,
+          `cannot start from ${this.opts.fromStepId}: earlier required steps are incomplete: ` +
+            bypassed.map((step) => `${step.id}=${step.status}`).join(', '),
+          { fromStepId: this.opts.fromStepId, incompleteSteps: bypassed.map(stepStateSummary) },
+        );
+      }
+    }
+    if (this.opts.onlyPhase && !order.some((step) => step.phase === this.opts.onlyPhase)) {
+      return stopForInvalidTransition(
+        `PHASE_${this.opts.onlyPhase}`,
+        `cannot run unknown or absent phase ${this.opts.onlyPhase}`,
+        { onlyPhase: this.opts.onlyPhase },
+      );
     }
 
     await this.requireEnginePermission({
@@ -439,16 +530,31 @@ export class PhaseEngine {
       }
     }
 
-    let started = !this.opts.fromStepId;
     let executed = 0;
     for (let index = 0; index < order.length; index += 1) {
       const step = order[index]!;
-      if (!started && step.id !== this.opts.fromStepId) {
-        if (step.status !== 'DONE') step.status = 'SKIPPED';
-        continue;
-      }
-      started = true;
+      if (index < fromIndex) continue;
       if (this.opts.onlyPhase && step.phase !== this.opts.onlyPhase) continue;
+      const blockers = incompleteTransitiveDependencies(step, stepById);
+      if (blockers.length > 0) {
+        const reason =
+          `cannot execute or accept ${step.id} ${step.phase}: dependency chain is incomplete: ` +
+          blockers.map((dependency) => `${dependency.id}=${dependency.status}`).join(', ');
+        this.lastFailure = { reason, failureLog: reason };
+        await this.opts.audit.event('note', reason, {
+          messageId: 'engine.step_blocked_incomplete_dependencies',
+          stepId: step.id,
+          phase: step.phase,
+          dependencies: blockers.map(stepStateSummary),
+        });
+        return {
+          totalSteps: order.length,
+          executedSteps: executed,
+          failedStepId: step.id,
+          failureReason: reason,
+          failureLog: reason,
+        };
+      }
       if (step.status === 'DONE') {
         this.log(chalk.gray(t().engine.stepSkipDone(step.id, step.phase)));
         continue;
@@ -543,6 +649,30 @@ export class PhaseEngine {
             failureReason: gate.failureReason,
           };
         }
+        if (gate.restartIndex !== undefined) {
+          index = gate.restartIndex;
+          continue;
+        }
+      }
+    }
+    if (!this.opts.onlyPhase) {
+      const incomplete = order.filter((step) => step.status !== 'DONE');
+      if (incomplete.length > 0) {
+        const reason =
+          'execution order ended with incomplete required steps: ' +
+          incomplete.map((step) => `${step.id}=${step.status}`).join(', ');
+        this.lastFailure = { reason, failureLog: reason };
+        await this.opts.audit.event('note', reason, {
+          messageId: 'engine.plan_incomplete_after_run',
+          steps: incomplete.map(stepStateSummary),
+        });
+        return {
+          totalSteps: order.length,
+          executedSteps: executed,
+          failedStepId: incomplete[0]!.id,
+          failureReason: reason,
+          failureLog: reason,
+        };
       }
     }
     return { totalSteps: order.length, executedSteps: executed };
@@ -950,6 +1080,7 @@ export class PhaseEngine {
       contextMode: 'iteration-gate',
     });
     if (repair.failedStepId) return repair;
+    if (repair.restartIndex !== undefined) return repair;
 
     auditResult = await runIterationGate({
       ws: this.opts.ws,
@@ -1068,7 +1199,10 @@ export class PhaseEngine {
 
     for (const step of order) {
       if ((step.iterationId ?? 'P1') !== iterationId) continue;
-      if (PHASE_ORDER[step.phase] <= PHASE_ORDER[sourcePhase]) continue;
+      if (step.id === sourceStep.id) continue;
+      const isLaterPhase = PHASE_ORDER[step.phase] > PHASE_ORDER[sourcePhase];
+      const dependsOnSource = stepTransitivelyDependsOn(step, sourceStep.id, stepById);
+      if (!isLaterPhase && !dependsOnSource) continue;
       if (step.status === 'PENDING') continue;
       step.status = 'PENDING';
       step.retries = 0;
@@ -1123,9 +1257,43 @@ export class PhaseEngine {
 
     await this.debugCache.markDone(routedTest.id);
     if (routedTest.id !== failedTest.id) await this.debugCache.markDone(failedTest.id);
-    const repairedTestValidation = await this.validateTestPhaseWithoutRegeneration(plan, routedTest);
-    const restartFrom = repairedTestValidation.status === 'passed' ? routedTest : sourceStep;
-    const restartIndex = Math.max(0, order.findIndex((step) => step.id === restartFrom.id));
+    const sourceIndex = order.findIndex((step) => step.id === sourceStep.id);
+    const routedTestIndex = order.findIndex((step) => step.id === routedTest.id);
+    const interveningSteps = sourceIndex >= 0 && routedTestIndex > sourceIndex
+      ? order
+          .slice(sourceIndex + 1, routedTestIndex)
+          .filter((step) => (step.iterationId ?? 'P1') === iterationId)
+      : [];
+    if (interveningSteps.length === 0) {
+      const repairedTestValidation = await this.validateTestPhaseWithoutRegeneration(plan, routedTest);
+      if (repairedTestValidation.status === 'denied') {
+        const failureReason = `${routedTest.phase} revalidation was denied after ${sourceStep.id} repair`;
+        this.lastFailure = {
+          reason: failureReason,
+          failureLog: repairedTestValidation.failureLog,
+        };
+        return {
+          ok: false,
+          totalSteps: order.length,
+          executedSteps: 1,
+          failedStepId: routedTest.id,
+          failureReason,
+          failureLog: repairedTestValidation.failureLog,
+        };
+      }
+    } else {
+      await this.opts.audit.event(
+        'note',
+        `deferred ${routedTest.id} validation until intervening V-model steps rerun`,
+        {
+          messageId: 'engine.rollback_validation_deferred',
+          sourceStepId: sourceStep.id,
+          routedTestStepId: routedTest.id,
+          interveningSteps: interveningSteps.map(stepStateSummary),
+        },
+      );
+    }
+    const restartIndex = Math.max(0, sourceIndex);
     return {
       ok: true,
       totalSteps: order.length,
@@ -1137,21 +1305,36 @@ export class PhaseEngine {
   private async validateTestPhaseWithoutRegeneration(
     plan: Plan,
     step: Step,
-  ): Promise<{ status: 'passed' | 'failed' | 'skipped'; failureLog?: string }> {
-    if (!this.isVModelTestPhase(step.phase)) return { status: 'skipped' };
+  ): Promise<TestPhaseValidationResult> {
+    if (!this.isVModelTestPhase(step.phase)) {
+      return {
+        status: 'denied',
+        failureLog: `${step.id} ${step.phase} is not a V-model test phase and cannot run test revalidation.`,
+      };
+    }
+    const testArgs = this.testGateArgsForStep(step);
     const missing: string[] = [];
     for (const out of step.outputs) {
       if (out.endsWith('/')) continue;
       if (!(await this.opts.ws.exists(out))) missing.push(out);
     }
+    const missingTestOutputs = missing
+      .map((out) => normalizeGitPath(out))
+      .filter(isTestFilePath);
     if (missing.length > 0) {
-      await this.opts.audit.event('note', `rollback validation skipped for ${step.id}: missing outputs ${missing.join(', ')}`, {
+      await this.opts.audit.event('note', `rollback validation found missing outputs for ${step.id}: ${missing.join(', ')}`, {
         messageId: 'engine.rollback_validation_missing_outputs',
         stepId: step.id,
         phase: step.phase,
         missing,
+        missingTestOutputs,
+        testGateRunnable: missingTestOutputs.length === 0,
       });
-      return { status: 'skipped' };
+      if (missingTestOutputs.length > 0) {
+        const failureLog = renderIncompleteTestPhaseFailure(step, missing);
+        this.log(chalk.yellow(t().engine.cachedTestArtifactsIncomplete(step.id, missing)));
+        return { status: 'incomplete', failureLog, missingOutputs: missing };
+      }
     }
 
     await this.profile.ensureTestBootstrap?.(this.opts.ws, this.opts.audit);
@@ -1174,12 +1357,25 @@ export class PhaseEngine {
         phase: step.phase,
         reason: testPermission.reason,
       });
-      return { status: 'skipped' };
+      return {
+        status: 'denied',
+        failureLog:
+          `permission denied for test revalidation ${step.id}` +
+          (testPermission.reason ? `: ${testPermission.reason}` : ''),
+      };
     }
 
-    const testArgs = this.testGateArgsForStep(step);
+    this.log(chalk.gray(t().engine.cachedTestGateStart(step.id, testArgs)));
+    await this.opts.audit.event('note', `running current test gate for ${step.id}`, {
+      messageId: 'engine.rollback_validation_started',
+      stepId: step.id,
+      phase: step.phase,
+      testArgs,
+      missingNonTestOutputs: missing,
+    });
     const tests = await this.opts.sandbox.runTests(testArgs, {});
     if (tests.exitCode !== 0 || tests.timedOut) {
+      this.log(chalk.red(t().engine.cachedTestGateFailed(step.id, tests.exitCode, !!tests.timedOut)));
       await this.opts.audit.event('note', `rollback validation failed for ${step.id}`, {
         messageId: 'engine.rollback_validation_failed',
         stepId: step.id,
@@ -1195,6 +1391,7 @@ export class PhaseEngine {
         failureLog: renderTestValidationFailure(step, testArgs, tests),
       };
     }
+    this.log(chalk.green(t().engine.cachedTestGatePassed(step.id)));
 
     if (step.phase === 'FUNCTIONAL_TEST') {
       const probePermission = await this.requestEnginePermission({
@@ -1214,7 +1411,12 @@ export class PhaseEngine {
           phase: step.phase,
           reason: probePermission.reason,
         });
-        return { status: 'skipped' };
+        return {
+          status: 'denied',
+          failureLog:
+            `permission denied for functional probe revalidation ${step.id}` +
+            (probePermission.reason ? `: ${probePermission.reason}` : ''),
+        };
       }
       const probe = await this.profile.probeEntry(this.opts.ws, this.opts.sandbox);
       if (!probe.ok) {
@@ -1239,6 +1441,19 @@ export class PhaseEngine {
           ].filter(Boolean).join('\n'),
         };
       }
+    }
+
+    if (missing.length > 0) {
+      const failureLog = renderIncompleteTestPhaseFailure(step, missing);
+      this.log(chalk.yellow(t().engine.cachedTestArtifactsIncomplete(step.id, missing)));
+      await this.opts.audit.event('note', `current test gate passed but ${step.id} outputs are incomplete`, {
+        messageId: 'engine.rollback_validation_incomplete_outputs',
+        stepId: step.id,
+        phase: step.phase,
+        testArgs,
+        missing,
+      });
+      return { status: 'incomplete', failureLog, missingOutputs: missing };
     }
 
     step.status = 'DONE';
@@ -1281,13 +1496,31 @@ export class PhaseEngine {
     const hadUnresolved = this.debugCache.hasUnresolvedFailure(step.id);
     const preserveCachedTestOutputs =
       !initialDebug && hadUnresolved && this.isVModelTestPhase(step.phase);
-    // 阶段产物归档：在首次尝试前，将本 Step outputs 中已存在的 docs/* 文件移至 docs/history/
-    // 历史测试失败恢复必须先复验当前产物；归档会让 required outputs 暂时缺失并绕过复验。
-    if (!opts.skipOutputArchive && !preserveCachedTestOutputs) {
-      for (const out of step.outputs) {
-        await archiveIfExists(this.opts.ws, out, this.opts.audit);
+    // 归档属于一次尝试的工作区事务：快照必须先于归档。若该尝试回滚，
+    // 下一次 Debugger 尝试会重新归档恢复后的旧产物；保留增量修复时则不重复归档。
+    let archiveOutputsOnNextAttempt =
+      !opts.skipOutputArchive && !preserveCachedTestOutputs;
+    const runAttempt = async (debug?: DebugAttemptContext): Promise<AttemptOutcome> => {
+      const archiveOutputs = archiveOutputsOnNextAttempt;
+      const hadArchivableOutput = archiveOutputs && (
+        await Promise.all(
+          step.outputs.map(async (output) => {
+            const normalized = output.replaceAll('\\', '/');
+            return (
+              normalized.startsWith('docs/') &&
+              !normalized.startsWith('docs/history/') &&
+              await this.opts.ws.exists(normalized)
+            );
+          }),
+        )
+      ).some(Boolean);
+      archiveOutputsOnNextAttempt = false;
+      const outcome = await this.runOneAttempt(plan, step, debug, { archiveOutputs });
+      if (hadArchivableOutput && outcome.workspaceReverted) {
+        archiveOutputsOnNextAttempt = true;
       }
-    }
+      return outcome;
+    };
     // 测试 / DEBUG 阶段：语言相关的测试前置（Python 写 tests/conftest.py 注入 sys.path；
     // TypeScript 无需）。解决 LLM 反复生成无法被测试框架解析的 import 问题。
     if (this.isVModelTestPhase(step.phase) || step.phase === 'DEBUG') {
@@ -1311,7 +1544,7 @@ export class PhaseEngine {
     let initial: Awaited<ReturnType<PhaseEngine['runOneAttempt']>>;
     try {
       if (initialDebug) {
-        initial = await this.runOneAttempt(plan, step, {
+        initial = await runAttempt({
           asDebugger: true,
           failureLog: rootDebugFailureLog ?? initialDebug.failureLog,
           reason: initialDebug.reason,
@@ -1338,7 +1571,7 @@ export class PhaseEngine {
           this.log(chalk.yellow(t().engine.debugResumeInfraRetry(step.id, attempts.length)));
           await this.debugCache.markDone(step.id);
           priorPrompt = '';
-          initial = await this.runOneAttempt(plan, step);
+          initial = await runAttempt();
         } else {
           if (this.isVModelTestPhase(step.phase)) {
             if (
@@ -1346,7 +1579,7 @@ export class PhaseEngine {
               isCachedTestArtifactRegressionAfterPassingVerification(step, resumeFailureLog)
             ) {
               this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
-              initial = await this.runOneAttempt(plan, step, {
+              initial = await runAttempt({
                 asDebugger: true,
                 failureLog: resumeFailureLog,
                 reason: resume.reason,
@@ -1373,14 +1606,39 @@ export class PhaseEngine {
                     staleFailureCleared: true,
                   },
                 };
+              } else if (validation.status === 'incomplete') {
+                const reason =
+                  `${step.phase} required artifacts are incomplete; ` +
+                  'repairing the current test phase without rolling back source implementation.';
+                await this.debugCache.markDone(step.id);
+                priorPrompt = '';
+                initial = await runAttempt({
+                  asDebugger: true,
+                  failureLog: validation.failureLog,
+                  reason,
+                  extraAllowedWrites: inheritedExtraAllowedWrites,
+                  testScopeArgs: this.testGateArgsForStep(step),
+                  issueId: activeIssueId,
+                  completedBeforeDebug,
+                });
+              } else if (validation.status === 'denied') {
+                const reason = `${step.phase} cached failure could not be revalidated because permission was denied.`;
+                initial = {
+                  ok: false,
+                  failureLog: validation.failureLog,
+                  reason,
+                  issueKind: 'infrastructure',
+                  evidence: {
+                    stage: 'cached-test-revalidation',
+                    permissionDenied: true,
+                    attempts: attempts.length,
+                  },
+                };
               } else {
                 const reason =
-                  validation.status === 'failed'
-                    ? `${step.phase} cached failure was reproduced by the current test gate; ` +
-                      'rolling back to the paired V-model source phase.'
-                    : `${step.phase} had an unresolved failure from a previous run; ` +
-                      'rolling back to the paired V-model source phase instead of resuming same-phase Debugger.';
-                const currentFailureLog = validation.failureLog ?? resumeFailureLog;
+                  `${step.phase} cached failure was reproduced by the current test gate; ` +
+                  'rolling back to the paired V-model source phase.';
+                const currentFailureLog = validation.failureLog;
                 const ownerTestStep = this.findOwningTestStepForFailure(plan, step, currentFailureLog);
                 initial = {
                   ok: false,
@@ -1400,7 +1658,7 @@ export class PhaseEngine {
             }
           } else {
             this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
-            initial = await this.runOneAttempt(plan, step, {
+            initial = await runAttempt({
               asDebugger: true,
               failureLog: resumeFailureLog,
               reason: resume.reason,
@@ -1414,7 +1672,7 @@ export class PhaseEngine {
           }
         }
       } else {
-        initial = await this.runOneAttempt(plan, step);
+        initial = await runAttempt();
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -1540,7 +1798,7 @@ export class PhaseEngine {
         const retryFailureLog = rootDebugFailureLog
           ? composeDebugRetryFailureLog(rootDebugFailureLog, retryBaseLog, lastReason)
           : retryBaseLog;
-        r = await this.runOneAttempt(plan, step, {
+        r = await runAttempt({
           asDebugger: true,
           failureLog: retryFailureLog,
           reason: lastReason,
@@ -1947,6 +2205,7 @@ export class PhaseEngine {
     plan: Plan,
     step: Step,
     debug?: DebugAttemptContext,
+    attemptOpts: { archiveOutputs?: boolean } = {},
   ): Promise<AttemptOutcome> {
     const role = debug ? 'Debugger' : step.role;
     await this.plugins.emit('step.attempt.before', {
@@ -1957,7 +2216,7 @@ export class PhaseEngine {
       retry: step.retries,
     });
     try {
-      const outcome = await this.runOneAttemptCore(plan, step, debug);
+      const outcome = await this.runOneAttemptCore(plan, step, debug, attemptOpts);
       if (debug && !outcome.ok) {
         await this.recordDebugWikiFailure(step, debug, outcome);
       }
@@ -1995,6 +2254,7 @@ export class PhaseEngine {
     plan: Plan,
     step: Step,
     debug?: DebugAttemptContext,
+    attemptOpts: { archiveOutputs?: boolean } = {},
   ): Promise<AttemptOutcome> {
     const role = debug ? 'Debugger' : step.role;
     // 解析 step.tools 中的 skill: 引用为底层工具名
@@ -2068,7 +2328,7 @@ export class PhaseEngine {
 
     let executor: StepExecutor;
     let ctxSnippets: Array<{ path: string; content: string }>;
-    let sha: string;
+    let sha = '';
     try {
       const llm = this.opts.router.for(role);
       const baseRounds = this.opts.maxRoundsPerStep ?? 6;
@@ -2105,6 +2365,11 @@ export class PhaseEngine {
       step.status = 'RUNNING';
       await this.persistPlan(plan);
       sha = await this.opts.git.snapshot(step.id, step.retries, debug ? 'debug retry' : 'before');
+      if (attemptOpts.archiveOutputs) {
+        for (const out of step.outputs) {
+          await archiveIfExists(this.opts.ws, out, this.opts.audit);
+        }
+      }
       await this.opts.audit.event('phase.start', t().engine.phaseStart(step.id, debug ? 'DEBUG' : step.phase, step.title), {
         messageId: 'engine.phase_start',
         role,
@@ -2115,18 +2380,33 @@ export class PhaseEngine {
     } catch (err) {
       const msg = (err as Error).message;
       const stack = (err as Error).stack ?? msg;
+      let workspaceReverted = false;
+      let rollbackError: string | undefined;
+      if (sha) {
+        try {
+          await this.opts.git.revertTo(sha);
+          workspaceReverted = true;
+        } catch (rollbackErr) {
+          rollbackError = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        }
+      }
+      const failureLog = rollbackError
+        ? `${stack}\nGit rollback failed: ${rollbackError}`
+        : stack;
       await this.opts.audit.event('phase.end', t().engine.phaseException(step.id, msg), {
         messageId: 'engine.phase_exception',
         error: msg,
         stack,
+        rollbackError,
         stage: 'attempt-preparation',
         role,
         retry: step.retries,
       });
       return {
         ok: false,
-        failureLog: stack,
+        failureLog,
         reason: msg,
+        workspaceReverted,
         issueKind: 'exception',
         evidence: { stage: 'attempt-preparation', role },
       };
@@ -2200,6 +2480,7 @@ export class PhaseEngine {
           ok: false,
           failureLog,
           reason,
+          workspaceReverted: true,
           metrics: r.metrics,
           rollbackToPairedSource: true,
           issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
@@ -2234,6 +2515,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: true,
               metrics: r.metrics,
               issueKind: 'architecture-gate',
               evidence: { missingTokens },
@@ -2268,6 +2550,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: false,
               metrics: r.metrics,
               issueKind: 'infrastructure',
               evidence: { stage: 'code-validation', permissionDenied: true, command: command.display },
@@ -2302,6 +2585,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: false,
               metrics: r.metrics,
               issueKind: 'phase',
               evidence: {
@@ -2340,6 +2624,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: true,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
@@ -2373,6 +2658,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: true,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               rollbackTestStepId: ownerTestStep?.id,
@@ -2417,6 +2703,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: true,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               issueKind: 'functional-gate',
@@ -2450,6 +2737,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: true,
               metrics: r.metrics,
               rollbackToPairedSource: true,
               issueKind: 'functional-gate',
@@ -2486,6 +2774,7 @@ export class PhaseEngine {
               ok: false,
               failureLog,
               reason,
+              workspaceReverted: true,
               metrics: r.metrics,
               issueKind: 'phase',
               evidence: { completedBeforeDebug: true, repairRequired: true },
@@ -2560,7 +2849,15 @@ export class PhaseEngine {
       } else {
         await this.opts.git.revertTo(sha);
       }
-      return { ok: false, failureLog, reason, metrics: m, issueKind: 'phase', issueResolutionPlan: r.issueResolutionPlan };
+      return {
+        ok: false,
+        failureLog,
+        reason,
+        workspaceReverted: !debug,
+        metrics: m,
+        issueKind: 'phase',
+        issueResolutionPlan: r.issueResolutionPlan,
+      };
     } catch (err) {
       const msg = (err as Error).message;
       const stack = (err as Error).stack ?? msg;
@@ -2568,8 +2865,27 @@ export class PhaseEngine {
       await this.opts.audit.event('phase.end', t().engine.phaseException(step.id, msg), {
         messageId: 'engine.phase_exception', error: msg, stack,
       });
-      await this.opts.git.revertTo(sha).catch(() => {});
-      return { ok: false, failureLog: stack, reason: msg, issueKind: 'exception' };
+      let workspaceReverted = false;
+      let rollbackError: string | undefined;
+      try {
+        await this.opts.git.revertTo(sha);
+        workspaceReverted = true;
+      } catch (rollbackErr) {
+        rollbackError = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+        await this.opts.audit.event('phase.end', `Git rollback failed for ${step.id}: ${rollbackError}`, {
+          messageId: 'engine.git_rollback_failed',
+          stepId: step.id,
+          snapshot: sha,
+          rollbackError,
+        });
+      }
+      return {
+        ok: false,
+        failureLog: rollbackError ? `${stack}\nGit rollback failed: ${rollbackError}` : stack,
+        reason: msg,
+        workspaceReverted,
+        issueKind: 'exception',
+      };
     } finally {
       void path;
     }
@@ -2821,8 +3137,7 @@ export function shouldRunCodeValidation(plan: Plan, current: Step): boolean {
     step.id !== current.id &&
     step.phase === 'CODE' &&
     (step.iterationId ?? 'P1') === iterationId &&
-    step.status !== 'DONE' &&
-    step.status !== 'SKIPPED',
+    step.status !== 'DONE',
   );
 }
 
@@ -3115,6 +3430,7 @@ function isNonDebuggableInfrastructureFailure(reason?: string, failureLog?: stri
   return (
     /sandbox dependency install failed|npm dependency install failed|pip install failed/u.test(text) ||
     /permission denied for code validation/u.test(text) ||
+    /permission denied for (?:test|functional probe) revalidation/u.test(text) ||
     /typeerror:\s*fetch failed/u.test(text) ||
 	    /(?:openai|ollama) http (?:401|403|408|409|429|5\d\d)\b/u.test(text) ||
     /rate limit exceeded|free-models-per-day|retry_after_seconds|retry-after/u.test(text) ||
@@ -3187,6 +3503,14 @@ function renderTestValidationFailure(
     `run_tests args=${testArgs.join(' ')} exit=${result.exitCode} timedOut=${result.timedOut}`,
     evidence,
   ].filter(Boolean).join('\n');
+}
+
+function renderIncompleteTestPhaseFailure(step: Step, missingOutputs: string[]): string {
+  return [
+    `${step.phase} ${step.id} has incomplete required outputs.`,
+    `missing outputs: ${missingOutputs.join(', ')}`,
+    'Repair the missing test-phase artifacts in the current step. Do not change source implementation unless a current test gate reproduces a source failure.',
+  ].join('\n');
 }
 
 export function shouldRollbackTestPhaseFailure(reason?: string, failureLog?: string): boolean {
@@ -3299,6 +3623,19 @@ function stepTransitivelyDependsOn(
     if (dep) stack.push(...dep.dependsOn);
   }
   return false;
+}
+
+function incompleteTransitiveDependencies(step: Step, byId: Map<string, Step>): Step[] {
+  const found: Step[] = [];
+  for (const candidate of byId.values()) {
+    if (candidate.status === 'DONE') continue;
+    if (stepTransitivelyDependsOn(step, candidate.id, byId)) found.push(candidate);
+  }
+  return found;
+}
+
+function stepStateSummary(step: Step): Pick<Step, 'id' | 'phase' | 'status'> {
+  return { id: step.id, phase: step.phase, status: step.status };
 }
 
 function inferRepairMode(

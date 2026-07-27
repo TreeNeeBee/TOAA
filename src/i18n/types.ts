@@ -320,6 +320,7 @@ export interface Messages {
     runReasonLabel: string;
     runFailureLogHeader: string;
     runAllDone: (executed: number, total: number) => string;
+    runPartialDone: (executed: number, total: number, remaining: string) => string;
     projectAuditSummary: (errors: number, warnings: number) => string;
     projectMemoryRefreshFailed: (message: string) => string;
     projectAuditCheck: (name: string, summary: string) => string;
@@ -347,6 +348,10 @@ export interface Messages {
     autoFixedSrcImports: (n: number, files: string) => string;
     debugResumeNotice: (id: string, n: number) => string;
     cachedTestRevalidationNotice: (id: string, n: number) => string;
+    cachedTestGateStart: (id: string, testArgs: string[]) => string;
+    cachedTestGatePassed: (id: string) => string;
+    cachedTestGateFailed: (id: string, exitCode: number, timedOut: boolean) => string;
+    cachedTestArtifactsIncomplete: (id: string, missing: string[]) => string;
     testRollbackNotice: (testId: string, testPhase: string, sourceId: string, sourcePhase: string) => string;
     debugResumeInfraRetry: (id: string, n: number) => string;
     spinDebugRetry: (id: string, attempt: number, budget: number, cap: number, reason: string) => string;

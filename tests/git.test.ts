@@ -61,4 +61,58 @@ describe('GitService', () => {
     expect(tracked).not.toContain('.sandbox/test/bin/python');
     await expect(ws.exists('.sandbox/test/bin/python')).resolves.toBe(true);
   });
+
+  it('keeps runtime audit and debug evidence across source rollback', async () => {
+    await git.ensureRepo();
+    await ws.writeFile('src/main.ts', 'export const value = 1;\n');
+    await ws.writeFile('.xcompiler/audit.jsonl', '{"event":"before"}\n');
+    await ws.writeFile('.xcompiler/issues/ISSUE-1.json', '{"status":"open"}\n');
+    await ws.writeFile('.xcompiler/debug-wiki/external/entry.md', '# before\n');
+    await ws.writeFile('logs/run.log', 'before\n');
+    await ws.writeFile('docs/process_log.md', '# before\n');
+    await ws.writeFile('sample.xc', '{"status":"RUNNING"}\n');
+    const sha = await git.snapshot('S001', 0, 'before failed attempt');
+
+    await ws.writeFile('src/main.ts', 'export const value = 2;\n');
+    await ws.writeFile('.xcompiler/audit.jsonl', '{"event":"after"}\n');
+    await ws.writeFile('.xcompiler/issues/ISSUE-1.json', '{"status":"resolved"}\n');
+    await ws.writeFile('.xcompiler/debug-wiki/external/entry.md', '# after\n');
+    await ws.writeFile('logs/run.log', 'after\n');
+    await ws.writeFile('docs/process_log.md', '# after\n');
+    await ws.writeFile('sample.xc', '{"status":"FAILED"}\n');
+
+    await git.revertTo(sha);
+
+    expect(await ws.readFile('src/main.ts')).toContain('value = 1');
+    expect(await ws.readFile('.xcompiler/audit.jsonl')).toContain('"after"');
+    expect(await ws.readFile('.xcompiler/issues/ISSUE-1.json')).toContain('resolved');
+    expect(await ws.readFile('.xcompiler/debug-wiki/external/entry.md')).toContain('# after');
+    expect(await ws.readFile('logs/run.log')).toBe('after\n');
+    expect(await ws.readFile('docs/process_log.md')).toBe('# after\n');
+    expect(await ws.readFile('sample.xc')).toContain('FAILED');
+
+    const tracked = await git.raw().raw(['ls-files']);
+    expect(tracked).toContain('.xcompiler/.gitkeep');
+    expect(tracked).not.toContain('.xcompiler/audit.jsonl');
+    expect(tracked).not.toContain('.xcompiler/issues/ISSUE-1.json');
+    expect(tracked).not.toContain('logs/run.log');
+    expect(tracked).not.toContain('docs/process_log.md');
+    expect(tracked).not.toContain('sample.xc');
+  });
+
+  it('untracks previously committed runtime metadata without deleting it', async () => {
+    await git.ensureRepo();
+    await ws.writeFile('.xcompiler/audit.jsonl', '{"event":"tracked"}\n');
+    await ws.writeFile('logs/run.log', 'tracked\n');
+    await git.raw().raw(['add', '-f', '.xcompiler/audit.jsonl', 'logs/run.log']);
+    await git.raw().commit('track runtime metadata');
+
+    await git.snapshot('S002', 0, 'detach runtime metadata');
+
+    const tracked = await git.raw().raw(['ls-files']);
+    expect(tracked).not.toContain('.xcompiler/audit.jsonl');
+    expect(tracked).not.toContain('logs/run.log');
+    await expect(ws.exists('.xcompiler/audit.jsonl')).resolves.toBe(true);
+    await expect(ws.exists('logs/run.log')).resolves.toBe(true);
+  });
 });

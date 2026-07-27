@@ -146,6 +146,8 @@ export class StepExecutor {
     const toolDocs = inp.tools
       .map((t) => `- ${t.name}: ${describeToolForStep(t, inp.ctx, inp.step)} args=${JSON.stringify(t.argsSchema)}`)
       .join('\n');
+    const initialVerify = await verifyOutputs(inp);
+    const initialMissingOutputs = initialVerify.missing;
     const skillBlock =
       inp.skillHints && inp.skillHints.length > 0
         ? '\n\n可用 Skill 提示:\n' + inp.skillHints.map((h) => '- ' + h).join('\n')
@@ -158,7 +160,7 @@ export class StepExecutor {
         ? t().prompts.executorGlobalBlock(inp.globalPrompt.trim())
         : '';
     const stepBlock = t().prompts.executorStepBlock(inp.step.systemPrompt.trim());
-    const userPrompt = renderUserPrompt(inp, toolDocs);
+    const userPrompt = renderUserPrompt(inp, toolDocs, initialMissingOutputs);
     const profile = inp.languageProfile ?? getLanguageProfile('python');
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
@@ -170,7 +172,6 @@ export class StepExecutor {
     let issueResolutionPlan: string | undefined;
 
     // 健康度信号采集
-    const initialVerify = await verifyOutputs(inp);
     const initialMissing = initialVerify.missing.length;
     const hardRoundLimit = Math.max(maxRounds, maxRounds + Math.min(12, Math.max(4, initialMissing * 2)));
     let lastMissingCount = initialMissing;
@@ -236,7 +237,9 @@ export class StepExecutor {
                 `- ${tool.name}: ${describeToolForStep(tool, inp.ctx, inp.step)} args=${JSON.stringify(tool.argsSchema)}`,
               )
               .join('\n');
-            if (messages[1]) messages[1].content = renderUserPrompt(inp, refreshedToolDocs);
+            if (messages[1]) {
+              messages[1].content = renderUserPrompt(inp, refreshedToolDocs, initialMissingOutputs);
+            }
             chatOptions.maxTokens = inp.ctx.responseTokenBudget;
             rep.reset();
             rep.setModel(`${name}/${model}`);
@@ -667,7 +670,7 @@ export class StepExecutor {
                 targets: actions.flatMap((action) => actionTargetPaths(action.tool, action.args)).join(', '),
               }
             : undefined,
-          missingOutputStallWarning: missingOutputStallRounds >= MISSING_OUTPUT_STALL_ROUND_LIMIT - 1 && !verify.ok
+          missingOutputStallWarning: missingOutputStallRounds >= 1 && !verify.ok
             ? {
                 rounds: missingOutputStallRounds,
                 missing: verify.missing.join(', '),
@@ -758,6 +761,7 @@ function hasActionableDebuggerFailure(debugContext: ExecutorRunInput['debugConte
   return /content must be a string/i.test(text) ||
     /invalid (?:write_file|append_file|replace_in_file|apply_patch) args/i.test(text) ||
     /outputs?\s+(?:still\s+missing|missing)/i.test(text) ||
+    /missing\s+(?:required\s+)?outputs?/i.test(text) ||
     /outputs?\s*(?:仍缺失|缺失)/u.test(text) ||
     /仍缺失[:：]/u.test(text);
 }
@@ -792,7 +796,7 @@ function isOutputCompletionFailure(reason = '', failureLog = ''): boolean {
   const text = `${reason}\n${failureLog}`;
   return /max rounds exceeded without satisfying outputs/i.test(text) ||
     /outputs?\s+(?:still\s+)?missing/i.test(text) ||
-    /missing\s+required\s+outputs?/i.test(text) ||
+    /missing\s+(?:required\s+)?outputs?/i.test(text) ||
     /outputs?\s*仍缺失/u.test(text) ||
     /仍缺失[:：]/u.test(text);
 }
@@ -1434,7 +1438,11 @@ export async function verifyOutputs(inp: ExecutorRunInput): Promise<{ ok: boolea
   return { ok: missing.length === 0, missing };
 }
 
-function renderUserPrompt(inp: ExecutorRunInput, toolDocs: string): string {
+function renderUserPrompt(
+  inp: ExecutorRunInput,
+  toolDocs: string,
+  initialMissingOutputs: string[] = [],
+): string {
   const role = inp.executionRole ?? inp.step.role;
   const compactContext = !!inp.debugContext;
   const snippetLimit = compactContext ? 900 : 2200;
@@ -1453,12 +1461,23 @@ function renderUserPrompt(inp: ExecutorRunInput, toolDocs: string): string {
         inp.debugContext.suggestions ? `\n${inp.debugContext.suggestions}\n` : '',
       ].join('\n')
     : '';
+  const missingOutputPriority = initialMissingOutputs.length > 0
+    ? [
+        '## highest-priority required-output gate',
+        'The following exact required outputs are missing at this attempt start:',
+        initialMissingOutputs.map((output) => `- ${output}`).join('\n'),
+        'Create these exact paths before rewriting outputs that already exist. ' +
+          'A write/progress round that does not reduce this list is not progress.',
+        '',
+      ].join('\n')
+    : '';
   return [
     `# Step ${inp.step.id} — ${inp.step.title}`,
     `phase: ${inp.step.phase}`,
     `role: ${role}`,
     `acceptance: ${inp.step.acceptance}`,
     '',
+    missingOutputPriority,
     '## description',
     inp.step.description,
     '',

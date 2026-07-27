@@ -353,6 +353,47 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       await runtimeResult(io, 'run', 'failed', { failedStepId: r.failedStepId, exitCode: 4 });
       return { status: 'failed', engine: r, message: r.failureReason, exitCode: 4 };
     }
+    const incompleteSteps = plan.steps.filter((step) => step.status !== 'DONE');
+    if (!opts.onlyPhase && incompleteSteps.length > 0) {
+      const failedStepId = incompleteSteps[0]!.id;
+      const reason =
+        'runtime refused to complete an incomplete plan: ' +
+        incompleteSteps.map((step) => `${step.id}=${step.status}`).join(', ');
+      r = {
+        ...r,
+        failedStepId,
+        failureReason: reason,
+        failureLog: reason,
+      };
+      await runtimeLog(io, 'error', t().execute.runInterrupted(failedStepId, r.executedSteps, r.totalSteps));
+      await runtimeLog(io, 'error', `${t().execute.runReasonLabel}${reason}`);
+      await audit.event('note', reason, {
+        messageId: 'execute.incomplete_plan_blocked',
+        steps: incompleteSteps.map(({ id, phase, status }) => ({ id, phase, status })),
+      });
+      await audit.end({
+        status: 'failed',
+        executedSteps: r.executedSteps,
+        totalSteps: r.totalSteps,
+        failedStepId,
+        failureReason: reason,
+      });
+      await updateProjectFile({
+        workspace: ws.root,
+        planPath: publicPlanPath,
+        configPath: cfgPath,
+        projectFilePath,
+        command: projectCommand,
+        intent: plan.intent,
+        plan,
+      });
+      await runtimeResult(io, 'run', 'failed', {
+        failedStepId,
+        incompleteSteps: incompleteSteps.map((step) => step.id),
+        exitCode: 4,
+      });
+      return { status: 'failed', engine: r, message: reason, exitCode: 4 };
+    }
     let auditWarnings = 0;
     if (shouldRunProjectAudit(plan, { onlyPhase: opts.onlyPhase })) {
       if (io.requestPermission) {
@@ -387,8 +428,16 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           messageId: 'execute.project_audit_repair_start',
           checks: auditResult.checks,
         });
-        const repair = await engine.repairProjectAuditFailure(plan, auditResult);
+        let repair = await engine.repairProjectAuditFailure(plan, auditResult);
         await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
+        if (!repair.failedStepId && repair.restartIndex !== undefined) {
+          const rerun = await engine.run(plan);
+          repair = {
+            ...rerun,
+            executedSteps: repair.executedSteps + rerun.executedSteps,
+          };
+          await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
+        }
         if (repair.failedStepId) {
           await runtimeLog(
             io,
@@ -458,7 +507,8 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       }
       auditWarnings = auditResult.warnings;
     }
-    const phaseAdvance = target.phasePlan && target.phasePlanPath && !opts.onlyPhase
+    const allStepsDone = plan.steps.every((step) => step.status === 'DONE');
+    const phaseAdvance = target.phasePlan && target.phasePlanPath && !opts.onlyPhase && allStepsDone
       ? await completeAndPrepareNextPhase({
           phasePlan: target.phasePlan,
           phasePlanPath: target.phasePlanPath,
@@ -467,6 +517,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           audit,
           io,
           currentPlanPath: planAbs,
+          currentPlan: plan,
         })
       : undefined;
     const projectPlan = phaseAdvance?.nextPlan ?? plan;
@@ -477,7 +528,15 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         `iteration ${phaseAdvance.completedPhaseId} passed; prepared ${phaseAdvance.nextPlan.phaseId}`,
       );
     }
-    await runtimeLog(io, 'success', t().execute.runAllDone(r.executedSteps, r.totalSteps));
+    if (allStepsDone) {
+      await runtimeLog(io, 'success', t().execute.runAllDone(r.executedSteps, r.totalSteps));
+    } else {
+      await runtimeLog(io, 'warning', t().execute.runPartialDone(
+        r.executedSteps,
+        r.totalSteps,
+        incompleteSteps.map((step) => step.id).join(', '),
+      ));
+    }
     await audit.end({
       status: auditWarnings > 0 ? 'warn' : 'ok',
       executedSteps: r.executedSteps,
@@ -558,7 +617,15 @@ async function completeAndPrepareNextPhase(args: {
   audit: AuditLogger;
   io: RuntimeIO;
   currentPlanPath: string;
+  currentPlan: Plan;
 }): Promise<{ completedPhaseId: string; nextPlan?: Plan }> {
+  const incomplete = args.currentPlan.steps.filter((step) => step.status !== 'DONE');
+  if (incomplete.length > 0) {
+    throw new Error(
+      `cannot advance implementation phase with incomplete steps: ` +
+      incomplete.map((step) => `${step.id}=${step.status}`).join(', '),
+    );
+  }
   const transition = advancePhasePlan(args.phasePlan);
   const next = transition.nextPhase;
   if (!next) {

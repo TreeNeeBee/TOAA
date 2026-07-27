@@ -163,11 +163,16 @@ function classify(
   toolFailures: string[],
 ): DebugFailureCategory {
   const lower = text.toLowerCase();
+  if (
+    /write\/progress actions did not reduce missing outputs|missing (?:required )?outputs?\s*[:：]/u.test(lower)
+  ) {
+    return 'missing_output';
+  }
   if (/permission denied/u.test(lower)) return 'permission_denied';
   if (/modulenotfounderror|importerror/u.test(lower)) return 'import_error';
   if (/could not find a version|no matching distribution|pip install|add_dependency/u.test(lower)) return 'dependency_error';
   if (/syntaxerror|indentationerror|taberror/u.test(lower)) return 'syntax_error';
-  if (/outputs? (?:still )?missing|missing required outputs?|outputs? \S*缺失|仍缺失/u.test(lower)) return 'missing_output';
+  if (/outputs? (?:still )?missing|missing (?:required )?outputs?|outputs? \S*缺失|仍缺失/u.test(lower)) return 'missing_output';
 
   // Assertion/test identities are root-cause evidence. Provider retry messages and
   // URLs commonly appear later in accumulated logs and must not replace them.
@@ -226,13 +231,17 @@ function findPrimaryError(
       /\bHTTP\s+(?:401|403|404|408|409|410|422|429|5\d\d)[^\n]*/iu,
       /Network API failure detected[^\n]*/iu,
     ],
-    missing_output: [/outputs?[^\n]*(?:missing|缺失|仍缺失)[^\n]*/iu],
+    missing_output: [
+      /missing (?:required )?outputs?[^\n]*/iu,
+      /outputs?[^\n]*(?:missing|缺失|仍缺失)[^\n]*/iu,
+    ],
     tool_loop: [/repeated read-only\/probe actions[^\n]*/iu],
   };
   const genericPatterns: RegExp[] = [
     /(?:SyntaxError|IndentationError|TabError|ModuleNotFoundError|ImportError|AssertionError|TypeError|ValueError|FileNotFoundError|AttributeError|RuntimeError):[^\n]+/u,
     /\bFAILED\s+[^\n]+/u,
     /\b(?:pytest|vitest)[^\n]*(?:exit|failed|FAIL)[^\n]*/iu,
+    /missing (?:required )?outputs?[^\n]*/iu,
     /outputs?[^\n]*(?:missing|缺失|仍缺失)[^\n]*/iu,
     /repeated read-only\/probe actions[^\n]*/iu,
   ];

@@ -4,6 +4,11 @@ import { simpleGit, type SimpleGit } from 'simple-git';
 import type { Workspace } from './workspace.js';
 
 const RUNTIME_EXCLUDE_PATTERNS = [
+  '.xcompiler/*',
+  '!.xcompiler/.gitkeep',
+  'logs/',
+  'docs/process_log.md',
+  '*.xc',
   '.sandbox/',
   '.pytest_cache/',
   '**/__pycache__/',
@@ -114,6 +119,10 @@ function isRuntimeArtifactPath(file: string): boolean {
   const normalized = file.replace(/\\/g, '/');
   if (!normalized) return false;
   return (
+    (normalized.startsWith('.xcompiler/') && normalized !== '.xcompiler/.gitkeep') ||
+    normalized.startsWith('logs/') ||
+    normalized === 'docs/process_log.md' ||
+    normalized.endsWith('.xc') ||
     normalized === '.coverage' ||
     normalized.startsWith('.sandbox/') ||
     normalized.startsWith('.pytest_cache/') ||

@@ -588,6 +588,8 @@ const messages: Messages = {
     runReasonLabel: '  reason: ',
     runFailureLogHeader: '  --- failure log (tail, 40 lines) ---',
     runAllDone: (e, total) => `Plan fully completed (${e}/${total})`,
+    runPartialDone: (e, total, remaining) =>
+      `requested scope completed (${e}/${total}); plan remains incomplete: ${remaining}`,
     projectAuditSummary: (errors, warnings) => `project audit: ${errors} error(s), ${warnings} warning(s)`,
     projectMemoryRefreshFailed: (message) => `project memory refresh failed: ${message}`,
     projectAuditCheck: (name, summary) => `[audit:${name}] ${summary}`,
@@ -621,6 +623,13 @@ const messages: Messages = {
     debugResumeNotice: (id, n) => `  ↻ ${id} previous session ended FAILED (${n} attempts so far); first round of this run goes straight into Debugger mode.`,
     cachedTestRevalidationNotice: (id, n) =>
       `  ↻ ${id} has a cached FAILED result (${n} attempts so far); rerunning its current test gate before any V-model rollback.`,
+    cachedTestGateStart: (id, testArgs) =>
+      `  [Engine Gate] ${id} run_tests${testArgs.length > 0 ? `: ${testArgs.join(', ')}` : ': full test suite'}`,
+    cachedTestGatePassed: (id) => `  [Engine Gate] ${id} current test gate passed`,
+    cachedTestGateFailed: (id, exitCode, timedOut) =>
+      `  [Engine Gate] ${id} current test gate failed (exit=${exitCode}${timedOut ? ', timeout' : ''})`,
+    cachedTestArtifactsIncomplete: (id, missing) =>
+      `  [Engine Gate] ${id} has incomplete phase artifacts; repairing this test phase: ${missing.join(', ')}`,
     testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
       `  ↳ ${testId} ${testPhase} gate failed; V-model rollback → ${sourceId} ${sourcePhase} Debugger.`,
     debugResumeInfraRetry: (id, n) => `  ↻ ${id} previous session only recorded LLM provider/connectivity failures (${n} attempt(s)); clearing the stale debug cache entry and rerunning the step normally.`,

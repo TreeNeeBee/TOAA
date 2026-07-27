@@ -180,4 +180,23 @@ describe('debug brief extraction', () => {
     expect(brief.primaryError).toContain('append_file 失败');
     expect(brief.primaryError).not.toContain('write_file 成功');
   });
+
+  it('keeps an exact missing-output stall as the root issue over incidental tool denial', () => {
+    const brief = buildDebugBrief({
+      reason:
+        'write/progress actions did not reduce missing outputs for 3 rounds; ' +
+        'missing outputs: docs/tests/unit-test-plan.md.',
+      failureLog: [
+        'read_file denied: path is outside the project directory',
+        'write/progress actions did not reduce missing outputs for 3 rounds',
+        'missing outputs: docs/tests/unit-test-plan.md',
+      ].join('\n'),
+      phase: 'CODE',
+    });
+
+    expect(brief.category).toBe('missing_output');
+    expect(brief.primaryError).toContain('missing outputs');
+    expect(brief.primaryError).toContain('docs/tests/unit-test-plan.md');
+    expect(brief.debugDemand).toContain('Create or repair the declared output files');
+  });
 });

@@ -92,6 +92,22 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastUser).toContain('The target must already exist');
   });
 
+  it('prioritizes exact missing outputs in the first model turn', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
+
+    const result = await exec.run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.lastUser).toContain('## highest-priority required-output gate');
+    expect(llm.lastUser).toContain('- src/x.py');
+    expect(llm.lastUser).toContain('Create these exact paths before rewriting outputs that already exist');
+  });
+
   it('updates skill operation windows when the active LLM provider switches', async () => {
     class SwitchingWindowLLM implements LLMClient {
       readonly name = 'switching-window';
