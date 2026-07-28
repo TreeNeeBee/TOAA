@@ -10,16 +10,25 @@ import {
   type Step,
 } from './plan.js';
 
-export const TICKET_VERSION = 2;
+export const TICKET_VERSION = 3;
 export const TICKET_TYPES = [
+  'epic',
+  'feature',
   'task',
   'sub-task',
   'change-request',
   'bug',
   'enhance',
-  'feature',
 ] as const;
 export type TicketType = (typeof TICKET_TYPES)[number];
+
+export const WORK_TICKET_KINDS = [
+  'iteration',
+  'v-model-stage',
+  'delivery',
+  'planned-work',
+] as const;
+export type WorkTicketKind = (typeof WORK_TICKET_KINDS)[number];
 
 export const TICKET_STATUSES = [
   'open',
@@ -116,7 +125,19 @@ export interface TicketBase {
 }
 
 export interface WorkTicket extends TicketBase {
-  type: 'task' | 'sub-task' | 'feature';
+  type: 'epic' | 'feature' | 'task' | 'sub-task';
+  workKind: WorkTicketKind;
+  /** Scheduling dependencies. Array position is never treated as execution order. */
+  dependsOnTicketIds: string[];
+  /** Left-side V-model Feature points to the right-side verification Feature. */
+  verificationTicketId?: string;
+  /** Right-side V-model Feature points to the left-side source Feature. */
+  pairedSourceTicketId?: string;
+  execution: {
+    state: 'queued' | 'running' | 'passed' | 'failed';
+    attempts: number;
+    maxAttempts: number;
+  };
 }
 
 export interface EnhanceTicket extends TicketBase {
@@ -133,7 +154,7 @@ export interface EnhanceTicket extends TicketBase {
   verificationPhase?: Phase;
   qualityFailures?: string[];
   qualityAssessment?: unknown;
-  affectedTaskTicketIds: string[];
+  affectedWorkTicketIds: string[];
   changeRequestTicketIds: string[];
   disposition: 'debug' | 'change-request';
 }
@@ -299,7 +320,7 @@ const TicketModelAttributionSchema = z.object({
 
 const TicketBaseSchema = z.object({
   version: z.literal(TICKET_VERSION),
-  id: z.string().regex(/^(?:TASK|SUBTASK|CR|BUG|ENHANCE|FEATURE)-P\d{1,3}-\d{3}$/u),
+  id: z.string().regex(/^(?:EPIC|FEATURE|TASK|SUBTASK|CR|BUG|ENHANCE)-P\d{1,3}-\d{3}$/u),
   type: z.enum(TICKET_TYPES),
   status: z.enum(TICKET_STATUSES),
   priority: z.enum(TICKET_PRIORITIES),
@@ -323,8 +344,66 @@ const TicketBaseSchema = z.object({
 });
 
 const WorkTicketSchema = TicketBaseSchema.extend({
-  type: z.enum(['task', 'sub-task', 'feature']),
+  type: z.enum(['epic', 'feature', 'task', 'sub-task']),
+  workKind: z.enum(WORK_TICKET_KINDS),
+  dependsOnTicketIds: z.array(z.string().min(1)),
+  verificationTicketId: z.string().regex(/^FEATURE-P\d{1,3}-\d{3}$/u).optional(),
+  pairedSourceTicketId: z.string().regex(/^FEATURE-P\d{1,3}-\d{3}$/u).optional(),
+  execution: z.object({
+    state: z.enum(['queued', 'running', 'passed', 'failed']),
+    attempts: z.number().int().nonnegative(),
+    maxAttempts: z.number().int().positive(),
+  }).strict(),
 }).strict().superRefine((ticket, ctx) => {
+  const validKind =
+    (ticket.type === 'epic' && ticket.workKind === 'iteration') ||
+    (ticket.type === 'feature' &&
+      (ticket.workKind === 'v-model-stage' || ticket.workKind === 'delivery')) ||
+    ((ticket.type === 'task' || ticket.type === 'sub-task') &&
+      ticket.workKind === 'planned-work');
+  if (!validKind) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `${ticket.type} cannot use workKind ${ticket.workKind}`,
+      path: ['workKind'],
+    });
+  }
+  if (ticket.type === 'epic' && (ticket.parentTicketId || ticket.rootTicketId)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'epic tickets cannot have parentTicketId or rootTicketId',
+      path: ['parentTicketId'],
+    });
+  }
+  if (ticket.type !== 'epic' && (!ticket.parentTicketId || !ticket.rootTicketId)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `${ticket.type} tickets require parentTicketId and rootTicketId`,
+      path: ['parentTicketId'],
+    });
+  }
+  if (
+    ticket.type === 'feature' &&
+    ticket.workKind === 'v-model-stage' &&
+    !ticket.source.stepId
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'v-model-stage features require source.stepId',
+      path: ['source', 'stepId'],
+    });
+  }
+  if (
+    ticket.type === 'feature' &&
+    ticket.workKind === 'delivery' &&
+    ticket.source.stepId
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'delivery features cannot own a Plan Step',
+      path: ['source', 'stepId'],
+    });
+  }
   if (ticket.type === 'sub-task' && !ticket.parentTicketId) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -346,7 +425,9 @@ export const EnhanceTicketSchema = TicketBaseSchema.extend({
   verificationPhase: z.enum(PHASES).optional(),
   qualityFailures: z.array(z.string().min(1)).optional(),
   qualityAssessment: z.unknown().optional(),
-  affectedTaskTicketIds: z.array(z.string().regex(/^TASK-P\d{1,3}-\d{3}$/u)),
+  affectedWorkTicketIds: z.array(
+    z.string().regex(/^(?:FEATURE|TASK|SUBTASK)-P\d{1,3}-\d{3}$/u),
+  ),
   changeRequestTicketIds: z.array(z.string().regex(/^CR-P\d{1,3}-\d{3}$/u)),
   disposition: z.enum(['debug', 'change-request']),
 }).strict().superRefine((ticket, ctx) => {
@@ -503,16 +584,17 @@ const TICKET_TRANSITIONS: StateTransitions<TicketStatus> = {
   resolved: ['closed', 'in_progress'],
   closed: ['in_progress'],
   cancelled: [],
-  failed: ['triaged', 'in_progress', 'cancelled'],
+  failed: ['triaged', 'in_progress', 'blocked', 'cancelled'],
 };
 
 const TYPE_PREFIX: Record<TicketType, string> = {
+  epic: 'EPIC',
+  feature: 'FEATURE',
   task: 'TASK',
   'sub-task': 'SUBTASK',
   'change-request': 'CR',
   bug: 'BUG',
   enhance: 'ENHANCE',
-  feature: 'FEATURE',
 };
 
 export function transitionTicket(
@@ -534,6 +616,14 @@ export function transitionTicket(
   if (next === 'closed') ticket.closedAt = at;
   if (next === 'cancelled') ticket.cancelledAt = at;
   return true;
+}
+
+export function projectWorkStatusToStepStatus(
+  ticket: WorkTicket,
+): Step['status'] {
+  if (ticket.execution.state === 'passed') return 'DONE';
+  if (ticket.execution.state === 'failed' || ticket.status === 'blocked') return 'FAILED';
+  return ticket.execution.state === 'running' ? 'RUNNING' : 'PENDING';
 }
 
 export class TicketStore {
@@ -612,10 +702,14 @@ export class TicketStore {
     return ticket?.type === 'enhance' ? ticket : undefined;
   }
 
-  activeQualityEnhanceForStep(stepId: string): EnhanceTicket | undefined {
+  activeQualityEnhanceForStep(
+    stepId: string,
+    iterationId: string,
+  ): EnhanceTicket | undefined {
     return [...this.tickets].reverse().find(
       (ticket): ticket is EnhanceTicket =>
         ticket.type === 'enhance' &&
+        ticket.iterationId === iterationId &&
         ticket.sourceQualityGateStepId === stepId &&
         !['closed', 'cancelled', 'failed'].includes(ticket.status),
     );
@@ -641,10 +735,29 @@ export class TicketStore {
     );
   }
 
-  workForStep(stepId: string): WorkTicket | undefined {
+  featureForStep(stepId: string, iterationId: string): WorkTicket | undefined {
     return this.tickets.find(
       (ticket): ticket is WorkTicket =>
-        ticket.type === 'task' && ticket.source.stepId === stepId,
+        ticket.type === 'feature' &&
+        ticket.workKind === 'v-model-stage' &&
+        ticket.iterationId === iterationId &&
+        ticket.source.stepId === stepId,
+    );
+  }
+
+  epicForIteration(iterationId: string): WorkTicket | undefined {
+    return this.tickets.find(
+      (ticket): ticket is WorkTicket =>
+        ticket.type === 'epic' && ticket.iterationId === iterationId,
+    );
+  }
+
+  deliveryForIteration(iterationId: string): WorkTicket | undefined {
+    return this.tickets.find(
+      (ticket): ticket is WorkTicket =>
+        ticket.type === 'feature' &&
+        ticket.workKind === 'delivery' &&
+        ticket.iterationId === iterationId,
     );
   }
 
@@ -656,6 +769,11 @@ export class TicketStore {
     priority?: TicketPriority;
     parentTicketId?: string;
     rootTicketId?: string;
+    workKind: WorkTicketKind;
+    dependsOnTicketIds?: string[];
+    verificationTicketId?: string;
+    pairedSourceTicketId?: string;
+    maxAttempts?: number;
     source: TicketSource;
     acceptance?: string[];
     artifacts?: string[];
@@ -673,6 +791,15 @@ export class TicketStore {
       iterationId: input.iterationId,
       parentTicketId: input.parentTicketId,
       rootTicketId: input.rootTicketId,
+      workKind: input.workKind,
+      dependsOnTicketIds: input.dependsOnTicketIds ?? [],
+      verificationTicketId: input.verificationTicketId,
+      pairedSourceTicketId: input.pairedSourceTicketId,
+      execution: {
+        state: 'queued',
+        attempts: 0,
+        maxAttempts: input.maxAttempts ?? 3,
+      },
       relatedTicketIds: [],
       blockedByTicketIds: [],
       source: input.source,
@@ -872,6 +999,15 @@ export class TicketStore {
     if (ticket.blockedByTicketIds.length === 0 && ticket.status === 'blocked') {
       transitionTicket(ticket, 'in_progress');
     }
+    if (
+      ticket.blockedByTicketIds.length === 0 &&
+      isWorkTicket(ticket) &&
+      ticket.execution.state === 'passed' &&
+      ticket.status !== 'closed'
+    ) {
+      if (ticket.status !== 'resolved') transitionTicket(ticket, 'resolved');
+      transitionTicket(ticket, 'closed');
+    }
     await this.persist(ticket, 'unblocked', { blockerId });
   }
 
@@ -905,6 +1041,20 @@ export class TicketStore {
         parentTicketId: ticket.parentTicketId,
         relatedTicketIds: ticket.relatedTicketIds,
         blockedByTicketIds: ticket.blockedByTicketIds,
+        ...(ticket.type === 'epic' ||
+        ticket.type === 'feature' ||
+        ticket.type === 'task' ||
+        ticket.type === 'sub-task'
+          ? {
+              workKind: ticket.workKind,
+              dependsOnTicketIds: ticket.dependsOnTicketIds,
+              verificationTicketId: ticket.verificationTicketId,
+              pairedSourceTicketId: ticket.pairedSourceTicketId,
+              executionState: ticket.execution.state,
+              attempts: ticket.execution.attempts,
+              maxAttempts: ticket.execution.maxAttempts,
+            }
+          : {}),
         stepId: ticket.source.stepId,
         phase: ticket.source.phase,
         modelProviders: dedup(ticket.modelAttributions.map((attribution) => attribution.provider)),
@@ -912,7 +1062,7 @@ export class TicketStore {
           ? {
               enhanceKind: ticket.kind,
               sourceBugTicketId: ticket.sourceBugTicketId,
-              affectedTaskTicketIds: ticket.affectedTaskTicketIds,
+              affectedWorkTicketIds: ticket.affectedWorkTicketIds,
               changeRequestTicketIds: ticket.changeRequestTicketIds,
               disposition: ticket.disposition,
             }
@@ -986,6 +1136,13 @@ function dedup(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
 }
 
+function isWorkTicket(ticket: Ticket): ticket is WorkTicket {
+  return ticket.type === 'epic' ||
+    ticket.type === 'feature' ||
+    ticket.type === 'task' ||
+    ticket.type === 'sub-task';
+}
+
 function renderTicket(ticket: Ticket): string {
   const lines = [
     `# ${ticket.id}: ${ticket.title}`,
@@ -1005,6 +1162,26 @@ function renderTicket(ticket: Ticket): string {
     ...(ticket.acceptance.length > 0 ? ticket.acceptance.map((item) => `- ${item}`) : ['- Not specified']),
     '',
   ];
+  if (
+    ticket.type === 'epic' ||
+    ticket.type === 'feature' ||
+    ticket.type === 'task' ||
+    ticket.type === 'sub-task'
+  ) {
+    lines.push(
+      '## Work Graph',
+      `- Kind: ${ticket.workKind}`,
+      `- Depends on: ${ticket.dependsOnTicketIds.join(', ') || 'none'}`,
+      ticket.verificationTicketId
+        ? `- Verification Feature: ${ticket.verificationTicketId}`
+        : '',
+      ticket.pairedSourceTicketId
+        ? `- Paired source Feature: ${ticket.pairedSourceTicketId}`
+        : '',
+      `- Attempts: ${ticket.execution.attempts}/${ticket.execution.maxAttempts}`,
+      '',
+    );
+  }
   if (ticket.type === 'bug') {
     lines.push(
       '## Bug',
@@ -1031,7 +1208,7 @@ function renderTicket(ticket: Ticket): string {
         ? `- Verification: ${ticket.verificationStepId} ${ticket.verificationPhase ?? ''}`
         : '',
       ...(ticket.qualityFailures ?? []).map((failure) => `- Quality gap: ${failure}`),
-      `- Affected Tasks: ${ticket.affectedTaskTicketIds.join(', ') || 'none'}`,
+      `- Affected work: ${ticket.affectedWorkTicketIds.join(', ') || 'none'}`,
       `- Change Requests: ${ticket.changeRequestTicketIds.join(', ') || 'none'}`,
       `- Disposition: ${ticket.disposition}`,
       '',

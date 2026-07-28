@@ -13,6 +13,8 @@ import {
   PROJECT_DEVELOPMENT_REPORT_PATH,
 } from '../src/core/project_report.js';
 import type { Plan, Step } from '../src/core/plan.js';
+import { TicketStore } from '../src/core/ticket.js';
+import { WorkTicketLifecycle } from '../src/core/engine/work_ticket_lifecycle.js';
 
 describe('stage quality gates', () => {
   let root = '';
@@ -141,6 +143,9 @@ describe('stage quality gates', () => {
       evaluateQualityGate(historicalStep, historicalAssessment),
     );
     const plan = planWith(step);
+    const workTickets = new WorkTicketLifecycle(new TicketStore(workspace));
+    await workTickets.registerExecutionGraph(plan);
+    await workTickets.completeDelivery('P1');
     const reportPath = await generateProjectDevelopmentReport({
       workspace,
       plan,
@@ -164,6 +169,8 @@ describe('stage quality gates', () => {
     expect(report).toContain('Project stage quality gates passed: 2/2');
     expect(report).toContain('| P0/S005 | UNIT_TEST | PASS |');
     expect(report).toContain('completion 100.0%/95.0%');
+    expect(report).toContain('- Tasks: 0');
+    expect(report).toContain('- Sub-tasks: 0');
     expect(report).toContain('PASS: tests - tests passed');
   });
 });

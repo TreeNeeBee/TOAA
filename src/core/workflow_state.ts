@@ -1,92 +1,4 @@
-import { PHASE_ORDER, type Phase, type Step, type StepStatus } from './plan.js';
-import { assertStateTransition, type StateTransitions } from '../util/state_machine.js';
-
-export type StepTransitionReason =
-  | 'attempt-started'
-  | 'attempt-passed'
-  | 'attempt-failed'
-  | 'interrupted'
-  | 'explicit-reset'
-  | 'v-model-rollback'
-  | 'downstream-rerun'
-  | 'quality-enhancement'
-  | 'quality-gate-failed'
-  | 'cached-gate-passed'
-  | 'cached-gate-failed';
-
-const ALLOWED_STEP_TRANSITIONS: StateTransitions<StepStatus> = {
-  // A persisted artifact may pass a cached gate after a rollback reset without
-  // regenerating the Step, so PENDING -> DONE is an explicit validation path.
-  PENDING: ['RUNNING', 'DONE', 'FAILED'],
-  RUNNING: ['PENDING', 'DONE', 'FAILED'],
-  FAILED: ['PENDING', 'RUNNING', 'DONE'],
-  DONE: ['PENDING', 'RUNNING'],
-};
-
-const STEP_REASON_TARGETS: Record<StepTransitionReason, StepStatus> = {
-  'attempt-started': 'RUNNING',
-  'attempt-passed': 'DONE',
-  'attempt-failed': 'FAILED',
-  interrupted: 'PENDING',
-  'explicit-reset': 'PENDING',
-  'v-model-rollback': 'PENDING',
-  'downstream-rerun': 'PENDING',
-  'quality-enhancement': 'PENDING',
-  'quality-gate-failed': 'FAILED',
-  'cached-gate-passed': 'DONE',
-  'cached-gate-failed': 'FAILED',
-};
-
-export class InvalidStepTransitionError extends Error {
-  constructor(
-    public readonly stepId: string,
-    public readonly from: StepStatus,
-    public readonly to: StepStatus,
-    public readonly reason: StepTransitionReason,
-  ) {
-    super(`Invalid step transition ${stepId}: ${from} -> ${to} (${reason})`);
-    this.name = 'InvalidStepTransitionError';
-  }
-}
-
-/**
- * The only supported mutation boundary for persisted Step state.
- *
- * Retries may start from FAILED/DONE, interrupted work returns to PENDING, and a
- * cached test gate may validate a previously FAILED step without regenerating it.
- */
-export function transitionStep(
-  step: Step,
-  next: StepStatus,
-  reason: StepTransitionReason,
-): boolean {
-  if (STEP_REASON_TARGETS[reason] !== next) {
-    throw new InvalidStepTransitionError(step.id, step.status, next, reason);
-  }
-  const changed = assertStateTransition(
-    'step',
-    step.id,
-    step.status,
-    next,
-    ALLOWED_STEP_TRANSITIONS,
-    () => new InvalidStepTransitionError(step.id, step.status, next, reason),
-  );
-  if (!changed) return false;
-  step.status = next;
-  return true;
-}
-
-export function resetStepForRerun(
-  step: Step,
-  reason: Extract<
-    StepTransitionReason,
-    'explicit-reset' | 'v-model-rollback' | 'downstream-rerun' | 'quality-enhancement' | 'interrupted'
-  >,
-): boolean {
-  const changed = transitionStep(step, 'PENDING', reason);
-  step.retries = 0;
-  return changed;
-}
+import { PHASE_ORDER, type Phase, type Step } from './plan.js';
 
 export function stepTransitivelyDependsOn(
   step: Step,
@@ -104,17 +16,6 @@ export function stepTransitivelyDependsOn(
     if (dependency) stack.push(...dependency.dependsOn);
   }
   return false;
-}
-
-export function incompleteTransitiveDependencies(
-  step: Step,
-  byId: ReadonlyMap<string, Step>,
-): Step[] {
-  return [...byId.values()].filter(
-    (candidate) =>
-      candidate.status !== 'DONE' &&
-      stepTransitivelyDependsOn(step, candidate.id, byId),
-  );
 }
 
 export function downstreamStepsForRerun(
@@ -145,7 +46,11 @@ export type ExecutionSelection =
 
 export function validateExecutionSelection(
   order: readonly Step[],
-  options: { fromStepId?: string; onlyPhase?: string },
+  options: {
+    fromStepId?: string;
+    onlyPhase?: string;
+    isComplete: (step: Step) => boolean;
+  },
 ): ExecutionSelection {
   const fromIndex = options.fromStepId
     ? order.findIndex((step) => step.id === options.fromStepId)
@@ -161,7 +66,9 @@ export function validateExecutionSelection(
   }
 
   if (options.fromStepId) {
-    const incomplete = order.slice(0, fromIndex).filter((step) => step.status !== 'DONE');
+    const incomplete = order.slice(0, fromIndex).filter(
+      (step) => !options.isComplete(step),
+    );
     if (incomplete.length > 0) {
       return {
         ok: false,

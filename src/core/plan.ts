@@ -236,6 +236,12 @@ export const StepSchema = z
 
 export type Step = z.infer<typeof StepSchema>;
 
+export function stepExecutionKey(
+  step: Pick<Step, 'id' | 'iterationId'>,
+): string {
+  return `${step.iterationId ?? 'P1'}:${step.id}`;
+}
+
 export const PlanSchema = z
   .object({
     version: z.literal('1'),

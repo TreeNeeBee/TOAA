@@ -4,6 +4,7 @@ import {
   PHASE_ORDER,
   V_MODEL_TEST_PHASES,
   V_MODEL_TEST_TO_SOURCE_PHASE,
+  stepExecutionKey,
   type Plan,
   type Step,
 } from './plan.js';
@@ -51,11 +52,8 @@ import {
 import { PluginHost } from '../plugins/host.js';
 import {
   downstreamStepsForRerun,
-  incompleteTransitiveDependencies,
-  resetStepForRerun,
   stepStateSummary,
   stepTransitivelyDependsOn,
-  transitionStep,
   validateExecutionSelection,
 } from './workflow_state.js';
 import {
@@ -166,6 +164,8 @@ export interface EngineOptions {
   debugWikiPath?: string;
   /** If true, debug wiki read/write failures abort instead of only being audited. */
   debugWikiStrict?: boolean;
+  /** Reset the current iteration Ticket graph before execution. */
+  resetExecutionState?: boolean;
 }
 
 export interface EngineResult {
@@ -217,6 +217,7 @@ export class PhaseEngine {
   private readonly repairArtifacts: RepairArtifactService;
   private readonly testPhases: TestPhaseValidator;
   private readonly qualityAssessments: QualityAssessmentStore;
+  private readonly initializedExecutionGraphs = new Set<string>();
 
   constructor(private readonly opts: EngineOptions) {
     this.registry = opts.registry ?? buildDefaultRegistry();
@@ -253,6 +254,7 @@ export class PhaseEngine {
       opts.router,
       this.enhancementLifecycle,
       this.bugLifecycle,
+      this.workTickets,
     );
     this.changeRequestOpening = new ChangeRequestOpening(
       this.tickets,
@@ -318,9 +320,12 @@ export class PhaseEngine {
   async run(plan: Plan): Promise<EngineResult> {
     await this.plugins.initialize();
     await this.debugWiki.load();
-    await this.tickets.load();
     await this.qualityAssessments.load();
-    await this.workTickets.registerPlan(plan);
+    await this.ensureExecutionGraph(plan);
+    if (this.opts.resetExecutionState) {
+      await this.workTickets.resetExecutionGraph(plan, 'explicit runtime reset');
+      await this.persistPlan(plan);
+    }
     if (!this.pluginExtensionsApplied) {
       this.plugins.applyExtensions({ tools: this.registry, skills: this.skills });
       this.pluginExtensionsApplied = true;
@@ -341,8 +346,15 @@ export class PhaseEngine {
     auditResult: ProjectAuditResult,
     opts: { iterationId?: string; contextMode?: 'audit-repair' | 'iteration-gate' } = {},
   ): Promise<EngineResult> {
+    await this.ensureExecutionGraph(plan);
     const order = topoSort(plan.steps);
-    const step = selectAuditRepairStep(plan, order, auditResult, opts.iterationId);
+    const step = selectAuditRepairStep(
+      plan,
+      order,
+      auditResult,
+      (candidate) => this.workTickets.isStepComplete(candidate),
+      opts.iterationId,
+    );
     const failureLog = renderProjectAuditFailureLog(auditResult);
     const reason = opts.iterationId
       ? `iteration ${opts.iterationId} gate failed (${auditResult.errors} error(s), ${auditResult.warnings} warning(s))`
@@ -397,7 +409,7 @@ export class PhaseEngine {
           }),
           contextMode: opts.contextMode ?? (opts.iterationId ? 'iteration-gate' : 'audit-repair'),
           bugTicketId: bug.id,
-          completedBeforeDebug: step.status === 'DONE',
+          completedBeforeDebug: this.workTickets.isStepComplete(step),
         },
         skipOutputArchive: true,
       });
@@ -413,7 +425,6 @@ export class PhaseEngine {
       const downstream = downstreamStepsForRerun(order, step);
       if (downstream.length > 0) {
         for (const candidate of downstream) {
-          resetStepForRerun(candidate, 'downstream-rerun');
           await this.workTickets.resetStep(candidate, 'downstream-rerun');
         }
         await this.persistPlan(plan);
@@ -444,11 +455,18 @@ export class PhaseEngine {
     };
   }
 
+  incompleteSteps(plan: Plan): Step[] {
+    return this.workTickets.incompleteSteps(plan.steps);
+  }
+
+  isIterationDelivered(iterationId: string): boolean {
+    return this.workTickets.isIterationDelivered(iterationId);
+  }
+
   private async runCore(plan: Plan): Promise<EngineResult> {
     this.profile = getLanguageProfile(plan.language);
     await this.refreshCurrentProjectMemory(plan);
     const order = topoSort(plan.steps);
-    const stepById = new Map(order.map((step) => [step.id, step] as const));
     const stopForInvalidTransition = async (
       failedStepId: string,
       reason: string,
@@ -477,6 +495,7 @@ export class PhaseEngine {
     const selection = validateExecutionSelection(order, {
       fromStepId: this.opts.fromStepId,
       onlyPhase: this.opts.onlyPhase,
+      isComplete: (step) => this.workTickets.isStepComplete(step),
     });
     if (!selection.ok) {
       return stopForInvalidTransition(
@@ -516,7 +535,9 @@ export class PhaseEngine {
         spin?.fail(message);
         // 依赖安装属于基础设施失败（典型：npm/pip 网络超时）：返回结构化失败而非抛未处理异常，
         // 下一次 xcompiler run 会在启动时重新构建沙盒并从断点恢复。
-        const failedStepId = order.find((s) => s.status !== 'DONE')?.id ?? order[0]?.id ?? 'S000';
+        const failedStepId = this.workTickets.incompleteSteps(order)[0]?.id ??
+          order[0]?.id ??
+          'S000';
         this.lastFailure = { reason: sandboxBuildFailureReason(message), failureLog: message };
         return {
           totalSteps: order.length,
@@ -533,17 +554,23 @@ export class PhaseEngine {
       const step = order[index]!;
       if (index < fromIndex) continue;
       if (this.opts.onlyPhase && step.phase !== this.opts.onlyPhase) continue;
-      const blockers = incompleteTransitiveDependencies(step, stepById);
-      if (blockers.length > 0) {
+      const readiness = this.workTickets.readiness(step);
+      if (readiness.incompleteDependencies.length > 0) {
         const reason =
           `cannot execute or accept ${step.id} ${step.phase}: dependency chain is incomplete: ` +
-          blockers.map((dependency) => `${dependency.id}=${dependency.status}`).join(', ');
+          readiness.incompleteDependencies
+            .map((dependency) => `${dependency.id}=${dependency.status}`)
+            .join(', ');
         this.lastFailure = { reason, failureLog: reason };
         await this.opts.audit.event('note', reason, {
           messageId: 'engine.step_blocked_incomplete_dependencies',
           stepId: step.id,
           phase: step.phase,
-          dependencies: blockers.map(stepStateSummary),
+          featureTicketId: readiness.feature.id,
+          dependencyTicketIds: readiness.feature.dependsOnTicketIds,
+          incompleteDependencyTicketIds: readiness.incompleteDependencies.map(
+            (dependency) => dependency.id,
+          ),
         });
         return {
           totalSteps: order.length,
@@ -553,8 +580,48 @@ export class PhaseEngine {
           failureLog: reason,
         };
       }
-      if (step.status === 'DONE') {
+      if (readiness.activeBlockers.length > 0 && !readiness.repairReady) {
+        const reason =
+          `cannot execute ${step.id} ${step.phase}: its stage Feature has unrelated active blockers: ` +
+          readiness.activeBlockers.map((ticket) => `${ticket.id}=${ticket.status}`).join(', ');
+        this.lastFailure = { reason, failureLog: reason };
+        await this.opts.audit.event('note', reason, {
+          messageId: 'engine.stage_feature_blocked',
+          stepId: step.id,
+          phase: step.phase,
+          featureTicketId: readiness.feature.id,
+          blockerTicketIds: readiness.activeBlockers.map((ticket) => ticket.id),
+        });
+        return {
+          totalSteps: order.length,
+          executedSteps: executed,
+          failedStepId: step.id,
+          failureReason: reason,
+          failureLog: reason,
+        };
+      }
+      if (this.workTickets.isStepComplete(step)) {
         this.log(chalk.gray(t().engine.stepSkipDone(step.id, step.phase)));
+        if (this.shouldRunIterationGate(plan, step)) {
+          const gate = await this.runIterationGateWithRepair(plan, step);
+          executed += gate.executedSteps;
+          await this.persistPlan(plan);
+          if (gate.failedStepId) {
+            return {
+              totalSteps: order.length,
+              executedSteps: executed,
+              failedStepId: gate.failedStepId,
+              failureLog: gate.failureLog,
+              failureReason: gate.failureReason,
+            };
+          }
+          if (gate.restartIndex !== undefined) {
+            index = gate.restartIndex;
+            continue;
+          }
+          const delivery = await this.completeIterationDelivery(plan, step);
+          if (delivery) return { ...delivery, totalSteps: order.length, executedSteps: executed };
+        }
         continue;
       }
 
@@ -574,7 +641,10 @@ export class PhaseEngine {
       executed++;
       await this.persistPlan(plan);
       if (!ok) {
-        const failedEnhance = this.tickets.activeQualityEnhanceForStep(step.id);
+        const failedEnhance = this.tickets.activeQualityEnhanceForStep(
+          step.id,
+          step.iterationId ?? 'P1',
+        );
         if (failedEnhance && !this.opts.onlyPhase) {
           const rollback = await this.rollbackQualityEnhancement(
             plan,
@@ -597,7 +667,10 @@ export class PhaseEngine {
             failureReason: rollback.failureReason ?? this.lastFailure?.reason,
           };
         }
-        const failedBug = this.bugLifecycle.openBugForFailedStep(step.id);
+        const failedBug = this.bugLifecycle.openBugForFailedStep(
+          step.id,
+          step.iterationId ?? 'P1',
+        );
         if (activeChangeRequest) {
           await this.changeRequests.recordFailure(activeChangeRequest, failedBug, step);
         }
@@ -693,10 +766,12 @@ export class PhaseEngine {
           index = gate.restartIndex;
           continue;
         }
+        const delivery = await this.completeIterationDelivery(plan, step);
+        if (delivery) return { ...delivery, totalSteps: order.length, executedSteps: executed };
       }
     }
     if (!this.opts.onlyPhase) {
-      const incomplete = order.filter((step) => step.status !== 'DONE');
+      const incomplete = this.workTickets.incompleteSteps(order);
       if (incomplete.length > 0) {
         const reason =
           'execution order ended with incomplete required steps: ' +
@@ -729,9 +804,50 @@ export class PhaseEngine {
     const executablePhase = plan.implementationPhases
       ?.find((phase) => phase.id === iterationId && phase.status !== 'deferred');
     if (!executablePhase) return false;
-    return plan.steps
-      .filter((candidate) => (candidate.iterationId ?? 'P1') === iterationId)
-      .every((candidate) => candidate.status === 'DONE');
+    const delivery = this.workTickets.deliveryForIteration(iterationId);
+    if (!delivery || delivery.status === 'closed') return false;
+    return this.workTickets.incompleteSteps(
+      plan.steps.filter((candidate) => (candidate.iterationId ?? 'P1') === iterationId),
+    ).length === 0;
+  }
+
+  private async completeIterationDelivery(
+    plan: Plan,
+    finalStep: Step,
+  ): Promise<EngineResult | undefined> {
+    const iterationId = finalStep.iterationId ?? 'P1';
+    try {
+      await this.workTickets.completeDelivery(iterationId);
+      this.workTickets.projectPlanState(plan);
+      await this.persistPlan(plan);
+      await this.opts.audit.event(
+        'note',
+        `delivery Feature and Epic closed for iteration ${iterationId}`,
+        {
+          messageId: 'engine.iteration_delivery_completed',
+          iterationId,
+          epicTicketId: this.workTickets.epicForIteration(iterationId)?.id,
+          deliveryFeatureTicketId: this.workTickets.deliveryForIteration(iterationId)?.id,
+        },
+      );
+      return undefined;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.lastFailure = { reason, failureLog: reason };
+      await this.opts.audit.event('note', reason, {
+        messageId: 'engine.iteration_delivery_blocked',
+        iterationId,
+        epicTicketId: this.workTickets.epicForIteration(iterationId)?.id,
+        deliveryFeatureTicketId: this.workTickets.deliveryForIteration(iterationId)?.id,
+      });
+      return {
+        totalSteps: plan.steps.length,
+        executedSteps: 0,
+        failedStepId: `DELIVERY_${iterationId}`,
+        failureReason: reason,
+        failureLog: reason,
+      };
+    }
   }
 
   private async runIterationGateWithRepair(plan: Plan, finalStep: Step): Promise<EngineResult> {
@@ -852,7 +968,7 @@ export class PhaseEngine {
   private async preserveFailedValidationEvidence(step: Step, reason: string): Promise<void> {
     const snapshot = await this.opts.git.snapshot(
       step.id,
-      step.retries,
+      this.workTickets.attemptCount(step),
       'failed validation evidence preserved',
     );
     await this.opts.audit.event(
@@ -876,6 +992,7 @@ export class PhaseEngine {
     enhancement: EnhanceTicket,
     activeChangeRequest?: ChangeRequestTicket,
   ): Promise<EngineResult & { ok: boolean; restartIndex?: number }> {
+    await this.ensureExecutionGraph(plan);
     const target = order.find((step) => step.id === enhancement.targetStepId) ??
       this.qualityRemediationTarget(plan, failedStep);
     enhancement.targetStepId = target.id;
@@ -893,8 +1010,7 @@ export class PhaseEngine {
       const dependsOnTarget = stepTransitivelyDependsOn(step, target.id, byId);
       if (!isTarget && !isLaterPhase && !dependsOnTarget) continue;
       if (!isTarget) affectedSteps.push(step);
-      if (step.status !== 'PENDING') {
-        resetStepForRerun(step, 'quality-enhancement');
+      if (this.workTickets.executionState(step) !== 'queued') {
         await this.workTickets.resetStep(step, 'quality-enhancement');
       }
     }
@@ -967,6 +1083,7 @@ export class PhaseEngine {
     bug?: BugTicket,
     activeChangeRequest?: ChangeRequestTicket,
   ): Promise<EngineResult & { ok: boolean; restartIndex?: number }> {
+    await this.ensureExecutionGraph(plan);
     const ownerStep = this.lastFailure?.rollbackTestStepId
       ? order.find((step) =>
           step.id === this.lastFailure?.rollbackTestStepId &&
@@ -1018,7 +1135,9 @@ export class PhaseEngine {
     }
 
     await this.debugCache.load();
-    const sourceFailureLog = latestActionableSourceFailureLog(this.debugCache.attempts(sourceStep.id));
+    const sourceFailureLog = latestActionableSourceFailureLog(
+      this.debugCache.attempts(stepExecutionKey(sourceStep)),
+    );
     const debugFailureLog = [
       failureLog,
       sourceFailureLog
@@ -1058,8 +1177,7 @@ export class PhaseEngine {
       const dependsOnSource = stepTransitivelyDependsOn(step, sourceStep.id, stepById);
       if (!isLaterPhase && !dependsOnSource) continue;
       affectedSteps.push(step);
-      if (step.status === 'PENDING') continue;
-      resetStepForRerun(step, 'v-model-rollback');
+      if (this.workTickets.executionState(step) === 'queued') continue;
       await this.workTickets.resetStep(step, 'v-model-rollback');
     }
     await this.persistPlan(plan);
@@ -1094,7 +1212,7 @@ export class PhaseEngine {
           contextMode: 'test-rollback',
           testScopeArgs: this.testGateArgsForStep(plan, routedTest),
           bugTicketId: bug?.id,
-          completedBeforeDebug: sourceStep.status === 'DONE',
+          completedBeforeDebug: this.workTickets.isStepComplete(sourceStep),
         },
         skipOutputArchive: true,
         changeRequest: sourceChangeRequest,
@@ -1128,8 +1246,10 @@ export class PhaseEngine {
       });
     }
 
-    await this.debugCache.markDone(routedTest.id);
-    if (routedTest.id !== failedTest.id) await this.debugCache.markDone(failedTest.id);
+    await this.debugCache.markDone(stepExecutionKey(routedTest));
+    if (stepExecutionKey(routedTest) !== stepExecutionKey(failedTest)) {
+      await this.debugCache.markDone(stepExecutionKey(failedTest));
+    }
     const sourceIndex = order.findIndex((step) => step.id === sourceStep.id);
     const routedTestIndex = order.findIndex((step) => step.id === routedTest.id);
     const interveningSteps = sourceIndex >= 0 && routedTestIndex > sourceIndex
@@ -1168,13 +1288,12 @@ export class PhaseEngine {
       this.profile,
     );
     if (validation.status !== 'passed') return validation;
-    transitionStep(step, 'DONE', 'cached-gate-passed');
-    step.retries = 0;
+    await this.workTickets.completeStep(step);
     await this.persistPlan(plan);
     await this.refreshCurrentProjectMemory(plan);
     const commit = await this.opts.git.snapshot(
       step.id,
-      step.retries,
+      this.workTickets.attemptCount(step),
       'validated without test regeneration',
     );
     await this.opts.audit.event('phase.end', `${step.id} current test validation passed`, {
@@ -1198,12 +1317,15 @@ export class PhaseEngine {
       enhancement?: EnhanceTicket;
     } = {},
   ): Promise<boolean> {
+    await this.ensureExecutionGraph(plan);
     await this.debugCache.load();
+    const debugKey = stepExecutionKey(step);
     const initialDebug = opts.initialDebug;
     const inheritedExtraAllowedWrites = initialDebug?.extraAllowedWrites;
     const inheritedContextMode = initialDebug?.contextMode;
     const inheritedTestScopeArgs = initialDebug?.testScopeArgs;
-    const completedBeforeDebug = initialDebug?.completedBeforeDebug ?? step.status === 'DONE';
+    const completedBeforeDebug =
+      initialDebug?.completedBeforeDebug ?? this.workTickets.isStepComplete(step);
     const rootDebugFailureLog = initialDebug
       ? cleanFailureLogForDebugContext(initialDebug.failureLog)
       : undefined;
@@ -1211,10 +1333,13 @@ export class PhaseEngine {
       rootDebugFailureLog
         ? composeDebugRetryFailureLog(rootDebugFailureLog, failureLog, reason)
         : failureLog;
-    const hadUnresolved = this.debugCache.hasUnresolvedFailure(step.id);
+    const hadUnresolved = this.debugCache.hasUnresolvedFailure(debugKey);
     let activeBugTicketId = initialDebug?.bugTicketId;
     if (!activeBugTicketId && hadUnresolved) {
-      activeBugTicketId = this.bugLifecycle.openBugForFailedStep(step.id)?.id;
+      activeBugTicketId = this.bugLifecycle.openBugForFailedStep(
+        step.id,
+        step.iterationId ?? 'P1',
+      )?.id;
     }
     const preserveCachedTestOutputs =
       !initialDebug && hadUnresolved && this.isVModelTestPhase(step.phase);
@@ -1260,10 +1385,10 @@ export class PhaseEngine {
       }
     }
     // 每轮新 xcompiler run 都重置本 Step 的 retries 计数，避免历史失败累计后显示成 "retry 31/3" 这种误导。
-    step.retries = 0;
+    await this.workTickets.setAttemptCount(step, 0);
 
     // 跨会话记忆：上次以 FAILED 结束 → 首轮直接用 Debugger 模式，告诉它历史尝试
-    let priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(step.id);
+    let priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(debugKey);
     let initial: Awaited<ReturnType<PhaseEngine['runOneAttempt']>>;
     try {
       if (initialDebug) {
@@ -1280,7 +1405,7 @@ export class PhaseEngine {
           completedBeforeDebug,
         });
       } else if (hadUnresolved) {
-        const attempts = this.debugCache.attempts(step.id);
+        const attempts = this.debugCache.attempts(debugKey);
         const last = attempts.slice(-1)[0]!;
         const resume = latestActionableDebugAttempt(attempts) ?? last;
         const resumeFailureLog = cleanFailureLogForDebugContext(resume.failureLogTail);
@@ -1292,7 +1417,7 @@ export class PhaseEngine {
           // 清掉被污染的缓存条目，按正常流程重新执行该 Step。若 LLM 仍不可用，
           // 本次尝试会现场失败并走既有的基础设施失败退出路径，而不会持续累积。
           this.log(chalk.yellow(t().engine.debugResumeInfraRetry(step.id, attempts.length)));
-          await this.debugCache.markDone(step.id);
+          await this.debugCache.markDone(debugKey);
           priorPrompt = '';
           initial = await runAttempt();
         } else {
@@ -1314,14 +1439,14 @@ export class PhaseEngine {
               this.log(chalk.yellow(t().engine.cachedTestRevalidationNotice(step.id, attempts.length)));
               const validation = await this.validateTestPhaseWithoutRegeneration(plan, step);
               if (validation.status === 'passed') {
-                await this.debugCache.markDone(step.id);
+                await this.debugCache.markDone(debugKey);
                 priorPrompt = '';
                 initial = await runAttempt();
               } else if (validation.status === 'incomplete') {
                 const reason =
                   `${step.phase} required artifacts are incomplete; ` +
                   'repairing the current test phase without rolling back source implementation.';
-                await this.debugCache.markDone(step.id);
+                await this.debugCache.markDone(debugKey);
                 priorPrompt = '';
                 initial = await runAttempt({
                   asDebugger: true,
@@ -1399,7 +1524,7 @@ export class PhaseEngine {
       };
     }
     if (initial.ok) {
-      await this.debugCache.markDone(step.id);
+      await this.debugCache.markDone(debugKey);
       if (hadUnresolved && activeBugTicketId) {
         await this.bugLifecycle.closeBug(
           activeBugTicketId,
@@ -1424,7 +1549,6 @@ export class PhaseEngine {
         initial.qualityGap,
         initial.metrics?.providers ?? [],
       );
-      transitionStep(step, 'FAILED', 'quality-gate-failed');
       this.lastFailure = {
         reason: initial.reason ?? `${step.phase} quality gate failed`,
         failureLog: initial.failureLog,
@@ -1469,7 +1593,7 @@ export class PhaseEngine {
     // 记录首轮失败
     const initialReason = initial.reason ?? 'failed';
     const initialFailureLogForRecord = includeRootDebugFailureLog(initial.failureLog, initialReason);
-    await this.debugCache.recordAttempt(step.id, {
+    await this.debugCache.recordAttempt(debugKey, {
       attempt: 0,
       reason: initialReason,
       failureLogTail: initialFailureLogForRecord,
@@ -1490,12 +1614,11 @@ export class PhaseEngine {
     });
     if (nonDebuggableInfrastructureFailure) {
       const reason = initial.reason ?? 'infrastructure failure';
-      transitionStep(step, 'FAILED', 'attempt-failed');
       this.lastFailure = {
         reason,
         failureLog: initial.failureLog,
       };
-      await this.debugCache.markFailed(step.id, reason);
+      await this.debugCache.markFailed(debugKey, reason);
       await this.bugLifecycle.markBugFailed(activeBugTicketId, reason);
       if (this.terminalOutput) {
         presentStepFailure(this.log.bind(this), step, {
@@ -1511,18 +1634,17 @@ export class PhaseEngine {
       return false;
     }
     if (initial.rollbackToPairedSource && this.isVModelTestPhase(step.phase)) {
-      transitionStep(step, 'FAILED', 'cached-gate-failed');
       this.lastFailure = {
         reason: initial.reason ?? 'test phase failed',
         failureLog: initial.failureLog,
         rollbackTestStepId: initial.rollbackTestStepId,
       };
-      await this.debugCache.markFailed(step.id, this.lastFailure.reason);
+      await this.debugCache.markFailed(debugKey, this.lastFailure.reason);
       return false;
     }
-    priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(step.id);
+    priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(debugKey);
 
-    const baseMax = this.opts.maxDebugRetries ?? step.maxRetries ?? 3;
+    const baseMax = this.opts.maxDebugRetries ?? this.workTickets.maxAttempts(step);
     const absoluteCap = Math.max(this.opts.maxDebugRetriesCap ?? Math.max(baseMax * 4, 10), baseMax);
     // 滑动窗口：budget 从 baseMax 起步，可在 [attempt+1, absoluteCap] 区间动态伸缩。
     let budget = baseMax;
@@ -1541,7 +1663,7 @@ export class PhaseEngine {
     let earlyAbort = false;
     while (attempt < budget) {
       attempt++;
-      step.retries = attempt;
+      await this.workTickets.setAttemptCount(step, attempt);
       await this.persistPlan(plan);
       const spin = this.spin(
         t().engine.spinDebugRetry(step.id, attempt, budget, absoluteCap, lastReason),
@@ -1591,7 +1713,7 @@ export class PhaseEngine {
       }
       if (r.ok) {
         spin?.succeed(t().engine.fixSucceeded(step.id, attempt));
-        await this.debugCache.markDone(step.id);
+        await this.debugCache.markDone(debugKey);
         await this.workTickets.completeStep(step);
         return true;
 	      }
@@ -1613,7 +1735,7 @@ export class PhaseEngine {
         const rollbackReason = r.reason ?? `${step.phase} failed`;
         const recordedFailureLog = includeRootDebugFailureLog(r.failureLog, rollbackReason);
         spin?.fail(t().engine.retryStillFailed(attempt, budget, '', rollbackReason));
-        await this.debugCache.recordAttempt(step.id, {
+        await this.debugCache.recordAttempt(debugKey, {
           attempt,
           reason: rollbackReason,
           failureLogTail: recordedFailureLog,
@@ -1632,13 +1754,12 @@ export class PhaseEngine {
               }
             : undefined,
         });
-        transitionStep(step, 'FAILED', 'attempt-failed');
         this.lastFailure = {
           reason: rollbackReason,
           failureLog: recordedFailureLog,
           rollbackTestStepId: r.rollbackTestStepId,
         };
-        await this.debugCache.markFailed(step.id, rollbackReason);
+        await this.debugCache.markFailed(debugKey, rollbackReason);
         return false;
       }
       const m = r.metrics;
@@ -1708,7 +1829,7 @@ export class PhaseEngine {
         lastActionableFailureLog = r.failureLog;
       }
       // 记录本轮 retry 到跨会话缓存，并刷新 priorPrompt 以供下一轮 LLM 看到
-      await this.debugCache.recordAttempt(step.id, {
+      await this.debugCache.recordAttempt(debugKey, {
         attempt,
         reason: r.reason ?? lastReason,
         failureLogTail: recordedFailureLog,
@@ -1727,15 +1848,14 @@ export class PhaseEngine {
             }
           : undefined,
       });
-      priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(step.id);
+      priorPrompt = this.debugCache.renderPriorAttemptsForPrompt(debugKey);
     }
-    transitionStep(step, 'FAILED', 'attempt-failed');
     this.lastFailure = {
       reason: lastResult.reason ?? lastReason,
       failureLog: lastResult.failureLog ?? lastFailureLog,
       rollbackTestStepId: lastResult.rollbackTestStepId,
     };
-    await this.debugCache.markFailed(step.id, this.lastFailure.reason);
+    await this.debugCache.markFailed(debugKey, this.lastFailure.reason);
     await this.bugLifecycle.markBugFailed(activeBugTicketId, this.lastFailure.reason);
     if (this.terminalOutput) {
       presentStepFailure(this.log.bind(this), step, {
@@ -1758,13 +1878,14 @@ export class PhaseEngine {
     debug?: DebugAttemptContext,
     attemptOpts: AttemptOptions = {},
   ): Promise<AttemptOutcome> {
+    await this.ensureExecutionGraph(plan);
     const role = debug ? 'Debugger' : step.role;
     await this.plugins.emit('step.attempt.before', {
       plan,
       step,
       role,
       debug: !!debug,
-      retry: step.retries,
+      retry: this.workTickets.attemptCount(step),
     });
     try {
       const outcome = await this.runOneAttemptCore(plan, step, debug, attemptOpts);
@@ -1776,7 +1897,7 @@ export class PhaseEngine {
         step,
         role,
         debug: !!debug,
-        retry: step.retries,
+        retry: this.workTickets.attemptCount(step),
         outcome,
       });
       return outcome;
@@ -1794,7 +1915,7 @@ export class PhaseEngine {
         step,
         role,
         debug: !!debug,
-        retry: step.retries,
+        retry: this.workTickets.attemptCount(step),
         outcome,
       });
       throw error;
@@ -1823,7 +1944,12 @@ export class PhaseEngine {
           ],
         };
         const evaluation = evaluateQualityGate(step, assessment);
-        await this.qualityAssessments.record(step, step.retries, assessment, evaluation);
+        await this.qualityAssessments.record(
+          step,
+          this.workTickets.attemptCount(step),
+          assessment,
+          evaluation,
+        );
         await this.opts.audit.event('phase.end', `${step.id} ${reason}`, {
           messageId: 'engine.test_case_completeness_failed',
           stepId: step.id,
@@ -1882,10 +2008,13 @@ export class PhaseEngine {
         onToolEvent: this.opts.onToolEvent,
       });
 
-      transitionStep(step, 'RUNNING', 'attempt-started');
       await this.workTickets.startStep(step);
       await this.persistPlan(plan);
-      sha = await this.opts.git.snapshot(step.id, step.retries, debug ? 'debug retry' : 'before');
+      sha = await this.opts.git.snapshot(
+        step.id,
+        this.workTickets.attemptCount(step),
+        debug ? 'debug retry' : 'before',
+      );
       if (attemptOpts.archiveOutputs) {
         for (const out of step.outputs) {
           await archiveIfExists(this.opts.ws, out, this.opts.audit);
@@ -1893,14 +2022,14 @@ export class PhaseEngine {
       }
       await this.opts.audit.event('phase.start', t().engine.phaseStart(step.id, debug ? 'DEBUG' : step.phase, step.title), {
         messageId: 'engine.phase_start',
-        ticketId: this.tickets.workForStep(step.id)?.id,
+        ticketId: this.tickets.featureForStep(step.id, step.iterationId ?? 'P1')?.id,
         bugTicketId: debug?.bugTicketId,
         changeRequestTicketId: attemptOpts.changeRequest?.id,
         enhanceTicketId: attemptOpts.enhancement?.id,
         role,
         tools: environment.toolNames,
         snapshot: sha,
-        retry: step.retries,
+        retry: this.workTickets.attemptCount(step),
       });
     } catch (err) {
       const msg = (err as Error).message;
@@ -1925,7 +2054,7 @@ export class PhaseEngine {
         rollbackError,
         stage: 'attempt-preparation',
         role,
-        retry: step.retries,
+        retry: this.workTickets.attemptCount(step),
       });
       return {
         ok: false,
@@ -1969,7 +2098,7 @@ export class PhaseEngine {
         tools: guardedTools,
         ctx,
         contextSnippets: ctxSnippets,
-        ticket: this.tickets.workForStep(step.id),
+        ticket: this.tickets.featureForStep(step.id, step.iterationId ?? 'P1'),
         changeRequest: attemptOpts.changeRequest,
         enhancement: attemptOpts.enhancement,
         skillHints: hints,
@@ -2008,7 +2137,7 @@ export class PhaseEngine {
           messageId: 'engine.phase_failed',
           rounds: r.rounds,
           reason,
-          retry: step.retries,
+          retry: this.workTickets.attemptCount(step),
           metrics: r.metrics,
           rollbackToPairedSource: true,
         });
@@ -2044,7 +2173,7 @@ export class PhaseEngine {
           phase: step.phase,
           validationDefect: r.validationDefect,
           rounds: r.rounds,
-          retry: step.retries,
+          retry: this.workTickets.attemptCount(step),
           metrics: r.metrics,
           rollbackToPairedSource: true,
         });
@@ -2087,7 +2216,12 @@ export class PhaseEngine {
               gaps: missingTokens.map((token) => `missing architecture contract token: ${token}`),
             };
             const evaluation = evaluateQualityGate(step, assessment);
-            await this.qualityAssessments.record(step, step.retries, assessment, evaluation);
+            await this.qualityAssessments.record(
+              step,
+              this.workTickets.attemptCount(step),
+              assessment,
+              evaluation,
+            );
             const failureLog = [
               t().engine.reasonLine(reason),
               t().engine.roundsLine(r.rounds),
@@ -2099,7 +2233,7 @@ export class PhaseEngine {
               messageId: 'engine.phase_failed',
               rounds: r.rounds,
               reason,
-              retry: step.retries,
+              retry: this.workTickets.attemptCount(step),
             });
             return {
               ok: false,
@@ -2121,7 +2255,11 @@ export class PhaseEngine {
         // 延迟到集成测试后才暴露。失败产物会保留，供同阶段 Debugger 修复。
         if (
           step.phase === 'CODE' &&
-          shouldRunCodeValidation(plan, step) &&
+          shouldRunCodeValidation(
+            plan,
+            step,
+            (candidate) => this.workTickets.isStepComplete(candidate),
+          ) &&
           await hasCodeValidationPrerequisites(this.opts.ws, this.profile.id)
         ) {
           const command = codeValidationCommand(this.profile.id);
@@ -2139,7 +2277,11 @@ export class PhaseEngine {
             const reason = `permission denied for CODE validation ${step.id}`;
             const failureLog = [t().engine.reasonLine(reason), permission.reason ?? ''].filter(Boolean).join('\n');
             spin?.fail(t().engine.phaseFailed(step.id, !!debug, reason));
-            await this.opts.git.snapshot(step.id, step.retries, 'code validation denied preserved');
+            await this.opts.git.snapshot(
+              step.id,
+              this.workTickets.attemptCount(step),
+              'code validation denied preserved',
+            );
             return {
               ok: false,
               failureLog,
@@ -2169,12 +2311,16 @@ export class PhaseEngine {
               messageId: 'engine.code_validation_failed',
               rounds: r.rounds,
               reason,
-              retry: step.retries,
+              retry: this.workTickets.attemptCount(step),
               command: command.display,
               exitCode: validation.exitCode,
               timedOut: validation.timedOut,
             });
-            await this.opts.git.snapshot(step.id, step.retries, 'code validation failed preserved');
+            await this.opts.git.snapshot(
+              step.id,
+              this.workTickets.attemptCount(step),
+              'code validation failed preserved',
+            );
             return {
               ok: false,
               failureLog,
@@ -2249,7 +2395,7 @@ export class PhaseEngine {
               messageId: 'engine.phase_failed',
               rounds: r.rounds,
               reason,
-              retry: step.retries,
+              retry: this.workTickets.attemptCount(step),
             });
             await this.preserveFailedValidationEvidence(step, reason);
             return {
@@ -2328,7 +2474,7 @@ export class PhaseEngine {
               messageId: 'engine.phase_failed',
               rounds: r.rounds,
               reason,
-              retry: step.retries,
+              retry: this.workTickets.attemptCount(step),
             });
             await this.preserveFailedValidationEvidence(step, reason);
             return {
@@ -2365,7 +2511,7 @@ export class PhaseEngine {
               messageId: 'engine.phase_failed',
               rounds: r.rounds,
               reason,
-              retry: step.retries,
+              retry: this.workTickets.attemptCount(step),
             });
             await this.opts.git.revertTo(sha);
             return {
@@ -2383,7 +2529,7 @@ export class PhaseEngine {
         const qualityEvaluation = evaluateQualityGate(step, qualityAssessment);
         await this.qualityAssessments.record(
           step,
-          step.retries,
+          this.workTickets.attemptCount(step),
           qualityAssessment,
           qualityEvaluation,
         );
@@ -2457,7 +2603,10 @@ export class PhaseEngine {
             attemptOpts.enhancement.id,
           );
         }
-        const workTicket = this.tickets.workForStep(step.id);
+        const workTicket = this.tickets.featureForStep(
+          step.id,
+          step.iterationId ?? 'P1',
+        );
         if (workTicket && r.metrics.providers.length > 0) {
           await this.tickets.recordModelAttribution(workTicket, {
             providers: r.metrics.providers,
@@ -2495,7 +2644,6 @@ export class PhaseEngine {
             phase: step.phase,
           });
         }
-        transitionStep(step, 'DONE', 'attempt-passed');
         await this.refreshCurrentProjectMemory(plan);
         const repair = debug?.bugTicketId
           ? await this.repairArtifacts.create(
@@ -2508,7 +2656,7 @@ export class PhaseEngine {
           : undefined;
         const completionCommit = await this.opts.git.snapshot(
           step.id,
-          step.retries,
+          this.workTickets.attemptCount(step),
           attemptOpts.changeRequest
             ? `${attemptOpts.changeRequest.id} ${debug ? 'debug done' : 'done'}`
             : debug ? 'debug done' : 'done',
@@ -2546,7 +2694,9 @@ export class PhaseEngine {
         }
         spin?.succeed(t().engine.phaseDone(step.id, r.rounds));
         await this.opts.audit.event('phase.end', t().engine.phaseDone(step.id, r.rounds), {
-          messageId: 'engine.phase_done', rounds: r.rounds, retry: step.retries,
+          messageId: 'engine.phase_done',
+          rounds: r.rounds,
+          retry: this.workTickets.attemptCount(step),
         });
         // 不在这里调 markDone：executeStepWithDebug 中统一处理（避免 retry-loop 里双写）。
         return {
@@ -2583,7 +2733,7 @@ export class PhaseEngine {
         messageId: 'engine.phase_failed',
         rounds: r.rounds,
         reason,
-        retry: step.retries,
+        retry: this.workTickets.attemptCount(step),
         metrics: m,
       });
       const completionGap =
@@ -2606,8 +2756,17 @@ export class PhaseEngine {
           gaps: verify.missing.map((output) => `missing required output: ${output}`),
         };
         const evaluation = evaluateQualityGate(step, assessment);
-        await this.qualityAssessments.record(step, step.retries, assessment, evaluation);
-        await this.opts.git.snapshot(step.id, step.retries, 'quality completion gap preserved');
+        await this.qualityAssessments.record(
+          step,
+          this.workTickets.attemptCount(step),
+          assessment,
+          evaluation,
+        );
+        await this.opts.git.snapshot(
+          step.id,
+          this.workTickets.attemptCount(step),
+          'quality completion gap preserved',
+        );
         return {
           ok: false,
           failureLog,
@@ -2632,12 +2791,16 @@ export class PhaseEngine {
           messageId: 'engine.debug_failed_attempt_preserved',
           stepId: step.id,
           phase: step.phase,
-          retry: step.retries,
+          retry: this.workTickets.attemptCount(step),
           reason,
           metrics: m,
           previousSnapshot: sha,
         });
-        await this.opts.git.snapshot(step.id, step.retries, 'debug failed preserved');
+        await this.opts.git.snapshot(
+          step.id,
+          this.workTickets.attemptCount(step),
+          'debug failed preserved',
+        );
       } else {
         await this.opts.git.revertTo(sha);
       }
@@ -2702,6 +2865,20 @@ export class PhaseEngine {
     }
   }
 
+  private async ensureExecutionGraph(plan: Plan): Promise<void> {
+    await this.tickets.load();
+    const key = [
+      plan.requirementDigest,
+      plan.phaseId,
+      ...plan.steps.map((step) => step.id),
+    ].join(':');
+    if (!this.initializedExecutionGraphs.has(key)) {
+      await this.workTickets.registerExecutionGraph(plan);
+      this.initializedExecutionGraphs.add(key);
+      return;
+    }
+    this.workTickets.projectPlanState(plan);
+  }
 }
 
 function dedup<T>(arr: T[]): T[] {

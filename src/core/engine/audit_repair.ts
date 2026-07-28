@@ -16,6 +16,7 @@ export function selectAuditRepairStep(
   plan: Plan,
   order: Step[],
   auditResult: ProjectAuditResult,
+  isComplete: (step: Step) => boolean,
   iterationId?: string,
 ): Step | undefined {
   const failedNames = new Set(
@@ -26,7 +27,7 @@ export function selectAuditRepairStep(
   const scopedOrder = iterationId
     ? order.filter((step) => (step.iterationId ?? 'P1') === iterationId)
     : order;
-  const done = scopedOrder.filter((step) => step.status === 'DONE');
+  const done = scopedOrder.filter(isComplete);
   const latest = (phases: Step['phase'][]): Step | undefined =>
     [...done].reverse().find((step) => phases.includes(step.phase));
 
@@ -73,7 +74,7 @@ export function selectAuditRepairStep(
     return latest(['CODE', 'HIGH_LEVEL_DESIGN']);
   }
   return latest(['CODE', 'DETAILED_DESIGN', 'HIGH_LEVEL_DESIGN', 'REQUIREMENT_ANALYSIS']) ??
-    (iterationId ? selectAuditRepairStep(plan, order, auditResult) : undefined);
+    (iterationId ? selectAuditRepairStep(plan, order, auditResult, isComplete) : undefined);
 }
 
 export function auditRepairContextPaths(input: {

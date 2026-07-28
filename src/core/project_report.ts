@@ -29,15 +29,28 @@ export async function generateProjectDevelopmentReport(input: {
   );
   const summary = tickets.summary();
   const steps = input.plan.steps;
+  const stageFeatures = steps
+    .map((step) => tickets.featureForStep(step.id, step.iterationId ?? 'P1'))
+    .filter((ticket) => ticket !== undefined);
+  const epic = tickets.epicForIteration(input.plan.phaseId);
+  const delivery = tickets.deliveryForIteration(input.plan.phaseId);
   const qualityRows = collectQualityRows(steps, latest);
   const passedQualityGates = qualityRows.filter((row) => row.record?.evaluation.passed).length;
-  const allStepsDone = steps.every((step) => step.status === 'DONE');
+  const allStepsDone =
+    stageFeatures.length === steps.length &&
+    stageFeatures.every(
+      (ticket) => ticket.status === 'closed' && ticket.execution.state === 'passed',
+    );
   const auditPassed = input.projectAudit?.ok ?? false;
   const allQualityGatesPassed =
     qualityRows.length > 0 &&
     qualityRows.every((row) => row.record?.evaluation.passed);
   const deliveryPassed =
     allStepsDone &&
+    epic?.status === 'closed' &&
+    epic.execution.state === 'passed' &&
+    delivery?.status === 'closed' &&
+    delivery.execution.state === 'passed' &&
     allQualityGatesPassed &&
     auditPassed &&
     unresolved.length === 0;
@@ -59,7 +72,9 @@ export async function generateProjectDevelopmentReport(input: {
     `- Project type: ${input.plan.projectType}`,
     `- Complexity: ${input.plan.complexityAssessment.level}`,
     `- Current iteration: ${input.plan.phaseId}`,
-    `- Current iteration V-model steps complete: ${steps.filter((step) => step.status === 'DONE').length}/${steps.length}`,
+    `- Current iteration V-model Features complete: ${stageFeatures.filter((ticket) =>
+      ticket.status === 'closed' && ticket.execution.state === 'passed'
+    ).length}/${steps.length}`,
     `- Project stage quality gates passed: ${passedQualityGates}/${qualityRows.length}`,
     '',
     '## Iterations',
@@ -75,6 +90,10 @@ export async function generateProjectDevelopmentReport(input: {
     '## Ticket Summary',
     '',
     `- Total: ${summary.total}`,
+    `- Epics: ${summary.byType.epic}`,
+    `- Features: ${summary.byType.feature}`,
+    `- Tasks: ${summary.byType.task}`,
+    `- Sub-tasks: ${summary.byType['sub-task']}`,
     `- Bugs: ${summary.byType.bug}`,
     `- Enhancements: ${summary.byType.enhance} (functional gaps ${summary.enhancementsByKind['functional-gap']}, test incomplete ${summary.enhancementsByKind['test-incomplete']}, defects ${summary.enhancementsByKind.defect})`,
     `- Change requests: ${summary.changeRequests.total} (${summary.changeRequests.totalRevisions} revision(s), ${summary.changeRequests.open} open)`,
@@ -93,7 +112,7 @@ export async function generateProjectDevelopmentReport(input: {
     '',
     deliveryPassed
       ? '- All stage gates, Ticket verification, and the project audit passed.'
-      : '- Delivery is blocked until every V-model Step, quality gate, unresolved Ticket, and project audit error is cleared.',
+      : '- Delivery is blocked until every V-model Feature passes, every quality gate passes, all blocking Tickets close, and the project audit is clear.',
     '',
   ];
   await input.workspace.writeFile(PROJECT_DEVELOPMENT_REPORT_PATH, `${lines.join('\n')}\n`);

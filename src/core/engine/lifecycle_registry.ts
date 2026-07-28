@@ -1,6 +1,7 @@
 import type { TicketType } from '../ticket.js';
 
 export const TICKET_LIFECYCLE_OWNERS = {
+  epic: 'work',
   feature: 'work',
   task: 'work',
   'sub-task': 'work',

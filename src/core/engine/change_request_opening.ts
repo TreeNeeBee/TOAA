@@ -78,7 +78,9 @@ export class ChangeRequestOpening {
       ...input.affectedSteps.flatMap((step) => step.outputs),
     ]);
     const relatedWorkTicketIds = input.affectedSteps
-      .map((step) => this.store.workForStep(step.id)?.id)
+      .map((step) =>
+        this.store.featureForStep(step.id, step.iterationId ?? 'P1')?.id
+      )
       .filter((id): id is string => !!id);
     const objective =
       `Propagate the accepted ${input.sourceStep.phase} quality delta from ${input.enhancement.id} ` +
@@ -246,7 +248,9 @@ export class ChangeRequestOpening {
     const resolutionPlan = bug.bugResolutionPlan ??
       `Apply the repaired ${input.sourceStep.phase} contract incrementally through the affected downstream steps.`;
     const relatedWorkTicketIds = input.affectedSteps
-      .map((step) => this.store.workForStep(step.id)?.id)
+      .map((step) =>
+        this.store.featureForStep(step.id, step.iterationId ?? 'P1')?.id
+      )
       .filter((id): id is string => !!id);
     const request = await this.store.createChangeRequest({
       iterationId: input.sourceStep.iterationId ?? 'P1',
@@ -267,7 +271,7 @@ export class ChangeRequestOpening {
       objective: resolutionPlan,
       acceptance: [
         input.failedTest.acceptance,
-        `All affected tasks pass through ${input.failedTest.id} ${input.failedTest.phase}.`,
+        `All affected Features pass through ${input.failedTest.id} ${input.failedTest.phase}.`,
       ],
       artifacts: affectedArtifacts,
       sourceEnhanceTicketId: enhancement.id,

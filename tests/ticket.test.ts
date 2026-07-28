@@ -32,8 +32,15 @@ function codeStep(): Step {
       description: 'Apply the service contract.',
       acceptance: 'The service follows the new contract.',
       outputs: ['src/service.ts'],
+      subTasks: [{
+        id: 'M001.1',
+        title: 'Update result type',
+        description: 'Apply the result type contract.',
+        acceptance: 'The result type follows the detailed design.',
+        outputs: ['src/result.ts'],
+      }],
     }],
-    dependsOn: ['S003'],
+    dependsOn: [],
     acceptance: 'The design delta is implemented and verified.',
     status: 'PENDING',
     retries: 0,
@@ -43,14 +50,67 @@ function codeStep(): Step {
 
 function plan(step = codeStep()): Plan {
   return {
-    version: 2,
+    version: '1',
     intent: 'feature',
+    phaseId: 'P1',
     projectType: 'application',
     language: 'typescript',
     requirementDigest: 'Implement a ticket-driven service change.',
+    complexityAssessment: {
+      level: 'simple',
+      rationale: 'One isolated change.',
+      splitRecommended: false,
+      userForcedPhaseSplit: false,
+    },
+    implementationPhases: [{
+      id: 'P1',
+      title: 'Core delivery',
+      objective: 'Implement the ticket-driven service change.',
+      status: 'current',
+      scope: ['service'],
+      deliverables: ['src/main.ts'],
+      dependsOn: [],
+      verificationGate: {
+        summary: 'The service change is verified.',
+        checks: ['The stage acceptance passes.'],
+        failurePolicy: 'Open a Bug and route it to the paired source Feature.',
+      },
+    }],
     globalPrompt: 'Implement the approved plan.',
+    baselineSummary: '',
+    userAddenda: '',
+    createdAt: new Date().toISOString(),
     steps: [step],
   };
+}
+
+function vModelPlan(): Plan {
+  const phases = [
+    ['REQUIREMENT_ANALYSIS', 'Planner'],
+    ['HIGH_LEVEL_DESIGN', 'Architect'],
+    ['DETAILED_DESIGN', 'Architect'],
+    ['CODE', 'Coder'],
+    ['UNIT_TEST', 'Tester'],
+    ['INTEGRATION_TEST', 'Tester'],
+    ['MODULE_TEST', 'Tester'],
+    ['FUNCTIONAL_TEST', 'Tester'],
+  ] as const;
+  const base = plan();
+  base.steps = phases.map(([phase, role], index): Step => ({
+    ...codeStep(),
+    id: `S${String(index + 1).padStart(3, '0')}`,
+    phase,
+    role,
+    title: phase,
+    description: `Execute ${phase}.`,
+    systemPrompt: `Complete only ${phase}.`,
+    inputs: index === 0 ? [] : [`artifact-${index}`],
+    outputs: [`artifact-${index + 1}`],
+    subTasks: [],
+    dependsOn: index === 0 ? [] : [`S${String(index).padStart(3, '0')}`],
+    acceptance: `${phase} passes.`,
+  }));
+  return base;
 }
 
 async function setup() {
@@ -59,12 +119,12 @@ async function setup() {
   const store = new TicketStore(workspace);
   const workTickets = new WorkTicketLifecycle(store);
   const step = codeStep();
-  await workTickets.registerPlan(plan(step));
+  await workTickets.registerExecutionGraph(plan(step));
   return { root, workspace, store, workTickets, step };
 }
 
 async function createBug(store: TicketStore, step: Step): Promise<BugTicket> {
-  const work = store.workForStep(step.id)!;
+  const work = store.featureForStep(step.id, step.iterationId ?? 'P1')!;
   return store.createBug({
     priority: 'high',
     title: 'Unit test failed',
@@ -96,6 +156,7 @@ async function createBug(store: TicketStore, step: Step): Promise<BugTicket> {
 describe('ticket workflow', () => {
   it('assigns every Ticket type to an explicit lifecycle owner', () => {
     expect(TICKET_LIFECYCLE_OWNERS).toEqual({
+      epic: 'work',
       feature: 'work',
       task: 'work',
       'sub-task': 'work',
@@ -105,23 +166,44 @@ describe('ticket workflow', () => {
     });
   });
 
-  it('materializes feature, task, and sub-task tickets from the plan hierarchy', async () => {
+  it('materializes an Epic, stage and delivery Features, and two task levels', async () => {
     const { root, store, step } = await setup();
     const tickets = store.all();
-    const feature = tickets.find((ticket) => ticket.type === 'feature');
-    const task = store.workForStep(step.id);
+    const epic = tickets.find((ticket) => ticket.type === 'epic');
+    const feature = store.featureForStep(step.id, step.iterationId ?? 'P1');
+    const delivery = tickets.find(
+      (ticket) => ticket.type === 'feature' && ticket.workKind === 'delivery',
+    );
+    const task = tickets.find((ticket) => ticket.type === 'task');
     const subTask = tickets.find((ticket) => ticket.type === 'sub-task');
 
-    expect(feature).toMatchObject({ status: 'open', iterationId: 'P1' });
-    expect(task).toMatchObject({
-      type: 'task',
-      parentTicketId: feature?.id,
-      rootTicketId: feature?.id,
+    expect(epic).toMatchObject({
+      type: 'epic',
+      workKind: 'iteration',
+      status: 'open',
+      iterationId: 'P1',
+    });
+    expect(feature).toMatchObject({
+      type: 'feature',
+      workKind: 'v-model-stage',
+      parentTicketId: epic?.id,
+      rootTicketId: epic?.id,
       source: { stepId: 'S004', phase: 'CODE' },
+    });
+    expect(delivery).toMatchObject({
+      workKind: 'delivery',
+      parentTicketId: epic?.id,
+      rootTicketId: epic?.id,
+      dependsOnTicketIds: [feature?.id],
+    });
+    expect(task).toMatchObject({
+      parentTicketId: feature?.id,
+      rootTicketId: epic?.id,
+      source: { stepId: 'S004' },
     });
     expect(subTask).toMatchObject({
       parentTicketId: task?.id,
-      rootTicketId: feature?.id,
+      rootTicketId: epic?.id,
       source: { stepId: 'S004' },
     });
 
@@ -130,7 +212,7 @@ describe('ticket workflow', () => {
       'utf8',
     )).trim().split('\n').map((line) => JSON.parse(line) as { ticketType: string });
     expect(events.map((event) => event.ticketType)).toEqual(
-      expect.arrayContaining(['feature', 'task', 'sub-task']),
+      expect.arrayContaining(['epic', 'feature', 'task', 'sub-task']),
     );
   });
 
@@ -142,13 +224,141 @@ describe('ticket workflow', () => {
     const refactorPlan = plan();
     refactorPlan.intent = 'refactor';
 
-    await workTickets.registerPlan(refactorPlan);
+    await workTickets.registerExecutionGraph(refactorPlan);
 
-    expect(store.all().filter((ticket) => ticket.type === 'feature')).toHaveLength(1);
+    expect(store.all().filter((ticket) => ticket.type === 'epic')).toHaveLength(1);
+    expect(store.all().filter((ticket) => ticket.type === 'feature')).toHaveLength(2);
     expect(store.all().filter((ticket) => ticket.type === 'enhance')).toHaveLength(0);
   });
 
-  it('rejects pre-v2 Ticket stores instead of running a compatibility path', async () => {
+  it('builds the V-model dependency graph and blocks delivery on active defects', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-ticket-v-model-'));
+    const store = new TicketStore(new Workspace(root));
+    const workTickets = new WorkTicketLifecycle(store);
+    const currentPlan = vModelPlan();
+
+    await workTickets.registerExecutionGraph(currentPlan);
+    const epic = store.epicForIteration('P1')!;
+    const delivery = store.deliveryForIteration('P1')!;
+    const features = currentPlan.steps.map((step) =>
+      store.featureForStep(step.id, step.iterationId ?? 'P1')!
+    );
+
+    expect(store.all().filter((ticket) => ticket.type === 'epic')).toHaveLength(1);
+    expect(store.all().filter((ticket) => ticket.type === 'feature')).toHaveLength(9);
+    expect(features[0]?.verificationTicketId).toBe(features[7]?.id);
+    expect(features[1]?.verificationTicketId).toBe(features[6]?.id);
+    expect(features[2]?.verificationTicketId).toBe(features[5]?.id);
+    expect(features[3]?.verificationTicketId).toBe(features[4]?.id);
+    expect(features[4]?.pairedSourceTicketId).toBe(features[3]?.id);
+    expect(features[1]?.dependsOnTicketIds).toEqual([features[0]?.id]);
+    expect(delivery.dependsOnTicketIds).toEqual(features.map((feature) => feature.id));
+    expect(workTickets.readiness(currentPlan.steps[0]!).ready).toBe(true);
+    expect(workTickets.readiness(currentPlan.steps[1]!).ready).toBe(false);
+
+    for (const step of currentPlan.steps) await workTickets.completeStep(step);
+    const bug = await createBug(store, currentPlan.steps[3]!);
+    await expect(workTickets.completeDelivery('P1')).rejects.toThrow(bug.id);
+
+    await store.transition(bug, 'cancelled', 'test-defect-cancelled');
+    await workTickets.completeDelivery('P1', ['docs/project-development-report.md']);
+    expect(delivery).toMatchObject({
+      status: 'closed',
+      execution: { state: 'passed' },
+    });
+    expect(epic).toMatchObject({
+      status: 'closed',
+      execution: { state: 'passed' },
+    });
+  });
+
+  it('gates a later iteration through its upstream Epic instead of Plan order', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-ticket-iterations-'));
+    const store = new TicketStore(new Workspace(root));
+    const workTickets = new WorkTicketLifecycle(store);
+    const currentPlan = plan();
+    const first = {
+      ...codeStep(),
+      id: 'S001',
+      iterationId: 'P1',
+      dependsOn: [],
+      subTasks: [],
+    };
+    const second = {
+      ...codeStep(),
+      id: 'S001',
+      iterationId: 'P2',
+      dependsOn: [],
+      subTasks: [],
+    };
+    currentPlan.steps = [second, first];
+    currentPlan.implementationPhases = [
+      currentPlan.implementationPhases[0]!,
+      {
+        ...currentPlan.implementationPhases[0]!,
+        id: 'P2',
+        title: 'Enhancement delivery',
+        status: 'planned',
+        dependsOn: ['P1'],
+      },
+    ];
+
+    await workTickets.registerExecutionGraph(currentPlan);
+    const firstEpic = store.epicForIteration('P1')!;
+    const secondEpic = store.epicForIteration('P2')!;
+    const firstFeature = store.featureForStep(first.id, first.iterationId)!;
+    const secondFeature = store.featureForStep(second.id, second.iterationId)!;
+
+    expect(firstFeature.id).not.toBe(secondFeature.id);
+    expect(firstFeature.iterationId).toBe('P1');
+    expect(secondFeature.iterationId).toBe('P2');
+    expect(secondEpic.dependsOnTicketIds).toEqual([firstEpic.id]);
+    expect(secondFeature.dependsOnTicketIds).toEqual([firstEpic.id]);
+    expect(workTickets.readiness(second).ready).toBe(false);
+
+    await workTickets.completeStep(first);
+    await workTickets.completeDelivery('P1');
+    expect(workTickets.readiness(second).ready).toBe(true);
+
+    await workTickets.completeStep(second);
+    await workTickets.completeDelivery('P2');
+    expect(workTickets.isIterationDelivered('P2')).toBe(true);
+  });
+
+  it('rejects missing Step and prerequisite Epic dependencies during graph compilation', async () => {
+    const missingStepRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'xcompiler-ticket-missing-step-'),
+    );
+    const missingStepLifecycle = new WorkTicketLifecycle(
+      new TicketStore(new Workspace(missingStepRoot)),
+    );
+    const missingStepPlan = plan({
+      ...codeStep(),
+      dependsOn: ['S999'],
+    });
+    await expect(missingStepLifecycle.registerExecutionGraph(missingStepPlan))
+      .rejects.toThrow('dependency Step(s) missing for S999');
+
+    const missingEpicRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'xcompiler-ticket-missing-epic-'),
+    );
+    const missingEpicLifecycle = new WorkTicketLifecycle(
+      new TicketStore(new Workspace(missingEpicRoot)),
+    );
+    const missingEpicPlan = plan({
+      ...codeStep(),
+      iterationId: 'P2',
+    });
+    missingEpicPlan.implementationPhases = [{
+      ...missingEpicPlan.implementationPhases[0]!,
+      id: 'P2',
+      dependsOn: ['P1'],
+    }];
+    await expect(missingEpicLifecycle.registerExecutionGraph(missingEpicPlan))
+      .rejects.toThrow('prerequisite Epic(s) missing for P1');
+  });
+
+  it('rejects pre-v3 Ticket stores instead of running a compatibility path', async () => {
     const { root, workspace } = await setup();
     const indexPath = path.join(root, '.xcompiler/tickets/index.json');
     const legacy = (JSON.parse(await fs.readFile(indexPath, 'utf8')) as Array<Record<string, unknown>>)
@@ -181,12 +391,14 @@ describe('ticket workflow', () => {
 
   it('reopens closed ancestor tickets when completed work starts again', async () => {
     const { store, workTickets, step } = await setup();
-    const work = store.workForStep(step.id)!;
+    const work = store.featureForStep(step.id, step.iterationId ?? 'P1')!;
     const root = store.find(work.rootTicketId!)!;
 
     await workTickets.startStep(step);
     await workTickets.completeStep(step);
     expect(work.status).toBe('closed');
+    expect(root.status).toBe('in_progress');
+    await workTickets.completeDelivery('P1');
     expect(root.status).toBe('closed');
 
     await workTickets.startStep(step);
@@ -197,7 +409,7 @@ describe('ticket workflow', () => {
   it('persists a change-request ticket linked to its triggering bug and affected tasks', async () => {
     const { root, store, step } = await setup();
     const bug = await createBug(store, step);
-    const work = store.workForStep(step.id)!;
+    const work = store.featureForStep(step.id, step.iterationId ?? 'P1')!;
     const enhancement = await store.createEnhance({
       priority: 'high',
       iterationId: 'P1',
@@ -219,7 +431,7 @@ describe('ticket workflow', () => {
       kind: 'functional-gap',
       finding: 'The service does not expose the required structured result.',
       sourceBugTicketId: bug.id,
-      affectedTaskTicketIds: [work.id],
+      affectedWorkTicketIds: [work.id],
       changeRequestTicketIds: [],
       disposition: 'change-request',
     });
@@ -306,6 +518,7 @@ describe('ticket workflow', () => {
 
     const changes = new ChangeRequestLifecycle(
       store,
+      null as never,
       null as never,
       null as never,
       null as never,

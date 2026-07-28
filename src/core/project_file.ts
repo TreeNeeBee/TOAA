@@ -13,6 +13,11 @@ import {
   type StepStatus,
 } from './plan.js';
 import { loadPlanTarget } from './storage.js';
+import {
+  projectWorkStatusToStepStatus,
+  TicketStore,
+} from './ticket.js';
+import { Workspace } from '../workspace/workspace.js';
 
 export const XCOMPILER_PROJECT_KIND = 'xcompiler.project';
 export const XCOMPILER_PROJECT_VERSION = '1';
@@ -181,7 +186,12 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
   const now = new Date().toISOString();
   const existing = await readExistingProjectFile(filePath);
   const plan = opts.plan ?? (await tryLoadPlan(planPath));
-  const progress = plan ? buildProjectProgress(plan) : existing?.progress;
+  let ticketStore: TicketStore | undefined;
+  if (plan) {
+    ticketStore = new TicketStore(new Workspace(workspace));
+    await ticketStore.load();
+  }
+  const progress = plan ? buildProjectProgress(plan, ticketStore) : existing?.progress;
   const history = existing?.history ?? [];
   const shouldRecord = opts.recordHistory ?? false;
   const nextHistory = shouldRecord
@@ -225,7 +235,10 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
   return filePath;
 }
 
-export function buildProjectProgress(plan: Plan): XCompilerProjectProgress {
+export function buildProjectProgress(
+  plan: Plan,
+  tickets?: TicketStore,
+): XCompilerProjectProgress {
   const counts: Record<StepStatus, number> = {
     PENDING: 0,
     RUNNING: 0,
@@ -233,15 +246,17 @@ export function buildProjectProgress(plan: Plan): XCompilerProjectProgress {
     FAILED: 0,
   };
   const steps = plan.steps.map((step) => {
-    counts[step.status]++;
+    const feature = tickets?.featureForStep(step.id, step.iterationId ?? 'P1');
+    const status = feature ? projectWorkStatusToStepStatus(feature) : step.status;
+    counts[status]++;
     return {
       id: step.id,
       iterationId: step.iterationId ?? 'P1',
       phase: step.phase as Phase,
       title: step.title,
-      status: step.status,
-      retries: step.retries,
-      maxRetries: step.maxRetries,
+      status,
+      retries: feature?.execution.attempts ?? step.retries,
+      maxRetries: feature?.execution.maxAttempts ?? step.maxRetries,
     };
   });
   const total = plan.steps.length;

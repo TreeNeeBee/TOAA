@@ -53,7 +53,11 @@ V-model behavior:
 - Every S1-S4 delivery gate records stage completion and alignment with its upstream requirement/design contract. Missing or under-aligned work opens an `enhance` Ticket and reruns the owning stage in incremental mode.
 - S5 enforces line, branch, and test-case pass coverage; S6 enforces interface and integration-scenario coverage; S7 enforces module and contract coverage; S8 enforces functional, requirement, and end-to-end coverage. Each plan can override thresholds and bounded `tolerance`.
 - A metric shortfall, skipped-test excess, warning excess, or missing quality evidence opens an `enhance`; an actual failed test, command error, or semantic `validationDefect` opens a `bug`.
-- Runtime materializes every planned iteration as a `feature`; each macro Step is a `task`, and its two-level `subTasks` become parent-linked `sub-task` Tickets.
+- Runtime compiles every executable iteration into one `epic`, eight `kind: v-model-stage` Features, and one final `kind: delivery` Feature. A Step's first and second `subTasks` levels become Task and Sub-task Tickets.
+- Stage Features carry explicit `dependsOnTicketIds`; V-model source/verification pairs use `verificationTicketId` and `pairedSourceTicketId`. Array order is never treated as a dependency.
+- A later iteration Epic explicitly depends on its prerequisite Epics, and its first stage Feature inherits that gate. Reordering Plan arrays cannot bypass an unfinished iteration.
+- Stage identity is the composite `(iterationId, stepId)`, so P1/S001 and P2/S001 have separate Features, blockers, retries, and Debug histories.
+- The delivery Feature starts only after all eight stage Features are both `closed` and execution-`passed`, prerequisite Epics have passed, and no active Bug, Enhance, or Change Request remains. Closing it closes the Epic; it never cascades fake completion into unfinished children.
 - A concrete failure creates a `bug` for Debugger execution. Quality findings are independent `enhance` Tickets with kind `defect`, `functional-gap`, or `test-incomplete`; they are not disguised as Bugs.
 - Only an accepted upstream design/contract delta creates a `change-request`. Its trigger is the Enhance finding; `originBugTicketId` is present only when a Bug initiated that finding. Downstream stages apply only the delta and record change/verification commits.
 - A downstream failure creates another linked Bug and increments the same change-request revision. A child change-request is created only when the correction materially expands contract or scope.
@@ -74,14 +78,14 @@ Layer responsibilities:
 
 - **Adapters**: argument/protocol parsing, config loading, user interaction, output rendering, exit codes.
 - **Runtime**: Runtime API, Build Service, Run Service, Event Stream, and Permission Broker; the only business entry point.
-- **Workflow and planning**: phase iteration, V-model scheduling, Ticket registration/routing, rollback, iteration gates, resume.
-- **State policy**: one Ticket lifecycle for `feature`, `enhance`, `task`, `sub-task`, `bug`, and `change-request`; Step and implementation-phase cursors remain execution state. No adapter or agent mutates persisted workflow state directly.
+- **Workflow and planning**: phase iteration, V-model definition, Ticket-graph compilation/routing, rollback, iteration gates, delivery, resume.
+- **State policy**: the Ticket graph is the runtime source of truth for `epic`, `feature`, `task`, `sub-task`, `bug`, `enhance`, and `change-request`. Plan Step status/retry fields are progress projections only. No adapter or agent mutates persisted workflow state directly.
 - **Agents / Skills**: role-specific prompts plus allowed tools for each stage.
 - **Tools**: guarded file edits, program/test execution, API fetches, dependency edits, git snapshots.
 - **LLM Router**: role chains, provider scores, cluster fallbacks, OpenAI-compatible/Ollama clients, audit.
 - **Workspace**: `phasePlan.json`, `plan.P<N>.json`, `<name>.xc`, `.xcompiler/audit.jsonl`, `.xcompiler/tickets/`, `.xcompiler/quality/assessments.json`, debug cache, project memory, and `docs/project-development-report.md`.
 
-Ticket state is persisted in `.xcompiler/tickets/index.json`, per-ticket JSON/Markdown snapshots, and the append-only `.xcompiler/tickets/events.jsonl`. Bug evidence and repair patches live under the Bug Ticket directory, so every handoff keeps its trigger, parent/root relationship, blockers, affected artifacts, acceptance gates, and final resolution.
+Ticket state is persisted in `.xcompiler/tickets/index.json`, per-ticket JSON/Markdown snapshots, and the append-only `.xcompiler/tickets/events.jsonl`. Work Tickets separate governance status from execution state (`queued`, `running`, `passed`, `failed`). Bug evidence and repair patches live under the Bug Ticket directory, so every handoff keeps its trigger, root Epic, dependencies, V-model pairing, blockers, affected artifacts, acceptance gates, and final resolution.
 `.xcompiler/tickets/summary.json` separates enhancement kinds, CR revisions, status counts, and per-provider model impact. A quality gap penalizes the attributed author provider; a validated finding rewards its validator; verified Debug and CR work rewards the providers that produced the accepted repair. Creating a CR by itself never changes a model score.
 
 ---

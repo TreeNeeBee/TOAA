@@ -43,7 +43,6 @@ import {
   silentRuntimeIO,
   type RuntimeIO,
 } from './io.js';
-import { resetStepForRerun } from '../core/workflow_state.js';
 
 export interface ExecuteOptions {
   planPath: string;
@@ -127,43 +126,18 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   const publicPlanPath = target.phasePlanPath ?? target.planPath;
   const plan = target.plan;
   const projectCommand = opts.projectCommand ?? 'run';
-  // --force 隐含重置所有 Step 状态、覆写锁，让整个 Plan 从头执行。
+  // --force resets the current iteration Ticket graph and clears debug history.
   if (opts.force) {
     await runtimeLog(io, 'warning', t().execute.forceReset);
     opts.resetStatus = true;
   }
 
   if (opts.resetStatus) {
-    for (const s of plan.steps) {
-      resetStepForRerun(s, 'explicit-reset');
-    }
-    await savePlan(planAbs, plan);
     const debugCache = new DebugCache(ws.abs('.xcompiler/debug_cache.json'));
     await debugCache.clearAll();
     await audit.event('plan.persist', 'cleared debug cache because run reset was requested', {
       messageId: 'execute.debug_cache_reset',
     });
-  }
-  let recoveredRunning: Array<{ stepId: string; status: string; reason: string }> = [];
-  if (!opts.resetStatus) {
-    recoveredRunning = resetInterruptedRunningSteps(plan);
-    if (recoveredRunning.length > 0) {
-      await savePlan(planAbs, plan);
-      const debugCache = new DebugCache(ws.abs('.xcompiler/debug_cache.json'));
-      const recoveredDebugSteps: string[] = [];
-      for (const recovered of recoveredRunning) {
-        const marked = await debugCache.markInterrupted(
-          recovered.stepId,
-          `interrupted while ${recovered.reason}; resume the latest recorded Debugger attempt`,
-        );
-        if (marked) recoveredDebugSteps.push(recovered.stepId);
-      }
-      await audit.event('plan.persist', `recovered ${recoveredRunning.length} stale RUNNING step(s)`, {
-        messageId: 'execute.plan_running_recovered',
-        steps: recoveredRunning,
-        recoveredDebugSteps,
-      });
-    }
   }
   let projectFilePath = await updateProjectFile({
     workspace: ws.root,
@@ -270,6 +244,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
     debugWikiPath: opts.debugWikiPath ? path.resolve(opts.debugWikiPath) : undefined,
     debugWikiStrict: !!opts.debugWikiPath,
+    resetExecutionState: !!opts.resetStatus,
     requestPermission: io.requestPermission
       ? async (request: ToolPermissionRequest) => {
           await io.emit({ type: 'permission', status: 'requested', request });
@@ -347,7 +322,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       await runtimeResult(io, 'run', 'failed', { failedStepId: r.failedStepId, exitCode: 4 });
       return { status: 'failed', engine: r, message: r.failureReason, exitCode: 4 };
     }
-    const incompleteSteps = plan.steps.filter((step) => step.status !== 'DONE');
+    const incompleteSteps = engine.incompleteSteps(plan);
     if (!opts.onlyPhase && incompleteSteps.length > 0) {
       const failedStepId = incompleteSteps[0]!.id;
       const reason =
@@ -390,7 +365,10 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     }
     let auditWarnings = 0;
     let finalProjectAudit: ProjectAuditResult | undefined;
-    if (shouldRunProjectAudit(plan, { onlyPhase: opts.onlyPhase })) {
+    if (shouldRunProjectAudit(
+      { onlyPhase: opts.onlyPhase },
+      engine.incompleteSteps(plan).length === 0,
+    )) {
       if (io.requestPermission) {
         const request: ToolPermissionRequest = {
           operationType: 'test_command',
@@ -503,8 +481,8 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       auditWarnings = auditResult.warnings;
       finalProjectAudit = auditResult;
     }
-    const allStepsDone = plan.steps.every((step) => step.status === 'DONE');
-    const phaseAdvance = target.phasePlan && target.phasePlanPath && !opts.onlyPhase && allStepsDone
+    const iterationDelivered = !opts.onlyPhase && engine.isIterationDelivered(plan.phaseId);
+    const phaseAdvance = target.phasePlan && target.phasePlanPath && iterationDelivered
       ? await completeAndPrepareNextPhase({
           phasePlan: target.phasePlan,
           phasePlanPath: target.phasePlanPath,
@@ -514,10 +492,11 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           io,
           currentPlanPath: planAbs,
           currentPlan: plan,
+          iterationDelivered,
         })
       : undefined;
     const projectPlan = phaseAdvance?.nextPlan ?? plan;
-    const reportPath = allStepsDone
+    const reportPath = iterationDelivered
       ? await generateProjectDevelopmentReport({
           workspace: ws,
           plan,
@@ -541,7 +520,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         `iteration ${phaseAdvance.completedPhaseId} passed; prepared ${phaseAdvance.nextPlan.phaseId}`,
       );
     }
-    if (allStepsDone) {
+    if (iterationDelivered) {
       await runtimeLog(io, 'success', t().execute.runAllDone(r.executedSteps, r.totalSteps));
     } else {
       await runtimeLog(io, 'warning', t().execute.runPartialDone(
@@ -601,27 +580,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
 }
 
-/**
- * A persisted RUNNING state proves that the phase did not finish its acceptance
- * gates. Existing output files are useful resume context, but are not completion
- * evidence: they may be partial, inconsistent, or fail compilation.
- */
-export function resetInterruptedRunningSteps(
-  plan: Pick<Plan, 'steps'>,
-): Array<{ stepId: string; status: 'PENDING'; reason: string }> {
-  const recovered: Array<{ stepId: string; status: 'PENDING'; reason: string }> = [];
-  for (const step of plan.steps) {
-    if (step.status !== 'RUNNING') continue;
-    resetStepForRerun(step, 'interrupted');
-    recovered.push({
-      stepId: step.id,
-      status: 'PENDING',
-      reason: 'interrupted before acceptance gates completed; revalidation required',
-    });
-  }
-  return recovered;
-}
-
 async function completeAndPrepareNextPhase(args: {
   phasePlan: PhasePlan;
   phasePlanPath: string;
@@ -631,13 +589,10 @@ async function completeAndPrepareNextPhase(args: {
   io: RuntimeIO;
   currentPlanPath: string;
   currentPlan: Plan;
+  iterationDelivered: boolean;
 }): Promise<{ completedPhaseId: string; phasePlan: PhasePlan; nextPlan?: Plan }> {
-  const incomplete = args.currentPlan.steps.filter((step) => step.status !== 'DONE');
-  if (incomplete.length > 0) {
-    throw new Error(
-      `cannot advance implementation phase with incomplete steps: ` +
-      incomplete.map((step) => `${step.id}=${step.status}`).join(', '),
-    );
+  if (!args.iterationDelivered) {
+    throw new Error('cannot advance implementation phase before its Delivery Feature and Epic close');
   }
   const transition = advancePhasePlan(args.phasePlan);
   const next = transition.nextPhase;

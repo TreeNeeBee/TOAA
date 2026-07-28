@@ -43,10 +43,12 @@ export class EnhancementLifecycle {
     if (existing) return existing;
 
     const failedWork = bug.source.stepId
-      ? this.store.workForStep(bug.source.stepId)
+      ? this.store.featureForStep(bug.source.stepId, bug.iterationId)
       : undefined;
-    const targetWork = target ? this.store.workForStep(target.id) : undefined;
-    const affectedTaskTicketIds = dedup([
+    const targetWork = target
+      ? this.store.featureForStep(target.id, target.iterationId ?? 'P1')
+      : undefined;
+    const affectedWorkTicketIds = dedup([
       targetWork?.id,
       failedWork?.id,
     ].filter((id): id is string => !!id));
@@ -74,7 +76,7 @@ export class EnhancementLifecycle {
       iterationId: bug.iterationId,
       parentTicketId: bug.rootTicketId,
       rootTicketId: bug.rootTicketId,
-      relatedTicketIds: dedup([bug.id, ...affectedTaskTicketIds]),
+      relatedTicketIds: dedup([bug.id, ...affectedWorkTicketIds]),
       blockedByTicketIds: [],
       source: {
         kind: 'runtime',
@@ -91,15 +93,20 @@ export class EnhancementLifecycle {
       kind,
       finding: bug.debugBrief?.summary ?? bug.reason,
       sourceBugTicketId: bug.id,
-      affectedTaskTicketIds,
+      targetStepId: target?.id,
+      targetPhase: target?.phase,
+      verificationStepId: bug.verificationStepId ?? bug.source.stepId,
+      verificationPhase: bug.verificationPhase ?? bug.source.phase,
+      affectedWorkTicketIds,
       changeRequestTicketIds: [],
       disposition: 'debug',
     });
-    await this.workTickets.childOpened(enhancement, 'enhancement-opened', {
+    await this.workTickets.reopenAncestorsFor(enhancement, 'enhancement-opened', {
       enhanceTicketId: enhancement.id,
       sourceBugTicketId: enhancement.sourceBugTicketId,
       sourceQualityGateStepId: enhancement.sourceQualityGateStepId,
     });
+    await this.blockAffectedWork(enhancement);
     if (detectedProviders.length > 0 && bug.source.role) {
       await this.store.recordModelAttribution(enhancement, {
         providers: detectedProviders,
@@ -141,7 +148,7 @@ export class EnhancementLifecycle {
         ticketId: enhancement.id,
         bugTicketId: bug.id,
         enhanceKind: enhancement.kind,
-        affectedTaskTicketIds,
+        affectedWorkTicketIds,
         detectedProviders,
         attributedProviders,
       },
@@ -155,7 +162,10 @@ export class EnhancementLifecycle {
     qualityGap: QualityGap,
     providers: string[] = [],
   ): Promise<EnhanceTicket> {
-    const existing = this.store.activeQualityEnhanceForStep(failedStep.id);
+    const existing = this.store.activeQualityEnhanceForStep(
+      failedStep.id,
+      failedStep.iterationId ?? 'P1',
+    );
     if (existing) {
       existing.targetStepId = targetStep.id;
       existing.targetPhase = targetStep.phase;
@@ -164,13 +174,20 @@ export class EnhancementLifecycle {
       existing.qualityFailures = qualityGap.evaluation.enhancementFailures;
       existing.qualityAssessment = qualityGap.assessment;
       await this.store.persist(existing, 'quality-gap-refreshed');
+      await this.blockAffectedWork(existing);
       this.lastEnhance = existing;
       return existing;
     }
 
-    const failedWork = this.store.workForStep(failedStep.id);
-    const targetWork = this.store.workForStep(targetStep.id);
-    const affectedTaskTicketIds = dedup([
+    const failedWork = this.store.featureForStep(
+      failedStep.id,
+      failedStep.iterationId ?? 'P1',
+    );
+    const targetWork = this.store.featureForStep(
+      targetStep.id,
+      targetStep.iterationId ?? 'P1',
+    );
+    const affectedWorkTicketIds = dedup([
       failedWork?.id,
       targetWork?.id,
     ].filter((id): id is string => !!id));
@@ -181,7 +198,7 @@ export class EnhancementLifecycle {
       iterationId: failedStep.iterationId ?? 'P1',
       parentTicketId: failedWork?.rootTicketId ?? targetWork?.rootTicketId,
       rootTicketId: failedWork?.rootTicketId ?? targetWork?.rootTicketId,
-      relatedTicketIds: affectedTaskTicketIds,
+      relatedTicketIds: affectedWorkTicketIds,
       blockedByTicketIds: [],
       source: {
         kind: 'runtime',
@@ -204,15 +221,16 @@ export class EnhancementLifecycle {
       verificationPhase: failedStep.phase,
       qualityFailures: qualityGap.evaluation.enhancementFailures,
       qualityAssessment: qualityGap.assessment,
-      affectedTaskTicketIds,
+      affectedWorkTicketIds,
       changeRequestTicketIds: [],
       disposition: 'debug',
     });
-    await this.workTickets.childOpened(enhancement, 'enhancement-opened', {
+    await this.workTickets.reopenAncestorsFor(enhancement, 'enhancement-opened', {
       enhanceTicketId: enhancement.id,
       sourceBugTicketId: enhancement.sourceBugTicketId,
       sourceQualityGateStepId: enhancement.sourceQualityGateStepId,
     });
+    await this.blockAffectedWork(enhancement);
     if (providers.length > 0) {
       await this.store.recordModelAttribution(enhancement, {
         providers,
@@ -296,12 +314,6 @@ export class EnhancementLifecycle {
 
   async close(enhancement: EnhanceTicket, verifiedStep: Step): Promise<void> {
     if (enhancement.status === 'closed') return;
-    for (const taskTicketId of enhancement.affectedTaskTicketIds) {
-      const task = this.store.find(taskTicketId);
-      if (task?.blockedByTicketIds.includes(enhancement.id)) {
-        await this.store.unblock(task, enhancement.id);
-      }
-    }
     await this.closeTicket(enhancement);
     await this.audit.event(
       'ticket.enhance.closed',
@@ -320,6 +332,7 @@ export class EnhancementLifecycle {
     const matches = this.store.all().filter(
       (ticket): ticket is EnhanceTicket =>
         ticket.type === 'enhance' &&
+        ticket.iterationId === (step.iterationId ?? 'P1') &&
         ticket.sourceQualityGateStepId !== undefined &&
         ticket.verificationStepId === step.id &&
         !['closed', 'cancelled', 'failed'].includes(ticket.status),
@@ -401,6 +414,12 @@ export class EnhancementLifecycle {
   }
 
   private async closeTicket(enhancement: EnhanceTicket): Promise<void> {
+    for (const workTicketId of enhancement.affectedWorkTicketIds) {
+      const work = this.store.find(workTicketId);
+      if (work?.blockedByTicketIds.includes(enhancement.id)) {
+        await this.store.unblock(work, enhancement.id);
+      }
+    }
     if (['open', 'triaged', 'failed'].includes(enhancement.status)) {
       await this.store.transition(
         enhancement,
@@ -422,7 +441,23 @@ export class EnhancementLifecycle {
         'enhancement-verified:closed',
       );
     }
-    await this.workTickets.childClosed(enhancement);
+  }
+
+  private async blockAffectedWork(enhancement: EnhanceTicket): Promise<void> {
+    for (const ticketId of enhancement.affectedWorkTicketIds) {
+      const ticket = this.store.find(ticketId);
+      if (
+        ticket &&
+        (ticket.type === 'feature' || ticket.type === 'task' || ticket.type === 'sub-task') &&
+        !ticket.blockedByTicketIds.includes(enhancement.id)
+      ) {
+        await this.store.block(
+          ticket,
+          enhancement.id,
+          `${ticket.id} is blocked by ${enhancement.id}`,
+        );
+      }
+    }
   }
 }
 

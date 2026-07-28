@@ -17,6 +17,7 @@ import {
 import { normalizeGitPath } from './v_model_policy.js';
 import { BugLifecycle } from './bug_lifecycle.js';
 import { EnhancementLifecycle } from './enhancement_lifecycle.js';
+import { WorkTicketLifecycle } from './work_ticket_lifecycle.js';
 
 export class ChangeRequestLifecycle {
   constructor(
@@ -26,6 +27,7 @@ export class ChangeRequestLifecycle {
     private readonly router: LLMRouter,
     private readonly enhancements: EnhancementLifecycle,
     private readonly bugs: BugLifecycle,
+    private readonly workTickets: WorkTicketLifecycle,
   ) {}
 
   async recordApplication(
@@ -133,7 +135,10 @@ export class ChangeRequestLifecycle {
     if (['closed', 'cancelled', 'failed'].includes(request.status)) return;
     if (request.blockedByTicketIds.length > 0) return;
     const byId = new Map(plan.steps.map((step) => [step.id, step]));
-    if (!request.affectedSteps.every((affected) => byId.get(affected.stepId)?.status === 'DONE')) {
+    if (!request.affectedSteps.every((affected) => {
+      const step = byId.get(affected.stepId);
+      return !!step && this.workTickets.isStepComplete(step);
+    })) {
       return;
     }
     const applied = new Set(request.applications.map((application) => application.stepId));

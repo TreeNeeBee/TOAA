@@ -22,7 +22,7 @@ import {
   computeDebugAllowedWrites,
 } from '../src/core/engine/context.js';
 import { getLanguageProfile } from '../src/core/language.js';
-import type { Plan } from '../src/core/plan.js';
+import { stepExecutionKey, type Plan } from '../src/core/plan.js';
 import { TicketStore } from '../src/core/ticket.js';
 import type { LLMRouter } from '../src/llm/router.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
@@ -861,11 +861,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const laterCode = { ...code, id: 'S004B', status: 'PENDING' as const };
     plan.steps = [code, laterCode];
 
-    expect(shouldRunCodeValidation(plan, code)).toBe(false);
+    expect(shouldRunCodeValidation(plan, code, (step) => step.status === 'DONE')).toBe(false);
     code.status = 'DONE';
-    expect(shouldRunCodeValidation(plan, laterCode)).toBe(true);
+    expect(shouldRunCodeValidation(plan, laterCode, (step) => step.status === 'DONE')).toBe(true);
     code.status = 'FAILED';
-    expect(shouldRunCodeValidation(plan, laterCode)).toBe(false);
+    expect(shouldRunCodeValidation(plan, laterCode, (step) => step.status === 'DONE')).toBe(false);
   });
 
   it('does not let --from bypass an earlier incomplete V-model step', async () => {
@@ -1426,7 +1426,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [unitStep.id]: {
+          [stepExecutionKey(unitStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'UNIT_TEST tool verification failed; rolling back to paired V-model source phase.',
@@ -1495,7 +1495,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [codeStep.id]: {
+          [stepExecutionKey(codeStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'RUNNING',
             lastReason: 'all LLM providers failed for role Debugger',
@@ -1682,7 +1682,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [codeStep.id]: {
+          [stepExecutionKey(codeStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'all LLM providers failed for role Coder',
@@ -1738,7 +1738,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const cache = JSON.parse(await fs.readFile(path.join(tmp, '.xcompiler/debug_cache.json'), 'utf8')) as {
       steps: Record<string, unknown>;
     };
-    expect(cache.steps[codeStep.id]).toBeUndefined();
+    expect(cache.steps[stepExecutionKey(codeStep)]).toBeUndefined();
   });
 
   it('rolls INTEGRATION_TEST gate failures back to DETAILED_DESIGN, not HIGH_LEVEL_DESIGN', async () => {
@@ -1896,7 +1896,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          S006: {
+          [stepExecutionKey(integrationStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'cached integration failure',
@@ -2001,7 +2001,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [integrationStep.id]: {
+          [stepExecutionKey(integrationStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'cached integration test failure',
@@ -2165,7 +2165,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [unitStep.id]: {
+          [stepExecutionKey(unitStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'UNIT_TEST tool verification failed; rolling back to paired V-model source phase.',
@@ -2207,7 +2207,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const cache = JSON.parse(await ws.readFile('.xcompiler/debug_cache.json')) as {
       steps: Record<string, unknown>;
     };
-    expect(cache.steps[unitStep.id]).toBeUndefined();
+    expect(cache.steps[stepExecutionKey(unitStep)]).toBeUndefined();
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.rollback_validation_passed');
     expect(auditLog).not.toContain('engine.test_phase_rollback');
@@ -2234,7 +2234,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [unitStep.id]: {
+          [stepExecutionKey(unitStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'UNIT_TEST cached failure',
@@ -2308,7 +2308,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [unitStep.id]: {
+          [stepExecutionKey(unitStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'UNIT_TEST cached failure',
@@ -2446,7 +2446,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          S004: {
+          [stepExecutionKey(codeStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'read-only recovery mode repeated probe actions for 2 rounds',
@@ -2889,7 +2889,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [unitStep.id]: {
+          [stepExecutionKey(unitStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'repeated read-only/probe actions without progress for 3 rounds',
@@ -3290,7 +3290,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         version: 1,
         steps: {
-          [codeStep.id]: {
+          [stepExecutionKey(codeStep)]: {
             lastUpdated: new Date().toISOString(),
             lastStatus: 'FAILED',
             lastReason: 'completed phase debug finished with failed verification but without a successful repair mutation',
@@ -3841,8 +3841,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const cache = JSON.parse(await ws.readFile('.xcompiler/debug_cache.json')) as {
       steps: Record<string, { lastStatus: string; attempts: Array<{ failureLogTail: string }> }>;
     };
-    const logs = cache.steps.S004!.attempts.map((attempt) => attempt.failureLogTail).join('\n');
-    expect(cache.steps.S004!.lastStatus).toBe('FAILED');
+    const debugKey = stepExecutionKey(plan.steps[0]!);
+    const logs = cache.steps[debugKey]!.attempts
+      .map((attempt) => attempt.failureLogTail)
+      .join('\n');
+    expect(cache.steps[debugKey]!.lastStatus).toBe('FAILED');
     expect(logs).toContain('test_parse_dbc_malformed_raises');
     expect(logs).toContain('DID NOT RAISE <DBCParseError>');
     expect(logs).not.toContain('latest Debugger attempt failure');

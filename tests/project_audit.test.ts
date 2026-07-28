@@ -86,10 +86,10 @@ describe('project quality audit', () => {
         { id: 'S002', phase: 'FUNCTIONAL_TEST', title: 'b', description: 'b', systemPrompt: 'x'.repeat(30), role: 'Tester', tools: [], inputs: [], outputs: ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'], dependsOn: ['S001'], acceptance: 'ok', status: 'PENDING', retries: 0, maxRetries: 3 },
       ],
     } as Plan;
-    expect(shouldRunProjectAudit(plan, { onlyPhase: 'CODE' })).toBe(false);
-    expect(shouldRunProjectAudit(plan, { onlyPhase: undefined })).toBe(false);
+    expect(shouldRunProjectAudit({ onlyPhase: 'CODE' }, false)).toBe(false);
+    expect(shouldRunProjectAudit({ onlyPhase: undefined }, false)).toBe(false);
     plan.steps[1]!.status = 'DONE';
-    expect(shouldRunProjectAudit(plan, { onlyPhase: undefined })).toBe(true);
+    expect(shouldRunProjectAudit({ onlyPhase: undefined }, true)).toBe(true);
   });
 
   it('passes when tests, entrypoint, build and lint succeed', async () => {

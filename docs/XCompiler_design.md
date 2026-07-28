@@ -83,24 +83,25 @@ V 模型流程：
 编码实现 ─────────────►  单元测试
 ```
 
-左侧四个阶段同步产出配对测试计划和可执行测试用例，并在交付门禁提交阶段完成度与上游功能/契约对齐度；右侧四个阶段只检查测试完整性与契约一致性、运行既有测试并记录结构化工程指标。Runtime 将计划注册为 `feature -> task -> sub-task` Ticket 图。真实执行或测试错误创建 `bug`；完成度、对齐度、覆盖率或 tolerance 不达标创建独立 `enhance`，再按责任阶段增量补齐。
+左侧四个阶段同步产出配对测试计划和可执行测试用例，并在交付门禁提交阶段完成度与上游功能/契约对齐度；右侧四个阶段只检查测试完整性与契约一致性、运行既有测试并记录结构化工程指标。Runtime 将当前迭代编译为 `Epic -> 阶段 Feature -> Task -> Sub-task` 执行图，并在八个阶段 Feature 之后增加独立 Delivery Feature。真实执行或测试错误创建 `bug`；完成度、对齐度、覆盖率或 tolerance 不达标创建独立 `enhance`，再按责任阶段增量补齐。
 
 ### 3.1 完整 Ticket 驱动流程
 
 1. **Build**：澄清需求、评估复杂度、拆分 Phase，并只生成当前 Phase 的 V 模型计划。
-2. **登记**：Run 将计划迭代统一登记为 `feature`，将每个 V 模型 Step 登记为 `task`，将计划内最多两层子任务登记为相互关联的 `sub-task`。`enhance` 不作为计划根节点。
-3. **实施**：S01-S04 按 Task 执行并同步生成配对测试资产，门禁检查 `completion` 和 `upstreamAlignment`；S05-S08 只检查测试完整性、执行既有测试并提交覆盖率、通过率、跳过数、失败数和 warning 等验证证据。
-4. **质量分流**：执行异常、测试失败或结构化 `validationDefect` 创建 `bug`，进入 Debugger；阶段内容缺失、上游对齐不足、覆盖指标不足或 tolerance 超限（非 failed test）创建 `enhance`，由原角色按缺口增量补齐。两条路径不互相冒充。
-5. **局部修复**：回退到非设计阶段时，Debugger 必须先提交 `bugResolutionPlan`，再生成 patch/rewrite 或有效验证证据；随后从修复点重跑受影响的下游 Task。
-6. **设计变更**：回退到概要设计或详细设计、且形成已确认的上游契约差异时，Debugger 只完成根因修复与 `change-request` 编制。CR 由 Enhance 触发，并保留原始 Bug、契约差异、影响 Step/产物、实施方案和验证门禁；下游只应用增量变更，并逐站记录代码或验证提交。
-7. **返工**：CR 下游失败时创建新的关联 Bug，并让原 CR 进入下一 revision；只有契约或范围实质扩大时才建立父子 CR。失败不会被跳过，也不会通过全量重做掩盖增量变更。
-8. **关闭与交付**：所有受影响门禁通过后先关闭 CR；Bug 的修复方案和有效证据写入 debug-wiki 后进入 `resolved`、`closed`。直接质量 Enhance 在验证阶段通过后关闭。所有 Task、Enhance、CR 和 Bug 清零后，Runtime 汇总 `.xcompiler/quality/assessments.json`、Ticket、Phase 与项目审计结果，生成 `docs/project-development-report.md`。
+2. **编译执行图**：Run 为每个可独立交付的迭代建立一个 `epic`；S01-S08 各建立一个 `kind=v-model-stage` Feature；Step 一级和二级子任务分别建立 Task、Sub-task；最后建立 `kind=delivery` Feature。
+3. **依赖与配对**：阶段 Feature 使用显式 `dependsOnTicketIds` 排序，数组位置不代表执行顺序。后续 Epic 显式依赖前置 Epic，其首个阶段 Feature 继承该门禁。左侧 Feature 通过 `verificationTicketId` 指向右侧验证 Feature，右侧通过 `pairedSourceTicketId` 指回错误回退目标。
+4. **实施**：S01-S04 按阶段 Feature 执行并同步生成配对测试资产，门禁检查 `completion` 和 `upstreamAlignment`；S05-S08 只检查测试完整性、执行既有测试并提交覆盖率、通过率、跳过数、失败数和 warning 等验证证据。
+5. **质量分流**：执行异常、测试失败或结构化 `validationDefect` 创建 `bug`，进入 Debugger；阶段内容缺失、上游对齐不足、覆盖指标不足或 tolerance 超限（非 failed test）创建 `enhance`，由原角色按缺口增量补齐。两条路径不互相冒充。
+6. **局部修复**：回退到非设计阶段时，Debugger 必须先提交 `bugResolutionPlan`，再生成 patch/rewrite 或有效验证证据；随后沿 Feature 依赖图从修复点重跑受影响的下游阶段。
+7. **设计变更**：回退到概要设计或详细设计、且形成已确认的上游契约差异时，Debugger 只完成根因修复与 `change-request` 编制。CR 由 Enhance 触发，并保留原始 Bug、契约差异、影响 Feature/产物、实施方案和验证门禁；下游只应用增量变更，并逐站记录代码或验证提交。
+8. **返工**：CR 下游失败时创建新的关联 Bug，并让原 CR 进入下一 revision；只有契约或范围实质扩大时才建立父子 CR。失败不会被跳过，也不会通过全量重做掩盖增量变更。
+9. **关闭与交付**：所有受影响门禁通过后先关闭 CR；Bug 的修复方案和有效证据写入 debug-wiki 后进入 `resolved`、`closed`。直接质量 Enhance 在验证阶段通过后关闭。S01-S08 必须同时达到治理态 `closed` 与执行态 `passed`，前置 Epic 已交付且迭代门禁通过后，Delivery Feature 才能关闭；Delivery 关闭后 Epic 才能关闭。Runtime 随后生成 `docs/project-development-report.md`。
 
 Ticket 只持久化到 `.xcompiler/tickets/`。旧 Issue Journal、独立 CR Store 及其目录不再读取、转换或镜像，Runtime 内不存在兼容双轨。
 
 ### 3.2 Phase Engine 内部边界
 
-`src/core/engine.ts` 只保留执行状态机的编排职责：选择可执行 Step、推进 Plan 状态、建立单次尝试的事务边界，以及按 V 模型执行回退和下游重跑。可复用规则与持久化流程位于 `src/core/engine/`：
+`src/core/engine.ts` 只保留执行编排职责：请求 WorkTicketLifecycle 选择依赖就绪的阶段 Feature、建立单次尝试事务边界，以及按 V 模型执行回退和下游重跑。Ticket 状态推进与 Plan 进度投影不在 Engine 内直接实现。可复用规则与持久化流程位于 `src/core/engine/`：
 
 | 模块 | 单一职责 |
 | --- | --- |
@@ -113,7 +114,8 @@ Ticket 只持久化到 `.xcompiler/tickets/`。旧 Issue Journal、独立 CR Sto
 | `debug_prompt.ts` | 压缩 Debug 证据、合并 Ticket/Enhance 信息并检索 Debug Wiki |
 | `debug_wiki_feedback.ts` | 隔离 Debug Wiki 的加载、检索及正负反馈持久化 |
 | `failure_presenter.ts` | 渲染 CLI 终态失败、指标和校准建议，不参与状态跳转 |
-| `work_ticket_lifecycle.ts` | Feature、Task、Sub-task 的注册、执行同步和父子关闭 |
+| `work_ticket_graph.ts` | 将 Plan 编译为 Epic/阶段 Feature/两级任务/Delivery 拓扑，建立跨迭代依赖和 V 模型配对 |
+| `work_ticket_lifecycle.ts` | 推进 Work Ticket 的运行、阻塞、回退、完成、Plan 投影和交付关闭 |
 | `bug_lifecycle.ts` | Bug Ticket 的创建、路由、修复验证和关闭 |
 | `enhancement_lifecycle.ts` | Enhance Ticket 的质量缺口、模型归因和关闭 |
 | `change_request_opening.ts` | 从设计修复或质量缺口建立增量 CR |
@@ -122,9 +124,9 @@ Ticket 只持久化到 `.xcompiler/tickets/`。旧 Issue Journal、独立 CR Sto
 | `test_phase_validator.ts` | 检查配对测试资产并复验已有测试与功能入口 |
 | `repair_artifact.ts` | 生成 Debug Patch/摘要并验证已完成阶段的修复证据 |
 
-六种 Ticket 的 lifecycle owner 固定为：`feature/task/sub-task -> WorkTicketLifecycle`、`bug -> BugLifecycle`、`enhance -> EnhancementLifecycle`、`change-request -> ChangeRequestLifecycle`。三个 Work Ticket 共享生命周期，是因为它们组成同一棵计划工作树，而不是三个互相独立的状态机。
+七种 Ticket 的 lifecycle owner 固定为：`epic/feature/task/sub-task -> WorkTicketLifecycle`、`bug -> BugLifecycle`、`enhance -> EnhancementLifecycle`、`change-request -> ChangeRequestLifecycle`。四种 Work Ticket 共享生命周期，是因为它们组成同一张迭代执行图，而不是四个互相独立的状态机。
 
-模块化边界遵循两条约束：只有 Phase Engine 推进 `Step.status`；Ticket lifecycle 只推进 Ticket 图。`TicketStore` 仅保留创建、查询、通用状态转换、关联和持久化原语，不承载某一种 Ticket 的专属流程。测试应直接验证对应模块的公开函数或服务，不依赖 Phase Engine 的私有方法。
+模块化边界遵循三条约束：Ticket 执行图是运行状态的唯一真相；`plan.P<N>.json` 中的 Step 状态/重试字段只接受 WorkTicketLifecycle 投影，不参与调度裁决；阶段身份始终使用 `(iterationId, stepId)` 复合键，允许每个 Phase 独立采用 S001-S008 而不串用 Feature、阻塞关系或 Debug 历史。`TicketStore` 仅保留创建、查询、通用状态转换、关联和持久化原语，不承载某一种 Ticket 的专属流程。测试应直接验证对应模块的公开函数或服务，不依赖 Phase Engine 的私有方法。
 
 ---
 
@@ -189,9 +191,9 @@ export interface Step {
   outputs: string[];             // 预期产出路径
   dependsOn: string[];           // 前置 Step id
   acceptance: string;            // 验收标准
-  status: StepStatus;            // 由 xcompiler run 写回
-  retries: number;
-  maxRetries: number;            // 默认 3
+  status: StepStatus;            // Work Ticket 执行态的进度投影，不参与调度
+  retries: number;               // 阶段 Feature attempt 计数的进度投影
+  maxRetries: number;            // 首次编译阶段 Feature 时使用，默认 3
 }
 
 export interface Plan {
@@ -227,42 +229,40 @@ Plan Lint 规则：
 async function xcompilerRun(phasePlanPath: string) {
   const target = await loadPlanTarget(phasePlanPath);
   const plan = target.plan; // current plan.P<N>.json
-  const tickets = await registerPlanTickets(plan);
-  for (const step of topoSort(plan.steps)) {
-    if (step.status === 'DONE') continue;     // 断点续跑
-    const task = tickets.taskForStep(step.id);
-    await startTicket(task);
-    transitionStep(step, 'RUNNING', 'attempt-started');
-    await persist(plan);
+  const graph = await compileTicketGraph(plan);
+  for (const feature of graph.readyStageFeatures()) {
+    if (feature.execution.state === 'passed') continue;
+    const step = graph.stepDefinition(feature);
+    await graph.start(feature);
     try {
-      await executeStep(step, task);          // role LLM + Skill + Ticket
-      await verifyAcceptance(step);           // outputs / acceptance
-      transitionStep(step, 'DONE', 'attempt-passed');
-      await closeTicket(task);
+      await executeStep(step, feature);
+      await verifyAcceptance(step);
+      await graph.closeStageFeature(feature);
     } catch (err) {
-      transitionStep(step, 'FAILED', 'attempt-failed');
       const route = classifyDebugFailure(step, err);
-      const bug = await createAndRouteBugTicket(task, route, err);
+      const bug = await createAndRouteBugTicket(feature, route, err);
       if (!(await repairThroughVModel(bug))) { await persist(plan); throw err; }
     }
-    await persist(plan);
+    await projectTicketProgress(plan, graph);
   }
-  await emitDelivery(plan);
+  await runIterationGate(plan);
+  await graph.closeDeliveryFeature();
+  await graph.closeEpic();
 }
 ```
 
 行为约定：
 
-- **Ticket 分类**：`feature` 表示计划迭代，`task` 表示 V 模型宏 Step，`sub-task` 映射最多两层子任务；`bug` 表示需要 Debugger 处理的具体失败；`enhance` 表示已经识别的缺陷、功能欠缺或测试不完备；`change-request` 只表示已确认上游变化向下游的增量传导。
-- **Ticket 关系**：每个 Ticket 保存 `parentTicketId`、`rootTicketId`、`relatedTicketIds` 和 `blockedByTicketIds`。真实失败链为 `Task -> Bug -> Debug`；质量不足链为 `Task -> Enhance -> incremental remediation`。两者在上游契约变化时都可汇入 `Enhance -> CR`；CR 的 `triggerTicketId/sourceEnhanceTicketId` 必须指向 Enhance，`originBugTicketId` 仅在 Bug 起源时存在。
-- **Ticket 状态**：统一使用 `open -> triaged -> in_progress -> in_review|verification -> resolved -> closed` 主链，另有 `blocked`、`failed`、`cancelled`。恢复和返工可将 `closed|failed` 显式转回 `in_progress`，所有迁移经过同一守卫。
-- **断点续跑**：每次 Step 与 Ticket 状态变更立即回写当前 `plan.P<N>.json`、`.xcompiler/tickets/` 和工程进度，中断后再次执行自动续跑。
+- **Ticket 分类**：`epic` 是单个可交付迭代；`feature` 分为 V 模型阶段与 Delivery；`task/sub-task` 映射 Step 下最多两层工作；`bug` 进入 Debugger；`enhance` 表示缺陷、功能欠缺或测试不完备；`change-request` 承接已确认上游变化的下游增量传导。
+- **Ticket 关系**：工作图除 `parentTicketId/rootTicketId` 外，使用 `dependsOnTicketIds` 表达调度依赖，使用 `verificationTicketId/pairedSourceTicketId` 表达 V 模型验证与回退关系。真实失败链为 `Stage Feature -> Bug -> Debug`；质量不足链为 `Stage Feature -> Enhance -> incremental remediation`。
+- **Ticket 状态**：治理状态使用 `open -> triaged -> in_progress -> in_review|verification -> resolved -> closed` 主链；工作执行态独立使用 `queued/running/passed/failed`。`in_progress + queued` 表示已重开但尚未执行，不能显示成 RUNNING。
+- **断点续跑**：每次 Ticket 状态变更立即写入 `.xcompiler/tickets/`，再将执行态投影到当前 `plan.P<N>.json` 和工程进度。持久化 Ticket 与 Plan 不一致时以 Ticket 为准。
 - **DEBUG 闭环**：失败创建 Bug Ticket，按失败阶段路由到匹配上游阶段；Debugger 必须输出 `bugResolutionPlan` 并生成 patch/rewrite 或有效验证证据。Bug 只在门禁通过、方案与证据写入 debug-wiki 后进入 `closed`。
 - **Debug 决策**：基础设施/Provider 故障立即停止；测试执行失败回退到配对源阶段；测试产物或当前阶段质量问题留在本阶段修复。修复后从回退点重跑全部下游阶段，不得跳过中间门禁。
 - **Enhance 识别**：完成度、上游对齐度、覆盖率、跳过测试、warning 或测试资产完整度不达标时，按结构化证据分类为 `defect`、`functional-gap` 或 `test-incomplete`。Enhance 保存责任阶段、验证阶段、缺口、测量值与证据，但不冒充 Debug Bug。
 - **质量指标**：默认 S1-S4 完成度 95%，S1 上游对齐 95%、S2-S4 为 90%；S5 行覆盖 80%、分支覆盖 70%；S6 接口/集成场景覆盖 85%；S7 模块/契约覆盖 90%；S8 功能/需求/端到端覆盖 95%。默认指标短缺 tolerance 为 2%，计划可通过 `qualityGate` 覆盖。
 - **质量持久化与报告**：每次门禁测量写入 `.xcompiler/quality/assessments.json`。最终项目审计通过后生成 `docs/project-development-report.md`，汇总 Phase、S1-S8 指标、tolerance、Ticket、模型影响与项目审计结论。
-- **CR 增量传导**：只有概要/详细设计修复形成上游契约差异时才创建 `change-request` Ticket；下游 Task 只实施 `contractChange`、`affectedSteps` 和 `affectedArtifacts` 声明的增量，每站记录 commit、changed files 和验收摘要。
+- **CR 增量传导**：只有概要/详细设计修复形成上游契约差异时才创建 `change-request` Ticket；下游阶段 Feature 只实施 `contractChange`、`affectedSteps` 和 `affectedArtifacts` 声明的增量，每站记录 commit、changed files 和验收摘要。
 - **CR 重做与子 CR**：普通下游失败创建关联 Bug 和 Enhance，将同一 change-request revision 加一后继续；只有契约或范围扩大时才创建带 `parentTicketId` 的子 change-request。全部受影响门禁通过后 CR 先关闭，再解除原始 Bug 的阻塞并完成 Bug 验证、debug-wiki 沉淀和 Enhance 关闭。
 - **提示词策略**：工作区路径、真实修复、依赖真实性、fixture、外部 API 和完成证据由共享 Prompt Policy 注入；角色 Skill 只补充当前职责，避免重复规则在不同 prompt 中漂移。
 - **Debug-wiki**：默认复制并加载 XCompiler 自身路径的 `.xcompiler/debug-wiki/`（设置 `XC_PATH` 时使用 `$XC_PATH`），也可通过 `--debug-wiki-path <dir>` 指定。存储和处理参考 LLM-wiki：`wiki/system/*.md` 是系统级策略，`wiki/agent/*.md` 是 agent/calibration 级规则，`wiki/external/*.md` 是已关闭 Bug Ticket 的修复知识，`index.md` 是可读目录，`index.json` 是检索索引，`log.md` 是追加式操作日志，`wiki/external/feedback.jsonl` 是运行反馈 overlay。
@@ -414,7 +414,7 @@ Sandbox / 测试失败 → 创建 Bug Ticket + DebugBrief
              → CODE 等局部修复：Bug = verification → 重跑对应门禁
                 → 通过：写入 debug-wiki → Bug = resolved → closed
              → HLD / DD 设计修复：创建 change-request Ticket，Bug = blocked
-                → 下游 Task 按 CR 增量实施并记录 change / verification commit
+                → 下游阶段 Feature 按 CR 增量实施并记录 change / verification commit
                 → 门禁失败：创建关联 Bug，同一 CR revision + 1
                 → 契约/范围实质扩大：创建 parent-linked child change-request
                 → 全部受影响门禁通过：CR = closed

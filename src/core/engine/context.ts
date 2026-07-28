@@ -41,7 +41,10 @@ export async function buildContextSnippets(input: {
   contextWindowTokens: number;
 }): Promise<Array<{ path: string; content: string }>> {
   const out = new Map<string, string>();
-  const workTicket = input.tickets.workForStep(input.step.id);
+  const workTicket = input.tickets.featureForStep(
+    input.step.id,
+    input.step.iterationId ?? 'P1',
+  );
   if (workTicket) {
     out.set(
       `.xcompiler/tickets/${workTicket.id}.json`,

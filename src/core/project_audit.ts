@@ -44,11 +44,10 @@ export function renderProjectAuditFailureLog(result: ProjectAuditResult): string
 }
 
 export function shouldRunProjectAudit(
-  plan: Plan,
   opts: { onlyPhase?: string },
+  allStageFeaturesComplete: boolean,
 ): boolean {
-  if (opts.onlyPhase) return false;
-  return plan.steps.every((step) => step.status === 'DONE');
+  return !opts.onlyPhase && allStageFeaturesComplete;
 }
 
 export async function runProjectAudit(opts: {

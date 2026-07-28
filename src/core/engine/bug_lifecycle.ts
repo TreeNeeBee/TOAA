@@ -64,7 +64,9 @@ export class BugLifecycle {
       maxChars: 6000,
       maxLines: 90,
     });
-    const workTicket = step ? this.store.workForStep(step.id) : undefined;
+    const workTicket = step
+      ? this.store.featureForStep(step.id, step.iterationId ?? 'P1')
+      : undefined;
     const bug = await this.store.createBug({
       priority: input.kind === 'infrastructure' ? 'critical' : 'high',
       title: step ? `${step.id} ${step.phase} failed` : 'Project execution failed',
@@ -189,7 +191,7 @@ export class BugLifecycle {
     await this.store.transition(bug, 'closed', 'closed-after-wiki');
     await this.enhancements.closeForBug(bug, step);
     const workTicket = bug.source.stepId
-      ? this.store.workForStep(bug.source.stepId)
+      ? this.store.featureForStep(bug.source.stepId, bug.iterationId)
       : undefined;
     if (workTicket?.blockedByTicketIds.includes(bug.id)) {
       await this.store.unblock(workTicket, bug.id);
@@ -269,9 +271,10 @@ export class BugLifecycle {
     });
   }
 
-  openBugForFailedStep(stepId: string): BugTicket | undefined {
+  openBugForFailedStep(stepId: string, iterationId: string): BugTicket | undefined {
     if (
       this.lastBug?.source.stepId === stepId &&
+      this.lastBug.iterationId === iterationId &&
       !['resolved', 'closed', 'cancelled'].includes(this.lastBug.status)
     ) {
       return this.lastBug;
@@ -279,6 +282,7 @@ export class BugLifecycle {
     return [...this.store.all()].reverse().find(
       (ticket): ticket is BugTicket =>
         ticket.type === 'bug' &&
+        ticket.iterationId === iterationId &&
         ticket.source.stepId === stepId &&
         !['resolved', 'closed', 'cancelled'].includes(ticket.status),
     );
@@ -288,6 +292,7 @@ export class BugLifecycle {
     const bugs = this.store.all().filter(
       (ticket): ticket is BugTicket =>
         ticket.type === 'bug' &&
+        ticket.iterationId === (step.iterationId ?? 'P1') &&
         !['resolved', 'closed', 'cancelled'].includes(ticket.status) &&
         ticket.verificationStepId === step.id,
     );

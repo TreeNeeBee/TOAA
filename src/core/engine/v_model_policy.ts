@@ -39,14 +39,18 @@ export function codeValidationCommand(
     : { cmd: 'python3', args: ['-m', 'compileall', '-q', 'src'], display: 'python3 -m compileall -q src' };
 }
 
-export function shouldRunCodeValidation(plan: Plan, current: Step): boolean {
+export function shouldRunCodeValidation(
+  plan: Plan,
+  current: Step,
+  isComplete: (step: Step) => boolean,
+): boolean {
   if (current.phase !== 'CODE') return false;
   const iterationId = current.iterationId ?? 'P1';
   return !plan.steps.some((step) =>
     step.id !== current.id &&
     step.phase === 'CODE' &&
     (step.iterationId ?? 'P1') === iterationId &&
-    step.status !== 'DONE',
+    !isComplete(step),
   );
 }
 
