@@ -31,6 +31,21 @@ describe('debug policy', () => {
     )).toBe(true);
   });
 
+  it('routes missing test discovery back to the paired source phase', () => {
+    expect(shouldRollbackTestPhaseFailure(
+      'UNIT_TEST run_tests failed',
+      'filter: tests/test_hello.py\nNo test files found, exiting with code 1',
+    )).toBe(true);
+    expect(shouldRollbackTestPhaseFailure(
+      'INTEGRATION_TEST run_tests failed',
+      'Error: No test suite found in file tests/integration.test.ts',
+    )).toBe(true);
+    expect(shouldRollbackTestPhaseFailure(
+      'MODULE_TEST found an incomplete or inconsistent paired test contract',
+      'Validation defect: missing cross-module error propagation case',
+    )).toBe(true);
+  });
+
   it('expands only productive retry windows and aborts repeated low-quality attempts', () => {
     const productive = adjustDebugRetryWindow({
       attempt: 1,

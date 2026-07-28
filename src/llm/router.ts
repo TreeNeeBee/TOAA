@@ -28,6 +28,12 @@ export type ProviderAvailabilityProbe = (
   provider: ProviderConfig,
 ) => Promise<LLMProbeResult>;
 
+export type TicketScoreOutcome =
+  | 'quality-gap'
+  | 'finding-validated'
+  | 'repair-verified'
+  | 'change-verified';
+
 /** 探测结果缓存时长：同一 provider 短时间内多次切换/重试不重复发起探测。 */
 const PROBE_CACHE_TTL_MS = 15_000;
 
@@ -129,6 +135,28 @@ export class LLMRouter {
     const ranked = this.rankByScore(this.resolveChain(role));
     const provider = ranked.find((name) => this.clients.has(name));
     return normalizeContextWindowTokens(provider ? this.cfg.llm.providers[provider]?.context_window : undefined);
+  }
+
+  /**
+   * Apply quality feedback only after a Ticket establishes the outcome.
+   * Enhance findings penalize the attributed author; verified Bug/CR work
+   * rewards the models that produced the accepted repair or change.
+   */
+  recordTicketOutcome(
+    providers: readonly string[],
+    outcome: TicketScoreOutcome,
+    ticketId: string,
+  ): void {
+    if (!this.scores) return;
+    for (const provider of [...new Set(providers)]) {
+      if (!this.cfg.llm.providers[provider]) continue;
+      const reason = `${outcome} from ${ticketId}`;
+      if (outcome === 'quality-gap') {
+        this.scores.decay(provider, reason);
+      } else {
+        this.scores.boost(provider, reason);
+      }
+    }
   }
 
   private resolveChain(role: Role): string[] {

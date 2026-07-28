@@ -23,21 +23,18 @@ DEBUG 不是正常 V 模型阶段，只是运行时失败回退/修复模式。�
 P2+ 迭代把同名阶段文档写入 \`docs/iterations/<iterationId>/\`。顶层 \`docs/topic.md\` 由 xcompiler build 写入，任何 Step 都不得把它列为 outputs。
 
 同步测试设计规则：
-- REQUIREMENT_ANALYSIS 同步输出 \`docs/tests/functional-test-plan.md\`。
-- HIGH_LEVEL_DESIGN 同步输出 \`docs/tests/module-test-plan.md\`。
-- DETAILED_DESIGN 同步输出 \`docs/tests/integration-test-plan.md\`。
-- CODE 同步输出 \`docs/tests/unit-test-plan.md\`。
+- REQUIREMENT_ANALYSIS 同步输出 \`docs/tests/functional-test-plan.md\` 和 tests/ 下的可执行功能/验收测试。
+- HIGH_LEVEL_DESIGN 同步输出 \`docs/tests/module-test-plan.md\` 和可执行模块/契约测试，包括全部 \`architectureModules.testPaths\`。
+- DETAILED_DESIGN 同步输出 \`docs/tests/integration-test-plan.md\` 和可执行集成测试。
+- CODE 同步输出 \`docs/tests/unit-test-plan.md\`，并与实现一起产出可执行单元测试。
 P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`。
 
 阶段职责：
-- REQUIREMENT_ANALYSIS 定义功能范围、验收标准、边界条件和用户可见行为。
-- HIGH_LEVEL_DESIGN 负责架构设计，说明当前开发模块在整体系统中的定位，并定义系统层面的对外接口和依赖，包括外部 API、第三方库选型、依赖确认、数据契约和集成边界。
-- DETAILED_DESIGN 定义模块内部的具体功能实现和架构，包括函数/类、数据结构、算法、控制流、错误处理和内部协作。
-- CODE 只实现已设计范围并产出可运行/可导入的 Python 源码。
-- UNIT_TEST 验证 CODE 的内部函数和公开 API。
-- INTEGRATION_TEST 验证 DETAILED_DESIGN 中定义的模块内部协作、数据流和组件集成。
-- MODULE_TEST 验证 HIGH_LEVEL_DESIGN 中当前开发模块在整体系统中的定位、对外接口和依赖边界。
-- FUNCTIONAL_TEST 按需求端到端验收，并产出面向用户的文档。
+- REQUIREMENT_ANALYSIS 定义功能范围、验收标准、边界条件和用户可见行为，并编写配对的功能测试。
+- HIGH_LEVEL_DESIGN 负责架构设计，说明当前开发模块在整体系统中的定位，并定义系统层面的对外接口和依赖，包括外部 API、第三方库选型、依赖确认、数据契约和集成边界，同时编写配对的模块/契约测试。
+- DETAILED_DESIGN 定义模块内部的具体功能实现和架构，包括函数/类、数据结构、算法、控制流、错误处理和内部协作，并编写配对的集成测试。
+- CODE 实现已设计范围，并同步编写配对的单元测试。
+- UNIT_TEST、INTEGRATION_TEST、MODULE_TEST、FUNCTIONAL_TEST 检查既有配对测试的完整性和一致性，运行测试并写验证报告；不得创建或改写测试与产品代码。
 
 功能验收文档包：P1 FUNCTIONAL_TEST outputs 必须包含 \`README.md\`、\`docs/quickstart.md\`、\`docs/08-functional-test.md\`；当 \`projectType\` 为 \`library\` 或 \`mixed\` 时还必须包含 \`docs/api-guide.md\`。P2+ 使用 \`docs/iterations/<iterationId>/08-functional-test.md\`、\`quickstart.md\` 和可选 \`api-guide.md\`。文档语言遵循当前 i18n。
 
@@ -47,7 +44,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
 3. 每个宏 Step 的 \`subTasks\` 最多嵌套 2 层；不要为了内部细节拆出大量可执行 Step。
 4. dependsOn 必须按阶段顺序且无环。右侧测试阶段必须直接或间接依赖其对应左侧阶段。
 5. 每个 CODE Step 必须被同迭代的 UNIT_TEST Step 覆盖。
-6. 需求/设计阶段不得输出 src/ 或 tests/ 文件；CODE 产出 src/ 下的产品源码和运行时资产；测试阶段产出 tests/ 和报告文档；FUNCTIONAL_TEST 不得修改 src/。
+6. REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN 可以输出配对的 tests/ 测试，但不得输出 src/ 产品代码；CODE 拥有产品源码、运行时资产和单元测试；右侧测试阶段只拥有报告/交付文档，不得修改 src/ 或 tests/。
 7. outputs 路径全局唯一。DEBUG 运行时可修改依赖链文件，计划 Step 不要重复声明 outputs。
 8. id 形如 S001、S002；role 只能是 Planner / Architect / Coder / Tester / Debugger。
 9. 每个 Step 必须有 systemPrompt，明确范围、输入、产出、验收、禁令，以及左侧阶段的同步测试设计义务。
@@ -56,8 +53,9 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
 12. implementationPhases 必须包含 P1 current 和后续 planned 可执行迭代；verificationGate 的 failurePolicy 必须说明把失败日志传给 Debugger，回退到对应 V 模型阶段并重新执行后续阶段。
 13. dependencies 是 Python pip 依赖列表；必须包含 \`pytest\`；只写裸包名；任何 Step 都不要输出 \`requirements.txt\`。
 14. application/mixed 项目需要可直接运行的 Python 入口（\`src/main.py\` 或包 \`__main__.py\`）并复用 CODE 模块；library/mixed 项目需要稳定公开 API 和 \`docs/api-guide.md\`。
-15. 复杂需求必须返回 \`architectureModules\`：每个模块包含 id、name、responsibility、sourcePaths、可选 assetPaths、testPaths、dependencies。运行时非代码资产放入 assetPaths；CODE/MODULE_TEST Step 可覆盖多个模块，但必须在 subTasks 中列出模块级工作。
+15. 复杂需求必须返回 \`architectureModules\`：每个模块包含 id、name、responsibility、sourcePaths、可选 assetPaths、testPaths、dependencies。HIGH_LEVEL_DESIGN 产出 testPaths，CODE 产出实现路径，MODULE_TEST 消费 testPaths；宏 Step 覆盖多个模块时必须在 subTasks 中列出模块级工作。
 16. 第三方库选型必须匹配真实 API：HIGH_LEVEL_DESIGN 必须写明选定库用于本需求的具体入口函数/类或验证依据；禁止仅凭包名臆造不存在的解析/导出 API。
+17. 每个 Step 可声明 qualityGate。S1-S4 使用 completionMin 和 upstreamAlignmentMin；S5-S8 声明对应阶段 metrics 与 tolerance（metricShortfall、maxFailedTests、maxSkippedTests、maxWarnings）。阈值应符合项目风险；省略时由 Runtime 注入工程默认值。
 
 输出 JSON 形如：
 {
@@ -83,12 +81,13 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
       "role": "Planner",
       "tools": ["write_file"],
       "inputs": ["docs/topic.md"],
-      "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md"],
+      "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"],
       "subTasks": [
         { "id": "T1", "title": "string", "description": "string", "acceptance": "string", "outputs": ["docs/01-requirement-analysis.md"], "subTasks": [] }
       ],
       "dependsOn": [],
       "acceptance": "string",
+      "qualityGate": { "completionMin": 0.95, "upstreamAlignmentMin": 0.95, "metrics": {}, "tolerance": { "metricShortfall": 0.02, "maxFailedTests": 0, "maxSkippedTests": 0, "maxWarnings": 0 } },
       "maxRetries": 3
     }
   ]
@@ -99,7 +98,16 @@ const PYTHON_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只能�
 每一轮你必须返回严格 JSON：
 {
   "thoughts": "<用一句话说明本轮意图>",
-  "issueResolutionPlan": "<仅 DEBUG issue 模式必填：简明说明根因假设、修复目标和验证方案>",
+  "bugResolutionPlan": "<仅 DEBUG Bug Ticket 必填：简明说明根因假设、修复目标和验证方案>",
+  "validationDefect": null,
+  "qualityAssessment": {
+    "completion": 1,
+    "upstreamAlignment": 1,
+    "metrics": {},
+    "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
+    "evidence": ["产物路径、测试报告或命令结果"],
+    "gaps": []
+  },
   "actions": [ { "tool": "<工具名>", "args": { ... } }, ... ],
   "done": true | false
 }
@@ -132,7 +140,11 @@ const PYTHON_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只能�
      再 write_file 整文件重写并 run_tests。复杂领域格式连续失败后必须停止凭记忆生成，改为请求用户样例或网络参考。
      严禁因为解析错误就去改被测模块、测试断言或 mock 掉解析逻辑——先把 fixture 修对再说。
    - 【时间稳定性】时间相关测试必须冻结系统时钟（例如 \`vi.setSystemTime\` / patch datetime）或根据当前时钟推导期望值；禁止在调用 \`new Date()\` / \`date.today()\` 的同时硬编码某个年份。
-4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空。
+4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空，并提交有具体证据支撑的 qualityAssessment。
+   REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE 必须报告 completion 和 upstreamAlignment。
+   UNIT_TEST 报告 lineCoverage、branchCoverage、testCasePassRate；INTEGRATION_TEST 报告 interfaceCoverage、integrationScenarioCoverage、testCasePassRate；MODULE_TEST 报告 moduleCoverage、contractCoverage、testCasePassRate；FUNCTIONAL_TEST 报告 functionalCoverage、requirementCoverage、endToEndPassRate。
+   所有比率使用 0..1；禁止编造测量结果，无法取得的证据必须写入 gaps，由 Runtime 建立 Enhance Ticket。
+   UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 不得修复测试或产品代码；若检查发现测试执行未必能暴露的语义性测试缺陷，必须填写 validationDefect、设置 done=false，由 Runtime 建立 Bug Ticket 并路由到配对源阶段。
 5. 任何错误都通过下一轮的 actions 修正；不要尝试越权或捏造工具。
 6. 【大文件拆块写入】write_file / append_file 单次 content 必须低于工具文档展示的当前 Step 运行时 chunk limit。
    - 超过时请拆分：同一轮 actions 里先一个 write_file 写首段（import + 顶层常量 + 第一个函数/类），
@@ -153,7 +165,7 @@ DEBUG 只是运行时失败回退/修复模式。任意测试阶段失败时，X
 - REQUIREMENT_ANALYSIS：\`docs/01-requirement-analysis.md\` + \`docs/tests/functional-test-plan.md\`。
 - HIGH_LEVEL_DESIGN：\`docs/02-high-level-design.md\` + \`docs/tests/module-test-plan.md\`。
 - DETAILED_DESIGN：\`docs/03-detailed-design.md\` + \`docs/tests/integration-test-plan.md\`。
-- CODE：实现产物 + \`docs/tests/unit-test-plan.md\`。
+- CODE：实现产物 + \`docs/tests/unit-test-plan.md\` + 可执行单元测试。
 - UNIT_TEST：\`docs/05-unit-test.md\`。
 - INTEGRATION_TEST：\`docs/06-integration-test.md\`。
 - MODULE_TEST：\`docs/07-module-test.md\`。
@@ -167,9 +179,9 @@ DETAILED_DESIGN 必须定义模块内部具体功能实现和架构，包括函�
 1. 只返回纯 JSON。禁止输出旧阶段 REQUIREMENT、ARCH、TASK、TEST、REFACTOR、DELIVERY。
 2. 每个 current/planned implementation phase 都必须包含完整 8 阶段 V 模型。
 3. 每个宏 Step 的 \`subTasks\` 最多嵌套 2 层。
-4. 每个 CODE Step 必须被同迭代 UNIT_TEST 覆盖；architectureModules 的 testPaths 必须由 MODULE_TEST 产出。
-   CODE outputs 只能包含 src/ 下的产品源码/运行时资产和 docs/tests/unit-test-plan.md；禁止把 tests/**/*.test.ts 或其他 tests/** 文件列为 CODE outputs。
-5. 设计阶段不得输出 src/ 或 tests/ 文件；HIGH_LEVEL_DESIGN 是唯一可输出 \`package.json\` / \`tsconfig.json\` 的阶段。
+4. 每个 CODE Step 必须被同迭代 UNIT_TEST 覆盖；architectureModules.testPaths 必须由 HIGH_LEVEL_DESIGN 产出并作为 MODULE_TEST inputs。
+   CODE outputs 包含 src/ 下的产品源码/运行时资产、docs/tests/unit-test-plan.md 和 tests/ 下的可执行单元测试。
+5. REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN 只能输出文档、配对测试和允许的工程配置，不得输出 src/ 产品代码；右侧测试阶段不得输出 tests/ 或 src/。HIGH_LEVEL_DESIGN 是唯一可输出 \`package.json\` / \`tsconfig.json\` 的阶段。
 6. TypeScript greenfield 计划必须且只能有一个 HIGH_LEVEL_DESIGN Step 输出 \`package.json\`，并确保 one HIGH_LEVEL_DESIGN Step output \`package.json\`，包含 \`build\`、\`test\`、最好还有 \`lint\` 脚本。
 7. 本地 TypeScript 源码模块必须使用带显式 \`.ts\` 后缀的 ESM 相对导入；配置 \`allowImportingTsExtensions: true\`，build/lint 使用 \`tsc --noEmit\`。代码必须兼容 Node 原生 type stripping，避免 enum、namespace、参数属性等需转译语法。
 8. 时间相关测试必须冻结系统时钟（例如 \`vi.setSystemTime\` / patch datetime）或根据当前时钟推导期望值；禁止在调用 \`new Date()\` / \`date.today()\` 的同时硬编码某个年份。
@@ -177,8 +189,9 @@ DETAILED_DESIGN 必须定义模块内部具体功能实现和架构，包括函�
 10. application/mixed 需要 \`src/main.ts\` 且可直接 \`node src/main.ts --help\`；library/mixed 需要 \`src/index.ts\` 或等价公共 API 并写 API Guide。
 11. complexityAssessment 和 implementationPhases 规则同 Python：simple=>P1，moderate => 至少 P1+P2，complex => 至少 P1+P2+P3，用户强制分阶段时 userForcedPhaseSplit=true。
 12. verificationGate failurePolicy 必须说明把失败日志传给 Debugger，回退到对应 V 模型阶段并重跑后续阶段。
-13. 复杂需求返回 architectureModules；CODE/MODULE_TEST Step 可覆盖多个模块，但必须在 subTasks 中列出模块级工作。
+13. 复杂需求返回 architectureModules；HIGH_LEVEL_DESIGN/CODE/MODULE_TEST Step 可覆盖多个模块，但必须在 subTasks 中列出模块级工作。
 14. TypeScript 测试必须只使用 Vitest。Step prompt 或 package.json 中禁止要求 Jest、ts-jest、@types/jest、ts-node、nodemon；package.json 必须使用 "test": "vitest run" 和 "build": "tsc --noEmit"。
+15. 项目风险需要更严格阈值时应声明阶段 qualityGate 与 tolerance；省略时 Runtime 使用与 Python Planner 相同的 S1-S8 工程默认值。
 
 输出 JSON 结构同 Python，必须包含 \`"projectType": "application | library | mixed"\`，路径使用 \`src/example.ts\` 和 \`tests/example.test.ts\`；第一个 Step phase 必须是 \`REQUIREMENT_ANALYSIS\`，不是 \`REQUIREMENT\`。不存在命令行 project-type 覆盖。`;
 
@@ -187,7 +200,16 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只�
 每一轮你必须返回严格 JSON：
 {
   "thoughts": "<用一句话说明本轮意图>",
-  "issueResolutionPlan": "<仅 DEBUG issue 模式必填：简明说明根因假设、修复目标和验证方案>",
+  "bugResolutionPlan": "<仅 DEBUG Bug Ticket 必填：简明说明根因假设、修复目标和验证方案>",
+  "validationDefect": null,
+  "qualityAssessment": {
+    "completion": 1,
+    "upstreamAlignment": 1,
+    "metrics": {},
+    "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
+    "evidence": ["产物路径、测试报告或命令结果"],
+    "gaps": []
+  },
   "actions": [ { "tool": "<工具名>", "args": { ... } }, ... ],
   "done": true | false
 }
@@ -202,7 +224,11 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只�
    - 【测试自包含】测试**严禁**读取一个磁盘上不存在的样例文件；当被测函数需要文件输入时，要么在测试里构造内容，要么写入 \`tests/fixtures/<name>\`。
    - 【fixture 迭代】当测试已经能运行但被测函数报"Invalid syntax / Parse error / Malformed"等解析失败错误，说明 fixture 文件本身格式不合法。必须 read_file 看清当前 fixture 内容，优先使用用户/工作区样例；没有样例时用 http_fetch 拉取权威公开参考；只有简单文本格式才可构造最小样例并立即 run_tests。严禁因为解析错误去弱化实现或断言，也严禁反复凭记忆生成复杂格式 fixture。
    - 【时间稳定性】时间相关测试必须冻结系统时钟（例如 \`vi.setSystemTime\` / patch datetime）或根据当前时钟推导期望值；禁止在调用 \`new Date()\` / \`date.today()\` 的同时硬编码某个年份。
-4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空。
+4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空，并提交有具体证据支撑的 qualityAssessment。
+   REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE 必须报告 completion 和 upstreamAlignment。
+   UNIT_TEST 报告 lineCoverage、branchCoverage、testCasePassRate；INTEGRATION_TEST 报告 interfaceCoverage、integrationScenarioCoverage、testCasePassRate；MODULE_TEST 报告 moduleCoverage、contractCoverage、testCasePassRate；FUNCTIONAL_TEST 报告 functionalCoverage、requirementCoverage、endToEndPassRate。
+   所有比率使用 0..1；禁止编造测量结果，无法取得的证据必须写入 gaps，由 Runtime 建立 Enhance Ticket。
+   UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 不得修复测试或产品代码；若检查发现测试执行未必能暴露的语义性测试缺陷，必须填写 validationDefect、设置 done=false，由 Runtime 建立 Bug Ticket 并路由到配对源阶段。
 5. 任何错误都通过下一轮的 actions 修正；不要尝试越权或捏造工具。
 6. 【大文件拆块写入】write_file / append_file 单次 content 必须低于工具文档展示的当前 Step 运行时 chunk limit。
    - 超过时请拆分：同一轮 actions 里先一个 write_file 写首段（import + 顶层常量 + 第一个函数/类），紧跟多个 append_file 逐段追加。
@@ -255,25 +281,25 @@ function buildPlannerPhaseDecomposeSystem(profile: LanguageProfile): string {
 REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TEST -> INTEGRATION_TEST -> MODULE_TEST -> FUNCTIONAL_TEST。
 
 阶段职责：
-- REQUIREMENT_ANALYSIS 定义功能范围、验收标准、边界条件和用户可见行为，并同步输出功能测试计划。
-- HIGH_LEVEL_DESIGN 定义系统定位、外部接口、第三方库选型、依赖确认和集成边界，并同步输出集成测试计划。
-- DETAILED_DESIGN 定义模块内部函数/类、数据结构、算法、控制流、错误处理和内部架构，并同步输出模块测试计划。
-- CODE 只实现当前 phase 范围并同步输出单元测试计划。
-- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 分别验证对应左侧阶段。
+- REQUIREMENT_ANALYSIS 定义功能范围、验收标准、边界条件和用户可见行为，并同步编写功能测试计划和可执行功能测试。
+- HIGH_LEVEL_DESIGN 定义系统定位、外部接口、第三方库选型、依赖确认和集成边界，并同步编写模块测试计划和可执行模块/契约测试。
+- DETAILED_DESIGN 定义模块内部函数/类、数据结构、算法、控制流、错误处理和内部架构，并同步编写集成测试计划和可执行集成测试。
+- CODE 实现当前 phase 范围并同步编写单元测试计划和可执行单元测试。
+- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 检查既有配对测试、运行测试并写报告，不得创建或改写测试/产品代码。
 
 严格产物归属：
-- CODE outputs 只能包含 src/ 下的产品源码、运行时资产和单元测试计划文档；不得把 tests/** 文件放到 CODE outputs。
-- UNIT_TEST 拥有单元测试文件；INTEGRATION_TEST 拥有集成测试文件；MODULE_TEST 拥有 architectureModules.testPaths；FUNCTIONAL_TEST 拥有端到端/功能测试文件和交付文档。
+- REQUIREMENT_ANALYSIS 拥有功能测试；HIGH_LEVEL_DESIGN 拥有模块测试和 architectureModules.testPaths；DETAILED_DESIGN 拥有集成测试；CODE 拥有单元测试及产品源码/运行时资产。
+- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 只把这些测试作为 inputs，并仅输出验证报告/交付文档。
 - TypeScript greenfield 必须且只能有一个 HIGH_LEVEL_DESIGN Step 输出 package.json，包含 scripts、dependencies、devDependencies。CODE 不得输出 package.json。
 - TypeScript package.json 只能使用 Vitest："test": "vitest run"，"build": "tsc --noEmit"，devDependencies 包含 typescript/tsx/vitest/@types/node。禁止提及或要求 Jest、ts-jest、@types/jest、ts-node、nodemon。
 
-输出必须只包含当前 phase 的 dependencies、architectureModules 和 steps。复杂/多关注点任务必须用 architectureModules 表达当前 phase 的模块边界，并在 CODE/MODULE_TEST 的 subTasks 中映射模块级工作。每个 Step 的 subTasks 最多嵌套 2 层。
+输出必须只包含当前 phase 的 dependencies、architectureModules 和 steps。复杂/多关注点任务必须用 architectureModules 表达当前 phase 的模块边界，并在 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 的 subTasks 中映射模块级工作。每个 Step 的 subTasks 最多嵌套 2 层。
 
 architectureModules 只能描述当前 phase 的产品/业务源码模块：
 - sourcePaths 必须是 src/ 下的目标语言源码文件，不能是目录，不能是 tests/、docs/、README、fixtures、utils 或报告文件。
 - assetPaths 可选，只能包含 src/ 下随产品交付并在运行时使用的非代码文件（例如模板、schema、静态资源）；不得放测试 fixture、样例输入、临时输出或文档。
 - testPaths 必须是 tests/ 下的目标语言测试文件，不能是目录。
-- 测试 fixtures、测试工具、领域样例输入、临时输出文件应放在对应测试 Step 的 outputs 或 subTasks 中，不得登记为 architectureModules。
+- 测试 fixtures、测试工具、领域样例输入、临时输出文件应放在配对左侧阶段的 outputs 或 subTasks 中，不得登记为 architectureModules。
 
 只返回严格 JSON：
 {
@@ -284,11 +310,11 @@ architectureModules 只能描述当前 phase 的产品/业务源码模块：
     { "id": "M001", "name": "模块名", "responsibility": "单一明确职责", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
-    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
+    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
   ]
 }
 
-禁止输出未来 planned phase 的 Step；禁止输出 requirements.txt；禁止让需求/设计阶段写 src/tests；FUNCTIONAL_TEST 必须包含 README.md、docs/quickstart.md 和功能验收文档。` + profile.plannerPromptOverride;
+禁止输出未来 planned phase 的 Step；禁止输出 requirements.txt；需求/设计阶段不得写 src/ 产品代码，但必须写配对测试；FUNCTIONAL_TEST 必须包含 README.md、docs/quickstart.md 和功能验收文档。` + profile.plannerPromptOverride;
 }
 
 function buildExecutorSystem(profile: LanguageProfile): string {
@@ -309,7 +335,7 @@ const messages: Messages = {
     preflightOllamaUnreachable: (baseUrl, message) => `预检：Ollama ${baseUrl} 不可达：${message}`,
     preflightAutoAdded: (providers, roles) => `预检：自动增加 ${providers} 个 provider，覆盖角色 [${roles}]`,
     scoreFileHeader: '# XCompiler LLM provider 评分快照（由 ScoreStore 自动维护，请勿手工编辑）',
-    scoreFileSemantics: '# 评分语义：这是动态评分快照；默认 1.0；自动评分范围 0.1～1.0；tags: [cluster] 的 provider 默认 0.2～0.5，除非 llm.cluster_score_min/max 扩宽；失败 -0.5；成功 +0.1。用户覆盖请写 llm_scores_user.yaml，0 表示禁用。',
+    scoreFileSemantics: '# 评分语义：这是动态评分快照；默认 1.0；自动评分范围 0.1～1.0；tags: [cluster] 的 provider 默认 0.2～0.5，除非 llm.cluster_score_min/max 扩宽；传输失败或归因质量缺口 -0.5；已验证的发现、修复或变更 +0.1。用户覆盖请写 llm_scores_user.yaml，0 表示禁用。',
   },
   system: {
     configEnvMissing: (names) => `[xcompiler] 配置中的环境变量未设置，已替换为空字符串：${names}`,
@@ -776,7 +802,7 @@ ${opts.baseline || '（缺少基线摘要）'}
 `
   : ''}规划深度约束：
 - 除非需求明确只是一个很小的单函数 / 单脚本 / 小工具，否则不要把方案压缩成“一个源码文件 + 一个测试文件”的最小实现。
-- 如果需求横跨多个关注点（领域逻辑、API/CLI 接口、持久化、外部集成、流程编排、测试），必须在计划里体现为多个架构模块，并在 CODE/MODULE_TEST 宏 Step 的 subTasks 下分解模块级工作。
+- 如果需求横跨多个关注点（领域逻辑、API/CLI 接口、持久化、外部集成、流程编排、测试），必须在计划里体现为多个架构模块，并在 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 宏 Step 的 subTasks 下分解模块级工作。
 - 在 plan 中评估项目复杂度，并按评估结果确定 implementationPhases 数量：simple => 只有 P1 current；moderate => P1 current + 至少 P2 planned；complex => P1 current + 至少 P2/P3 planned。若用户明确要求分阶段/里程碑，至少使用 P1+P2，并设置 userForcedPhaseSplit=true。只为 current phase 生成一套完整 V 模型 Step；planned phase 保留目标，激活后再展开。
 - 请通过 HIGH_LEVEL_DESIGN / DETAILED_DESIGN Step 明确模块边界、职责划分、依赖和后续可扩展点，让后续增量开发可以持续追加，而不是每次重写。
 - 如果基线里已经存在相关文件，优先在原模块上扩展/重构，不要新造一套行为重复的影子实现。
@@ -838,7 +864,7 @@ ${opts.phasePlan}
 请只为 ${opts.phaseId} 输出完整 V 模型 StepPlan：
 - steps 中每个 Step.iterationId 必须等于 "${opts.phaseId}"。
 - 禁止输出其他 planned phase 的 Step；P2/P3 的详细计划留到它们成为 current phase 时再生成。
-- 如果 ${opts.phaseId} 横跨多个关注点（领域逻辑、CLI/API、文件 I/O、外部集成、流程编排、测试），必须在 architectureModules 中体现当前 phase 的模块边界，并在 CODE/MODULE_TEST 的 subTasks 下分解模块级工作。
+- 如果 ${opts.phaseId} 横跨多个关注点（领域逻辑、CLI/API、文件 I/O、外部集成、流程编排、测试），必须在 architectureModules 中体现当前 phase 的模块边界，并在 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 的 subTasks 下分解模块级工作。
 - architectureModules.sourcePaths 只能是 src/ 下的产品源码文件；随产品交付的运行时非代码资产写入 assetPaths。不要把 tests/fixtures、tests/utils、样例输入、临时输出、目录或文档登记为架构模块。
 - dependencies 只写当前 phase 需要的包名；Python 必须包含 pytest；不要输出 requirements.txt。
 - 当前 phase 必须包含标准 V 模型 8 个宏 Step，并满足同步测试设计规则。
@@ -847,7 +873,7 @@ ${opts.phasePlan}
     executorSystem: (p) => buildExecutorSystem(p),
     executorDebugBlock: (reason: string, suggestions?: string) =>
       `\n\n正处于 DEBUG 重试模式。上一轮失败原因: ${reason}\n` +
-      '以 issue 和压缩后的失败证据为事实来源。若回退到需求/设计阶段，而实际源码属于后续 Step，只更新当前契约、测试计划或诊断产物，由后续 V 模型 Step 实现。' +
+      '以 Bug Ticket 和压缩后的失败证据为事实来源。若回退到需求/设计阶段，而实际源码属于后续 Step，只更新当前契约、测试计划或诊断产物，由后续 V 模型 Step 实现。' +
       '如果上一轮停滞在只读探测，不要重复定位；直接执行下一项有依据的修改或验证动作。' +
       (suggestions ? `\n\n${suggestions}` : ''),
     executorGlobalBlock: (globalPrompt: string) => `\n\n## 项目全局约束\n${globalPrompt}`,
@@ -867,8 +893,8 @@ ${opts.phasePlan}
       '只读恢复模式已启用：上一轮已经因为持续探测失败。本轮必须基于已有 failure log 直接 patch/write/改依赖或执行验证；如果下一轮仍然只有只读/探测动作，本次重试会失败并回退。',
     executorFeedbackRepairEvidenceMissing:
       'DEBUG 完成无效：本次重试还没有产生修复证据。设置 done=true 前，必须至少完成一次成功的修复动作或成功的验证运行；否则只能在 thoughts 中给出具体 blocker 后停止。',
-    executorFeedbackIssueResolutionPlanMissing:
-      'DEBUG issue 完成无效：issueResolutionPlan 是 issue resolved 的必要字段。请返回包含简明处理方案的 JSON，并同时给出必要修复或验证动作。',
+    executorFeedbackBugResolutionPlanMissing:
+      'DEBUG Bug Ticket 完成无效：关闭 Ticket 前必须提供 bugResolutionPlan。请返回包含简明处理方案的 JSON，并同时给出必要修复或验证动作。',
   },
   skills: {
     patcher:

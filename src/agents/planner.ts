@@ -14,6 +14,7 @@ import {
   type ProjectType,
 } from '../core/plan.js';
 import { getLanguageProfile } from '../core/language.js';
+import { withDefaultQualityGate } from '../core/quality_gate.js';
 import {
   analyzeArchitectureDemand,
   architectureImplementationPaths,
@@ -349,7 +350,7 @@ function formatPlannerValidationFeedback(err: unknown): string {
     `校验错误：${message}`,
     '修正要求：',
     '- 保留已确认的 PhasePlan 约束；只生成当前 current phase 的内容。',
-    '- architectureModules 必须满足错误中要求的模块数量、sourcePaths/testPaths 和 CODE/MODULE_TEST 可追踪性。',
+    '- architectureModules 必须满足错误中要求的模块数量、sourcePaths/testPaths 和 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 可追踪性。',
     '- 若一个 CODE 宏 Step 覆盖多个模块，必须在该 CODE Step 的 subTasks 中逐一列出对应模块。',
     '- 不要删除标准 V 模型 8 个宏 Step。',
   ].join('\n');
@@ -442,7 +443,7 @@ export function buildPlan(
   const contracted = injectArchitectureContractPrompts(mapped, architectureModules);
   const languageContracted = injectLanguageContractPrompts(contracted, language);
   // 兜底：若 LLM 漏写了 UNIT_TEST 阶段或部分 CODE 没人覆盖，由 calibrationPlanCoverage 自动追加。
-  const steps = calibratePlanCoverage(languageContracted, language);
+  const steps = calibratePlanCoverage(languageContracted, language).map(withDefaultQualityGate);
   // Python 依赖需要校准（剥离版本锁 / 重写幻觉 PyPI 包名）；其他语言仅做去重清洗。
   const dependencies =
     language === 'python'
@@ -474,7 +475,7 @@ function injectLanguageContractPrompts(steps: Step[], language: Language): Step[
     '- 测试框架必须使用 Vitest：测试文件从 `vitest` 导入 `describe/it/expect/vi`，禁止 Jest API、`jest.fn`、`jest.spyOn`、`jest.mock`。\n' +
     '- `package.json` 必须使用 `"test": "vitest run"`，`"build": "tsc --noEmit"`，并包含 `type: "module"`。\n' +
     '- `tsconfig.json` 必须启用 `allowImportingTsExtensions: true`，确保显式 `.ts` 导入可通过 `tsc --noEmit`。\n' +
-    '- greenfield 项目的 HIGH_LEVEL_DESIGN 必须输出 `package.json` 与 `tsconfig.json`；CODE 阶段只输出产品源码与单元测试计划，不再补写基础工程配置。\n' +
+    '- greenfield 项目的 HIGH_LEVEL_DESIGN 必须输出 `package.json`、`tsconfig.json` 与模块测试；CODE 阶段输出产品源码、单元测试计划与可执行单元测试，不再补写基础工程配置。\n' +
     '- `devDependencies` 使用 `typescript`、`tsx`、`vitest`、`@types/node`；禁止新增或要求 `jest`、`ts-jest`、`@types/jest`、`ts-node`、`nodemon`。\n' +
     '- 本地源码导入必须使用显式 `.ts` ESM specifier，代码需兼容 Node 原生 TypeScript type stripping。\n' +
     '- 时间相关测试必须冻结系统时钟或从当前时钟推导预期值；禁止一边调用 `new Date()` 一边硬编码年份。';
@@ -499,7 +500,7 @@ function injectArchitectureContractPrompts(
     let contractBlock = '';
     if (step.phase === 'HIGH_LEVEL_DESIGN') {
       contractBlock =
-        `\n\nHIGH_LEVEL_DESIGN 契约（强制）：docs/02-high-level-design.md 必须逐项写明本开发模块在整体系统中的定位、系统级对外接口、外部 API、第三方库选型、依赖确认，以及以下模块的职责、源码路径、测试路径和依赖，不得合并或省略：\n${inventory}`;
+        `\n\nHIGH_LEVEL_DESIGN 契约（强制）：docs/02-high-level-design.md 必须逐项写明本开发模块在整体系统中的定位、系统级对外接口、外部 API、第三方库选型、依赖确认，以及以下模块的职责、源码路径、测试路径和依赖；本阶段同时创建这些 testPaths 对应的可执行模块测试，不得推迟到 MODULE_TEST：\n${inventory}`;
     } else if (step.phase === 'DETAILED_DESIGN') {
       contractBlock =
         `\n\nDETAILED_DESIGN 契约（强制）：docs/03-detailed-design.md 必须定义模块内部具体功能实现、内部架构、数据结构/控制流，并为以下每个模块保留独立 CODE/INTEGRATION_TEST 任务及验收映射：\n${inventory}`;
@@ -513,11 +514,11 @@ function injectArchitectureContractPrompts(
       }
     } else if (step.phase === 'MODULE_TEST') {
       const covered = modules.filter((module) =>
-        module.testPaths.some((testPath) => pathCoveredByOutputs(testPath, step.outputs)),
+        module.testPaths.some((testPath) => pathCoveredByOutputs(testPath, step.inputs)),
       );
       if (covered.length > 0) {
         contractBlock =
-          `\n\n本 MODULE_TEST Step 验证架构模块：\n${covered.map((module) => `${module.id} ${module.name}; testPaths=${module.testPaths.join(', ')}`).join('\n')}`;
+          `\n\n本 MODULE_TEST Step 只检查并运行 HIGH_LEVEL_DESIGN 已创建的模块测试，不得改写测试或产品代码；验证架构模块：\n${covered.map((module) => `${module.id} ${module.name}; testPaths=${module.testPaths.join(', ')}`).join('\n')}`;
       }
     }
     return contractBlock ? { ...step, systemPrompt: `${step.systemPrompt}${contractBlock}` } : step;
@@ -968,14 +969,24 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     if (demand.nonTrivial && architectureModules.length === 0) {
       throw new Error(
         `Planner omitted architectureModules for a non-trivial request (${demand.reasonLabel}); ` +
-        `expected at least ${demand.minModules} modules with CODE/MODULE_TEST traceability.`,
+        `expected at least ${demand.minModules} modules with HIGH_LEVEL_DESIGN/CODE/MODULE_TEST traceability.`,
       );
     }
     if (architectureModules.length > 0) {
-      const normalizedSteps = calibrateArchitectureStepMappings(
-        calibrateDocPaths(calibrateStepShape(calibrateStepIds(stepsWithIterations)), projectType),
-        architectureModules,
+      const ownedSteps = calibrateLanguageStepOwnership(
+        calibrateVModelDependencies(
+          calibrateDocPaths(calibrateStepShape(calibrateStepIds(stepsWithIterations)), projectType),
+        ),
+        {
+          language: context.language,
+          intent: context.intent,
+          architectureModules,
+        },
       );
+      const normalizedSteps = calibratePlanCoverage(
+        calibrateArchitectureStepMappings(ownedSteps, architectureModules),
+        context.language,
+      ).map(withDefaultQualityGate);
       const contractIssues = validateArchitectureContract(
         architectureModules,
         normalizedSteps,

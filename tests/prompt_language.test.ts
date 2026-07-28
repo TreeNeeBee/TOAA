@@ -10,7 +10,9 @@ describe('language-specific planner/executor prompts', () => {
     expect(prompt).toContain('TypeScript / Node.js only');
     expect(prompt).not.toContain('Output language: Python only');
     expect(prompt).toContain('one HIGH_LEVEL_DESIGN Step output `package.json`');
-    expect(prompt).toContain('never list tests/**/*.test.ts');
+    expect(prompt).toContain('CODE outputs contain product source/runtime assets');
+    expect(prompt).toContain('executable unit tests under tests/');
+    expect(prompt).toContain('Right-side test phases must not output tests/ or src/');
     expect(prompt).toContain('Vitest only');
     expect(prompt).toContain('Never request Jest');
     expect(prompt).toContain('allowImportingTsExtensions');
@@ -18,10 +20,11 @@ describe('language-specific planner/executor prompts', () => {
 
   it('keeps TypeScript StepPlan output ownership explicit in the two-level planner prompt', () => {
     const prompt = t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile('typescript'));
-    expect(prompt).toContain('CODE outputs may include only product source files and runtime assets under src/');
+    expect(prompt).toContain('CODE owns unit tests plus product source/runtime assets');
     expect(prompt).toContain('assetPaths is optional and may contain only non-code files under src/');
     expect(prompt).toContain('Do not put test fixtures, sample inputs, temporary outputs, or documentation there.');
-    expect(prompt).toContain('MODULE_TEST owns architectureModules.testPaths');
+    expect(prompt).toContain('HIGH_LEVEL_DESIGN owns module tests and architectureModules.testPaths');
+    expect(prompt).toContain('output validation reports/delivery docs only');
     expect(prompt).toContain('HIGH_LEVEL_DESIGN Step must output package.json');
     expect(prompt).toContain('CODE must not output package.json');
     expect(prompt).toContain('"test": "vitest run"');

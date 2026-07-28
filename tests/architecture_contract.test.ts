@@ -49,7 +49,10 @@ function complexPlan(): Plan {
     step({
       id: `S${String(index + 4).padStart(3, '0')}`,
       phase: 'CODE',
-      outputs: index === 0 ? [spec[3], 'docs/tests/unit-test-plan.md'] : [spec[3]],
+      outputs:
+        index === 0
+          ? [spec[3], 'docs/tests/unit-test-plan.md', 'tests/test_unit.py']
+          : [spec[3]],
       inputs: ['docs/02-high-level-design.md', 'docs/03-detailed-design.md'],
       dependsOn: ['S003'],
     }),
@@ -58,8 +61,11 @@ function complexPlan(): Plan {
     id: 'S012',
     phase: 'MODULE_TEST',
     role: 'Tester',
-    outputs: ['docs/07-module-test.md', ...moduleSpecs.map((spec) => spec[4])],
-    inputs: moduleSpecs.map((spec) => spec[3]),
+    outputs: ['docs/07-module-test.md'],
+    inputs: [
+      ...moduleSpecs.map((spec) => spec[3]),
+      ...moduleSpecs.map((spec) => spec[4]),
+    ],
     dependsOn: ['S011', ...codeSteps.map((item) => item.id)],
   });
   return {
@@ -129,20 +135,32 @@ function complexPlan(): Plan {
         id: 'S001',
         phase: 'REQUIREMENT_ANALYSIS',
         role: 'Planner',
-        outputs: ['docs/01-requirement-analysis.md', 'docs/tests/functional-test-plan.md'],
+        outputs: [
+          'docs/01-requirement-analysis.md',
+          'docs/tests/functional-test-plan.md',
+          'tests/test_functional.py',
+        ],
       }),
       step({
         id: 'S002',
         phase: 'HIGH_LEVEL_DESIGN',
         role: 'Architect',
-        outputs: ['docs/02-high-level-design.md', 'docs/tests/module-test-plan.md'],
+        outputs: [
+          'docs/02-high-level-design.md',
+          'docs/tests/module-test-plan.md',
+          ...moduleSpecs.map((spec) => spec[4]),
+        ],
         dependsOn: ['S001'],
       }),
       step({
         id: 'S003',
         phase: 'DETAILED_DESIGN',
         role: 'Architect',
-        outputs: ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'],
+        outputs: [
+          'docs/03-detailed-design.md',
+          'docs/tests/integration-test-plan.md',
+          'tests/test_integration.py',
+        ],
         dependsOn: ['S002'],
       }),
       ...codeSteps,
@@ -150,18 +168,26 @@ function complexPlan(): Plan {
         id: 'S010',
         phase: 'UNIT_TEST',
         role: 'Tester',
-        outputs: ['docs/05-unit-test.md', 'tests/test_unit.py'],
+        inputs: ['tests/test_unit.py'],
+        outputs: ['docs/05-unit-test.md'],
         dependsOn: codeSteps.map((item) => item.id),
       }),
       step({
         id: 'S011',
         phase: 'INTEGRATION_TEST',
         role: 'Tester',
-        outputs: ['docs/06-integration-test.md', 'tests/test_integration.py'],
+        inputs: ['tests/test_integration.py'],
+        outputs: ['docs/06-integration-test.md'],
         dependsOn: ['S010'],
       }),
       moduleTestStep,
-      step({ id: 'S013', phase: 'FUNCTIONAL_TEST', outputs: [...baseDeliveryDocs], dependsOn: ['S012'] }),
+      step({
+        id: 'S013',
+        phase: 'FUNCTIONAL_TEST',
+        inputs: ['tests/test_functional.py'],
+        outputs: [...baseDeliveryDocs],
+        dependsOn: ['S012'],
+      }),
     ],
   };
 }

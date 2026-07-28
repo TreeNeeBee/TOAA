@@ -108,6 +108,40 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastUser).toContain('Create these exact paths before rewriting outputs that already exist');
   });
 
+  it('returns a structured validation defect from a right-side test phase', async () => {
+    class ValidationDefectLLM implements LLMClient {
+      readonly name = 'validation-defect';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'the existing test omits the required error-path acceptance case',
+          validationDefect:
+            'tests/test_x.py has no case for the required invalid-input behavior in the unit test plan',
+          actions: [],
+          done: false,
+        });
+      }
+    }
+    const step: Step = {
+      ...baseStep,
+      id: 'S005',
+      phase: 'UNIT_TEST',
+      role: 'Tester',
+      tools: [],
+      outputs: [],
+    };
+    const exec = new StepExecutor({ llm: new ValidationDefectLLM(), maxRounds: 1 });
+
+    const result = await exec.run({
+      step,
+      tools: [],
+      ctx: { ...ctx, allowedWrites: [], stepId: step.id },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.validationDefect).toContain('invalid-input behavior');
+    expect(result.error).toContain('validation defect reported');
+  });
+
   it('updates skill operation windows when the active LLM provider switches', async () => {
     class SwitchingWindowLLM implements LLMClient {
       readonly name = 'switching-window';
@@ -187,12 +221,12 @@ describe('StepExecutor system prompt assembly', () => {
     expect(turns[0].data.role).toBe('Debugger');
   });
 
-  it('requires issueResolutionPlan before resolving a DEBUG issue', async () => {
+  it('requires bugResolutionPlan before resolving a DEBUG Bug Ticket', async () => {
     class MissingPlanLLM implements LLMClient {
       readonly name = 'missing-plan';
       async chat(): Promise<string> {
         return JSON.stringify({
-          thoughts: 'patch the issue without a reusable plan',
+          thoughts: 'patch the Bug Ticket without a reusable plan',
           actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 2\n' } }],
           done: true,
         });
@@ -205,7 +239,7 @@ describe('StepExecutor system prompt assembly', () => {
       tools: [writeFileTool],
       ctx,
       debugContext: {
-        issueId: 'ISSUE-1',
+        bugTicketId: 'BUG-1',
         reason: 'unit test failed',
         failureLog: 'AssertionError: expected x = 2',
         repairRequired: true,
@@ -213,16 +247,16 @@ describe('StepExecutor system prompt assembly', () => {
     });
 
     expect(r.success).toBe(false);
-    expect(r.error).toContain('issueResolutionPlan');
+    expect(r.error).toContain('bugResolutionPlan');
   });
 
-  it('returns the DEBUG issue resolution plan when the issue is fixed', async () => {
+  it('returns the DEBUG Bug Ticket resolution plan when the Bug Ticket is fixed', async () => {
     class PlannedLLM implements LLMClient {
       readonly name = 'planned';
       async chat(): Promise<string> {
         return JSON.stringify({
           thoughts: 'patch with a reusable plan',
-          issueResolutionPlan: 'Root cause is stale implementation in src/x.py; update it and verify the declared output exists.',
+          bugResolutionPlan: 'Root cause is stale implementation in src/x.py; update it and verify the declared output exists.',
           actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 3\n' } }],
           done: true,
         });
@@ -235,7 +269,7 @@ describe('StepExecutor system prompt assembly', () => {
       tools: [writeFileTool],
       ctx,
       debugContext: {
-        issueId: 'ISSUE-1',
+        bugTicketId: 'BUG-1',
         reason: 'unit test failed',
         failureLog: 'AssertionError: expected x = 3',
         repairRequired: true,
@@ -243,7 +277,7 @@ describe('StepExecutor system prompt assembly', () => {
     });
 
     expect(r.success).toBe(true);
-    expect(r.issueResolutionPlan).toContain('Root cause');
+    expect(r.bugResolutionPlan).toContain('Root cause');
   });
 
   it('extends past the base round limit when successful writes reduce missing outputs', async () => {
@@ -1211,7 +1245,7 @@ describe('StepExecutor system prompt assembly', () => {
         }
         return JSON.stringify({
           thoughts: 'write the missing output using the bounded evidence',
-          issueResolutionPlan: 'Inspect a bounded source sample, create the missing output, and verify its presence.',
+          bugResolutionPlan: 'Inspect a bounded source sample, create the missing output, and verify its presence.',
           actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }],
           done: true,
         });
@@ -1227,7 +1261,7 @@ describe('StepExecutor system prompt assembly', () => {
       tools: [readFileTool, writeFileTool],
       ctx,
       debugContext: {
-        issueId: 'ISSUE-BOUNDED',
+        bugTicketId: 'BUG-BOUNDED',
         reason: 'repeated read-only/probe actions without progress for 3 rounds',
         failureLog: 'previous attempt inspected the whole workspace without creating src/x.py',
         repairRequired: true,
@@ -1429,7 +1463,7 @@ describe('StepExecutor system prompt assembly', () => {
       async chat(): Promise<string> {
         return JSON.stringify({
           thoughts: 'the preserved retry already created the required output, but I accidentally emitted a malformed write',
-          issueResolutionPlan: 'The prior debug attempt created the missing output; verify output presence and ignore untargeted malformed write noise.',
+          bugResolutionPlan: 'The prior debug attempt created the missing output; verify output presence and ignore untargeted malformed write noise.',
           actions: [{ tool: 'write_file', args: {} }],
           done: false,
         });
@@ -1443,7 +1477,7 @@ describe('StepExecutor system prompt assembly', () => {
       tools: [writeFileTool],
       ctx,
       debugContext: {
-        issueId: 'ISSUE-1',
+        bugTicketId: 'BUG-1',
         reason: 'max rounds exceeded without satisfying outputs',
         failureLog: 'previous Debugger retry wrote src/x.py but did not return done=true',
         repairRequired: true,

@@ -45,19 +45,28 @@ describe('calibrateArchitectureStepMappings', () => {
     const steps = calibrateArchitectureStepMappings([
       step({
         id: 'S001',
-        phase: 'CODE',
-        outputs: ['src/templates/brief.md.hbs'],
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        outputs: ['docs/02-high-level-design.md'],
       }),
       step({
         id: 'S002',
+        phase: 'CODE',
+        outputs: ['src/templates/brief.md.hbs'],
+        dependsOn: ['S001'],
+      }),
+      step({
+        id: 'S003',
         phase: 'MODULE_TEST',
         role: 'Tester',
-        outputs: ['tests/brief-template.test.ts'],
-        dependsOn: ['S001'],
+        outputs: ['docs/07-module-test.md'],
+        dependsOn: ['S002'],
       }),
     ], modules);
 
-    expect(steps[0]?.subTasks?.[0]?.outputs).toEqual(['src/templates/brief.md.hbs']);
+    expect(steps[0]?.outputs).toContain('tests/brief-template.test.ts');
+    expect(steps[1]?.subTasks?.[0]?.outputs).toEqual(['src/templates/brief.md.hbs']);
+    expect(steps[2]?.inputs).toContain('tests/brief-template.test.ts');
     expect(validateArchitectureContract(modules, steps, 'typescript', {
       nonTrivial: true,
       surfaces: ['io'],
@@ -127,15 +136,26 @@ describe('calibrateArchitectureStepMappings', () => {
 
     const testSteps = calibrated.filter((item) => item.phase === 'MODULE_TEST');
     expect(testSteps.map((item) => item.outputs)).toEqual([
+      [],
+      [],
+    ]);
+    expect(calibrated.find((item) => item.phase === 'HIGH_LEVEL_DESIGN')?.outputs).toEqual(
+      expect.arrayContaining([
+        'tests/test_holiday_service.py',
+        'tests/test_models.py',
+        'tests/test_cli.py',
+      ]),
+    );
+    expect(testSteps.map((item) => item.inputs)).toEqual([
       ['tests/test_holiday_service.py', 'tests/test_models.py'],
-      ['tests/test_cli.py'],
+      ['tests/test_cli.py', 'tests/test_holiday_service.py', 'tests/test_models.py'],
     ]);
     expect(testSteps[0]?.subTasks?.map((task) => task.id)).toEqual(['M001', 'M002']);
 
-    const sharedTest = testSteps.find((item) => item.outputs.includes('tests/test_models.py'));
+    const sharedTest = testSteps.find((item) => item.inputs.includes('tests/test_models.py'));
     expect(sharedTest?.dependsOn).toEqual(expect.arrayContaining(['S004']));
 
-    const cliTest = testSteps.find((item) => item.outputs.includes('tests/test_cli.py'));
+    const cliTest = testSteps.find((item) => item.inputs.includes('tests/test_cli.py'));
     expect(cliTest?.dependsOn).toEqual(expect.arrayContaining(['S005']));
 
     const demand: ArchitectureDemand = {
@@ -160,17 +180,19 @@ describe('calibrateArchitectureStepMappings', () => {
       },
     ];
     const rawSteps = [
-      step({ id: 'S001', phase: 'CODE', outputs: ['src/weather_client.py'] }),
-      step({ id: 'S002', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_unit_weather.py'], dependsOn: ['S001'] }),
-      step({ id: 'S003', phase: 'INTEGRATION_TEST', role: 'Tester', outputs: ['docs/06-integration-test.md'], dependsOn: ['S002'] }),
-      step({ id: 'S004', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md'], dependsOn: ['S003'] }),
+      step({ id: 'S001', phase: 'HIGH_LEVEL_DESIGN', role: 'Architect', outputs: ['docs/02-high-level-design.md'] }),
+      step({ id: 'S002', phase: 'CODE', outputs: ['src/weather_client.py'], dependsOn: ['S001'] }),
+      step({ id: 'S003', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_unit_weather.py'], dependsOn: ['S002'] }),
+      step({ id: 'S004', phase: 'INTEGRATION_TEST', role: 'Tester', outputs: ['docs/06-integration-test.md'], dependsOn: ['S003'] }),
+      step({ id: 'S005', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md'], dependsOn: ['S004'] }),
     ];
 
     const calibrated = calibrateArchitectureStepMappings(rawSteps, modules);
-    const moduleTest = calibrated.find((item) => item.id === 'S004')!;
+    const moduleTest = calibrated.find((item) => item.id === 'S005')!;
 
-    expect(moduleTest.outputs).toContain('tests/test_weather_client.py');
-    expect(moduleTest.dependsOn).toContain('S001');
+    expect(calibrated[0]?.outputs).toContain('tests/test_weather_client.py');
+    expect(moduleTest.inputs).toContain('tests/test_weather_client.py');
+    expect(moduleTest.dependsOn).toContain('S002');
     expect(moduleTest.subTasks?.map((task) => task.id)).toEqual(['M001']);
     expect(validateArchitectureContract(modules, calibrated, 'python', {
       nonTrivial: true,
@@ -181,7 +203,7 @@ describe('calibrateArchitectureStepMappings', () => {
     })).toEqual([]);
   });
 
-  it('keeps architecture module testPaths owned by MODULE_TEST instead of UNIT_TEST', () => {
+  it('keeps architecture module testPaths owned by HIGH_LEVEL_DESIGN instead of UNIT_TEST', () => {
     const modules: ArchitectureModule[] = [
       {
         id: 'M001',
@@ -193,17 +215,20 @@ describe('calibrateArchitectureStepMappings', () => {
       },
     ];
     const rawSteps = [
-      step({ id: 'S001', phase: 'CODE', outputs: ['src/weather_client.py'] }),
-      step({ id: 'S002', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_weather_client.py'], dependsOn: ['S001'] }),
-      step({ id: 'S003', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md'], dependsOn: ['S002'] }),
+      step({ id: 'S001', phase: 'HIGH_LEVEL_DESIGN', role: 'Architect', outputs: ['docs/02-high-level-design.md'] }),
+      step({ id: 'S002', phase: 'CODE', outputs: ['src/weather_client.py'], dependsOn: ['S001'] }),
+      step({ id: 'S003', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_weather_client.py'], dependsOn: ['S002'] }),
+      step({ id: 'S004', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md'], dependsOn: ['S003'] }),
     ];
 
     const calibrated = calibrateArchitectureStepMappings(rawSteps, modules);
-    const unitTest = calibrated.find((item) => item.id === 'S002')!;
-    const moduleTest = calibrated.find((item) => item.id === 'S003')!;
+    const highLevelDesign = calibrated.find((item) => item.id === 'S001')!;
+    const unitTest = calibrated.find((item) => item.id === 'S003')!;
+    const moduleTest = calibrated.find((item) => item.id === 'S004')!;
 
-    expect(unitTest.outputs).toEqual(['tests/test_unit_s002.py']);
-    expect(moduleTest.outputs).toContain('tests/test_weather_client.py');
+    expect(highLevelDesign.outputs).toContain('tests/test_weather_client.py');
+    expect(unitTest.outputs).not.toContain('tests/test_weather_client.py');
+    expect(moduleTest.inputs).toContain('tests/test_weather_client.py');
     expect(validateArchitectureContract(modules, calibrated, 'python', {
       nonTrivial: true,
       surfaces: ['cli', 'integration'],
@@ -225,18 +250,21 @@ describe('calibrateArchitectureStepMappings', () => {
       },
     ];
     const rawSteps = [
-      step({ id: 'S001', phase: 'CODE', outputs: ['src/integration.py'] }),
-      step({ id: 'S002', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_unit_integration.py'], dependsOn: ['S001'] }),
-      step({ id: 'S003', phase: 'INTEGRATION_TEST', role: 'Tester', outputs: ['tests/test_integration.py'], dependsOn: ['S002'] }),
-      step({ id: 'S004', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md'], dependsOn: ['S003'] }),
+      step({ id: 'S001', phase: 'HIGH_LEVEL_DESIGN', role: 'Architect', outputs: ['docs/02-high-level-design.md'] }),
+      step({ id: 'S002', phase: 'CODE', outputs: ['src/integration.py'], dependsOn: ['S001'] }),
+      step({ id: 'S003', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_unit_integration.py'], dependsOn: ['S002'] }),
+      step({ id: 'S004', phase: 'INTEGRATION_TEST', role: 'Tester', outputs: ['tests/test_integration.py'], dependsOn: ['S003'] }),
+      step({ id: 'S005', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md'], dependsOn: ['S004'] }),
     ];
 
     const calibrated = calibrateArchitectureStepMappings(rawSteps, modules);
-    const integrationTest = calibrated.find((item) => item.id === 'S003')!;
-    const moduleTest = calibrated.find((item) => item.id === 'S004')!;
+    const highLevelDesign = calibrated.find((item) => item.id === 'S001')!;
+    const integrationTest = calibrated.find((item) => item.id === 'S004')!;
+    const moduleTest = calibrated.find((item) => item.id === 'S005')!;
 
-    expect(integrationTest.outputs).toEqual(['tests/test_integration_s003.py']);
-    expect(moduleTest.outputs).toContain('tests/test_integration.py');
+    expect(highLevelDesign.outputs).toContain('tests/test_integration.py');
+    expect(integrationTest.outputs).not.toContain('tests/test_integration.py');
+    expect(moduleTest.inputs).toContain('tests/test_integration.py');
     expect(validateArchitectureContract(modules, calibrated, 'python', {
       nonTrivial: true,
       surfaces: ['integration'],

@@ -13,7 +13,11 @@ import {
   transitionStep,
   validateExecutionSelection,
 } from '../src/core/workflow_state.js';
-import { transitionIssue } from '../src/core/issue_state.js';
+import {
+  TICKET_VERSION,
+  transitionTicket,
+  type WorkTicket,
+} from '../src/core/ticket.js';
 
 function step(
   id: string,
@@ -86,24 +90,33 @@ describe('workflow state policy', () => {
       .toEqual(['S002', 'S003']);
   });
 
-  it('keeps resolved issues terminal while allowing unresolved issues to be rerouted', () => {
-    const issue = { status: 'recorded' as const, updatedAt: 'before' };
-    transitionIssue(issue, 'unresolved', 'unresolved-at');
-    transitionIssue(issue, 'routed', 'routed-at');
-    transitionIssue(issue, 'resolved', 'resolved-at');
+  it('reopens completed work through the shared ticket transition guard', () => {
+    const ticket: WorkTicket = {
+      version: TICKET_VERSION,
+      id: 'TASK-P1-001',
+      type: 'task',
+      status: 'open',
+      priority: 'high',
+      title: 'Implement service',
+      description: 'Implement the approved service contract.',
+      iterationId: 'P1',
+      relatedTicketIds: [],
+      blockedByTicketIds: [],
+      source: { kind: 'plan', stepId: 'S004', phase: 'CODE', role: 'Coder' },
+      acceptance: ['Unit tests pass.'],
+      artifacts: ['src/service.ts'],
+      modelAttributions: [],
+      createdAt: 'created-at',
+      updatedAt: 'created-at',
+    };
+    transitionTicket(ticket, 'in_progress', 'started-at');
+    transitionTicket(ticket, 'resolved', 'resolved-at');
+    transitionTicket(ticket, 'closed', 'closed-at');
+    transitionTicket(ticket, 'in_progress', 'reopened-at');
 
-    expect(issue).toEqual({ status: 'resolved', updatedAt: 'resolved-at' });
-    expect(() => transitionIssue(issue, 'routed')).toThrow(
-      'Invalid issue transition issue: resolved -> routed',
+    expect(ticket).toMatchObject({ status: 'in_progress', updatedAt: 'reopened-at' });
+    expect(() => transitionTicket(ticket, 'open')).toThrow(
+      'Invalid ticket transition TASK-P1-001: in_progress -> open',
     );
-  });
-
-  it('keeps design issues open while their linked CR is implemented', () => {
-    const issue = { status: 'recorded' as const, updatedAt: 'before' };
-    transitionIssue(issue, 'routed', 'routed-at');
-    transitionIssue(issue, 'change_pending', 'change-pending-at');
-    expect(issue.status).toBe('change_pending');
-    transitionIssue(issue, 'resolved', 'resolved-at');
-    expect(issue.status).toBe('resolved');
   });
 });

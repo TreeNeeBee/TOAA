@@ -35,7 +35,7 @@ export interface DebugWikiEntry {
   resolutionPlan?: string;
   solution: string;
   evidence: string[];
-  sourceIssueId?: string;
+  sourceTicketId?: string;
   sourceStepId?: string;
   sourcePhase?: Phase;
   targetPhase?: Phase;
@@ -52,7 +52,7 @@ export interface DebugWikiFeedback {
   at: string;
   kind: 'used' | 'success' | 'failure' | 'corrected';
   entryId?: string;
-  issueId?: string;
+  ticketId?: string;
   stepId?: string;
   phase?: Phase;
   summary: string;
@@ -68,7 +68,7 @@ export interface DebugWikiMatch {
 
 export interface DebugWikiResolutionInput {
   brief: DebugBrief;
-  issueId?: string;
+  ticketId?: string;
   stepId?: string;
   phase?: Phase;
   targetPhase?: Phase;
@@ -92,7 +92,7 @@ interface DebugWikiOperationLogEntry {
   at: string;
   action: 'use' | 'failure' | 'resolution_created' | 'resolution_updated';
   entryIds: string[];
-  issueId?: string;
+  ticketId?: string;
   stepId?: string;
   phase?: Phase;
   summary: string;
@@ -178,7 +178,7 @@ export class DebugWiki {
       at: now,
       action: 'use',
       entryIds: feedback.map((item) => item.entryId).filter(Boolean) as string[],
-      issueId: input.issueId,
+      ticketId: input.ticketId,
       stepId: input.stepId,
       phase: input.phase,
       summary: input.brief.summary,
@@ -205,7 +205,7 @@ export class DebugWiki {
       at: now,
       action: 'failure',
       entryIds: feedback.map((item) => item.entryId).filter(Boolean) as string[],
-      issueId: input.issueId,
+      ticketId: input.ticketId,
       stepId: input.stepId,
       phase: input.phase,
       summary: input.brief.summary,
@@ -257,7 +257,7 @@ export class DebugWiki {
       at: now,
       action: createdId ? 'resolution_created' : 'resolution_updated',
       entryIds: createdId ? [createdId] : updated,
-      issueId: input.issueId,
+      ticketId: input.ticketId,
       stepId: input.stepId,
       phase: input.phase,
       summary: input.brief.summary,
@@ -355,7 +355,7 @@ export class DebugWiki {
       at: now,
       kind,
       entryId: entry.id,
-      issueId: input.issueId,
+      ticketId: input.ticketId,
       stepId: input.stepId,
       phase: input.phase,
       summary: input.brief.summary,
@@ -421,7 +421,7 @@ export class DebugWiki {
       at: now,
       kind,
       entryId: id,
-      issueId: input.issueId,
+      ticketId: input.ticketId,
       stepId: input.stepId,
       phase: input.phase,
       summary: input.brief.summary,
@@ -529,14 +529,14 @@ function createEntry(input: DebugWikiResolutionInput, now: string, id: string, l
     resolutionPlan: input.resolutionPlan?.trim(),
     solution: input.solution,
     evidence: (input.evidence ?? input.brief.evidence).slice(0, 12),
-    sourceIssueId: input.issueId,
+    sourceTicketId: input.ticketId,
     sourceStepId: input.stepId,
     sourcePhase: input.phase,
     targetPhase: input.targetPhase,
     language: input.language,
     repairFiles: input.repairFiles?.slice(0, 12),
     stats: { uses: 0, successes: 1, failures: 0 },
-    feedback: [{ at: now, kind: 'success', entryId: id, issueId: input.issueId, stepId: input.stepId, phase: input.phase, summary: input.brief.summary }],
+    feedback: [{ at: now, kind: 'success', entryId: id, ticketId: input.ticketId, stepId: input.stepId, phase: input.phase, summary: input.brief.summary }],
   }, layer);
 }
 
@@ -557,7 +557,7 @@ function normalizeEntry(raw: Partial<DebugWikiEntry>, layer: DebugWikiLayer): De
     resolutionPlan: raw.resolutionPlan,
     solution: raw.solution ?? '',
     evidence: raw.evidence ?? [],
-    sourceIssueId: raw.sourceIssueId,
+    sourceTicketId: raw.sourceTicketId,
     sourceStepId: raw.sourceStepId,
     sourcePhase: raw.sourcePhase,
     targetPhase: raw.targetPhase,
@@ -681,7 +681,7 @@ function renderOperationLogEntry(entry: DebugWikiOperationLogEntry): string {
   const lines = [
     '',
     `- ${entry.at} ${entry.action}: ${entry.entryIds.join(', ') || 'none'}`,
-    `  - issue: ${entry.issueId ?? 'n/a'}; step: ${entry.stepId ?? 'n/a'}; phase: ${entry.phase ?? 'n/a'}`,
+    `  - ticket: ${entry.ticketId ?? 'n/a'}; step: ${entry.stepId ?? 'n/a'}; phase: ${entry.phase ?? 'n/a'}`,
     `  - summary: ${entry.summary}`,
   ];
   if (entry.reason) lines.push(`  - reason: ${entry.reason}`);
@@ -696,7 +696,7 @@ function defaultDebugWikiReadme(): string {
     '',
     '- `wiki/system/` contains system-level debug policies and safety rules.',
     '- `wiki/agent/` contains agent-level calibration knowledge derived from recurring LLM failure patterns.',
-    '- `wiki/external/` stores real project issue resolutions and feedback.',
+    '- `wiki/external/` stores resolved bug-ticket knowledge and feedback.',
     '- `index.md` is a human-readable regenerated catalog.',
     '- `index.json` is the machine-readable retrieval cache.',
     '- `log.md` is an append-only operational log.',
@@ -711,7 +711,7 @@ function layerPurpose(layer: DebugWikiLayer): string {
     case 'agent':
       return 'bundled agent calibration knowledge';
     case 'external':
-      return 'local project issue resolutions';
+      return 'local project bug-ticket resolutions';
   }
 }
 

@@ -71,7 +71,9 @@ export function shouldRollbackTestPhaseFailure(reason?: string, failureLog?: str
   const text = `${reason ?? ''}\n${failureLog ?? ''}`.toLowerCase();
   if (isReadOnlyProbeLoopFailure(reason) || isRepairEvidenceMissingFailure(reason)) return false;
   if (/tool verification failed.*rolling back to paired/u.test(text)) return true;
-  if (isCachedTestArtifactDiscoveryFailure(text)) return false;
+  if (/no test files? found|no tests? found|no test suite found|filter:\s+tests?\//u.test(text)) return true;
+  if (/(?:enoent|no such file or directory|not a file)[^\n]{0,240}tests?\//u.test(text)) return true;
+  if (/validation defect|incomplete or inconsistent paired test contract/u.test(text)) return true;
   if (/missing outputs|outputs? 校验|verify outputs|declared outputs|产物/u.test(text)) return false;
   if (/invalid action|args must be an object|invalid json|parse failure/u.test(text)) return false;
   if (/test gate|functional gate|functional entry probe|entry probe|delivery gate|测试门禁|功能门禁|功能入口探测|入口探测|交付门禁/u.test(text)) return true;
@@ -201,10 +203,4 @@ export function cleanFailureLogForDebugContext(log: string): string {
   return stripNestedLatestDebuggerFailures(
     sanitizeDebugFailureLogForPrompt(log),
   );
-}
-
-function isCachedTestArtifactDiscoveryFailure(text: string): boolean {
-  return /no test files? found|no tests? found/u.test(text) ||
-    /filter:\s+tests?\//u.test(text) ||
-    /(?:enoent|no such file or directory|not a file)[^\n]{0,240}tests?\//u.test(text);
 }

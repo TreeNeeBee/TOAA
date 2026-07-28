@@ -35,7 +35,7 @@ export interface ChatOptions {
   /**
    * Whether a provider response should increase its dynamic score.
    * Step/workflow executors should disable this and score quality through
-   * their own validation instead of treating "returned text" as task success.
+   * final Enhance/Bug/CR outcomes instead of treating "returned text" as task success.
    */
   scoreSuccess?: boolean;
   /**

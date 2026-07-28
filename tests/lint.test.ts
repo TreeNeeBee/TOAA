@@ -50,7 +50,11 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         role: 'Planner',
         tools: [],
         inputs: [],
-        outputs: ['docs/01-requirement-analysis.md', 'docs/tests/functional-test-plan.md'],
+        outputs: [
+          'docs/01-requirement-analysis.md',
+          'docs/tests/functional-test-plan.md',
+          'tests/test_functional.py',
+        ],
         dependsOn: [],
         acceptance: 'requirement doc exists',
         status: 'PENDING',
@@ -67,7 +71,11 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         role: 'Architect',
         tools: [],
         inputs: ['docs/01-requirement-analysis.md'],
-        outputs: ['docs/02-high-level-design.md', 'docs/tests/module-test-plan.md'],
+        outputs: [
+          'docs/02-high-level-design.md',
+          'docs/tests/module-test-plan.md',
+          'tests/test_module.py',
+        ],
         dependsOn: ['S001'],
         acceptance: 'arch exists',
         status: 'PENDING',
@@ -84,7 +92,11 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         role: 'Planner',
         tools: [],
         inputs: ['docs/02-high-level-design.md'],
-        outputs: ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'],
+        outputs: [
+          'docs/03-detailed-design.md',
+          'docs/tests/integration-test-plan.md',
+          'tests/test_integration.py',
+        ],
         dependsOn: ['S002'],
         acceptance: 'tasks doc exists',
         status: 'PENDING',
@@ -101,7 +113,7 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         role: 'Coder',
         tools: ['write_file', 'apply_patch'],
         inputs: ['docs/02-high-level-design.md', 'docs/03-detailed-design.md'],
-        outputs: ['src/app.py', 'docs/tests/unit-test-plan.md'],
+        outputs: ['src/app.py', 'docs/tests/unit-test-plan.md', 'tests/test_app.py'],
         dependsOn: ['S003'],
         acceptance: 'src/app.py exists',
         status: 'PENDING',
@@ -117,8 +129,8 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         systemPrompt: '本 Step 专属提示词：明确范围、输入、产出、验收与禁令。',
         role: 'Tester',
         tools: ['run_tests'],
-        inputs: ['src/app.py'],
-        outputs: ['tests/test_app.py', 'docs/05-unit-test.md'],
+        inputs: ['src/app.py', 'tests/test_app.py'],
+        outputs: ['docs/05-unit-test.md'],
         dependsOn: ['S004'],
         acceptance: 'pytest passes',
         status: 'PENDING',
@@ -134,8 +146,8 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         systemPrompt: '本 Step 专属提示词：明确范围、输入、产出、验收与禁令。',
         role: 'Tester',
         tools: ['run_tests'],
-        inputs: ['src/app.py', 'tests/test_app.py'],
-        outputs: ['tests/test_integration.py', 'docs/06-integration-test.md'],
+        inputs: ['src/app.py', 'tests/test_integration.py'],
+        outputs: ['docs/06-integration-test.md'],
         dependsOn: ['S005'],
         acceptance: 'integration tests pass',
         status: 'PENDING',
@@ -151,8 +163,8 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         systemPrompt: '本 Step 专属提示词：明确范围、输入、产出、验收与禁令。',
         role: 'Tester',
         tools: ['run_tests'],
-        inputs: ['src/app.py', 'tests/test_app.py'],
-        outputs: ['tests/test_module.py', 'docs/07-module-test.md'],
+        inputs: ['src/app.py', 'tests/test_module.py'],
+        outputs: ['docs/07-module-test.md'],
         dependsOn: ['S006'],
         acceptance: 'module tests pass',
         status: 'PENDING',
@@ -168,7 +180,7 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         systemPrompt: '本 Step 专属提示词：明确范围、输入、产出、验收与禁令。',
         role: 'Tester',
         tools: ['run_tests'],
-        inputs: ['src/app.py', 'tests/test_app.py'],
+        inputs: ['src/app.py', 'tests/test_functional.py'],
         outputs: [...baseDeliveryDocs],
         dependsOn: ['S007'],
         acceptance: 'functional docs exist',
@@ -188,17 +200,50 @@ function makeTypeScriptPlan(): Plan {
   });
   plan.steps[1] = {
     ...plan.steps[1]!,
-    outputs: ['docs/02-high-level-design.md', 'docs/tests/module-test-plan.md', 'package.json'],
+    outputs: [
+      'docs/02-high-level-design.md',
+      'docs/tests/module-test-plan.md',
+      'tests/module.test.ts',
+      'package.json',
+    ],
+  };
+  plan.steps[0] = {
+    ...plan.steps[0]!,
+    outputs: [
+      'docs/01-requirement-analysis.md',
+      'docs/tests/functional-test-plan.md',
+      'tests/functional.test.ts',
+    ],
+  };
+  plan.steps[2] = {
+    ...plan.steps[2]!,
+    outputs: [
+      'docs/03-detailed-design.md',
+      'docs/tests/integration-test-plan.md',
+      'tests/integration.test.ts',
+    ],
   };
   plan.steps[3] = {
     ...plan.steps[3]!,
-    outputs: ['src/main.ts', 'docs/tests/unit-test-plan.md'],
+    outputs: ['src/main.ts', 'docs/tests/unit-test-plan.md', 'tests/main.test.ts'],
   };
   plan.steps[4] = {
     ...plan.steps[4]!,
-    inputs: ['src/main.ts'],
-    outputs: ['tests/main.test.ts', 'docs/05-unit-test.md'],
+    inputs: ['src/main.ts', 'tests/main.test.ts'],
+    outputs: ['docs/05-unit-test.md'],
     acceptance: 'npm test passes',
+  };
+  plan.steps[5] = {
+    ...plan.steps[5]!,
+    inputs: ['src/main.ts', 'tests/integration.test.ts'],
+  };
+  plan.steps[6] = {
+    ...plan.steps[6]!,
+    inputs: ['src/main.ts', 'tests/module.test.ts'],
+  };
+  plan.steps[7] = {
+    ...plan.steps[7]!,
+    inputs: ['src/main.ts', 'tests/functional.test.ts'],
   };
   return plan;
 }
@@ -339,17 +384,18 @@ describe('lintPlan', () => {
     expect(errs.some((e) => e.message.includes('must not output implementation'))).toBe(true);
   });
 
-  it('allows test steps to output tests files', () => {
+  it('requires executable tests to be owned by paired left-side phases', () => {
     const plan = makePlan();
+    plan.steps[4]!.outputs.push('tests/late_unit.py');
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
-    expect(errs.filter((e) => e.message.includes('must not output implementation'))).toEqual([]);
+    expect(errs.some((e) => e.message.includes('UNIT_TEST is validation-only'))).toBe(true);
   });
 
   it('still bans FUNCTIONAL_TEST step from producing src/*.py', () => {
     const plan = makePlan();
     plan.steps[7]!.outputs = [...baseDeliveryDocs, 'src/leak.py'];
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
-    expect(errs.some((e) => e.message.includes('FUNCTIONAL_TEST step must not output implementation'))).toBe(true);
+    expect(errs.some((e) => e.message.includes('FUNCTIONAL_TEST is validation-only'))).toBe(true);
   });
 
   it('requires paired test plans from left-side V-model phases', () => {

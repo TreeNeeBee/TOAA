@@ -62,7 +62,7 @@ XCompiler Runtime（唯一业务入口）
         └── Permission Broker（敏感操作授权）
         │
         ▼
-Workflow and Planning（Phase Planner + V-Model Engine + Issue Router）
+Workflow and Planning（Phase Planner + V-Model Engine + Ticket Workflow）
         │
         ▼
 Agents / Skills / Tool Guard / PluginHost / Project Memory
@@ -82,6 +82,21 @@ V 模型流程：
    │                       ▲
 编码实现 ─────────────►  单元测试
 ```
+
+左侧四个阶段同步产出配对测试计划和可执行测试用例，并在交付门禁提交阶段完成度与上游功能/契约对齐度；右侧四个阶段只检查测试完整性与契约一致性、运行既有测试并记录结构化工程指标。Runtime 将计划注册为 `feature -> task -> sub-task` Ticket 图。真实执行或测试错误创建 `bug`；完成度、对齐度、覆盖率或 tolerance 不达标创建独立 `enhance`，再按责任阶段增量补齐。
+
+### 3.1 完整 Ticket 驱动流程
+
+1. **Build**：澄清需求、评估复杂度、拆分 Phase，并只生成当前 Phase 的 V 模型计划。
+2. **登记**：Run 将计划迭代统一登记为 `feature`，将每个 V 模型 Step 登记为 `task`，将计划内最多两层子任务登记为相互关联的 `sub-task`。`enhance` 不作为计划根节点。
+3. **实施**：S01-S04 按 Task 执行并同步生成配对测试资产，门禁检查 `completion` 和 `upstreamAlignment`；S05-S08 只检查测试完整性、执行既有测试并提交覆盖率、通过率、跳过数、失败数和 warning 等验证证据。
+4. **质量分流**：执行异常、测试失败或结构化 `validationDefect` 创建 `bug`，进入 Debugger；阶段内容缺失、上游对齐不足、覆盖指标不足或 tolerance 超限（非 failed test）创建 `enhance`，由原角色按缺口增量补齐。两条路径不互相冒充。
+5. **局部修复**：回退到非设计阶段时，Debugger 必须先提交 `bugResolutionPlan`，再生成 patch/rewrite 或有效验证证据；随后从修复点重跑受影响的下游 Task。
+6. **设计变更**：回退到概要设计或详细设计、且形成已确认的上游契约差异时，Debugger 只完成根因修复与 `change-request` 编制。CR 由 Enhance 触发，并保留原始 Bug、契约差异、影响 Step/产物、实施方案和验证门禁；下游只应用增量变更，并逐站记录代码或验证提交。
+7. **返工**：CR 下游失败时创建新的关联 Bug，并让原 CR 进入下一 revision；只有契约或范围实质扩大时才建立父子 CR。失败不会被跳过，也不会通过全量重做掩盖增量变更。
+8. **关闭与交付**：所有受影响门禁通过后先关闭 CR；Bug 的修复方案和有效证据写入 debug-wiki 后进入 `resolved`、`closed`。直接质量 Enhance 在验证阶段通过后关闭。所有 Task、Enhance、CR 和 Bug 清零后，Runtime 汇总 `.xcompiler/quality/assessments.json`、Ticket、Phase 与项目审计结果，生成 `docs/project-development-report.md`。
+
+Ticket 只持久化到 `.xcompiler/tickets/`。旧 Issue Journal、独立 CR Store 及其目录不再读取、转换或镜像，Runtime 内不存在兼容双轨。
 
 ---
 
@@ -184,18 +199,23 @@ Plan Lint 规则：
 async function xcompilerRun(phasePlanPath: string) {
   const target = await loadPlanTarget(phasePlanPath);
   const plan = target.plan; // current plan.P<N>.json
+  const tickets = await registerPlanTickets(plan);
   for (const step of topoSort(plan.steps)) {
     if (step.status === 'DONE') continue;     // 断点续跑
-    transitionStep(step, 'RUNNING', 'attempt-started'); await persist(plan);
+    const task = tickets.taskForStep(step.id);
+    await startTicket(task);
+    transitionStep(step, 'RUNNING', 'attempt-started');
+    await persist(plan);
     try {
-      await executeStep(step);                // role LLM + Skill
+      await executeStep(step, task);          // role LLM + Skill + Ticket
       await verifyAcceptance(step);           // outputs / acceptance
       transitionStep(step, 'DONE', 'attempt-passed');
+      await closeTicket(task);
     } catch (err) {
       transitionStep(step, 'FAILED', 'attempt-failed');
       const route = classifyDebugFailure(step, err);
-      await recordAndRouteIssue(route, err);
-      if (!(await repairThroughVModel(route))) { await persist(plan); throw err; }
+      const bug = await createAndRouteBugTicket(task, route, err);
+      if (!(await repairThroughVModel(bug))) { await persist(plan); throw err; }
     }
     await persist(plan);
   }
@@ -205,16 +225,21 @@ async function xcompilerRun(phasePlanPath: string) {
 
 行为约定：
 
-- **断点续跑**：每次 Step 状态变更立即回写当前 `plan.P<N>.json` 和工程进度，中断后再次执行自动续跑。
-- **DEBUG 闭环**：失败先记录 issue，再按失败阶段路由到匹配上游阶段生成 patch/rewrite；Debugger 处理 issue 时必须输出 `issueResolutionPlan`。CODE 等局部修复通过对应门禁后可关闭 issue；HIGH_LEVEL_DESIGN / DETAILED_DESIGN 修复必须先转为工程 CR，完成下游实施与验证后才关闭 issue 并沉淀到 debug-wiki。
-- **Issue / CR 关联**：设计回退生成的 CR 以 `issueId` 和 `relatedIssueIds` 反向关联触发问题；issue 保存 `activeChangeRequestId` 和历史 `changeRequestIds`。issue 在 CR 执行期间保持 `change_pending`，不得在上游设计 patch 完成时提前 `resolved`。
-- **状态边界**：Step、Implementation Phase、Issue、CR 分别拥有独立迁移表，统一由状态迁移守卫执行；恢复、缓存门禁、V 模型回退等特殊路径必须声明迁移原因，不允许直接赋值。
+- **Ticket 分类**：`feature` 表示计划迭代，`task` 表示 V 模型宏 Step，`sub-task` 映射最多两层子任务；`bug` 表示需要 Debugger 处理的具体失败；`enhance` 表示已经识别的缺陷、功能欠缺或测试不完备；`change-request` 只表示已确认上游变化向下游的增量传导。
+- **Ticket 关系**：每个 Ticket 保存 `parentTicketId`、`rootTicketId`、`relatedTicketIds` 和 `blockedByTicketIds`。真实失败链为 `Task -> Bug -> Debug`；质量不足链为 `Task -> Enhance -> incremental remediation`。两者在上游契约变化时都可汇入 `Enhance -> CR`；CR 的 `triggerTicketId/sourceEnhanceTicketId` 必须指向 Enhance，`originBugTicketId` 仅在 Bug 起源时存在。
+- **Ticket 状态**：统一使用 `open -> triaged -> in_progress -> in_review|verification -> resolved -> closed` 主链，另有 `blocked`、`failed`、`cancelled`。恢复和返工可将 `closed|failed` 显式转回 `in_progress`，所有迁移经过同一守卫。
+- **断点续跑**：每次 Step 与 Ticket 状态变更立即回写当前 `plan.P<N>.json`、`.xcompiler/tickets/` 和工程进度，中断后再次执行自动续跑。
+- **DEBUG 闭环**：失败创建 Bug Ticket，按失败阶段路由到匹配上游阶段；Debugger 必须输出 `bugResolutionPlan` 并生成 patch/rewrite 或有效验证证据。Bug 只在门禁通过、方案与证据写入 debug-wiki 后进入 `closed`。
 - **Debug 决策**：基础设施/Provider 故障立即停止；测试执行失败回退到配对源阶段；测试产物或当前阶段质量问题留在本阶段修复。修复后从回退点重跑全部下游阶段，不得跳过中间门禁。
-- **CR 增量传导**：回退到概要/详细设计后，下游阶段进入 CR 模式，只实施 `contractChange`、`affectedSteps` 和 `affectedArtifacts` 声明的增量，不再全量重新开发。每个实施/验证阶段记录 commit、changed files 和验收摘要。
-- **CR 重做与子 CR**：普通下游失败记录关联 issue，并把同一 CR 置为 `rework`、revision 加一后从配对阶段继续；只有修复需要扩大既有契约或范围时才创建带 `parentChangeRequestId` 的子 CR。全部受影响阶段和门禁通过后 CR 才 `closed`，关联 issue 才 `resolved`。
+- **Enhance 识别**：完成度、上游对齐度、覆盖率、跳过测试、warning 或测试资产完整度不达标时，按结构化证据分类为 `defect`、`functional-gap` 或 `test-incomplete`。Enhance 保存责任阶段、验证阶段、缺口、测量值与证据，但不冒充 Debug Bug。
+- **质量指标**：默认 S1-S4 完成度 95%，S1 上游对齐 95%、S2-S4 为 90%；S5 行覆盖 80%、分支覆盖 70%；S6 接口/集成场景覆盖 85%；S7 模块/契约覆盖 90%；S8 功能/需求/端到端覆盖 95%。默认指标短缺 tolerance 为 2%，计划可通过 `qualityGate` 覆盖。
+- **质量持久化与报告**：每次门禁测量写入 `.xcompiler/quality/assessments.json`。最终项目审计通过后生成 `docs/project-development-report.md`，汇总 Phase、S1-S8 指标、tolerance、Ticket、模型影响与项目审计结论。
+- **CR 增量传导**：只有概要/详细设计修复形成上游契约差异时才创建 `change-request` Ticket；下游 Task 只实施 `contractChange`、`affectedSteps` 和 `affectedArtifacts` 声明的增量，每站记录 commit、changed files 和验收摘要。
+- **CR 重做与子 CR**：普通下游失败创建关联 Bug 和 Enhance，将同一 change-request revision 加一后继续；只有契约或范围扩大时才创建带 `parentTicketId` 的子 change-request。全部受影响门禁通过后 CR 先关闭，再解除原始 Bug 的阻塞并完成 Bug 验证、debug-wiki 沉淀和 Enhance 关闭。
 - **提示词策略**：工作区路径、真实修复、依赖真实性、fixture、外部 API 和完成证据由共享 Prompt Policy 注入；角色 Skill 只补充当前职责，避免重复规则在不同 prompt 中漂移。
-- **Debug-wiki**：默认复制并加载 XCompiler 自身路径的 `.xcompiler/debug-wiki/`（设置 `XC_PATH` 时使用 `$XC_PATH`），也可通过 `--debug-wiki-path <dir>` 指定。存储和处理参考 LLM-wiki：`wiki/system/*.md` 是系统级策略，`wiki/agent/*.md` 是 agent/calibration 级规则，`wiki/external/*.md` 是真实生成项目的 issue 修复条目，`index.md` 是可读目录，`index.json` 是检索索引，`log.md` 是追加式操作日志，`wiki/external/feedback.jsonl` 是对内置层的运行反馈 overlay。检索输入使用压缩后的 `DebugBrief`，输出采用 problem / priorPlan / confirmedSolution / feedback 摘要；复用失败的条目标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
-- **审计日志**：`.xcompiler/audit.jsonl`、LLM trace、debug cache、debug-wiki 反馈与 `docs/process_log.md` 同步记录关键事件和错误上下文。
+- **Debug-wiki**：默认复制并加载 XCompiler 自身路径的 `.xcompiler/debug-wiki/`（设置 `XC_PATH` 时使用 `$XC_PATH`），也可通过 `--debug-wiki-path <dir>` 指定。存储和处理参考 LLM-wiki：`wiki/system/*.md` 是系统级策略，`wiki/agent/*.md` 是 agent/calibration 级规则，`wiki/external/*.md` 是已关闭 Bug Ticket 的修复知识，`index.md` 是可读目录，`index.json` 是检索索引，`log.md` 是追加式操作日志，`wiki/external/feedback.jsonl` 是运行反馈 overlay。
+- **统计与评分**：`.xcompiler/tickets/summary.json` 分开统计 Enhance 类别、CR 数量/revision、状态和 provider 影响。Enhance 对被归因的作者模型产生质量扣分；缺口被最终验证后奖励发现它的验证模型；Bug 修复或 CR 实施只有通过对应门禁后才产生加分；单纯创建 CR 不修改评分。
+- **审计日志**：`.xcompiler/audit.jsonl` 使用独立的 `ticket.enhance.*`、`ticket.change-request.*` 和 `ticket.bug.*` 事件，LLM trace、debug cache、debug-wiki 反馈与 `docs/process_log.md` 同步记录关键事件和错误上下文。
 
 ---
 
@@ -224,26 +249,26 @@ async function xcompilerRun(phasePlanPath: string) {
 
 | 阶段 | 允许产出 | 明确禁止 |
 | --- | --- | --- |
-| REQUIREMENT_ANALYSIS | `docs/01-requirement-analysis.md`、验收场景、功能测试期望 | 实现代码、包含函数体的伪代码 |
-| HIGH_LEVEL_DESIGN | `docs/02-high-level-design.md`、系统接口、外部 API、第三方库和依赖确认、模块测试期望 | 函数实现体、可执行脚本、测试源码 |
-| DETAILED_DESIGN | `docs/03-detailed-design.md`、模块内部结构、集成测试期望 | 直接落地源码实现 |
-| CODE | `src/**`、入口文件、单元测试期望 | 跳过接口签约、跳过依赖声明 |
-| UNIT_TEST | `tests/**` 中的单元测试与执行结果 | 掩盖实现错误、无证据标记通过 |
-| INTEGRATION_TEST | 集成测试、依赖/API 联调结果 | 访问失败后跳过外部 API 门禁 |
-| MODULE_TEST | 模块级行为测试与契约验证 | 绕过 HIGH_LEVEL_DESIGN 中的模块契约 |
-| FUNCTIONAL_TEST | 功能验收、README、QuickStart、库项目 API Guide | 未通过入口/API 验证却交付 |
+| REQUIREMENT_ANALYSIS | `docs/01-requirement-analysis.md`、功能测试计划、可执行功能/验收测试 | 产品实现代码、把测试编写推迟到 FUNCTIONAL_TEST |
+| HIGH_LEVEL_DESIGN | `docs/02-high-level-design.md`、系统接口、外部 API、依赖确认、可执行模块/契约测试 | 产品实现代码、把测试编写推迟到 MODULE_TEST |
+| DETAILED_DESIGN | `docs/03-detailed-design.md`、模块内部设计、可执行集成测试 | 产品实现代码、把测试编写推迟到 INTEGRATION_TEST |
+| CODE | `src/**`、运行资产、单元测试计划、可执行单元测试 | 跳过设计契约、把测试编写推迟到 UNIT_TEST |
+| UNIT_TEST | 既有单元测试的完整性检查、执行证据和验证报告 | 创建或修改 `src/**`、`tests/**` |
+| INTEGRATION_TEST | 既有集成测试的完整性检查、依赖/API 联调证据和验证报告 | 创建或修改 `src/**`、`tests/**`，访问失败后跳过门禁 |
+| MODULE_TEST | 既有模块/契约测试的完整性检查、执行证据和验证报告 | 创建或修改 `src/**`、`tests/**`，绕过模块契约 |
+| FUNCTIONAL_TEST | 既有功能测试的完整性检查、功能验收、README、QuickStart、库项目 API Guide | 创建或修改 `src/**`、`tests/**`，未通过入口/API 验证却交付 |
 
 > Plan Lint 会检查越阶产出、V 模型阶段完整性、Step 子任务深度和输出路径冲突，并拒绝写入可执行计划。
 >
-> DEBUG 不属于计划阶段。它是通用修复模式，产物为 stage-aware issue、处理方案、
-> patch/rewrite 与重跑验证证据；空 patch、跳过错误或弱化测试均不能关闭 issue。
+> DEBUG 不属于计划阶段。它是 Bug Ticket 专属修复模式，产物为 stage-aware DebugBrief、
+> `bugResolutionPlan`、patch/rewrite 与重跑验证证据；空 patch、跳过错误或弱化测试均不能关闭 Ticket。
 
-| V 模型配对 | 测试期望生成时机 | 失败回退目标 |
+| V 模型配对 | 测试计划与用例生成时机 | 验证阶段职责与失败回退 |
 | --- | --- | --- |
-| REQUIREMENT_ANALYSIS -> FUNCTIONAL_TEST | 需求分析阶段同步生成验收口径 | 功能测试失败回退到需求分析 |
-| HIGH_LEVEL_DESIGN -> MODULE_TEST | 概要设计阶段同步生成模块契约检查 | 模块测试失败回退到概要设计 |
-| DETAILED_DESIGN -> INTEGRATION_TEST | 详细设计阶段同步生成集成检查 | 集成测试失败回退到详细设计 |
-| CODE -> UNIT_TEST | 编码阶段同步生成单元测试要求 | 单元测试失败回退到编码 |
+| REQUIREMENT_ANALYSIS -> FUNCTIONAL_TEST | 需求分析同步生成验收计划和可执行功能测试 | 检查并运行既有测试；失败回退到需求分析 |
+| HIGH_LEVEL_DESIGN -> MODULE_TEST | 概要设计同步生成模块测试计划和可执行契约测试 | 检查并运行既有测试；失败回退到概要设计 |
+| DETAILED_DESIGN -> INTEGRATION_TEST | 详细设计同步生成集成测试计划和可执行集成测试 | 检查并运行既有测试；失败回退到详细设计 |
+| CODE -> UNIT_TEST | 编码同步生成单元测试计划和可执行单元测试 | 检查并运行既有测试；失败回退到编码 |
 
 ### 5.1 依赖清单约定
 
@@ -274,7 +299,7 @@ export interface LLMClient {
 | Architect | 概要设计、详细设计、依赖推导 | `xcompiler run` |
 | Coder     | 代码生成和增量 patch | `xcompiler run` |
 | Tester    | 单元/集成/模块/功能测试生成与执行 | `xcompiler run` |
-| Debugger  | 错误分析、issue 路由、patch/rewrite 修复 | `xcompiler run` |
+| Debugger  | Bug Ticket 分析与路由、patch/rewrite 修复、debug-wiki 沉淀 | `xcompiler run` |
 
 ---
 
@@ -348,16 +373,24 @@ teardown → 保留缓存镜像，删除临时目录
 ### 8.3 Debug 闭环
 
 ```text
-Sandbox 失败 → 记录 issue + DebugBrief
+质量门禁不足 → 创建 Enhance Ticket
+             → S1-S4 completion/alignment：原阶段按缺口增量补齐
+             → S5-S8 coverage/tolerance：回退配对源阶段增量补齐
+             → HLD / DD 契约变化：创建 change-request 向下游传导
+             → 原验证阶段通过且相关 CR 关闭：Enhance = closed
+
+Sandbox / 测试失败 → 创建 Bug Ticket + DebugBrief
              → 检索 debug-wiki system/agent/external 的历史问题/方案/反馈摘要
-             → Debugger LLM 输出 issueResolutionPlan
+             → Debugger LLM 输出 bugResolutionPlan
              → 选 Skill 修改源码 (apply_patch / replace_in_file / add_dependency …)
-             → CODE 等局部修复：重跑对应门禁 → 通过则关闭 issue
-             → HLD / DD 设计修复：创建 CR，issue = change_pending
-                → 下游按 CR 增量实施并记录 change / verification commit
-                → 门禁失败：关联新 issue，同一 CR = rework，revision + 1
-                → 契约/范围实质扩大：创建 parent-linked child CR
-                → 全部受影响门禁通过：CR = closed，issue = resolved，更新 debug-wiki
+             → CODE 等局部修复：Bug = verification → 重跑对应门禁
+                → 通过：写入 debug-wiki → Bug = resolved → closed
+             → HLD / DD 设计修复：创建 change-request Ticket，Bug = blocked
+                → 下游 Task 按 CR 增量实施并记录 change / verification commit
+                → 门禁失败：创建关联 Bug，同一 CR revision + 1
+                → 契约/范围实质扩大：创建 parent-linked child change-request
+                → 全部受影响门禁通过：CR = closed
+                → 解除 Bug 阻塞 → 写入 debug-wiki → Bug = resolved → closed
              → 失败则标记相关 wiki 条目 needs_review，并进入下一轮/终止
 ```
 
@@ -396,8 +429,13 @@ workspace/
 ├── src/                       # Python / TypeScript 源码
 ├── tests/                     # pytest / Vitest
 ├── .xcompiler/                # 锁、审计、项目记忆、debug cache、自举报告
-│   ├── issues/                # issue 快照、原始错误、repair patch 与生命周期日志
-│   └── change-requests/       # CR JSON/Markdown、revision、应用提交与验证证据
+│   └── tickets/
+│       ├── index.json         # feature/task/sub-task/bug/enhance/change-request 当前快照
+│       ├── summary.json       # Enhance/CR/状态/provider 影响统计
+│       ├── events.jsonl       # 追加式 Ticket 创建、关联、阻塞、验证与关闭事件
+│       ├── <TICKET-ID>.json   # 强类型机器可读快照
+│       ├── <TICKET-ID>.md     # 人类可读摘要
+│       └── <BUG-ID>/          # 原始错误、repair patch、修复摘要
 ├── .sandbox/                  # venv / docker 缓存（gitignore）
 └── node_modules/              # TypeScript subprocess sandbox（按需）
 ```

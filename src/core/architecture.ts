@@ -269,7 +269,7 @@ export function architectureImplementationPaths(module: ArchitectureModule): str
   return [...module.sourcePaths, ...(module.assetPaths ?? [])];
 }
 
-/** 校验 HIGH_LEVEL_DESIGN 模块契约到 CODE / MODULE_TEST 两侧的可追踪性。 */
+/** 校验 HIGH_LEVEL_DESIGN 模块契约、测试资产、实现与 MODULE_TEST 验证的可追踪性。 */
 export function validateArchitectureContract(
   modules: ArchitectureModule[],
   steps: Step[],
@@ -278,6 +278,7 @@ export function validateArchitectureContract(
 ): ArchitectureContractIssue[] {
   const issues: ArchitectureContractIssue[] = [];
   const profile = getLanguageProfile(language);
+  const designSteps = steps.filter((step) => step.phase === 'HIGH_LEVEL_DESIGN');
   const codeSteps = steps.filter((step) => step.phase === 'CODE');
   const testSteps = steps.filter((step) => step.phase === 'MODULE_TEST');
   const stepById = new Map(steps.map((step) => [step.id, step]));
@@ -366,11 +367,22 @@ export function validateArchitectureContract(
     ownedModules.push(module);
     modulesByCodeOwner.set(codeOwner.id, ownedModules);
 
+    const matchingDesigns = designSteps.filter((step) =>
+      module.testPaths.every((path) => pathCoveredByOutputs(path, step.outputs)),
+    );
+    if (matchingDesigns.length === 0) {
+      issues.push({
+        message: `${module.id} testPaths are not authored by any HIGH_LEVEL_DESIGN step.`,
+      });
+    }
+
     const matchingTests = testSteps.filter((step) =>
-      module.testPaths.some((path) => pathCoveredByOutputs(path, step.outputs)),
+      module.testPaths.every((path) => pathCoveredByOutputs(path, step.inputs)),
     );
     if (matchingTests.length === 0) {
-      issues.push({ message: `${module.id} testPaths are not produced by any MODULE_TEST step.` });
+      issues.push({
+        message: `${module.id} testPaths are not consumed by any MODULE_TEST step.`,
+      });
     } else if (!matchingTests.some((step) => transitivelyDependsOn(step, codeOwner.id, stepById))) {
       issues.push({
         message: `${module.id} MODULE_TEST step must depend directly or transitively on its CODE step ${codeOwner.id}.`,

@@ -14,7 +14,7 @@ fingerprints:
 symptoms:
   - "A real sample project fails repeatedly"
   - "Proposed fix adds project fixture or generated-project rule into XCompiler"
-solution: "When a generated project exposes a recurring failure, fix the generic agent/tool/debug process. Do not add DBC/news/test-project-specific fixtures, hardcoded APIs, or one-off output rules to XCompiler core. External wiki entries may record the project issue and solution, but system/agent rules must remain general."
+solution: "When a generated project exposes a recurring failure, fix the generic agent/tool/debug process. Do not add DBC/news/test-project-specific fixtures, hardcoded APIs, or one-off output rules to XCompiler core. External wiki entries may record the resolved Bug Ticket knowledge, but system/agent rules must remain general."
 evidence:
   - "Project-specific hardcoding is treated as poisoning"
 stats:

@@ -40,7 +40,7 @@ describe('DebugWiki', () => {
     }
   });
 
-  it('records a resolved debug issue and retrieves it by debug brief', async () => {
+  it('records a resolved Bug Ticket and retrieves it by debug brief', async () => {
     const root = await tmpRoot();
     const wiki = new DebugWiki(root);
     const brief = buildDebugBrief({
@@ -52,7 +52,7 @@ describe('DebugWiki', () => {
 
     const result = await wiki.recordResolution({
       brief,
-      issueId: 'ISSUE-1',
+      ticketId: 'BUG-1',
       stepId: 'S004',
       phase: 'CODE',
       targetPhase: 'CODE',
@@ -90,7 +90,7 @@ describe('DebugWiki', () => {
     });
     const created = await wiki.recordResolution({
       brief,
-      issueId: 'ISSUE-1',
+      ticketId: 'BUG-1',
       stepId: 'S004',
       phase: 'CODE',
       language: 'python',
@@ -100,7 +100,7 @@ describe('DebugWiki', () => {
 
     await wiki.recordUse([id], {
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S004',
       phase: 'CODE',
       language: 'python',
@@ -108,7 +108,7 @@ describe('DebugWiki', () => {
     });
     await wiki.recordFailure([id], {
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S004',
       phase: 'CODE',
       language: 'python',
@@ -141,7 +141,7 @@ describe('DebugWiki', () => {
 
     await wiki.recordUse([builtin!.entry.id], {
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S002',
       phase: 'HIGH_LEVEL_DESIGN',
       language: 'python',
@@ -149,7 +149,7 @@ describe('DebugWiki', () => {
     });
     await wiki.recordFailure([builtin!.entry.id], {
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S002',
       phase: 'HIGH_LEVEL_DESIGN',
       language: 'python',
@@ -168,7 +168,7 @@ describe('DebugWiki', () => {
 
     const corrected = await wiki.recordResolution({
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S002',
       phase: 'HIGH_LEVEL_DESIGN',
       language: 'python',
@@ -197,7 +197,7 @@ describe('DebugWiki', () => {
     });
     const created = await wiki.recordResolution({
       brief,
-      issueId: 'ISSUE-1',
+      ticketId: 'BUG-1',
       stepId: 'S002',
       phase: 'HIGH_LEVEL_DESIGN',
       language: 'python',
@@ -206,7 +206,7 @@ describe('DebugWiki', () => {
     const id = created.created!;
     await wiki.recordFailure([id], {
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S002',
       phase: 'HIGH_LEVEL_DESIGN',
       language: 'python',
@@ -216,7 +216,7 @@ describe('DebugWiki', () => {
 
     await wiki.recordResolution({
       brief,
-      issueId: 'ISSUE-2',
+      ticketId: 'BUG-2',
       stepId: 'S002',
       phase: 'HIGH_LEVEL_DESIGN',
       language: 'python',

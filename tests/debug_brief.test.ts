@@ -197,7 +197,7 @@ describe('debug brief extraction', () => {
     expect(brief.primaryError).not.toContain('write_file 成功');
   });
 
-  it('keeps an exact missing-output stall as the root issue over incidental tool denial', () => {
+  it('keeps an exact missing-output stall as the root defect over incidental tool denial', () => {
     const brief = buildDebugBrief({
       reason:
         'write/progress actions did not reduce missing outputs for 3 rounds; ' +

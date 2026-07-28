@@ -24,6 +24,7 @@ export interface ScoreStoreOptions {
  * 设计动机：
  *  - 配置允许给一个角色挂多个 provider；运行时按评分降序选择当前"最可信"的。
  *  - 评分会随成功/失败动态调整：失败 -0.5 直到 0.1；成功 +0.1 直到 cap=1。
+ *  - Workflow 输出关闭自动响应加分，改由 Enhance 归因、Bug 修复验证和 CR 门禁结果反馈。
  *  - `llm_scores.yaml` 是 XCompiler 维护的动态快照；它不是用户策略文件。
  *  - 用户手动覆盖写在 `llm_scores_user.yaml`；其中 score=0 表示禁用，并且优先生效。
  *  - preflight 检测到 ollama 服务器上**模型不存在**会在当前运行跳过该 provider，并把评分降到 0.1。

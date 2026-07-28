@@ -23,21 +23,18 @@ Mandatory phase documents:
 For P2+ iterations, put the same basenames under \`docs/iterations/<iterationId>/\`. The top-level \`docs/topic.md\` is written by xcompiler build and must never appear in Step outputs.
 
 Synchronous test-design rule:
-- REQUIREMENT_ANALYSIS must also output \`docs/tests/functional-test-plan.md\`.
-- HIGH_LEVEL_DESIGN must also output \`docs/tests/module-test-plan.md\`.
-- DETAILED_DESIGN must also output \`docs/tests/integration-test-plan.md\`.
-- CODE must also output \`docs/tests/unit-test-plan.md\`.
+- REQUIREMENT_ANALYSIS must output \`docs/tests/functional-test-plan.md\` and executable functional/acceptance tests under \`tests/\`.
+- HIGH_LEVEL_DESIGN must output \`docs/tests/module-test-plan.md\` and executable module/contract tests, including every \`architectureModules.testPaths\`.
+- DETAILED_DESIGN must output \`docs/tests/integration-test-plan.md\` and executable integration tests.
+- CODE must output \`docs/tests/unit-test-plan.md\` and executable unit tests together with the implementation.
 For P2+ iterations, put those under \`docs/iterations/<iterationId>/tests/\`.
 
 Phase responsibilities:
-- REQUIREMENT_ANALYSIS defines functional scope, acceptance criteria, boundaries, and user-visible behaviour.
-- HIGH_LEVEL_DESIGN defines the current development module's position in the whole system plus system-level external interfaces and dependencies, including external APIs, third-party library choices, dependency confirmation, data contracts, and integration boundaries.
-- DETAILED_DESIGN defines the module-internal functions, data structures, algorithms, control flow, error handling, and internal architecture.
-- CODE implements only the designed scope and produces runnable/importable Python source.
-- UNIT_TEST verifies CODE internals and public functions.
-- INTEGRATION_TEST verifies module-internal collaboration, data flow, and component integration from DETAILED_DESIGN.
-- MODULE_TEST verifies the current module's position in the whole system, external interfaces, and dependency boundaries from HIGH_LEVEL_DESIGN.
-- FUNCTIONAL_TEST verifies requirements end-to-end and produces user-facing documentation.
+- REQUIREMENT_ANALYSIS defines functional scope, acceptance criteria, boundaries, and user-visible behaviour, then authors the paired functional tests.
+- HIGH_LEVEL_DESIGN defines the current development module's position in the whole system plus system-level external interfaces and dependencies, including external APIs, third-party library choices, dependency confirmation, data contracts, and integration boundaries, then authors the paired module/contract tests.
+- DETAILED_DESIGN defines module-internal functions, data structures, algorithms, control flow, error handling and architecture, then authors the paired integration tests.
+- CODE implements only the designed scope and authors its paired unit tests.
+- UNIT_TEST, INTEGRATION_TEST, MODULE_TEST, and FUNCTIONAL_TEST inspect their existing paired tests for completeness/consistency, run them, and write validation reports. They must not create or rewrite tests or product code.
 
 Functional documentation bundle: P1 FUNCTIONAL_TEST outputs must include \`README.md\`, \`docs/quickstart.md\`, and \`docs/08-functional-test.md\`; for \`projectType\` = \`library\` or \`mixed\`, also include \`docs/api-guide.md\`. P2+ uses \`docs/iterations/<iterationId>/08-functional-test.md\`, \`quickstart.md\`, and optional \`api-guide.md\`. Documentation must follow the active i18n language.
 
@@ -47,7 +44,7 @@ Mandatory rules:
 3. Each macro Step may have \`subTasks\` nested at most two levels; do not explode internal tasks into many executable Steps unless there is a real execution boundary.
 4. dependsOn must follow the phase order and be acyclic. Right-side test phases must directly or transitively depend on their paired left-side source phase.
 5. Every CODE Step must be covered by a UNIT_TEST Step in the same iteration.
-6. Design phases must not output src/ or tests/ files. CODE owns product source and runtime assets under src/. Test phases own tests/ and their report docs. FUNCTIONAL_TEST must not modify src/.
+6. REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN may output their paired tests under tests/ but must not output product code under src/. CODE owns product source/runtime assets and unit tests. Right-side test phases own only reports/delivery docs and must not modify src/ or tests/.
 7. The same outputs path is globally unique. DEBUG may modify dependency-chain files at runtime; planned Steps should not duplicate outputs.
 8. id has the form S001, S002, ...; role is Planner / Architect / Coder / Tester / Debugger.
 9. Every Step needs a systemPrompt that pins scope, inputs, outputs, acceptance, forbidden actions, and the paired test-design obligation when applicable.
@@ -56,8 +53,9 @@ Mandatory rules:
 12. implementationPhases must include P1 current and any planned executable phases. Each phase has a verificationGate whose failurePolicy says to feed the failure log to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.
 13. dependencies is a Python pip dependency list. Include \`pytest\`; use bare package names only; never list \`requirements.txt\` in Step outputs.
 14. Application/mixed projects need a directly executable Python entry point (\`src/main.py\` or package \`__main__.py\`) that reuses CODE modules. Library/mixed projects need a stable public API and \`docs/api-guide.md\`.
-15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, optional assetPaths, testPaths, and dependencies. Put non-code runtime assets in assetPaths. CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
+15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, optional assetPaths, testPaths, and dependencies. HIGH_LEVEL_DESIGN authors testPaths, CODE authors implementation paths, and MODULE_TEST consumes testPaths. Macro Steps may cover multiple modules but must list module-level work in subTasks.
 16. Third-party library choices must match real APIs: HIGH_LEVEL_DESIGN must name the concrete entry point function/class or verification basis for the selected library in this requirement; do not invent parser/export APIs from package names alone.
+17. Every Step may declare a qualityGate. S1-S4 use completionMin and upstreamAlignmentMin. S5-S8 declare their stage metrics and tolerance (metricShortfall, maxFailedTests, maxSkippedTests, maxWarnings). Keep thresholds realistic for the project; Runtime supplies engineering defaults when omitted.
 
 Output JSON shape:
 {
@@ -83,12 +81,13 @@ Output JSON shape:
       "role": "Planner",
       "tools": ["write_file"],
       "inputs": ["docs/topic.md"],
-      "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md"],
+      "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"],
       "subTasks": [
         { "id": "T1", "title": "string", "description": "string", "acceptance": "string", "outputs": ["docs/01-requirement-analysis.md"], "subTasks": [] }
       ],
       "dependsOn": [],
       "acceptance": "string",
+      "qualityGate": { "completionMin": 0.95, "upstreamAlignmentMin": 0.95, "metrics": {}, "tolerance": { "metricShortfall": 0.02, "maxFailedTests": 0, "maxSkippedTests": 0, "maxWarnings": 0 } },
       "maxRetries": 3
     }
   ]
@@ -99,7 +98,16 @@ const PYTHON_EXECUTOR_SYSTEM = `You are XCompiler's Step Executor. You may only 
 Every round you must return strict JSON:
 {
   "thoughts": "<one sentence describing this round's intent>",
-  "issueResolutionPlan": "<required only in DEBUG issue mode: concise root cause, repair target, and validation plan>",
+  "bugResolutionPlan": "<required only for a DEBUG Bug Ticket: concise root cause, repair target, and validation plan>",
+  "validationDefect": null,
+  "qualityAssessment": {
+    "completion": 1,
+    "upstreamAlignment": 1,
+    "metrics": {},
+    "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
+    "evidence": ["artifact path, test report, or command result"],
+    "gaps": []
+  },
   "actions": [ { "tool": "<tool name>", "args": { ... } }, ... ],
   "done": true | false
 }
@@ -133,7 +141,11 @@ Rules:
      for a user sample or network reference.
      Never edit the implementation, the assertion, or mock out the parser to "fix" a parse error — fix the fixture first.
    - [Time stability] Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
-4. When all outputs files exist and self-check passes, set done = true with empty actions.
+4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
+   REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
+   UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
+   Ratios use 0..1. Never invent measurements: record unavailable evidence as a gap so Runtime can create an Enhance Ticket.
+   In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
 5. Correct any error in the next round's actions; never overstep authority or invent tools.
 6. [Large-file chunked writes] write_file / append_file content must stay under the current Step's runtime chunk limit shown in the tool docs.
    - For larger files: in the same actions array, first write_file the head (imports + top-level constants + first function/class),
@@ -154,7 +166,7 @@ Use the same phase documents and synchronous test-design rule as the Python plan
 - REQUIREMENT_ANALYSIS: \`docs/01-requirement-analysis.md\` plus \`docs/tests/functional-test-plan.md\`.
 - HIGH_LEVEL_DESIGN: \`docs/02-high-level-design.md\` plus \`docs/tests/module-test-plan.md\`.
 - DETAILED_DESIGN: \`docs/03-detailed-design.md\` plus \`docs/tests/integration-test-plan.md\`.
-- CODE: implementation outputs plus \`docs/tests/unit-test-plan.md\`.
+- CODE: implementation outputs plus \`docs/tests/unit-test-plan.md\` and executable unit tests.
 - UNIT_TEST: \`docs/05-unit-test.md\`.
 - INTEGRATION_TEST: \`docs/06-integration-test.md\`.
 - MODULE_TEST: \`docs/07-module-test.md\`.
@@ -168,9 +180,9 @@ Mandatory rules:
 1. Return pure JSON only. Never emit the old phases REQUIREMENT, ARCH, TASK, TEST, REFACTOR, or DELIVERY.
 2. Every current/planned implementation phase is a complete V-model iteration containing all eight canonical phases.
 3. Each macro Step may contain \`subTasks\` nested at most two levels.
-4. Every CODE Step must be covered by a UNIT_TEST Step in the same iteration; module testPaths from architectureModules must be produced by MODULE_TEST.
-   CODE outputs must contain product source files and runtime assets under src/ plus docs/tests/unit-test-plan.md only; never list tests/**/*.test.ts or other tests/** files as CODE outputs.
-5. Design phases must not output src/ or tests/ files. HIGH_LEVEL_DESIGN is the only phase that may output \`package.json\` / \`tsconfig.json\`.
+4. Every CODE Step must be covered by a UNIT_TEST Step in the same iteration. HIGH_LEVEL_DESIGN must author architectureModules.testPaths; MODULE_TEST consumes them as inputs.
+   CODE outputs contain product source/runtime assets, docs/tests/unit-test-plan.md, and executable unit tests under tests/.
+5. REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN may output only their documents, paired executable tests, and allowed project configuration; they must not output src/ product code. Right-side test phases must not output tests/ or src/. HIGH_LEVEL_DESIGN is the only phase that may output \`package.json\` / \`tsconfig.json\`.
 6. Exactly one HIGH_LEVEL_DESIGN Step must output \`package.json\` for greenfield TypeScript plans; ensure one HIGH_LEVEL_DESIGN Step output \`package.json\`. It must include scripts for \`build\`, \`test\`, and preferably \`lint\`.
 7. Local TypeScript source imports must use explicit \`.ts\` ESM specifiers. Configure \`allowImportingTsExtensions: true\` and use \`tsc --noEmit\`. Generated TypeScript must be compatible with Node native type stripping: avoid enums, namespaces, parameter properties, and transform-required syntax.
 8. Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
@@ -178,8 +190,9 @@ Mandatory rules:
 10. Application/mixed projects need \`src/main.ts\` with a directly runnable \`main()\`; library/mixed projects need \`src/index.ts\` or equivalent public API plus API guide.
 11. complexityAssessment and implementationPhases follow the same rules as Python: simple => P1, moderate => at least P1+P2, complex => at least P1+P2+P3, forced phase split => set userForcedPhaseSplit=true.
 12. verificationGate failurePolicy must say: Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.
-13. For non-trivial work, return architectureModules with sourcePaths, optional assetPaths, and testPaths; CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
+13. For non-trivial work, return architectureModules with sourcePaths, optional assetPaths, and testPaths; HIGH_LEVEL_DESIGN/CODE/MODULE_TEST Steps may cover multiple modules but must list module-level work in subTasks.
 14. TypeScript tests must use Vitest only. Never request Jest, ts-jest, @types/jest, ts-node, or nodemon in Step prompts or package.json; package.json must use "test": "vitest run" and "build": "tsc --noEmit".
+15. Declare stage qualityGate thresholds and tolerance when project risk requires stricter values; otherwise Runtime applies the same S1-S8 engineering defaults as the Python planner.
 
 Output JSON shape is identical to Python and must include \`"projectType": "application | library | mixed"\`, with TypeScript paths such as \`src/example.ts\` and \`tests/example.test.ts\`; the first Step phase must be \`REQUIREMENT_ANALYSIS\`, not \`REQUIREMENT\`. There is no CLI project-type override.`;
 
@@ -188,7 +201,16 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `You are XCompiler's Step Executor. You may o
 Every round you must return strict JSON:
 {
   "thoughts": "<one sentence describing this round's intent>",
-  "issueResolutionPlan": "<required only in DEBUG issue mode: concise root cause, repair target, and validation plan>",
+  "bugResolutionPlan": "<required only for a DEBUG Bug Ticket: concise root cause, repair target, and validation plan>",
+  "validationDefect": null,
+  "qualityAssessment": {
+    "completion": 1,
+    "upstreamAlignment": 1,
+    "metrics": {},
+    "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
+    "evidence": ["artifact path, test report, or command result"],
+    "gaps": []
+  },
   "actions": [ { "tool": "<tool name>", "args": { ... } }, ... ],
   "done": true | false
 }
@@ -203,7 +225,11 @@ Rules:
    - [Self-contained tests] Tests **must NOT** read a sample file that does not exist on disk. When a target function needs file input, either create the content inside the test or write fixtures under \`tests/fixtures/<name>\`.
    - [Fixture iteration] When a test runs but the target function raises "Invalid syntax / Parse error / Malformed", the **fixture itself is malformed**. read_file the fixture, prefer a user/workspace sample; if none exists, use http_fetch to obtain an authoritative public reference; construct minimal samples only for simple text formats and immediately run_tests. Never weaken the implementation/assertion, and never repeatedly invent complex domain fixtures from memory.
    - [Time stability] Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
-4. When all outputs files exist and self-check passes, set done = true with empty actions.
+4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
+   REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
+   UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
+   Ratios use 0..1. Never invent measurements: record unavailable evidence as a gap so Runtime can create an Enhance Ticket.
+   In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
 5. Correct any error in the next round's actions; never overstep authority or invent tools.
 6. [Large-file chunked writes] write_file / append_file content must stay under the current Step's runtime chunk limit shown in the tool docs.
    - For larger files: in the same actions array, first write_file the head (imports + top-level constants + first function/class), then several append_file calls each adding one function/class block.
@@ -259,25 +285,25 @@ Every current phase must use the canonical V-model:
 REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TEST -> INTEGRATION_TEST -> MODULE_TEST -> FUNCTIONAL_TEST.
 
 Phase responsibilities:
-- REQUIREMENT_ANALYSIS defines functional scope, acceptance, boundaries, and user-visible behaviour, and synchronously emits the functional test plan.
-- HIGH_LEVEL_DESIGN defines system position, external interfaces, third-party library choices, dependency confirmation, and integration boundaries, and synchronously emits the integration test plan.
-- DETAILED_DESIGN defines module-internal functions/classes, data structures, algorithms, control flow, error handling, and internal architecture, and synchronously emits the module test plan.
-- CODE implements only the current phase and synchronously emits the unit test plan.
-- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST verify their paired left-side phases.
+- REQUIREMENT_ANALYSIS defines functional scope, acceptance, boundaries, and user-visible behaviour, and synchronously authors the functional test plan and executable functional tests.
+- HIGH_LEVEL_DESIGN defines system position, external interfaces, third-party choices, dependencies and integration boundaries, and synchronously authors the module test plan and executable module/contract tests.
+- DETAILED_DESIGN defines module-internal functions/classes, data structures, algorithms, control flow, error handling and architecture, and synchronously authors the integration test plan and executable integration tests.
+- CODE implements the current phase and synchronously authors the unit test plan and executable unit tests.
+- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST inspect the existing paired tests, run them, and write reports; they do not create or rewrite test/product code.
 
 Strict output ownership:
-- CODE outputs may include only product source files and runtime assets under src/ plus the unit-test-plan document; do not put tests/** files in CODE outputs.
-- UNIT_TEST owns unit test files; INTEGRATION_TEST owns integration test files; MODULE_TEST owns architectureModules.testPaths; FUNCTIONAL_TEST owns end-to-end/functional test files and delivery docs.
+- REQUIREMENT_ANALYSIS owns functional tests; HIGH_LEVEL_DESIGN owns module tests and architectureModules.testPaths; DETAILED_DESIGN owns integration tests; CODE owns unit tests plus product source/runtime assets.
+- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST consume those tests as inputs and output validation reports/delivery docs only.
 - For greenfield TypeScript, exactly one HIGH_LEVEL_DESIGN Step must output package.json with scripts, dependencies, and devDependencies. CODE must not output package.json.
 - For TypeScript package.json, use Vitest only: "test": "vitest run", "build": "tsc --noEmit", devDependencies include typescript/tsx/vitest/@types/node. Do not mention or request Jest, ts-jest, @types/jest, ts-node, or nodemon.
 
-Return only the current phase's dependencies, architectureModules, and steps. Complex or multi-concern work must declare architectureModules for the current phase and map module-level work under CODE/MODULE_TEST subTasks. Each Step's subTasks may nest at most two levels.
+Return only the current phase's dependencies, architectureModules, and steps. Complex or multi-concern work must declare architectureModules for the current phase and map module-level work under HIGH_LEVEL_DESIGN/CODE/MODULE_TEST subTasks. Each Step's subTasks may nest at most two levels.
 
 architectureModules may describe only product/business source modules for the current phase:
 - sourcePaths must be target-language source files under src/. They must not be directories, tests/, docs/, README, fixtures, utils, or report files.
 - assetPaths is optional and may contain only non-code files under src/ that ship with and are used by the product at runtime (for example templates, schemas, or static assets). Do not put test fixtures, sample inputs, temporary outputs, or documentation there.
 - testPaths must be target-language test files under tests/. They must not be directories.
-- Test fixtures, test helpers, sample inputs, and temporary output files belong in test Step outputs or subTasks, not in architectureModules.
+- Test fixtures, test helpers, sample inputs, and temporary output files belong to the paired left-side source Step outputs/subTasks, not in architectureModules.
 
 Return strict JSON only:
 {
@@ -288,11 +314,11 @@ Return strict JSON only:
     { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
-    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
+    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
   ]
 }
 
-Do not output Steps for future planned phases. Do not output requirements.txt. Design phases must not write src/tests. FUNCTIONAL_TEST must include README.md, docs/quickstart.md, and the functional validation document.` + profile.plannerPromptOverride;
+Do not output Steps for future planned phases. Do not output requirements.txt. Design phases must not write src/ product code; their paired tests are mandatory. FUNCTIONAL_TEST must include README.md, docs/quickstart.md, and the functional validation document.` + profile.plannerPromptOverride;
 }
 
 function buildExecutorSystem(profile: LanguageProfile): string {
@@ -312,7 +338,7 @@ const messages: Messages = {
     preflightOllamaUnreachable: (baseUrl, message) => `preflight: ollama ${baseUrl} unreachable: ${message}`,
     preflightAutoAdded: (providers, roles) => `preflight: auto-added ${providers} provider(s) for roles [${roles}]`,
     scoreFileHeader: '# XCompiler LLM provider score snapshot (maintained automatically by ScoreStore; do not edit)',
-    scoreFileSemantics: '# Scores: dynamic snapshot; default 1.0; automatic range 0.1-1.0; providers tagged cluster default to 0.2-0.5 unless llm.cluster_score_min/max widens it; failure -0.5; success +0.1. Put user overrides in llm_scores_user.yaml; 0 disables a provider.',
+    scoreFileSemantics: '# Scores: dynamic snapshot; default 1.0; automatic range 0.1-1.0; providers tagged cluster default to 0.2-0.5 unless llm.cluster_score_min/max widens it; transport/attributed quality failure -0.5; verified finding/repair/change +0.1. Put user overrides in llm_scores_user.yaml; 0 disables a provider.',
   },
   system: {
     configEnvMissing: (names) => `[xcompiler] unset config environment variables were replaced with empty strings: ${names}`,
@@ -780,7 +806,7 @@ ${opts.baseline || '(missing baseline)'}
 `
   : ''}Planning depth rules:
 - Unless the request is explicitly tiny (single function / toy script / one-file utility), do not collapse the solution into one source file and one test.
-- If the requirement spans multiple concerns (domain logic, API/CLI surface, persistence, integration, orchestration, tests), reflect that with multiple architecture modules and Step.subTasks under CODE/MODULE_TEST macro Steps.
+- If the requirement spans multiple concerns (domain logic, API/CLI surface, persistence, integration, orchestration, tests), reflect that with multiple architecture modules and Step.subTasks under HIGH_LEVEL_DESIGN/CODE/MODULE_TEST macro Steps.
 - Assess project complexity in the plan and size implementationPhases from that assessment: simple => P1 current only; moderate => P1 current + at least P2 planned; complex => P1 current + at least P2/P3 planned. If the user explicitly requested phases/stages, use at least P1+P2 and set userForcedPhaseSplit=true. Materialize a full V-model cycle only for the current phase; planned phases remain goals until activated.
 - Use HIGH_LEVEL_DESIGN/DETAILED_DESIGN steps to describe module boundaries, responsibilities, dependencies, and extension points that future incremental work can build on.
 - When baseline files already exist, prefer editing/extending those modules over creating shadow implementations with duplicate behaviour.
@@ -842,7 +868,7 @@ Phase to expand now: ${opts.phaseId}
 Return a full V-model StepPlan only for ${opts.phaseId}:
 - Every Step.iterationId must equal "${opts.phaseId}".
 - Do not output Steps for any other planned phase; P2/P3 detailed plans are generated only when they become the current phase.
-- If ${opts.phaseId} spans multiple concerns (domain logic, CLI/API, file I/O, external integration, orchestration, tests), declare architectureModules for this phase and map module-level work under CODE/MODULE_TEST subTasks.
+- If ${opts.phaseId} spans multiple concerns (domain logic, CLI/API, file I/O, external integration, orchestration, tests), declare architectureModules for this phase and map module-level work under HIGH_LEVEL_DESIGN/CODE/MODULE_TEST subTasks.
 - architectureModules.sourcePaths may only contain product source files under src/. Put product runtime non-code files in assetPaths. Do not register tests/fixtures, tests/utils, sample inputs, temporary outputs, directories, or docs as architecture modules.
 - dependencies contains only packages required by this phase; Python must include pytest; never output requirements.txt.
 - This phase must contain the canonical eight V-model macro Steps and synchronous paired test-design outputs.
@@ -851,7 +877,7 @@ Return strict JSON StepPlan for the current phase only.`,
     executorSystem: (p) => buildExecutorSystem(p),
     executorDebugBlock: (reason: string, suggestions?: string) =>
       `\n\nYou are now in DEBUG retry mode. Previous failure reason: ${reason}\n` +
-      'Use the issue and compact failure evidence as the source of truth. In a requirement/design rollback, update only the current contract, test plan, or diagnostic outputs when the concrete source file belongs to a later Step; that later V-model Step will implement it. ' +
+      'Use the Bug Ticket and compact failure evidence as the source of truth. In a requirement/design rollback, update only the current contract, test plan, or diagnostic outputs when the concrete source file belongs to a later Step; that later V-model Step will implement it. ' +
       'If the previous attempt stalled on read-only probes, do not repeat discovery: perform the next justified mutation or verification action.' +
       (suggestions ? `\n\n${suggestions}` : ''),
     executorGlobalBlock: (globalPrompt: string) => `\n\n## Project-wide constraints\n${globalPrompt}`,
@@ -873,8 +899,8 @@ Return strict JSON StepPlan for the current phase only.`,
       'Read-only recovery mode is active because the previous attempt already failed from probing. The next response must use existing failure evidence to patch/write/change dependency or run verification; one more read-only-only response will fail this retry.',
     executorFeedbackRepairEvidenceMissing:
       'Invalid DEBUG completion: this retry has not produced repair evidence yet. Before done=true, perform at least one successful repair action or successful verification run; otherwise stop only with a concrete blocker in thoughts.',
-    executorFeedbackIssueResolutionPlanMissing:
-      'Invalid DEBUG issue completion: issueResolutionPlan is required before the issue can be resolved. Return JSON with a concise handling plan plus the needed repair or verification actions.',
+    executorFeedbackBugResolutionPlanMissing:
+      'Invalid DEBUG Bug Ticket completion: bugResolutionPlan is required before the ticket can close. Return JSON with a concise handling plan plus the needed repair or verification actions.',
   },
   skills: {
     patcher:

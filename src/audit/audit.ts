@@ -35,9 +35,18 @@ export type AuditKind =
   | 'executor.turn'
   | 'planner.thought'
   | 'conftest.autogen'
-  | 'issue.record'
-  | 'issue.route'
-  | 'issue.resolve'
+  | 'ticket.bug.created'
+  | 'ticket.bug.routed'
+  | 'ticket.bug.closed'
+  | 'ticket.enhance.created'
+  | 'ticket.enhance.closed'
+  | 'ticket.change-request.created'
+  | 'ticket.change-request.revised'
+  | 'ticket.change-request.closed'
+  | 'quality.gate.passed'
+  | 'quality.gate.enhance'
+  | 'quality.gate.bug'
+  | 'project.report.generated'
   | 'note';
 
 export interface AuditEvent {
@@ -221,7 +230,7 @@ export class AuditLogger {
   }
 
   /**
-   * 记录一轮 Executor 执行摘要：简短 intent、issue 处理方案、计划调用的 actions、是否完成。
+   * 记录一轮 Executor 执行摘要：简短 intent、Bug Ticket 处理方案、计划调用的 actions、是否完成。
    * 写入 jsonl + markdown 折叠块，交付时可追溯每轮决策和动作。
    */
   async executorTurn(
@@ -230,7 +239,7 @@ export class AuditLogger {
     round: number,
     payload: {
       thoughts?: string;
-      issueResolutionPlan?: string;
+      bugResolutionPlan?: string;
       actions?: unknown[];
       done?: boolean;
       raw?: string;

@@ -41,8 +41,14 @@ describe('calibratePlanCoverage', () => {
     expect(test.role).toBe('Tester');
     expect(test.id).toBe('S006');
     expect(test.dependsOn).toEqual(['S004', 'S005']);
-    expect(test.outputs).toEqual(['docs/05-unit-test.md', 'tests/test_auto_s006.py']);
-    expect(test.tools).toEqual(['skill:tester']);
+    expect(test.outputs).toEqual(['docs/05-unit-test.md']);
+    expect(test.inputs).toEqual(expect.arrayContaining([
+      'tests/test_unit_s004.py',
+      'tests/test_unit_s005.py',
+    ]));
+    expect(out[3]!.outputs).toContain('tests/test_unit_s004.py');
+    expect(out[4]!.outputs).toContain('tests/test_unit_s005.py');
+    expect(test.tools).toContain('skill:tester');
   });
 
   it('is idempotent / no-op when every CODE step is already transitively covered', () => {
@@ -53,8 +59,11 @@ describe('calibratePlanCoverage', () => {
       mkStep({ id: 'S003', phase: 'UNIT_TEST', role: 'Tester', outputs: ['tests/test_b.py'], dependsOn: ['S002'] }),
     ];
     const out = calibratePlanCoverage(steps);
-    expect(out).toBe(steps); // returns same array reference when nothing to add
     expect(out.length).toBe(3);
+    expect(out[0]!.outputs).toContain('tests/test_b.py');
+    expect(out[2]!.outputs).toEqual([]);
+    expect(out[2]!.inputs).toContain('tests/test_b.py');
+    expect(calibratePlanCoverage(out)).toEqual(out);
   });
 
   it('only injects coverage for the still-uncovered CODE steps when partial coverage exists', () => {
@@ -68,8 +77,14 @@ describe('calibratePlanCoverage', () => {
     expect(out[3]!.dependsOn).toEqual(['S002']);
   });
 
-  it('adds a runnable test file to existing V-model test steps that only declared report docs', () => {
+  it('adds runnable tests to left-side stages and keeps existing test steps validation-only', () => {
     const steps: Step[] = [
+      mkStep({
+        id: 'S000',
+        phase: 'DETAILED_DESIGN',
+        role: 'Architect',
+        outputs: ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'],
+      }),
       mkStep({ id: 'S001', phase: 'CODE', outputs: ['src/app.py'] }),
       mkStep({
         id: 'S002',
@@ -90,21 +105,28 @@ describe('calibratePlanCoverage', () => {
     const out = calibratePlanCoverage(steps);
 
     expect(out).not.toBe(steps);
-    expect(out).toHaveLength(3);
-    expect(out[1]!.outputs).toEqual([
+    expect(out).toHaveLength(4);
+    expect(out[1]!.outputs).toEqual(expect.arrayContaining([
+      'src/app.py',
+      'tests/test_unit_s001.py',
+    ]));
+    expect(out[2]!.outputs).toEqual([
       'docs/05-unit-test.md',
       'reports/unit-test-report.md',
-      'tests/test_unit_s002.py',
     ]);
-    expect(out[1]!.systemPrompt).toContain('tests/test_unit_s002.py');
-    expect(out[2]!.outputs).toContain('tests/test_integration_s003.py');
+    expect(out[2]!.inputs).toContain('tests/test_unit_s001.py');
+    expect(out[0]!.outputs).toContain('tests/test_integration_s000.py');
+    expect(out[3]!.outputs).toEqual(['docs/06-integration-test.md']);
+    expect(out[3]!.inputs).toContain('tests/test_integration_s000.py');
   });
 
-  it('skips CODE steps whose outputs are only __init__.py marker files', () => {
+  it('adds the paired unit test asset without adding a UNIT_TEST step for an init-only CODE marker', () => {
     const steps: Step[] = [
       mkStep({ id: 'S001', phase: 'CODE', outputs: ['src/pkg/__init__.py'] }),
     ];
-    expect(calibratePlanCoverage(steps)).toBe(steps);
+    const out = calibratePlanCoverage(steps);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.outputs).toContain('tests/test_unit_s001.py');
   });
 
   it('rewires downstream test phases to the synthetic UNIT_TEST step so the calibrated plan fully passes lint', () => {
@@ -168,9 +190,10 @@ describe('calibratePlanCoverage', () => {
     expect(out.length).toBe(2);
     const test = out[1]!;
     expect(test.phase).toBe('UNIT_TEST');
-    expect(test.description).toContain('Vitest');
-    expect(test.outputs).toEqual(['docs/05-unit-test.md', 'tests/auto_s002.test.ts']);
-    expect(test.systemPrompt).toContain('tests/auto_s002.test.ts');
-    expect(test.acceptance).toContain('npm test');
+    expect(test.outputs).toEqual(['docs/05-unit-test.md']);
+    expect(out[0]!.outputs).toContain('tests/unit_s001.test.ts');
+    expect(test.inputs).toContain('tests/unit_s001.test.ts');
+    expect(test.systemPrompt).toContain('npm test / Vitest');
+    expect(test.acceptance).toContain('Vitest');
   });
 });

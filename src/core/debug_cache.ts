@@ -62,7 +62,7 @@ export function sanitizeDebugFailureLogForPrompt(log: string): string {
       mode = 'skip-history';
       continue;
     }
-    if (/^##\s+(?:debug brief|root issue brief|current retry brief)\b/u.test(line)) {
+    if (/^##\s+(?:debug brief|root bug ticket brief|current retry brief)\b/u.test(line)) {
       mode = 'skip-brief';
       continue;
     }

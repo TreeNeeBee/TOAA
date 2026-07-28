@@ -287,7 +287,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
           verificationGate: {
             summary: 'Run generated tests and CLI smoke checks.',
             checks: ['pytest', 'CLI help'],
-            failurePolicy: 'Record issue, send failure log to Debugger, rollback to paired V-model phase, then rerun subsequent phases.',
+            failurePolicy: 'Create Bug Ticket, send failure log to Debugger, rollback to paired V-model phase, then rerun subsequent phases.',
           },
         },
         {
@@ -301,7 +301,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
           verificationGate: {
             summary: 'Run regression and performance checks.',
             checks: ['pytest'],
-            failurePolicy: 'Record issue and repair through V-model rollback.',
+            failurePolicy: 'Create Bug Ticket and repair through V-model rollback.',
           },
         },
       ],

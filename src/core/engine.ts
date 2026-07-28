@@ -54,7 +54,8 @@ import {
 } from './debug_wiki.js';
 import { getLanguageProfile, type LanguageProfile } from './language.js';
 import { missingArchitectureDocumentTokens } from './architecture.js';
-import { DOC_NAMES } from './docs.js';
+import { DOC_NAMES, testPlanDocForIteration } from './docs.js';
+import { pairedTestAssetPaths } from './test_assets.js';
 import {
   renderProjectAuditFailureLog,
   runIterationGate,
@@ -90,14 +91,23 @@ import {
   latestActionableSourceFailureLog,
   shouldRollbackTestPhaseFailure,
 } from './debug_policy.js';
-import { transitionIssue, type IssueStatus } from './issue_state.js';
-import { IssueJournal } from './issue_journal.js';
 import {
   affectedStepContract,
-  ChangeRequestStore,
   isDesignChangeRequestPhase,
-  type EngineeringChangeRequest,
-} from './change_request.js';
+  TicketStore,
+  type BugKind,
+  type BugTicket,
+  type ChangeRequestTicket,
+  type EnhanceKind,
+  type EnhanceTicket,
+} from './ticket.js';
+import {
+  QualityAssessmentStore,
+  emptyQualityAssessment,
+  evaluateQualityGate,
+  type QualityGateEvaluation,
+  type StageQualityAssessment,
+} from './quality_gate.js';
 
 export interface EngineOptions {
   ws: Workspace;
@@ -162,15 +172,16 @@ type DebugAttemptContext = {
   extraAllowedWrites?: string[];
   contextMode?: 'audit-repair' | 'iteration-gate' | 'test-rollback';
   testScopeArgs?: string[];
-  issueId?: string;
+  bugTicketId?: string;
   completedBeforeDebug?: boolean;
   debugWikiEntryIds?: string[];
-  issueResolutionPlan?: string;
+  bugResolutionPlan?: string;
 };
 
 type AttemptOptions = {
   archiveOutputs?: boolean;
-  changeRequest?: EngineeringChangeRequest;
+  changeRequest?: ChangeRequestTicket;
+  enhancement?: EnhanceTicket;
 };
 
 type AttemptOutcome = {
@@ -182,9 +193,14 @@ type AttemptOutcome = {
   metrics?: ExecutorRunMetrics;
   rollbackToPairedSource?: boolean;
   rollbackTestStepId?: string;
-  issueKind?: EngineIssueKind;
+  bugKind?: BugKind;
   evidence?: Record<string, unknown>;
-  issueResolutionPlan?: string;
+  bugResolutionPlan?: string;
+  qualityGap?: {
+    assessment: StageQualityAssessment;
+    evaluation: QualityGateEvaluation;
+    remediationTarget?: 'same-step' | 'paired-source';
+  };
 };
 
 type TestPhaseValidationResult =
@@ -198,69 +214,6 @@ type LastFailure = {
   failureLog: string;
   rollbackTestStepId?: string;
 };
-
-type EngineIssueKind =
-  | 'phase'
-  | 'architecture-gate'
-  | 'test-gate'
-  | 'functional-gate'
-  | 'iteration-gate'
-  | 'project-audit'
-  | 'infrastructure'
-  | 'exception';
-
-interface EngineIssue {
-  id: string;
-  createdAt: string;
-  updatedAt: string;
-  status: IssueStatus;
-  kind: EngineIssueKind;
-  severity: 'error';
-  language: Plan['language'];
-  intent: Plan['intent'];
-  requirementDigest: string;
-  iterationId?: string;
-  stepId?: string;
-  phase?: Step['phase'];
-  role?: Step['role'];
-  title?: string;
-  reason: string;
-  failureLog: string;
-  failureLogBytes?: number;
-  rawFailureLogPath?: string;
-  debugBrief?: DebugBrief;
-  metrics?: ExecutorRunMetrics;
-  evidence?: Record<string, unknown>;
-  targetStepId?: string;
-  targetPhase?: Step['phase'];
-  verificationStepId?: string;
-  verificationPhase?: Step['phase'];
-  routedAt?: string;
-  resolvedAt?: string;
-  issueResolutionPlan?: string;
-  resolutionPlanHistory?: Array<{
-    at: string;
-    stepId: string;
-    phase: Step['phase'];
-    plan: string;
-    outcome: 'accepted';
-  }>;
-  repair?: {
-    repairedStepId: string;
-    repairedPhase: Step['phase'];
-    completedBeforeDebug: boolean;
-    mode: 'patch' | 'rewrite' | 'patch-or-rewrite' | 'verification';
-    patchPath?: string;
-    summaryPath?: string;
-    changedFiles?: string[];
-    baselineCommit?: string;
-    commit?: string;
-  };
-  debugWikiEntryIds?: string[];
-  changeRequestIds?: string[];
-  activeChangeRequestId?: string;
-  causedByChangeRequestId?: string;
-}
 
 /** Phase Engine：拓扑顺序执行 Plan 的每个 Step；失败时自动调用 Debugger 重试。 */
 export class PhaseEngine {
@@ -278,12 +231,11 @@ export class PhaseEngine {
   private projectMemory: ProjectMemory | null = null;
   /** 最近一次 Step 终态失败时的详细日志（供 run() 汇总到 EngineResult）。 */
   private lastFailure?: LastFailure;
-  /** 当前 run 内记录的结构化 issue，持久化到 `.xcompiler/issues/`。 */
-  private readonly issues: EngineIssue[] = [];
-  private readonly issueJournal: IssueJournal;
-  private readonly changeRequests: ChangeRequestStore;
-  private issueSeq = 0;
-  private lastIssue?: EngineIssue;
+  /** Plan work, Bug evidence, Enhance findings, and CR propagation share one Ticket graph. */
+  private readonly tickets: TicketStore;
+  private readonly qualityAssessments: QualityAssessmentStore;
+  private lastBug?: BugTicket;
+  private lastEnhance?: EnhanceTicket;
 
   constructor(private readonly opts: EngineOptions) {
     this.registry = opts.registry ?? buildDefaultRegistry();
@@ -291,8 +243,8 @@ export class PhaseEngine {
     this.plugins = opts.plugins ?? new PluginHost();
     this.debugCache = new DebugCache(opts.ws.abs('.xcompiler/debug_cache.json'));
     this.debugWiki = new DebugWiki(opts.debugWikiPath ?? defaultDebugWikiPath(opts.ws.root));
-    this.issueJournal = new IssueJournal(opts.ws);
-    this.changeRequests = new ChangeRequestStore(opts.ws);
+    this.tickets = new TicketStore(opts.ws);
+    this.qualityAssessments = new QualityAssessmentStore(opts.ws);
   }
 
   private get terminalOutput(): boolean {
@@ -352,7 +304,9 @@ export class PhaseEngine {
   async run(plan: Plan): Promise<EngineResult> {
     await this.plugins.initialize();
     await this.withDebugWiki('load', () => this.debugWiki.load(), undefined);
-    await this.changeRequests.load();
+    await this.tickets.load();
+    await this.qualityAssessments.load();
+    await this.tickets.registerPlan(plan);
     if (!this.pluginExtensionsApplied) {
       this.plugins.applyExtensions({ tools: this.registry, skills: this.skills });
       this.pluginExtensionsApplied = true;
@@ -374,20 +328,21 @@ export class PhaseEngine {
     opts: { iterationId?: string; contextMode?: 'audit-repair' | 'iteration-gate' } = {},
   ): Promise<EngineResult> {
     const order = topoSort(plan.steps);
-    const step = this.selectAuditRepairStep(order, auditResult, opts.iterationId);
+    const step = this.selectAuditRepairStep(plan, order, auditResult, opts.iterationId);
     const failureLog = renderProjectAuditFailureLog(auditResult);
     const reason = opts.iterationId
       ? `iteration ${opts.iterationId} gate failed (${auditResult.errors} error(s), ${auditResult.warnings} warning(s))`
       : `project audit failed (${auditResult.errors} error(s), ${auditResult.warnings} warning(s))`;
     if (!step) {
       this.lastFailure = { reason, failureLog };
-      const issue = await this.recordIssue(plan, undefined, {
+      const bug = await this.recordBugTicket(plan, undefined, {
         kind: opts.contextMode === 'iteration-gate' ? 'iteration-gate' : 'project-audit',
         reason,
         failureLog,
         evidence: { checks: auditResult.checks, iterationId: opts.iterationId },
       });
-      await this.markIssueUnresolved(issue.id, 'no completed phase can own this audit repair');
+      await this.ensureEnhanceFinding(bug, undefined);
+      await this.markBugFailed(bug.id, 'no completed phase can own this audit repair');
       return {
         totalSteps: order.length,
         executedSteps: 0,
@@ -397,13 +352,13 @@ export class PhaseEngine {
       };
     }
 
-    const issue = await this.recordIssue(plan, step, {
+    const bug = await this.recordBugTicket(plan, step, {
       kind: opts.contextMode === 'iteration-gate' ? 'iteration-gate' : 'project-audit',
       reason,
       failureLog,
       evidence: { checks: auditResult.checks, iterationId: opts.iterationId },
     });
-    await this.routeIssueToStep(issue, step, 'audit gate selected this completed phase for repair');
+    await this.routeBugTicketToStep(bug, step, 'audit gate selected this completed phase for repair');
 
     await this.plugins.emit('step.before', { plan, step });
     let ok: boolean;
@@ -414,7 +369,7 @@ export class PhaseEngine {
           failureLog,
           contextPaths: this.auditRepairContextPaths(plan, step, auditResult),
           contextMode: opts.contextMode ?? (opts.iterationId ? 'iteration-gate' : 'audit-repair'),
-          issueId: issue.id,
+          bugTicketId: bug.id,
           completedBeforeDebug: step.status === 'DONE',
         },
         skipOutputArchive: true,
@@ -432,6 +387,7 @@ export class PhaseEngine {
       if (downstream.length > 0) {
         for (const candidate of downstream) {
           resetStepForRerun(candidate, 'downstream-rerun');
+          await this.tickets.syncStepReset(candidate, 'downstream-rerun');
         }
         await this.persistPlan(plan);
         await this.opts.audit.event(
@@ -575,7 +531,7 @@ export class PhaseEngine {
         continue;
       }
 
-      const activeChangeRequest = this.changeRequests.activeForStep(step);
+      const activeChangeRequest = this.tickets.activeChangeRequestForStep(step);
       await this.plugins.emit('step.before', { plan, step });
       let ok: boolean;
       try {
@@ -591,9 +547,32 @@ export class PhaseEngine {
       executed++;
       await this.persistPlan(plan);
       if (!ok) {
-        const failedIssue = await this.openIssueForFailedStep(step.id);
+        const failedEnhance = this.tickets.activeQualityEnhanceForStep(step.id);
+        if (failedEnhance && !this.opts.onlyPhase) {
+          const rollback = await this.rollbackQualityEnhancement(
+            plan,
+            order,
+            step,
+            failedEnhance,
+            activeChangeRequest,
+          );
+          executed += rollback.executedSteps;
+          await this.persistPlan(plan);
+          if (rollback.ok && rollback.restartIndex !== undefined) {
+            index = rollback.restartIndex;
+            continue;
+          }
+          return {
+            totalSteps: order.length,
+            executedSteps: executed,
+            failedStepId: rollback.failedStepId ?? step.id,
+            failureLog: rollback.failureLog ?? this.lastFailure?.failureLog,
+            failureReason: rollback.failureReason ?? this.lastFailure?.reason,
+          };
+        }
+        const failedBug = this.openBugForFailedStep(step.id);
         if (activeChangeRequest) {
-          await this.recordChangeRequestFailure(activeChangeRequest, failedIssue, step);
+          await this.recordChangeRequestFailure(activeChangeRequest, failedBug, step);
         }
         const failureRoute = classifyDebugFailure(
           this.isVModelTestPhase(step.phase) ? 'test' : 'development',
@@ -609,7 +588,7 @@ export class PhaseEngine {
             plan,
             order,
             step,
-            failedIssue,
+            failedBug,
             activeChangeRequest,
           );
           executed += rollback.executedSteps;
@@ -637,7 +616,8 @@ export class PhaseEngine {
       if (activeChangeRequest) {
         await this.maybeCloseChangeRequest(plan, activeChangeRequest, step);
       }
-      await this.resolveIssuesVerifiedByStep(step);
+      await this.resolveBugsVerifiedByStep(step);
+      await this.resolveQualityEnhancementsVerifiedByStep(step);
 
       if (step.phase === 'HIGH_LEVEL_DESIGN' && step.outputs.includes(this.profile.manifestFile)) {
         await this.requireEnginePermission({
@@ -711,20 +691,17 @@ export class PhaseEngine {
     return { totalSteps: order.length, executedSteps: executed };
   }
 
-  private async recordIssue(
+  private async recordBugTicket(
     plan: Plan,
     step: Step | undefined,
     input: {
-      kind: EngineIssueKind;
+      kind: BugKind;
       reason: string;
       failureLog: string;
       metrics?: ExecutorRunMetrics;
       evidence?: Record<string, unknown>;
     },
-  ): Promise<EngineIssue> {
-    const now = new Date().toISOString();
-    this.issueSeq += 1;
-    const id = `ISSUE-${now.replace(/[-:.TZ]/g, '').slice(0, 14)}-${String(this.issueSeq).padStart(3, '0')}`;
+  ): Promise<BugTicket> {
     const rawFailureLog = input.failureLog ?? '';
     const cleanedFailureLog = cleanFailureLogForDebugContext(rawFailureLog);
     const debugBrief = buildDebugBrief({
@@ -739,162 +716,559 @@ export class PhaseEngine {
       maxChars: 6000,
       maxLines: 90,
     });
-    const rawFailureLogPath = `.xcompiler/issues/${id}/failure.raw.log`;
-    await this.opts.ws.writeFile(rawFailureLogPath, rawFailureLog.endsWith('\n') ? rawFailureLog : `${rawFailureLog}\n`);
-    const issue: EngineIssue = {
-      id,
-      createdAt: now,
-      updatedAt: now,
-      status: 'recorded',
+    const workTicket = step ? this.tickets.workForStep(step.id) : undefined;
+    const bug = await this.tickets.createBug({
+      priority: input.kind === 'infrastructure' ? 'critical' : 'high',
+      title: step ? `${step.id} ${step.phase} failed` : 'Project execution failed',
+      description: input.reason,
+      iterationId: step?.iterationId ?? 'P1',
+      parentTicketId: undefined,
+      rootTicketId: workTicket?.rootTicketId,
+      relatedTicketIds: workTicket ? [workTicket.id] : [],
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: step?.id,
+        stepId: step?.id,
+        phase: step?.phase,
+        role: step?.role,
+      },
+      acceptance: [
+        step?.acceptance ?? 'The failure is repaired and its verification gate passes.',
+        'The confirmed resolution is persisted to debug-wiki before this ticket closes.',
+      ],
+      artifacts: [],
       kind: input.kind,
       severity: 'error',
       language: plan.language,
       intent: plan.intent,
       requirementDigest: plan.requirementDigest,
-      iterationId: step?.iterationId ?? 'P1',
-      stepId: step?.id,
-      phase: step?.phase,
-      role: step?.role,
-      title: step?.title,
       reason: input.reason,
       failureLog,
       failureLogBytes: Buffer.byteLength(rawFailureLog, 'utf8'),
-      rawFailureLogPath,
       debugBrief,
       metrics: input.metrics,
       evidence: input.evidence,
-    };
-    this.issues.push(issue);
-    this.lastIssue = issue;
-    await this.persistIssue(issue, 'recorded');
-    await this.opts.audit.event('issue.record', `${issue.id} ${issue.kind}: ${issue.reason}`, {
-      messageId: 'engine.issue_recorded',
-      issue,
     });
-    return issue;
+    bug.rawFailureLogPath = `.xcompiler/tickets/${bug.id}/failure.raw.log`;
+    bug.artifacts = [bug.rawFailureLogPath];
+    await this.opts.ws.writeFile(
+      bug.rawFailureLogPath,
+      rawFailureLog.endsWith('\n') ? rawFailureLog : `${rawFailureLog}\n`,
+    );
+    await this.tickets.persist(bug, 'failure-evidence-attached');
+    if (step && input.metrics?.providers.length) {
+      await this.tickets.recordModelAttribution(bug, {
+        providers: input.metrics.providers,
+        role: step.role,
+        contribution: this.isVModelTestPhase(step.phase) ? 'validator' : 'author',
+        outcome: 'detected-gap',
+        stepId: step.id,
+        phase: step.phase,
+      });
+    }
+    if (step) await this.tickets.syncStepFailed(step, bug.id);
+    this.lastBug = bug;
+    await this.opts.audit.event('ticket.bug.created', `${bug.id} ${bug.kind}: ${bug.reason}`, {
+      messageId: 'engine.bug_ticket_created',
+      ticket: bug,
+    });
+    return bug;
   }
 
-  private async routeIssueToStep(issue: EngineIssue | undefined, target: Step, reason: string): Promise<void> {
-    if (!issue) return;
+  private async routeBugTicketToStep(bug: BugTicket | undefined, target: Step, reason: string): Promise<void> {
+    if (!bug) return;
     const routedAt = new Date().toISOString();
-    transitionIssue(issue, 'routed', routedAt);
-    issue.targetStepId = target.id;
-    issue.targetPhase = target.phase;
-    issue.debugBrief = buildDebugBrief({
-      reason: issue.reason,
-      failureLog: issue.failureLog,
-      phase: issue.phase,
+    bug.targetStepId = target.id;
+    bug.targetPhase = target.phase;
+    bug.debugBrief = buildDebugBrief({
+      reason: bug.reason,
+      failureLog: bug.failureLog,
+      phase: bug.source.phase,
       targetPhase: target.phase,
     });
-    issue.routedAt = routedAt;
-    await this.persistIssue(issue, 'routed', { routingReason: reason });
-    await this.opts.audit.event('issue.route', `${issue.id} -> ${target.id} ${target.phase}`, {
-      messageId: 'engine.issue_routed',
-      issueId: issue.id,
+    bug.routedAt = routedAt;
+    await this.tickets.transition(bug, 'triaged', 'routed', {
+      targetStepId: target.id,
+      targetPhase: target.phase,
+      routingReason: reason,
+    });
+    await this.opts.audit.event('ticket.bug.routed', `${bug.id} -> ${target.id} ${target.phase}`, {
+      messageId: 'engine.bug_ticket_routed',
+      ticketId: bug.id,
       targetStepId: target.id,
       targetPhase: target.phase,
       reason,
     });
   }
 
-  private async markIssueUnresolved(issueId: string | undefined, reason: string): Promise<void> {
-    const issue = issueId ? await this.getIssue(issueId) : undefined;
-    if (!issue) return;
-    transitionIssue(issue, 'unresolved');
-    await this.persistIssue(issue, 'unresolved', { reason });
+  private classifyEnhanceKind(bug: BugTicket): EnhanceKind {
+    if (
+      bug.evidence?.validationDefect ||
+      bug.evidence?.stage === 'test-case-completeness'
+    ) {
+      return 'test-incomplete';
+    }
+    if (bug.kind === 'functional-gate') return 'functional-gap';
+    return 'defect';
   }
 
-  private async markIssueResolved(
-    issueId: string | undefined,
+  private async ensureEnhanceFinding(
+    bug: BugTicket,
+    target: Step | undefined,
+  ): Promise<EnhanceTicket | undefined> {
+    if (bug.kind === 'infrastructure') return undefined;
+    const existing = bug.enhanceTicketId
+      ? this.tickets.findEnhance(bug.enhanceTicketId)
+      : undefined;
+    if (existing) return existing;
+
+    const failedWork = bug.source.stepId
+      ? this.tickets.workForStep(bug.source.stepId)
+      : undefined;
+    const targetWork = target ? this.tickets.workForStep(target.id) : undefined;
+    const affectedTaskTicketIds = dedup([
+      targetWork?.id,
+      failedWork?.id,
+    ].filter((id): id is string => !!id));
+    const responsibleProviders = dedup(
+      (targetWork?.modelAttributions ?? [])
+        .filter((attribution) =>
+          attribution.contribution === 'author' &&
+          attribution.outcome === 'produced'
+        )
+        .map((attribution) => attribution.provider),
+    );
+    const detectedProviders = dedup(
+      bug.modelAttributions
+        .filter((attribution) => attribution.outcome === 'detected-gap')
+        .map((attribution) => attribution.provider),
+    );
+    const attributedProviders = responsibleProviders.length > 0
+      ? responsibleProviders
+      : detectedProviders;
+    const enhancement = await this.tickets.createEnhance({
+      priority: bug.priority,
+      title: `${this.classifyEnhanceKind(bug)} identified by ${bug.id}`,
+      description: bug.debugBrief?.summary ?? bug.reason,
+      iterationId: bug.iterationId,
+      parentTicketId: bug.rootTicketId,
+      rootTicketId: bug.rootTicketId,
+      relatedTicketIds: dedup([
+        bug.id,
+        ...affectedTaskTicketIds,
+      ]),
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: bug.id,
+        stepId: target?.id ?? bug.source.stepId,
+        phase: target?.phase ?? bug.source.phase,
+        role: target?.role ?? bug.source.role,
+      },
+      acceptance: [
+        'The identified quality gap is corrected.',
+        'All affected V-model verification gates pass.',
+      ],
+      artifacts: bug.rawFailureLogPath ? [bug.rawFailureLogPath] : [],
+      kind: this.classifyEnhanceKind(bug),
+      finding: bug.debugBrief?.summary ?? bug.reason,
+      sourceBugTicketId: bug.id,
+      affectedTaskTicketIds,
+      changeRequestTicketIds: [],
+      disposition: 'debug',
+    });
+    if (detectedProviders.length > 0 && bug.source.role) {
+      await this.tickets.recordModelAttribution(enhancement, {
+        providers: detectedProviders,
+        role: bug.source.role,
+        contribution: this.isVModelTestPhase(bug.source.phase ?? target?.phase ?? 'CODE')
+          ? 'validator'
+          : 'author',
+        outcome: 'detected-gap',
+        stepId: bug.source.stepId,
+        phase: bug.source.phase,
+      });
+    }
+    if (attributedProviders.length > 0 && target) {
+      await this.tickets.recordModelAttribution(enhancement, {
+        providers: attributedProviders,
+        role: target.role,
+        contribution: 'author',
+        outcome: 'attributed-gap',
+        stepId: target.id,
+        phase: target.phase,
+      });
+      this.opts.router.recordTicketOutcome?.(
+        attributedProviders,
+        'quality-gap',
+        enhancement.id,
+      );
+    }
+    bug.enhanceTicketId = enhancement.id;
+    bug.relatedTicketIds = dedup([...bug.relatedTicketIds, enhancement.id]);
+    await this.tickets.persist(bug, 'enhancement-linked', {
+      enhanceTicketId: enhancement.id,
+      enhanceKind: enhancement.kind,
+    });
+    await this.opts.audit.event(
+      'ticket.enhance.created',
+      `${enhancement.id} ${enhancement.kind}: ${enhancement.finding}`,
+      {
+        messageId: 'engine.enhance_ticket_created',
+        ticketId: enhancement.id,
+        bugTicketId: bug.id,
+        enhanceKind: enhancement.kind,
+        affectedTaskTicketIds,
+        detectedProviders,
+        attributedProviders,
+      },
+    );
+    return enhancement;
+  }
+
+  private async recordQualityEnhancement(
+    failedStep: Step,
+    targetStep: Step,
+    qualityGap: NonNullable<AttemptOutcome['qualityGap']>,
+    providers: string[] = [],
+  ): Promise<EnhanceTicket> {
+    const existing = this.tickets.activeQualityEnhanceForStep(failedStep.id);
+    if (existing) {
+      existing.targetStepId = targetStep.id;
+      existing.targetPhase = targetStep.phase;
+      existing.verificationStepId = failedStep.id;
+      existing.verificationPhase = failedStep.phase;
+      existing.qualityFailures = qualityGap.evaluation.enhancementFailures;
+      existing.qualityAssessment = qualityGap.assessment;
+      await this.tickets.persist(existing, 'quality-gap-refreshed');
+      this.lastEnhance = existing;
+      return existing;
+    }
+
+    const failedWork = this.tickets.workForStep(failedStep.id);
+    const targetWork = this.tickets.workForStep(targetStep.id);
+    const affectedTaskTicketIds = dedup([
+      failedWork?.id,
+      targetWork?.id,
+    ].filter((id): id is string => !!id));
+    const enhancement = await this.tickets.createEnhance({
+      priority: 'high',
+      title: `${failedStep.id} ${failedStep.phase} quality target incomplete`,
+      description: qualityGap.evaluation.enhancementFailures.join('; '),
+      iterationId: failedStep.iterationId ?? 'P1',
+      parentTicketId: failedWork?.rootTicketId ?? targetWork?.rootTicketId,
+      rootTicketId: failedWork?.rootTicketId ?? targetWork?.rootTicketId,
+      relatedTicketIds: affectedTaskTicketIds,
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: `${failedStep.id}:quality-gate`,
+        stepId: failedStep.id,
+        phase: failedStep.phase,
+        role: failedStep.role,
+      },
+      acceptance: [
+        ...qualityGap.evaluation.enhancementFailures.map((failure) => `Resolve: ${failure}`),
+        `${failedStep.id} ${failedStep.phase} quality gate passes within configured tolerance.`,
+      ],
+      artifacts: qualityGap.assessment.evidence,
+      kind: this.isVModelTestPhase(failedStep.phase) ? 'test-incomplete' : 'functional-gap',
+      finding: qualityGap.evaluation.enhancementFailures.join('; '),
+      sourceQualityGateStepId: failedStep.id,
+      targetStepId: targetStep.id,
+      targetPhase: targetStep.phase,
+      verificationStepId: failedStep.id,
+      verificationPhase: failedStep.phase,
+      qualityFailures: qualityGap.evaluation.enhancementFailures,
+      qualityAssessment: qualityGap.assessment,
+      affectedTaskTicketIds,
+      changeRequestTicketIds: [],
+      disposition: 'debug',
+    });
+    if (providers.length > 0) {
+      await this.tickets.recordModelAttribution(enhancement, {
+        providers,
+        role: failedStep.role,
+        contribution: this.isVModelTestPhase(failedStep.phase) ? 'validator' : 'author',
+        outcome: 'detected-gap',
+        stepId: failedStep.id,
+        phase: failedStep.phase,
+      });
+    }
+    const responsibleProviders = dedup(
+      (targetWork?.modelAttributions ?? [])
+        .filter((attribution) =>
+          attribution.contribution === 'author' &&
+          attribution.outcome === 'produced'
+        )
+        .map((attribution) => attribution.provider),
+    );
+    if (responsibleProviders.length > 0) {
+      await this.tickets.recordModelAttribution(enhancement, {
+        providers: responsibleProviders,
+        role: targetStep.role,
+        contribution: 'author',
+        outcome: 'attributed-gap',
+        stepId: targetStep.id,
+        phase: targetStep.phase,
+      });
+      this.opts.router.recordTicketOutcome?.(
+        responsibleProviders,
+        'quality-gap',
+        enhancement.id,
+      );
+    }
+    await this.tickets.transition(enhancement, 'triaged', 'quality-gap-triaged', {
+      targetStepId: targetStep.id,
+      verificationStepId: failedStep.id,
+    });
+    await this.tickets.transition(enhancement, 'in_progress', 'quality-remediation-started');
+    this.lastEnhance = enhancement;
+    await this.opts.audit.event(
+      'ticket.enhance.created',
+      `${enhancement.id} ${enhancement.kind}: ${enhancement.finding}`,
+      {
+        messageId: 'engine.quality_enhance_ticket_created',
+        ticketId: enhancement.id,
+        sourceQualityGateStepId: failedStep.id,
+        targetStepId: targetStep.id,
+        verificationStepId: failedStep.id,
+        qualityFailures: enhancement.qualityFailures,
+      },
+    );
+    return enhancement;
+  }
+
+  private async closeQualityEnhancement(enhancement: EnhanceTicket, verifiedStep: Step): Promise<void> {
+    if (enhancement.status === 'closed') return;
+    for (const taskTicketId of enhancement.affectedTaskTicketIds) {
+      const task = this.tickets.find(taskTicketId);
+      if (task?.blockedByTicketIds.includes(enhancement.id)) {
+        await this.tickets.unblock(task, enhancement.id);
+      }
+    }
+    await this.tickets.closeEnhance(enhancement);
+    await this.opts.audit.event(
+      'ticket.enhance.closed',
+      `${enhancement.id} closed after ${verifiedStep.id} quality verification`,
+      {
+        messageId: 'engine.quality_enhance_ticket_closed',
+        ticketId: enhancement.id,
+        verificationStepId: verifiedStep.id,
+        verificationPhase: verifiedStep.phase,
+      },
+    );
+    if (this.lastEnhance?.id === enhancement.id) this.lastEnhance = undefined;
+  }
+
+  private async resolveQualityEnhancementsVerifiedByStep(step: Step): Promise<void> {
+    const matches = this.tickets.all().filter(
+      (ticket): ticket is EnhanceTicket =>
+        ticket.type === 'enhance' &&
+        ticket.sourceQualityGateStepId !== undefined &&
+        ticket.verificationStepId === step.id &&
+        !['closed', 'cancelled', 'failed'].includes(ticket.status),
+    );
+    for (const enhancement of matches) {
+      const hasOpenChangeRequest = enhancement.changeRequestTicketIds.some((ticketId) => {
+        const ticket = this.tickets.find(ticketId);
+        return ticket?.type === 'change-request' &&
+          !['closed', 'cancelled', 'failed'].includes(ticket.status);
+      });
+      if (hasOpenChangeRequest) continue;
+      await this.closeQualityEnhancement(enhancement, step);
+    }
+  }
+
+  private async closeEnhanceForBug(bug: BugTicket, step: Step): Promise<void> {
+    const enhancement = bug.enhanceTicketId
+      ? this.tickets.findEnhance(bug.enhanceTicketId)
+      : undefined;
+    if (!enhancement || enhancement.status === 'closed') return;
+    const validatedDetectorProviders = dedup(
+      enhancement.modelAttributions
+        .filter((attribution) =>
+          attribution.contribution === 'validator' &&
+          attribution.outcome === 'detected-gap'
+        )
+        .map((attribution) => attribution.provider),
+    );
+    if (validatedDetectorProviders.length > 0) {
+      await this.tickets.recordModelAttribution(enhancement, {
+        providers: validatedDetectorProviders,
+        role: bug.source.role ?? 'Tester',
+        contribution: 'validator',
+        outcome: 'finding-validated',
+        stepId: bug.source.stepId,
+        phase: bug.source.phase,
+      });
+      this.opts.router.recordTicketOutcome?.(
+        validatedDetectorProviders,
+        'finding-validated',
+        enhancement.id,
+      );
+    }
+    const repairProviders = dedup(
+      bug.modelAttributions
+        .filter((attribution) =>
+          attribution.contribution === 'debugger' &&
+          attribution.outcome === 'repair-verified'
+        )
+        .map((attribution) => attribution.provider),
+    );
+    if (repairProviders.length > 0) {
+      await this.tickets.recordModelAttribution(enhancement, {
+        providers: repairProviders,
+        role: 'Debugger',
+        contribution: 'debugger',
+        outcome: 'repair-verified',
+        stepId: step.id,
+        phase: step.phase,
+      });
+      this.opts.router.recordTicketOutcome?.(
+        repairProviders,
+        'repair-verified',
+        enhancement.id,
+      );
+    }
+    await this.tickets.closeEnhance(enhancement);
+    await this.opts.audit.event(
+      'ticket.enhance.closed',
+      `${enhancement.id} closed after ${bug.id} verification`,
+      {
+        messageId: 'engine.enhance_ticket_closed',
+        ticketId: enhancement.id,
+        bugTicketId: bug.id,
+        enhanceKind: enhancement.kind,
+        validatedDetectorProviders,
+        repairProviders,
+      },
+    );
+  }
+
+  private async markBugFailed(ticketId: string | undefined, reason: string): Promise<void> {
+    const bug = ticketId ? this.tickets.findBug(ticketId) : undefined;
+    if (!bug || ['closed', 'cancelled'].includes(bug.status)) return;
+    bug.failureReason = reason;
+    await this.tickets.transition(bug, 'failed', 'debug-failed', { reason });
+  }
+
+  private async closeBugTicket(
+    ticketId: string | undefined,
     step: Step,
-    repair?: EngineIssue['repair'],
-    issueResolutionPlan?: string,
+    repair?: BugTicket['repair'],
+    bugResolutionPlan?: string,
   ): Promise<void> {
-    const issue = issueId ? await this.getIssue(issueId) : undefined;
-    if (!issue) return;
-    if (issue.status === 'resolved') return;
-    const resolvedAt = new Date().toISOString();
-    transitionIssue(issue, 'resolved', resolvedAt);
-    issue.resolvedAt = resolvedAt;
-    if (repair) issue.repair = repair;
-    const effectiveRepair = repair ?? issue.repair;
-    if (issueResolutionPlan?.trim()) {
-      issue.issueResolutionPlan = issueResolutionPlan.trim();
-      const latestPlan = issue.resolutionPlanHistory?.at(-1)?.plan;
-      if (latestPlan !== issue.issueResolutionPlan) {
-        issue.resolutionPlanHistory = [
-          ...(issue.resolutionPlanHistory ?? []),
+    const bug = ticketId ? this.tickets.findBug(ticketId) : undefined;
+    if (!bug || bug.status === 'closed') return;
+    if (repair) bug.repair = repair;
+    const effectiveRepair = repair ?? bug.repair;
+    if (bugResolutionPlan?.trim()) {
+      bug.bugResolutionPlan = bugResolutionPlan.trim();
+      const latestPlan = bug.resolutionPlanHistory?.at(-1)?.plan;
+      if (latestPlan !== bug.bugResolutionPlan) {
+        bug.resolutionPlanHistory = [
+          ...(bug.resolutionPlanHistory ?? []),
           {
-            at: issue.resolvedAt,
+            at: new Date().toISOString(),
             stepId: step.id,
             phase: step.phase,
-            plan: issue.issueResolutionPlan,
+            plan: bug.bugResolutionPlan,
             outcome: 'accepted' as const,
           },
         ].slice(-8);
       }
     }
-    await this.recordDebugWikiResolution(issue, step, effectiveRepair);
-    await this.persistIssue(issue, 'resolved');
+    for (const blockerId of [...bug.blockedByTicketIds]) {
+      await this.tickets.unblock(bug, blockerId);
+    }
+    if (bug.status === 'open' || bug.status === 'failed') {
+      await this.tickets.transition(bug, 'triaged', 'resolution-triaged');
+    }
+    if (bug.status === 'triaged') {
+      await this.tickets.transition(bug, 'in_progress', 'debug-started');
+    }
+    if (bug.status === 'in_progress' || bug.status === 'in_review') {
+      await this.tickets.transition(bug, 'verification', 'verification-passed', {
+        verificationStepId: step.id,
+        verificationPhase: step.phase,
+      });
+    }
+    if (bug.status !== 'resolved') {
+      await this.tickets.transition(bug, 'resolved', 'resolved');
+    }
+    await this.recordDebugWikiResolution(bug, step, effectiveRepair);
+    await this.tickets.transition(bug, 'closed', 'closed-after-wiki');
+    await this.closeEnhanceForBug(bug, step);
+    const workTicket = bug.source.stepId
+      ? this.tickets.workForStep(bug.source.stepId)
+      : undefined;
+    if (workTicket?.blockedByTicketIds.includes(bug.id)) {
+      await this.tickets.unblock(workTicket, bug.id);
+    }
+    await this.tickets.syncStepCompleted(step);
     const repairedStepId = effectiveRepair?.repairedStepId ?? step.id;
     const repairedPhase = effectiveRepair?.repairedPhase ?? step.phase;
-    await this.opts.audit.event('issue.resolve', `${issue.id} resolved by ${repairedStepId} ${repairedPhase}`, {
-      messageId: 'engine.issue_resolved',
-      issueId: issue.id,
+    await this.opts.audit.event('ticket.bug.closed', `${bug.id} resolved by ${repairedStepId} ${repairedPhase}`, {
+      messageId: 'engine.bug_ticket_closed',
+      ticketId: bug.id,
       repairedStepId,
       repairedPhase,
       repair: effectiveRepair,
     });
   }
 
-  private async recordIssueRepairReady(
-    issueId: string,
+  private async recordBugRepairReady(
+    ticketId: string,
     step: Step,
-    repair: EngineIssue['repair'] | undefined,
-    issueResolutionPlan: string | undefined,
+    repair: BugTicket['repair'] | undefined,
+    bugResolutionPlan: string | undefined,
   ): Promise<void> {
-    const issue = await this.getIssue(issueId);
-    if (!issue) return;
-    if (repair) issue.repair = repair;
-    if (issueResolutionPlan?.trim()) {
-      issue.issueResolutionPlan = issueResolutionPlan.trim();
-      issue.resolutionPlanHistory = [
-        ...(issue.resolutionPlanHistory ?? []),
+    const bug = this.tickets.findBug(ticketId);
+    if (!bug) return;
+    if (repair) bug.repair = repair;
+    if (bugResolutionPlan?.trim()) {
+      bug.bugResolutionPlan = bugResolutionPlan.trim();
+      bug.resolutionPlanHistory = [
+        ...(bug.resolutionPlanHistory ?? []),
         {
           at: new Date().toISOString(),
           stepId: step.id,
           phase: step.phase,
-          plan: issue.issueResolutionPlan,
+          plan: bug.bugResolutionPlan,
           outcome: 'accepted' as const,
         },
       ].slice(-8);
     }
-    issue.updatedAt = new Date().toISOString();
-    await this.persistIssue(issue, 'repair-ready', {
+    if (bug.status === 'triaged' || bug.status === 'failed') {
+      await this.tickets.transition(bug, 'in_progress', 'debug-started');
+    }
+    await this.tickets.transition(bug, 'verification', 'repair-ready', {
       repairedStepId: step.id,
       repairedPhase: step.phase,
       repair,
     });
   }
 
-  private async markIssueChangePending(
-    issue: EngineIssue,
-    request: EngineeringChangeRequest,
+  private async markBugBlockedByChange(
+    bug: BugTicket,
+    request: ChangeRequestTicket,
   ): Promise<void> {
-    transitionIssue(issue, 'change_pending');
-    issue.activeChangeRequestId = request.id;
-    issue.changeRequestIds = dedup([...(issue.changeRequestIds ?? []), request.id]);
-    await this.persistIssue(issue, 'change-pending', {
-      changeRequestId: request.id,
+    bug.activeChangeRequestTicketId = request.id;
+    bug.changeRequestTicketIds = dedup([...bug.changeRequestTicketIds, request.id]);
+    await this.tickets.block(bug, request.id, `${request.id} must pass all affected gates`);
+    await this.tickets.persist(bug, 'change-request-linked', {
+      changeRequestTicketId: request.id,
       changeRequestRevision: request.revision,
     });
     await this.opts.audit.event(
       'note',
-      `${issue.id} waits for ${request.id} downstream implementation`,
+      `${bug.id} waits for ${request.id} downstream implementation`,
       {
-        messageId: 'engine.issue_change_pending',
-        issueId: issue.id,
-        changeRequestId: request.id,
+        messageId: 'engine.bug_ticket_blocked_by_change',
+        ticketId: bug.id,
+        changeRequestTicketId: request.id,
         changeRequestRevision: request.revision,
       },
     );
@@ -907,21 +1281,21 @@ export class PhaseEngine {
   ): Promise<void> {
     const entryIds = dedup(debug.debugWikiEntryIds ?? []);
     if (entryIds.length === 0) return;
-    const issue = debug.issueId ? this.findIssue(debug.issueId) : undefined;
+    const bug = debug.bugTicketId ? this.tickets.findBug(debug.bugTicketId) : undefined;
     const brief = buildDebugBrief({
       reason: outcome.reason ?? debug.reason,
       failureLog: cleanFailureLogForDebugContext(outcome.failureLog),
-      phase: issue?.phase ?? step.phase,
-      targetPhase: issue?.targetPhase ?? step.phase,
+      phase: bug?.source.phase ?? step.phase,
+      targetPhase: bug?.targetPhase ?? step.phase,
     });
     await this.withDebugWiki(
       'record-failure',
       () => this.debugWiki.recordFailure(entryIds, {
         brief,
-        issueId: issue?.id,
+        ticketId: bug?.id,
         stepId: step.id,
         phase: step.phase,
-        targetPhase: issue?.targetPhase,
+        targetPhase: bug?.targetPhase,
         language: this.profile.id,
         solution: 'retrieved wiki solution did not resolve this attempt',
         reason: outcome.reason ?? debug.reason,
@@ -932,164 +1306,114 @@ export class PhaseEngine {
       messageId: 'engine.debug_wiki_feedback',
       kind: 'failure',
       entryIds,
-      issueId: issue?.id,
+      ticketId: bug?.id,
       stepId: step.id,
       reason: outcome.reason ?? debug.reason,
     });
   }
 
   private async recordDebugWikiResolution(
-    issue: EngineIssue,
+    bug: BugTicket,
     step: Step,
-    repair?: EngineIssue['repair'],
+    repair?: BugTicket['repair'],
   ): Promise<void> {
-    const brief = issue.debugBrief ?? buildDebugBrief({
-      reason: issue.reason,
-      failureLog: issue.failureLog,
-      phase: issue.phase,
-      targetPhase: issue.targetPhase,
+    const brief = bug.debugBrief ?? buildDebugBrief({
+      reason: bug.reason,
+      failureLog: bug.failureLog,
+      phase: bug.source.phase,
+      targetPhase: bug.targetPhase,
     });
     const repairFiles = repair?.changedFiles?.length ? repair.changedFiles : step.outputs;
     const repairedStepId = repair?.repairedStepId ?? step.id;
     const repairedPhase = repair?.repairedPhase ?? step.phase;
     const evidenceSummary = [
-      `Resolved ${issue.kind} by Debugger in ${repairedStepId}/${repairedPhase}.`,
+      `Resolved ${bug.kind} by Debugger in ${repairedStepId}/${repairedPhase}.`,
       `Mode: ${repair?.mode ?? 'verification'}.`,
       repairFiles.length > 0 ? `Changed/verified files: ${repairFiles.join(', ')}.` : '',
       repair?.patchPath ? `Patch: ${repair.patchPath}.` : '',
       `Demand: ${brief.debugDemand}`,
     ].filter(Boolean).join(' ');
-    const solution = issue.issueResolutionPlan
-      ? `${issue.issueResolutionPlan}\nResolution evidence: ${evidenceSummary}`
+    const solution = bug.bugResolutionPlan
+      ? `${bug.bugResolutionPlan}\nResolution evidence: ${evidenceSummary}`
       : evidenceSummary;
     const result = await this.withDebugWiki(
       'record-resolution',
       () => this.debugWiki.recordResolution({
         brief,
-        issueId: issue.id,
+        ticketId: bug.id,
         stepId: step.id,
         phase: step.phase,
-        targetPhase: issue.targetPhase,
+        targetPhase: bug.targetPhase,
         language: this.profile.id,
-        resolutionPlan: issue.issueResolutionPlan,
+        resolutionPlan: bug.bugResolutionPlan,
         solution,
         evidence: brief.evidence,
         repairFiles,
-        usedEntryIds: issue.debugWikiEntryIds,
+        usedEntryIds: bug.debugWikiEntryIds,
       }),
       { updated: [] },
     );
     if (result.created || result.updated.length > 0) {
-      await this.opts.audit.event('note', `debug wiki updated after ${issue.id}`, {
+      await this.opts.audit.event('note', `debug wiki updated after ${bug.id}`, {
         messageId: 'engine.debug_wiki_updated',
-        issueId: issue.id,
+        ticketId: bug.id,
         created: result.created,
         updated: result.updated,
       });
     }
   }
 
-  private findIssue(issueId: string): EngineIssue | undefined {
-    return this.issues.find((issue) => issue.id === issueId);
+  private findLatestOpenBugForStep(stepId: string): BugTicket | undefined {
+    return [...this.tickets.all()].reverse().find(
+      (ticket): ticket is BugTicket =>
+        ticket.type === 'bug' &&
+        ticket.source.stepId === stepId &&
+        !['resolved', 'closed', 'cancelled'].includes(ticket.status),
+    );
   }
 
-  private async getIssue(issueId: string): Promise<EngineIssue | undefined> {
-    const current = this.findIssue(issueId);
-    if (current) return current;
-    const raw = await this.opts.ws.readFile(`.xcompiler/issues/${issueId}.json`).catch(() => '');
-    if (!raw.trim()) return undefined;
-    const issue = JSON.parse(raw) as EngineIssue;
-    this.issues.push(issue);
-    return issue;
-  }
-
-  private async findLatestOpenIssueForStep(stepId: string): Promise<EngineIssue | undefined> {
-    const raw = await this.opts.ws.readFile('.xcompiler/issues/issues.jsonl').catch(() => '');
-    const seen = new Set<string>();
-    const entries = raw.split(/\r?\n/u).filter(Boolean).reverse();
-    for (const line of entries) {
-      let entry: { issueId?: string; stepId?: string; status?: IssueStatus };
-      try {
-        entry = JSON.parse(line) as typeof entry;
-      } catch {
-        continue;
-      }
-      if (!entry.issueId || seen.has(entry.issueId)) continue;
-      seen.add(entry.issueId);
-      if (entry.stepId !== stepId || entry.status === 'resolved') continue;
-      const issue = await this.getIssue(entry.issueId);
-      if (issue && issue.status !== 'resolved') return issue;
-    }
-    return undefined;
-  }
-
-  private async openIssueForFailedStep(stepId: string): Promise<EngineIssue | undefined> {
+  private openBugForFailedStep(stepId: string): BugTicket | undefined {
     if (
-      this.lastIssue?.stepId === stepId &&
-      this.lastIssue.status !== 'resolved'
+      this.lastBug?.source.stepId === stepId &&
+      !['resolved', 'closed', 'cancelled'].includes(this.lastBug.status)
     ) {
-      return this.lastIssue;
+      return this.lastBug;
     }
-    return this.findLatestOpenIssueForStep(stepId);
+    return this.findLatestOpenBugForStep(stepId);
   }
 
-  private async findOpenIssuesVerifiedByStep(stepId: string): Promise<EngineIssue[]> {
-    const found = new Map<string, EngineIssue>();
-    for (const issue of this.issues) {
-      if (
-        issue.status !== 'resolved' &&
-        issue.verificationStepId === stepId
-      ) {
-        found.set(issue.id, issue);
-      }
-    }
-    const raw = await this.opts.ws.readFile('.xcompiler/issues/issues.jsonl').catch(() => '');
-    const seen = new Set<string>();
-    for (const line of raw.split(/\r?\n/u).filter(Boolean).reverse()) {
-      let entry: { issueId?: string; status?: IssueStatus };
-      try {
-        entry = JSON.parse(line) as typeof entry;
-      } catch {
-        continue;
-      }
-      if (!entry.issueId || seen.has(entry.issueId)) continue;
-      seen.add(entry.issueId);
-      if (entry.status === 'resolved' || found.has(entry.issueId)) continue;
-      const issue = await this.getIssue(entry.issueId);
-      if (
-        issue &&
-        issue.status !== 'resolved' &&
-        issue.verificationStepId === stepId
-      ) {
-        found.set(issue.id, issue);
-      }
-    }
-    return [...found.values()];
+  private findOpenBugsVerifiedByStep(stepId: string): BugTicket[] {
+    return this.tickets.all().filter(
+      (ticket): ticket is BugTicket =>
+        ticket.type === 'bug' &&
+        !['resolved', 'closed', 'cancelled'].includes(ticket.status) &&
+        ticket.verificationStepId === stepId,
+    );
   }
 
-  private async resolveIssuesVerifiedByStep(step: Step): Promise<void> {
-    for (const issue of await this.findOpenIssuesVerifiedByStep(step.id)) {
-      if (issue.activeChangeRequestId) continue;
-      await this.markIssueResolved(
-        issue.id,
+  private async resolveBugsVerifiedByStep(step: Step): Promise<void> {
+    for (const bug of this.findOpenBugsVerifiedByStep(step.id)) {
+      if (bug.activeChangeRequestTicketId) continue;
+      await this.closeBugTicket(
+        bug.id,
         step,
-        issue.repair,
-        issue.issueResolutionPlan ??
-          `Repair ${issue.targetStepId ?? issue.stepId ?? 'the paired source phase'} and pass ${step.id} ${step.phase}.`,
+        bug.repair,
+        bug.bugResolutionPlan ??
+          `Repair ${bug.targetStepId ?? bug.source.stepId ?? 'the paired source phase'} and pass ${step.id} ${step.phase}.`,
       );
     }
   }
 
-  private async persistIssue(
-    issue: EngineIssue,
+  private async persistBugTicket(
+    bug: BugTicket,
     event: string,
     extra: Record<string, unknown> = {},
   ): Promise<void> {
-    await this.issueJournal.persist(issue, event, extra);
+    await this.tickets.persist(bug, event, extra);
   }
 
-  private classifyIssueKind(step: Step, outcome: AttemptOutcome): EngineIssueKind {
-    if (outcome.issueKind) return outcome.issueKind;
+  private classifyBugKind(step: Step, outcome: AttemptOutcome): BugKind {
+    if (outcome.bugKind) return outcome.bugKind;
     if (this.isVModelTestPhase(step.phase) && outcome.rollbackToPairedSource) {
       return step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate';
     }
@@ -1097,15 +1421,15 @@ export class PhaseEngine {
   }
 
   private async createCompletedPhaseRepairArtifact(
-    issueId: string,
+    ticketId: string,
     step: Step,
     beforeRef: string,
     completedBeforeDebug: boolean,
     toolCalls: Array<{ tool: string; ok: boolean; summary?: string; error?: string }>,
-  ): Promise<EngineIssue['repair'] | undefined> {
+  ): Promise<BugTicket['repair'] | undefined> {
     if (!completedBeforeDebug) return undefined;
-    const patchPath = `.xcompiler/issues/${issueId}/repair.patch`;
-    const summaryPath = `.xcompiler/issues/${issueId}/repair.md`;
+    const patchPath = `.xcompiler/tickets/${ticketId}/repair.patch`;
+    const summaryPath = `.xcompiler/tickets/${ticketId}/repair.md`;
     const diff = await this.opts.git.raw().diff([beforeRef, '--']).catch((err) => `# git diff failed: ${(err as Error).message}\n`);
     const mode = inferRepairMode(toolCalls);
     const changedFiles = parsePatchChangedFiles(diff);
@@ -1113,7 +1437,7 @@ export class PhaseEngine {
     await this.opts.ws.writeFile(
       summaryPath,
       [
-        `# Repair ${issueId}`,
+        `# Repair ${ticketId}`,
         '',
         `- repairedStep: ${step.id}`,
         `- repairedPhase: ${step.phase}`,
@@ -1165,14 +1489,75 @@ export class PhaseEngine {
       .filter((file) => !isRuntimeOnlyChange(file, planPath));
   }
 
-  private testGateArgsForStep(step: Step): string[] {
-    if (step.phase === 'FUNCTIONAL_TEST') return [];
-    return dedup(
-      step.outputs
-        .filter((out) => typeof out === 'string' && !out.endsWith('/'))
-        .map((out) => normalizeGitPath(out))
-        .filter(isTestFilePath),
-    );
+  private testGateArgsForStep(plan: Plan, step: Step): string[] {
+    return pairedTestAssetPaths(plan.steps, step, plan.language)
+      .map((testPath) => normalizeGitPath(testPath));
+  }
+
+  private async inspectPairedTestAssets(
+    plan: Plan,
+    step: Step,
+  ): Promise<{
+    ok: boolean;
+    testArgs: string[];
+    testPlanPath?: string;
+    missing: string[];
+    invalid: string[];
+    failureLog: string;
+  }> {
+    const testArgs = this.testGateArgsForStep(plan, step);
+    const iterationId = step.iterationId ?? 'P1';
+    const testPlanPath = testPlanDocForIteration(step.phase, iterationId);
+    const expected = dedup([
+      ...(testPlanPath ? [testPlanPath] : []),
+      ...testArgs,
+    ]);
+    const missing: string[] = [];
+    const invalid: string[] = [];
+    const illegallyOwnedTests = step.outputs
+      .map((output) => normalizeGitPath(output))
+      .filter(isTestFilePath);
+
+    if (testArgs.length === 0) {
+      invalid.push(`${step.phase} has no executable paired test asset`);
+    }
+    if (illegallyOwnedTests.length > 0) {
+      invalid.push(
+        `${step.phase} is validation-only but declares executable test outputs: ${illegallyOwnedTests.join(', ')}`,
+      );
+    }
+    for (const file of expected) {
+      if (!(await this.opts.ws.exists(file))) {
+        missing.push(file);
+        continue;
+      }
+      const content = await this.opts.ws.readFile(file).catch(() => '');
+      if (!content.trim()) {
+        invalid.push(`${file}: empty`);
+      } else if (isTestFilePath(file) && !hasExecutableTestDeclaration(content, plan.language)) {
+        invalid.push(`${file}: no executable test case declaration found`);
+      }
+    }
+
+    const ok = missing.length === 0 && invalid.length === 0;
+    return {
+      ok,
+      testArgs,
+      testPlanPath,
+      missing,
+      invalid,
+      failureLog: ok
+        ? ''
+        : [
+            `${step.id} ${step.phase} paired test completeness gate failed.`,
+            `Paired source phase: ${V_MODEL_TEST_TO_SOURCE_PHASE[step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE]}.`,
+            testPlanPath ? `Required test plan: ${testPlanPath}` : '',
+            testArgs.length > 0 ? `Executable tests: ${testArgs.join(', ')}` : '',
+            missing.length > 0 ? `Missing: ${missing.join(', ')}` : '',
+            invalid.length > 0 ? `Invalid: ${invalid.join(' | ')}` : '',
+            'Create a Bug Ticket and route it to the paired source phase; the validation phase must not create or rewrite tests.',
+          ].filter(Boolean).join('\n'),
+    };
   }
 
   private shouldRunIterationGate(plan: Plan, step: Step): boolean {
@@ -1276,22 +1661,43 @@ export class PhaseEngine {
     return (V_MODEL_TEST_PHASES as readonly string[]).includes(phase);
   }
 
+  private qualityRemediationTarget(
+    plan: Plan,
+    failedStep: Step,
+    mode: 'same-step' | 'paired-source' = this.isVModelTestPhase(failedStep.phase)
+      ? 'paired-source'
+      : 'same-step',
+  ): Step {
+    if (mode === 'same-step' || !this.isVModelTestPhase(failedStep.phase)) return failedStep;
+    const sourcePhase =
+      V_MODEL_TEST_TO_SOURCE_PHASE[failedStep.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE];
+    const order = topoSort(plan.steps);
+    const byId = new Map(order.map((step) => [step.id, step] as const));
+    const candidates = order.filter(
+      (step) =>
+        (step.iterationId ?? 'P1') === (failedStep.iterationId ?? 'P1') &&
+        step.phase === sourcePhase,
+    );
+    return [...candidates].reverse().find(
+      (step) => stepTransitivelyDependsOn(failedStep, step.id, byId),
+    ) ?? candidates.at(-1) ?? failedStep;
+  }
+
   /**
-   * A failed right-side V-model phase is still valuable evidence. Keep its
-   * declared test artifacts readable by the paired source-phase Debugger.
-   * Tool write guards already restrict the attempt to the phase allowlist.
+   * Keep failed right-side reports and tool evidence available to the paired
+   * source-phase Debugger. Test assets already belong to the source phase.
    */
-  private async preserveFailedTestArtifacts(step: Step, reason: string): Promise<void> {
+  private async preserveFailedValidationEvidence(step: Step, reason: string): Promise<void> {
     const snapshot = await this.opts.git.snapshot(
       step.id,
       step.retries,
-      'failed test artifacts preserved',
+      'failed validation evidence preserved',
     );
     await this.opts.audit.event(
       'note',
-      `preserved failed test artifacts for ${step.id}`,
+      `preserved failed validation evidence for ${step.id}`,
       {
-        messageId: 'engine.failed_test_artifacts_preserved',
+        messageId: 'engine.failed_validation_evidence_preserved',
         stepId: step.id,
         phase: step.phase,
         reason,
@@ -1301,12 +1707,103 @@ export class PhaseEngine {
     );
   }
 
+  private async rollbackQualityEnhancement(
+    plan: Plan,
+    order: Step[],
+    failedStep: Step,
+    enhancement: EnhanceTicket,
+    activeChangeRequest?: ChangeRequestTicket,
+  ): Promise<EngineResult & { ok: boolean; restartIndex?: number }> {
+    const target = order.find((step) => step.id === enhancement.targetStepId) ??
+      this.qualityRemediationTarget(plan, failedStep);
+    enhancement.targetStepId = target.id;
+    enhancement.targetPhase = target.phase;
+    enhancement.verificationStepId = failedStep.id;
+    enhancement.verificationPhase = failedStep.phase;
+    await this.tickets.persist(enhancement, 'quality-remediation-routed');
+
+    const byId = new Map(order.map((step) => [step.id, step] as const));
+    const affectedSteps: Step[] = [];
+    for (const step of order) {
+      if ((step.iterationId ?? 'P1') !== (target.iterationId ?? 'P1')) continue;
+      const isTarget = step.id === target.id;
+      const isLaterPhase = PHASE_ORDER[step.phase] > PHASE_ORDER[target.phase];
+      const dependsOnTarget = stepTransitivelyDependsOn(step, target.id, byId);
+      if (!isTarget && !isLaterPhase && !dependsOnTarget) continue;
+      if (!isTarget) affectedSteps.push(step);
+      if (step.status !== 'PENDING') {
+        resetStepForRerun(step, 'quality-enhancement');
+        await this.tickets.syncStepReset(step, 'quality-enhancement');
+      }
+    }
+    await this.persistPlan(plan);
+    await this.opts.audit.event(
+      'quality.gate.enhance',
+      `${enhancement.id} incrementally remediates ${target.id} before ${failedStep.id} revalidation`,
+      {
+        messageId: 'engine.quality_enhance_remediation_started',
+        enhanceTicketId: enhancement.id,
+        targetStepId: target.id,
+        targetPhase: target.phase,
+        verificationStepId: failedStep.id,
+        verificationPhase: failedStep.phase,
+      },
+    );
+
+    await this.plugins.emit('step.before', { plan, step: target });
+    const baselineCommit = await this.currentHead();
+    let ok: boolean;
+    try {
+      ok = await this.executeStepWithDebug(plan, target, {
+        enhancement,
+        skipOutputArchive: true,
+        changeRequest: activeChangeRequest,
+      });
+    } catch (error) {
+      await this.plugins.emit('step.error', { plan, step: target, error });
+      throw error;
+    }
+    await this.plugins.emit('step.after', { plan, step: target, ok });
+    await this.persistPlan(plan);
+    if (!ok) {
+      return {
+        ok: false,
+        totalSteps: order.length,
+        executedSteps: 1,
+        failedStepId: target.id,
+        failureLog: this.lastFailure?.failureLog,
+        failureReason: this.lastFailure?.reason,
+      };
+    }
+
+    if (isDesignChangeRequestPhase(target.phase) && affectedSteps.length > 0) {
+      await this.establishQualityChangeRequest({
+        plan,
+        enhancement,
+        sourceStep: target,
+        verificationStep: failedStep,
+        affectedSteps,
+        baselineCommit,
+        activeChangeRequest,
+      });
+    } else if (enhancement.verificationStepId === target.id) {
+      await this.closeQualityEnhancement(enhancement, target);
+    }
+    const targetIndex = order.findIndex((step) => step.id === target.id);
+    return {
+      ok: true,
+      totalSteps: order.length,
+      executedSteps: 1,
+      restartIndex: Math.max(0, targetIndex),
+    };
+  }
+
   private async rollbackFailedTestPhase(
     plan: Plan,
     order: Step[],
     failedTest: Step,
-    issue?: EngineIssue,
-    activeChangeRequest?: EngineeringChangeRequest,
+    bug?: BugTicket,
+    activeChangeRequest?: ChangeRequestTicket,
   ): Promise<EngineResult & { ok: boolean; restartIndex?: number }> {
     const ownerStep = this.lastFailure?.rollbackTestStepId
       ? order.find((step) =>
@@ -1328,7 +1825,7 @@ export class PhaseEngine {
     const failureLog = this.lastFailure?.failureLog ?? `${routedTest.phase} failed.`;
     if (isNonDebuggableInfrastructureFailure(this.lastFailure?.reason, failureLog)) {
       const reason = this.lastFailure?.reason ?? `${routedTest.phase} failed due to a non-debuggable infrastructure failure.`;
-      await this.markIssueUnresolved(issue?.id, reason);
+      await this.markBugFailed(bug?.id, reason);
       return {
         ok: false,
         totalSteps: order.length,
@@ -1347,7 +1844,7 @@ export class PhaseEngine {
         reason: `${routedTest.phase} failed but no paired ${sourcePhase} step exists in ${iterationId}.`,
         failureLog,
       };
-      await this.markIssueUnresolved(issue?.id, this.lastFailure.reason);
+      await this.markBugFailed(bug?.id, this.lastFailure.reason);
       return {
         ok: false,
         totalSteps: order.length,
@@ -1370,11 +1867,11 @@ export class PhaseEngine {
     this.log(chalk.yellow(
       t().engine.testRollbackNotice(routedTest.id, routedTest.phase, sourceStep.id, sourcePhase),
     ));
-    await this.routeIssueToStep(issue, sourceStep, reason);
-    if (issue) {
-      issue.verificationStepId = routedTest.id;
-      issue.verificationPhase = routedTest.phase;
-      await this.persistIssue(issue, 'verification-required', {
+    await this.routeBugTicketToStep(bug, sourceStep, reason);
+    if (bug) {
+      bug.verificationStepId = routedTest.id;
+      bug.verificationPhase = routedTest.phase;
+      await this.persistBugTicket(bug, 'verification-required', {
         verificationStepId: routedTest.id,
         verificationPhase: routedTest.phase,
       });
@@ -1401,6 +1898,7 @@ export class PhaseEngine {
       affectedSteps.push(step);
       if (step.status === 'PENDING') continue;
       resetStepForRerun(step, 'v-model-rollback');
+      await this.tickets.syncStepReset(step, 'v-model-rollback');
     }
     await this.persistPlan(plan);
 
@@ -1432,8 +1930,8 @@ export class PhaseEngine {
             this.profile.manifestFile,
           ),
           contextMode: 'test-rollback',
-          testScopeArgs: this.testGateArgsForStep(routedTest),
-          issueId: issue?.id,
+          testScopeArgs: this.testGateArgsForStep(plan, routedTest),
+          bugTicketId: bug?.id,
           completedBeforeDebug: sourceStep.status === 'DONE',
         },
         skipOutputArchive: true,
@@ -1457,11 +1955,10 @@ export class PhaseEngine {
       };
     }
 
-    let designChangeRequest: EngineeringChangeRequest | undefined;
-    if (issue && isDesignChangeRequestPhase(sourceStep.phase)) {
-      designChangeRequest = await this.establishDesignChangeRequest({
+    if (bug && isDesignChangeRequestPhase(sourceStep.phase)) {
+      await this.establishDesignChangeRequest({
         plan,
-        issue,
+        bug,
         sourceStep,
         failedTest: routedTest,
         affectedSteps,
@@ -1478,66 +1975,18 @@ export class PhaseEngine {
           .slice(sourceIndex + 1, routedTestIndex)
           .filter((step) => (step.iterationId ?? 'P1') === iterationId)
       : [];
-    if (interveningSteps.length === 0) {
-      const repairedTestValidation = await this.validateTestPhaseWithoutRegeneration(plan, routedTest);
-      const validationChangeRequest = designChangeRequest ?? activeChangeRequest;
-      if (repairedTestValidation.status === 'passed' && validationChangeRequest) {
-        const hasVerification = validationChangeRequest.applications.some(
-          (application) =>
-            application.stepId === routedTest.id &&
-            application.commit === repairedTestValidation.commit,
-        );
-        if (!hasVerification) {
-          await this.changeRequests.recordApplication(validationChangeRequest, {
-            stepId: routedTest.id,
-            phase: routedTest.phase,
-            kind: 'verification',
-            commit: repairedTestValidation.commit,
-            changedFiles: [],
-            summary: `Revalidated ${routedTest.id} ${routedTest.phase} without regenerating accepted test artifacts.`,
-          });
-        }
-        await this.maybeCloseChangeRequest(plan, validationChangeRequest, routedTest);
-      }
-      if (
-        repairedTestValidation.status === 'passed' &&
-        issue &&
-        !validationChangeRequest
-      ) {
-        await this.markIssueResolved(
-          issue.id,
-          routedTest,
-          issue.repair,
-          issue.issueResolutionPlan,
-        );
-      }
-      if (repairedTestValidation.status === 'denied') {
-        const failureReason = `${routedTest.phase} revalidation was denied after ${sourceStep.id} repair`;
-        this.lastFailure = {
-          reason: failureReason,
-          failureLog: repairedTestValidation.failureLog,
-        };
-        return {
-          ok: false,
-          totalSteps: order.length,
-          executedSteps: 1,
-          failedStepId: routedTest.id,
-          failureReason,
-          failureLog: repairedTestValidation.failureLog,
-        };
-      }
-    } else {
-      await this.opts.audit.event(
-        'note',
-        `deferred ${routedTest.id} validation until intervening V-model steps rerun`,
-        {
-          messageId: 'engine.rollback_validation_deferred',
-          sourceStepId: sourceStep.id,
-          routedTestStepId: routedTest.id,
-          interveningSteps: interveningSteps.map(stepStateSummary),
-        },
-      );
-    }
+    await this.opts.audit.event(
+      'note',
+      `deferred ${routedTest.id} acceptance to its complete V-model quality gate`,
+      {
+        messageId: 'engine.rollback_validation_deferred',
+        sourceStepId: sourceStep.id,
+        routedTestStepId: routedTest.id,
+        reason:
+          'The formal test phase must rerun to collect coverage, tolerance, and alignment evidence before closing Bug or Change Request tickets.',
+        interveningSteps: interveningSteps.map(stepStateSummary),
+      },
+    );
     const restartIndex = Math.max(0, sourceIndex);
     return {
       ok: true,
@@ -1548,71 +1997,245 @@ export class PhaseEngine {
   }
 
   private async recordChangeRequestFailure(
-    request: EngineeringChangeRequest,
-    issue: EngineIssue | undefined,
+    request: ChangeRequestTicket,
+    bug: BugTicket | undefined,
     step: Step,
   ): Promise<void> {
-    if (!issue) return;
-    issue.causedByChangeRequestId = request.id;
-    issue.changeRequestIds = dedup([...(issue.changeRequestIds ?? []), request.id]);
-    await this.persistIssue(issue, 'change-request-failure', {
-      changeRequestId: request.id,
+    if (!bug) return;
+    bug.causedByChangeRequestTicketId = request.id;
+    bug.changeRequestTicketIds = dedup([...bug.changeRequestTicketIds, request.id]);
+    await this.persistBugTicket(bug, 'change-request-failure', {
+      changeRequestTicketId: request.id,
       failedChangeStepId: step.id,
       failedChangeStepPhase: step.phase,
     });
-    if (!request.relatedIssueIds.includes(issue.id)) {
-      await this.changeRequests.requestRework(
+    if (!request.relatedTicketIds.includes(bug.id)) {
+      await this.tickets.requestChangeRework(
         request,
-        issue.id,
-        `${step.id} ${step.phase} failed while applying ${request.id}: ${issue.reason}`,
+        bug.id,
+        `${step.id} ${step.phase} failed while applying ${request.id}: ${bug.reason}`,
       );
     }
     await this.opts.audit.event(
-      'note',
+      'ticket.change-request.revised',
       `${request.id} revision ${request.revision} requires rework after ${step.id}`,
       {
         messageId: 'engine.change_request_rework',
-        changeRequestId: request.id,
+        changeRequestTicketId: request.id,
         revision: request.revision,
-        issueId: issue.id,
+        bugTicketId: bug.id,
+        enhanceTicketId: bug.enhanceTicketId,
         stepId: step.id,
         phase: step.phase,
       },
     );
   }
 
-  private async establishDesignChangeRequest(input: {
+  private async establishQualityChangeRequest(input: {
     plan: Plan;
-    issue: EngineIssue;
+    enhancement: EnhanceTicket;
     sourceStep: Step;
-    failedTest: Step;
+    verificationStep: Step;
     affectedSteps: Step[];
-    activeChangeRequest?: EngineeringChangeRequest;
-  }): Promise<EngineeringChangeRequest> {
-    const issue = await this.getIssue(input.issue.id) ?? input.issue;
+    baselineCommit: string;
+    activeChangeRequest?: ChangeRequestTicket;
+  }): Promise<ChangeRequestTicket> {
     const current = input.activeChangeRequest;
     const currentCoversSource = current && (
       current.designSource.stepId === input.sourceStep.id ||
       current.affectedSteps.some((step) => step.stepId === input.sourceStep.id)
     );
     if (current && currentCoversSource) {
-      if (!current.relatedIssueIds.includes(issue.id)) {
-        await this.changeRequests.requestRework(
-          current,
-          issue.id,
-          `${input.failedTest.id} requires a design correction in ${input.sourceStep.id}`,
-        );
+      await this.tickets.requestChangeRework(
+        current,
+        input.enhancement.id,
+        `${input.enhancement.id} adds a quality delta in ${input.sourceStep.id}`,
+      );
+      await this.tickets.linkEnhanceToChange(input.enhancement, current.id);
+      if (!current.relatedTicketIds.includes(input.enhancement.id)) {
+        await this.tickets.link(current, input.enhancement.id, 'enhancement-linked');
       }
-      await this.ensureDesignApplication(current, issue, input.sourceStep);
-      await this.markIssueChangePending(issue, current);
       return current;
     }
 
-    const repairCommit = issue.repair?.commit ?? await this.currentHead();
-    const baselineCommit = issue.repair?.baselineCommit ?? repairCommit;
+    const repairCommit = await this.currentHead();
+    const changedArtifacts = dedup(input.sourceStep.outputs);
+    const affectedSteps = input.affectedSteps.map(affectedStepContract);
+    const affectedArtifacts = dedup([
+      ...changedArtifacts,
+      ...input.affectedSteps.flatMap((step) => step.outputs),
+    ]);
+    const relatedWorkTicketIds = input.affectedSteps
+      .map((step) => this.tickets.workForStep(step.id)?.id)
+      .filter((id): id is string => !!id);
+    const objective =
+      `Propagate the accepted ${input.sourceStep.phase} quality delta from ${input.enhancement.id} ` +
+      'through affected downstream stages without regenerating accepted baseline work.';
+    const request = await this.tickets.createChangeRequest({
+      iterationId: input.sourceStep.iterationId ?? 'P1',
+      priority: 'high',
+      parentTicketId: current?.id,
+      rootTicketId: input.enhancement.rootTicketId,
+      relatedTicketIds: dedup([
+        input.enhancement.id,
+        ...relatedWorkTicketIds,
+      ]),
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: `${input.enhancement.id}:${input.sourceStep.id}`,
+        stepId: input.sourceStep.id,
+        phase: input.sourceStep.phase,
+        role: input.sourceStep.role,
+      },
+      title: `${input.sourceStep.phase} quality change propagation`,
+      description: objective,
+      objective,
+      acceptance: [
+        ...input.enhancement.acceptance,
+        `All affected stages pass through ${input.verificationStep.id} ${input.verificationStep.phase}.`,
+      ],
+      artifacts: affectedArtifacts,
+      sourceEnhanceTicketId: input.enhancement.id,
+      triggerTicketId: input.enhancement.id,
+      scope: {
+        in: dedup([
+          `${input.sourceStep.id} accepted quality delta`,
+          ...affectedSteps.map((step) => `${step.stepId} ${step.phase}`),
+          ...affectedArtifacts,
+        ]),
+        out: ['Unrelated requirements, modules, files, and accepted behavior'],
+      },
+      trigger: {
+        failedStepId: input.verificationStep.id,
+        failedPhase: input.verificationStep.phase,
+        failedAcceptance: input.verificationStep.acceptance,
+        reason: input.enhancement.finding,
+        failureSummary: input.enhancement.qualityFailures?.join('; ') ??
+          input.enhancement.finding,
+      },
+      designSource: {
+        stepId: input.sourceStep.id,
+        phase: input.sourceStep.phase as 'HIGH_LEVEL_DESIGN' | 'DETAILED_DESIGN',
+        baselineCommit: input.baselineCommit,
+        repairCommit,
+        changedArtifacts,
+      },
+      contractChange: {
+        summary: input.enhancement.finding,
+        before: input.enhancement.qualityFailures ?? [input.enhancement.finding],
+        after: input.enhancement.acceptance,
+        interfaces: input.sourceStep.outputs.map((output) => `Contract artifact: ${output}`),
+        dependencies: input.plan.dependencies ?? [],
+        constraints: [
+          'Apply only the accepted quality delta.',
+          'Preserve unrelated accepted behavior and artifacts.',
+        ],
+      },
+      implementationPlan: [
+        objective,
+        `Apply in order: ${affectedSteps.map((step) => `${step.stepId}/${step.phase}`).join(' -> ')}.`,
+      ].join('\n'),
+      affectedSteps,
+      affectedArtifacts,
+      verification: {
+        targetStepId: input.verificationStep.id,
+        targetPhase: input.verificationStep.phase,
+        testArgs: this.isVModelTestPhase(input.verificationStep.phase)
+          ? this.testGateArgsForStep(input.plan, input.verificationStep)
+          : [],
+        checks: [
+          input.verificationStep.acceptance,
+          ...input.enhancement.acceptance,
+        ],
+        failurePolicy:
+          'Open a linked Ticket, revise this change request, and resume from the owning V-model stage.',
+        rollbackTargetStepId: input.sourceStep.id,
+        rollbackTargetPhase: input.sourceStep.phase,
+      },
+      execution: {
+        completedStepIds: [],
+      },
+    });
+    await this.tickets.linkEnhanceToChange(input.enhancement, request.id);
+    await this.tickets.recordApplication(request, {
+      stepId: input.sourceStep.id,
+      phase: input.sourceStep.phase,
+      kind: 'design-change',
+      commit: repairCommit,
+      changedFiles: changedArtifacts,
+      summary: objective,
+    });
+    const providers = dedup(
+      input.enhancement.modelAttributions
+        .filter((attribution) => attribution.outcome === 'repair-verified')
+        .map((attribution) => attribution.provider),
+    );
+    if (providers.length > 0) {
+      await this.tickets.recordModelAttribution(request, {
+        providers,
+        role: input.sourceStep.role,
+        contribution: 'change-applier',
+        outcome: 'change-applied',
+        stepId: input.sourceStep.id,
+        phase: input.sourceStep.phase,
+      });
+    }
+    await this.opts.audit.event(
+      'ticket.change-request.created',
+      `${request.id} opened for ${input.enhancement.id}`,
+      {
+        messageId: 'engine.quality_change_request_opened',
+        changeRequestTicketId: request.id,
+        sourceEnhanceTicketId: input.enhancement.id,
+        sourceStepId: input.sourceStep.id,
+        sourcePhase: input.sourceStep.phase,
+        affectedStepIds: affectedSteps.map((step) => step.stepId),
+      },
+    );
+    return request;
+  }
+
+  private async establishDesignChangeRequest(input: {
+    plan: Plan;
+    bug: BugTicket;
+    sourceStep: Step;
+    failedTest: Step;
+    affectedSteps: Step[];
+    activeChangeRequest?: ChangeRequestTicket;
+  }): Promise<ChangeRequestTicket> {
+    const bug = input.bug;
+    const enhancement = await this.ensureEnhanceFinding(bug, input.sourceStep);
+    if (!enhancement) {
+      throw new Error(`${bug.id} cannot create a change-request without an Enhance finding`);
+    }
+    const current = input.activeChangeRequest;
+    const currentCoversSource = current && (
+      current.designSource.stepId === input.sourceStep.id ||
+      current.affectedSteps.some((step) => step.stepId === input.sourceStep.id)
+    );
+    if (current && currentCoversSource) {
+      if (!current.relatedTicketIds.includes(bug.id)) {
+        await this.tickets.requestChangeRework(
+          current,
+          bug.id,
+          `${input.failedTest.id} requires a design correction in ${input.sourceStep.id}`,
+        );
+      }
+      await this.tickets.linkEnhanceToChange(enhancement, current.id);
+      if (!current.relatedTicketIds.includes(enhancement.id)) {
+        await this.tickets.link(current, enhancement.id, 'enhancement-linked');
+      }
+      await this.ensureDesignApplication(current, bug, input.sourceStep);
+      await this.markBugBlockedByChange(bug, current);
+      return current;
+    }
+
+    const repairCommit = bug.repair?.commit ?? await this.currentHead();
+    const baselineCommit = bug.repair?.baselineCommit ?? repairCommit;
     const changedArtifacts = dedup(
-      issue.repair?.changedFiles?.length
-        ? issue.repair.changedFiles
+      bug.repair?.changedFiles?.length
+        ? bug.repair.changedFiles
         : input.sourceStep.outputs,
     );
     const affectedSteps = input.affectedSteps.map(affectedStepContract);
@@ -1620,15 +2243,36 @@ export class PhaseEngine {
       ...changedArtifacts,
       ...input.affectedSteps.flatMap((step) => step.outputs),
     ]);
-    const resolutionPlan = issue.issueResolutionPlan ??
+    const resolutionPlan = bug.bugResolutionPlan ??
       `Apply the repaired ${input.sourceStep.phase} contract incrementally through the affected downstream steps.`;
-    const request = await this.changeRequests.create({
+    const relatedWorkTicketIds = input.affectedSteps
+      .map((step) => this.tickets.workForStep(step.id)?.id)
+      .filter((id): id is string => !!id);
+    const request = await this.tickets.createChangeRequest({
       iterationId: input.sourceStep.iterationId ?? 'P1',
-      issueId: issue.id,
-      relatedIssueIds: [issue.id],
-      parentChangeRequestId: current?.id,
+      priority: 'high',
+      parentTicketId: current?.id,
+      rootTicketId: current?.rootTicketId ?? bug.rootTicketId,
+      relatedTicketIds: dedup([enhancement.id, bug.id, ...relatedWorkTicketIds]),
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: `${bug.id}:${input.sourceStep.id}`,
+        stepId: input.sourceStep.id,
+        phase: input.sourceStep.phase,
+        role: input.sourceStep.role,
+      },
       title: `${input.sourceStep.phase} correction after ${input.failedTest.phase} failure`,
+      description: resolutionPlan,
       objective: resolutionPlan,
+      acceptance: [
+        input.failedTest.acceptance,
+        `All affected tasks pass through ${input.failedTest.id} ${input.failedTest.phase}.`,
+      ],
+      artifacts: affectedArtifacts,
+      sourceEnhanceTicketId: enhancement.id,
+      originBugTicketId: bug.id,
+      triggerTicketId: enhancement.id,
       scope: {
         in: dedup([
           `${input.sourceStep.id} design correction`,
@@ -1641,9 +2285,9 @@ export class PhaseEngine {
         failedStepId: input.failedTest.id,
         failedPhase: input.failedTest.phase,
         failedAcceptance: input.failedTest.acceptance,
-        reason: issue.reason,
-        failureSummary: issue.debugBrief?.summary ?? issue.failureLog.slice(0, 1200),
-        failureEvidencePath: issue.rawFailureLogPath,
+        reason: bug.reason,
+        failureSummary: bug.debugBrief?.summary ?? bug.failureLog.slice(0, 1200),
+        failureEvidencePath: bug.rawFailureLogPath,
       },
       designSource: {
         stepId: input.sourceStep.id,
@@ -1651,13 +2295,13 @@ export class PhaseEngine {
         baselineCommit,
         repairCommit,
         changedArtifacts,
-        patchPath: issue.repair?.patchPath,
+        patchPath: bug.repair?.patchPath,
       },
       contractChange: {
         summary: resolutionPlan,
         before: [
           `Rejected acceptance: ${input.failedTest.acceptance}`,
-          `Observed failure: ${issue.debugBrief?.summary ?? issue.reason}`,
+          `Observed failure: ${bug.debugBrief?.summary ?? bug.reason}`,
         ],
         after: [
           `Accepted repair plan: ${resolutionPlan}`,
@@ -1679,40 +2323,41 @@ export class PhaseEngine {
       verification: {
         targetStepId: input.failedTest.id,
         targetPhase: input.failedTest.phase,
-        testArgs: this.testGateArgsForStep(input.failedTest),
+        testArgs: this.testGateArgsForStep(input.plan, input.failedTest),
         checks: [
           input.failedTest.acceptance,
           ...input.failedTest.outputs.map((output) => `Required output exists: ${output}`),
         ],
         failurePolicy:
-          'Record a linked issue, return this CR to rework, and resume from the paired V-model source. ' +
-          'Create a child CR only when the correction expands the design contract or scope.',
+          'Create a linked bug ticket, return this change-request ticket to rework, and resume from the paired V-model source. ' +
+          'Create a child change-request ticket only when the correction expands the design contract or scope.',
         rollbackTargetStepId: input.sourceStep.id,
         rollbackTargetPhase: input.sourceStep.phase,
       },
       execution: {
         completedStepIds: [],
-        blockedBy: [],
       },
     });
-    await this.ensureDesignApplication(request, issue, input.sourceStep);
+    await this.tickets.linkEnhanceToChange(enhancement, request.id);
+    await this.ensureDesignApplication(request, bug, input.sourceStep);
     if (current) {
-      await this.changeRequests.blockOnChild(
+      await this.tickets.blockChangeOnChild(
         current,
         request.id,
-        issue.id,
+        bug.id,
         `${request.id} expands ${current.id} to upstream ${input.sourceStep.phase} scope`,
       );
     }
-    await this.markIssueChangePending(issue, request);
+    await this.markBugBlockedByChange(bug, request);
     await this.opts.audit.event(
-      'note',
-      `${request.id} opened for ${issue.id}`,
+      'ticket.change-request.created',
+      `${request.id} opened for ${bug.id}`,
       {
         messageId: 'engine.change_request_opened',
-        changeRequestId: request.id,
-        parentChangeRequestId: request.parentChangeRequestId,
-        issueId: issue.id,
+        changeRequestTicketId: request.id,
+        sourceEnhanceTicketId: enhancement.id,
+        parentTicketId: request.parentTicketId,
+        bugTicketId: bug.id,
         sourceStepId: input.sourceStep.id,
         sourcePhase: input.sourceStep.phase,
         affectedStepIds: affectedSteps.map((step) => step.stepId),
@@ -1722,11 +2367,11 @@ export class PhaseEngine {
   }
 
   private async ensureDesignApplication(
-    request: EngineeringChangeRequest,
-    issue: EngineIssue,
+    request: ChangeRequestTicket,
+    bug: BugTicket,
     sourceStep: Step,
   ): Promise<void> {
-    const commit = issue.repair?.commit ?? await this.currentHead();
+    const commit = bug.repair?.commit ?? await this.currentHead();
     const alreadyRecorded = request.applications.some(
       (application) =>
         application.revision === request.revision &&
@@ -1735,49 +2380,106 @@ export class PhaseEngine {
         application.commit === commit,
     );
     if (alreadyRecorded) return;
-    await this.changeRequests.recordApplication(request, {
+    await this.tickets.recordApplication(request, {
       stepId: sourceStep.id,
       phase: sourceStep.phase,
       kind: 'design-change',
       commit,
-      changedFiles: issue.repair?.changedFiles ?? sourceStep.outputs,
-      summary: issue.issueResolutionPlan ??
-        `Repair ${sourceStep.id} ${sourceStep.phase} contract for ${issue.id}.`,
+      changedFiles: bug.repair?.changedFiles ?? sourceStep.outputs,
+      summary: bug.bugResolutionPlan ??
+        `Repair ${sourceStep.id} ${sourceStep.phase} contract for ${bug.id}.`,
     });
+    const providers = dedup(
+      bug.modelAttributions
+        .filter((attribution) =>
+          attribution.contribution === 'debugger' &&
+          attribution.outcome === 'repair-verified'
+        )
+        .map((attribution) => attribution.provider),
+    );
+    if (providers.length > 0) {
+      await this.tickets.recordModelAttribution(request, {
+        providers,
+        role: 'Debugger',
+        contribution: 'change-applier',
+        outcome: 'change-applied',
+        stepId: sourceStep.id,
+        phase: sourceStep.phase,
+      });
+    }
   }
 
   private async maybeCloseChangeRequest(
     plan: Plan,
-    request: EngineeringChangeRequest,
+    request: ChangeRequestTicket,
     completedStep: Step,
   ): Promise<void> {
     if (request.status === 'closed' || request.status === 'cancelled' || request.status === 'failed') return;
-    if (request.execution.blockedBy.length > 0) return;
+    if (request.blockedByTicketIds.length > 0) return;
     const byId = new Map(plan.steps.map((step) => [step.id, step]));
     if (!request.affectedSteps.every((affected) => byId.get(affected.stepId)?.status === 'DONE')) return;
     const applied = new Set(request.applications.map((application) => application.stepId));
     if (!request.affectedSteps.every((affected) => applied.has(affected.stepId))) return;
 
-    await this.changeRequests.close(request);
-    for (const issueId of request.relatedIssueIds) {
-      const issue = await this.getIssue(issueId);
-      if (!issue || issue.status === 'resolved') continue;
-      issue.activeChangeRequestId = undefined;
-      await this.markIssueResolved(issue.id, completedStep, issue.repair, issue.issueResolutionPlan);
+    const verifiedProviders = dedup(
+      request.modelAttributions
+        .filter((attribution) =>
+          attribution.contribution === 'change-applier' &&
+          attribution.outcome === 'change-applied'
+        )
+        .map((attribution) => attribution.provider),
+    );
+    for (const provider of verifiedProviders) {
+      const source = [...request.modelAttributions].reverse().find((attribution) =>
+        attribution.provider === provider &&
+        attribution.contribution === 'change-applier' &&
+        attribution.outcome === 'change-applied'
+      );
+      if (!source) continue;
+      await this.tickets.recordModelAttribution(request, {
+        providers: [provider],
+        role: source.role,
+        contribution: 'change-applier',
+        outcome: 'change-verified',
+        stepId: source.stepId,
+        phase: source.phase,
+      });
+    }
+    await this.tickets.closeChange(request);
+    const sourceEnhancement = this.tickets.findEnhance(request.sourceEnhanceTicketId);
+    if (sourceEnhancement?.sourceQualityGateStepId) {
+      await this.closeQualityEnhancement(sourceEnhancement, completedStep);
+    }
+    this.opts.router.recordTicketOutcome?.(
+      verifiedProviders,
+      'change-verified',
+      request.id,
+    );
+    for (const relatedTicketId of request.relatedTicketIds) {
+      const bug = this.tickets.findBug(relatedTicketId);
+      if (!bug || bug.status === 'closed') continue;
+      bug.activeChangeRequestTicketId = undefined;
+      if (bug.blockedByTicketIds.includes(request.id)) {
+        await this.tickets.unblock(bug, request.id);
+      }
+      await this.closeBugTicket(bug.id, completedStep, bug.repair, bug.bugResolutionPlan);
     }
     await this.opts.audit.event(
-      'note',
+      'ticket.change-request.closed',
       `${request.id} closed after all affected V-model gates passed`,
       {
         messageId: 'engine.change_request_closed',
-        changeRequestId: request.id,
+        changeRequestTicketId: request.id,
         revision: request.revision,
         applications: request.applications,
+        verifiedProviders,
       },
     );
 
-    const parent = await this.changeRequests.unblockParent(request);
+    const parentTicket = request.parentTicketId ? this.tickets.find(request.parentTicketId) : undefined;
+    const parent = parentTicket?.type === 'change-request' ? parentTicket : undefined;
     if (parent) {
+      await this.tickets.unblock(parent, request.id);
       const parentSteps = new Set(parent.affectedSteps.map((affected) => affected.stepId));
       for (const application of request.applications) {
         if (!parentSteps.has(application.stepId)) continue;
@@ -1787,7 +2489,7 @@ export class PhaseEngine {
             candidate.commit === application.commit,
         );
         if (alreadyRecorded) continue;
-        await this.changeRequests.recordApplication(parent, {
+        await this.tickets.recordApplication(parent, {
           stepId: application.stepId,
           phase: application.phase,
           kind: application.kind,
@@ -1805,7 +2507,7 @@ export class PhaseEngine {
   }
 
   private async recordChangeRequestApplicationFromAttempt(
-    request: EngineeringChangeRequest,
+    request: ChangeRequestTicket,
     step: Step,
     debug: DebugAttemptContext | undefined,
     beforeCommit: string,
@@ -1826,7 +2528,7 @@ export class PhaseEngine {
       : this.isVModelTestPhase(step.phase)
         ? 'verification' as const
         : 'implementation-change' as const;
-    await this.changeRequests.recordApplication(request, {
+    await this.tickets.recordApplication(request, {
       stepId: step.id,
       phase: step.phase,
       kind,
@@ -1840,7 +2542,7 @@ export class PhaseEngine {
       `${request.id} ${kind} recorded for ${step.id}`,
       {
         messageId: 'engine.change_request_application',
-        changeRequestId: request.id,
+        changeRequestTicketId: request.id,
         revision: request.revision,
         stepId: step.id,
         phase: step.phase,
@@ -1861,7 +2563,20 @@ export class PhaseEngine {
         failureLog: `${step.id} ${step.phase} is not a V-model test phase and cannot run test revalidation.`,
       };
     }
-    const testArgs = this.testGateArgsForStep(step);
+    const completeness = await this.inspectPairedTestAssets(plan, step);
+    const testArgs = completeness.testArgs;
+    if (!completeness.ok) {
+      await this.opts.audit.event('note', `rollback validation found incomplete paired tests for ${step.id}`, {
+        messageId: 'engine.rollback_validation_test_cases_incomplete',
+        stepId: step.id,
+        phase: step.phase,
+        testPlanPath: completeness.testPlanPath,
+        testArgs,
+        missing: completeness.missing,
+        invalid: completeness.invalid,
+      });
+      return { status: 'failed', failureLog: completeness.failureLog };
+    }
     const missing: string[] = [];
     for (const out of step.outputs) {
       if (out.endsWith('/')) continue;
@@ -2031,7 +2746,8 @@ export class PhaseEngine {
     opts: {
       initialDebug?: Omit<DebugAttemptContext, 'asDebugger'>;
       skipOutputArchive?: boolean;
-      changeRequest?: EngineeringChangeRequest;
+      changeRequest?: ChangeRequestTicket;
+      enhancement?: EnhanceTicket;
     } = {},
   ): Promise<boolean> {
     await this.debugCache.load();
@@ -2048,9 +2764,9 @@ export class PhaseEngine {
         ? composeDebugRetryFailureLog(rootDebugFailureLog, failureLog, reason)
         : failureLog;
     const hadUnresolved = this.debugCache.hasUnresolvedFailure(step.id);
-    let activeIssueId = initialDebug?.issueId;
-    if (!activeIssueId && hadUnresolved) {
-      activeIssueId = (await this.findLatestOpenIssueForStep(step.id))?.id;
+    let activeBugTicketId = initialDebug?.bugTicketId;
+    if (!activeBugTicketId && hadUnresolved) {
+      activeBugTicketId = this.findLatestOpenBugForStep(step.id)?.id;
     }
     const preserveCachedTestOutputs =
       !initialDebug && hadUnresolved && this.isVModelTestPhase(step.phase);
@@ -2076,6 +2792,7 @@ export class PhaseEngine {
       const outcome = await this.runOneAttempt(plan, step, debug, {
         archiveOutputs,
         changeRequest: opts.changeRequest,
+        enhancement: opts.enhancement,
       });
       if (hadArchivableOutput && outcome.workspaceReverted) {
         archiveOutputsOnNextAttempt = true;
@@ -2111,7 +2828,7 @@ export class PhaseEngine {
           extraAllowedWrites: inheritedExtraAllowedWrites,
           contextMode: inheritedContextMode,
           testScopeArgs: inheritedTestScopeArgs,
-          issueId: activeIssueId,
+          bugTicketId: activeBugTicketId,
           completedBeforeDebug,
         });
       } else if (hadUnresolved) {
@@ -2132,10 +2849,7 @@ export class PhaseEngine {
           initial = await runAttempt();
         } else {
           if (this.isVModelTestPhase(step.phase)) {
-            if (
-              !shouldRollbackTestPhaseFailure(resume.reason, resumeFailureLog) ||
-              isCachedTestArtifactRegressionAfterPassingVerification(step, resumeFailureLog)
-            ) {
+            if (!shouldRollbackTestPhaseFailure(resume.reason, resumeFailureLog)) {
               this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
               initial = await runAttempt({
                 asDebugger: true,
@@ -2145,7 +2859,7 @@ export class PhaseEngine {
                 extraAllowedWrites: inheritedExtraAllowedWrites,
                 contextMode: cachedContextMode,
                 testScopeArgs: cachedTestScopeArgs,
-                issueId: activeIssueId,
+                bugTicketId: activeBugTicketId,
                 completedBeforeDebug,
               });
             } else {
@@ -2153,17 +2867,8 @@ export class PhaseEngine {
               const validation = await this.validateTestPhaseWithoutRegeneration(plan, step);
               if (validation.status === 'passed') {
                 await this.debugCache.markDone(step.id);
-                initial = {
-                  ok: true,
-                  failureLog: '',
-                  reason: `${step.phase} cached failure was stale; the current test gate passed.`,
-                  evidence: {
-                    stage: 'cached-test-revalidation',
-                    role: 'Tester',
-                    attempts: attempts.length,
-                    staleFailureCleared: true,
-                  },
-                };
+                priorPrompt = '';
+                initial = await runAttempt();
               } else if (validation.status === 'incomplete') {
                 const reason =
                   `${step.phase} required artifacts are incomplete; ` +
@@ -2175,8 +2880,8 @@ export class PhaseEngine {
                   failureLog: validation.failureLog,
                   reason,
                   extraAllowedWrites: inheritedExtraAllowedWrites,
-                  testScopeArgs: this.testGateArgsForStep(step),
-                  issueId: activeIssueId,
+                  testScopeArgs: this.testGateArgsForStep(plan, step),
+                  bugTicketId: activeBugTicketId,
                   completedBeforeDebug,
                 });
               } else if (validation.status === 'denied') {
@@ -2185,7 +2890,7 @@ export class PhaseEngine {
                   ok: false,
                   failureLog: validation.failureLog,
                   reason,
-                  issueKind: 'infrastructure',
+                  bugKind: 'infrastructure',
                   evidence: {
                     stage: 'cached-test-revalidation',
                     permissionDenied: true,
@@ -2204,7 +2909,7 @@ export class PhaseEngine {
                   reason,
                   rollbackToPairedSource: true,
                   rollbackTestStepId: ownerTestStep?.id,
-                  issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
+                  bugKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
                   evidence: {
                     stage: 'cached-test-failure',
                     role: 'Debugger',
@@ -2224,7 +2929,7 @@ export class PhaseEngine {
               extraAllowedWrites: inheritedExtraAllowedWrites,
               contextMode: cachedContextMode,
               testScopeArgs: cachedTestScopeArgs,
-              issueId: activeIssueId,
+              bugTicketId: activeBugTicketId,
               completedBeforeDebug,
             });
           }
@@ -2238,7 +2943,7 @@ export class PhaseEngine {
         ok: false,
         failureLog: err instanceof Error ? (err.stack ?? reason) : reason,
           reason,
-          issueKind: 'exception',
+          bugKind: 'exception',
         evidence: {
           stage: initialDebug || hadUnresolved ? 'initial-debug-attempt' : 'initial-attempt',
           role: initialDebug || hadUnresolved ? 'Debugger' : step.role,
@@ -2247,38 +2952,70 @@ export class PhaseEngine {
     }
     if (initial.ok) {
       await this.debugCache.markDone(step.id);
-      if (hadUnresolved && activeIssueId) {
-        await this.markIssueResolved(
-          activeIssueId,
+      if (hadUnresolved && activeBugTicketId) {
+        await this.closeBugTicket(
+          activeBugTicketId,
           step,
           undefined,
-          initial.issueResolutionPlan ??
+          initial.bugResolutionPlan ??
             'Restore the failed execution dependency or provider, retry the same Step, and accept it only after its declared outputs pass.',
         );
       }
+      await this.tickets.syncStepCompleted(step);
       return true;
+    }
+    if (initial.qualityGap) {
+      const target = this.qualityRemediationTarget(
+        plan,
+        step,
+        initial.qualityGap.remediationTarget,
+      );
+      const enhancement = await this.recordQualityEnhancement(
+        step,
+        target,
+        initial.qualityGap,
+        initial.metrics?.providers ?? [],
+      );
+      transitionStep(step, 'FAILED', 'quality-gate-failed');
+      this.lastFailure = {
+        reason: initial.reason ?? `${step.phase} quality gate failed`,
+        failureLog: initial.failureLog,
+        rollbackTestStepId: this.isVModelTestPhase(step.phase) ? step.id : undefined,
+      };
+      await this.opts.audit.event(
+        'quality.gate.enhance',
+        `${step.id} routed to ${target.id} through ${enhancement.id}`,
+        {
+          messageId: 'engine.quality_enhance_routed',
+          enhanceTicketId: enhancement.id,
+          failedStepId: step.id,
+          targetStepId: target.id,
+          targetPhase: target.phase,
+        },
+      );
+      return false;
     }
     const nonDebuggableInfrastructureFailure = isNonDebuggableInfrastructureFailure(
       initial.reason,
       initial.failureLog,
     );
-    if (!activeIssueId) {
-      const issue = await this.recordIssue(plan, step, {
-        kind: this.classifyIssueKind(step, initial),
+    if (!activeBugTicketId) {
+      const bug = await this.recordBugTicket(plan, step, {
+        kind: this.classifyBugKind(step, initial),
         reason: initial.reason ?? 'failed',
         failureLog: initial.failureLog,
         metrics: initial.metrics,
         evidence: initial.evidence,
       });
-      activeIssueId = issue.id;
+      activeBugTicketId = bug.id;
       if (opts.changeRequest) {
-        await this.recordChangeRequestFailure(opts.changeRequest, issue, step);
+        await this.recordChangeRequestFailure(opts.changeRequest, bug, step);
       }
       if (
         !nonDebuggableInfrastructureFailure &&
         !(initial.rollbackToPairedSource && this.isVModelTestPhase(step.phase))
       ) {
-        await this.routeIssueToStep(issue, step, 'same phase Debugger repair');
+        await this.routeBugTicketToStep(bug, step, 'same phase Debugger repair');
       }
     }
     // 记录首轮失败
@@ -2311,7 +3048,7 @@ export class PhaseEngine {
         failureLog: initial.failureLog,
       };
       await this.debugCache.markFailed(step.id, reason);
-      await this.markIssueUnresolved(activeIssueId, reason);
+      await this.markBugFailed(activeBugTicketId, reason);
       this.printStepFailure(step, {
         attempts: 0,
         budget: 0,
@@ -2376,13 +3113,13 @@ export class PhaseEngine {
           extraAllowedWrites: inheritedExtraAllowedWrites,
           contextMode: inheritedContextMode,
           testScopeArgs: inheritedTestScopeArgs,
-          issueId: activeIssueId,
+          bugTicketId: activeBugTicketId,
           completedBeforeDebug,
         });
       } catch (err) {
         const msg = (err as Error).message;
         spin?.fail(t().engine.retryException(attempt, budget, msg));
-        await this.markIssueUnresolved(activeIssueId, msg);
+        await this.markBugFailed(activeBugTicketId, msg);
         if (isNonDebuggableInfrastructureFailure(msg, msg)) {
           lastReason = msg;
           lastFailureLog = msg;
@@ -2405,6 +3142,7 @@ export class PhaseEngine {
       if (r.ok) {
         spin?.succeed(t().engine.fixSucceeded(step.id, attempt));
         await this.debugCache.markDone(step.id);
+        await this.tickets.syncStepCompleted(step);
         return true;
 	      }
       if (isNonDebuggableInfrastructureFailure(r.reason, r.failureLog)) {
@@ -2548,7 +3286,7 @@ export class PhaseEngine {
       rollbackTestStepId: lastResult.rollbackTestStepId,
     };
     await this.debugCache.markFailed(step.id, this.lastFailure.reason);
-    await this.markIssueUnresolved(activeIssueId, this.lastFailure.reason);
+    await this.markBugFailed(activeBugTicketId, this.lastFailure.reason);
     this.printStepFailure(step, {
       attempts: attempt,
       budget,
@@ -2617,6 +3355,7 @@ export class PhaseEngine {
   }
 
   private selectAuditRepairStep(
+    plan: Plan,
     order: Step[],
     auditResult: ProjectAuditResult,
     iterationId?: string,
@@ -2633,17 +3372,41 @@ export class PhaseEngine {
     const latest = (phases: Step['phase'][]): Step | undefined =>
       [...done].reverse().find((step) => phases.includes(step.phase));
 
-    if ([...failedNames].some((name) => name === 'entrypoint' || name.startsWith('doc:') || name.endsWith('-doc') || name === 'readme' || name === 'quickstart' || name === 'api-guide')) {
-      return latest(['FUNCTIONAL_TEST', 'MODULE_TEST', 'INTEGRATION_TEST', 'UNIT_TEST', 'CODE']);
+    if (failedNames.has('entrypoint')) {
+      return latest(['CODE', 'DETAILED_DESIGN', 'HIGH_LEVEL_DESIGN', 'REQUIREMENT_ANALYSIS']);
+    }
+    if ([...failedNames].some((name) => name.startsWith('doc:') || name.endsWith('-doc') || name === 'readme' || name === 'quickstart' || name === 'api-guide')) {
+      return latest(['FUNCTIONAL_TEST', 'REQUIREMENT_ANALYSIS']);
     }
     if (failedNames.has('tests') || failedNames.has('test-files')) {
-      return latest(['UNIT_TEST', 'CODE', 'DETAILED_DESIGN']);
+      const failureText = auditResult.checks
+        .filter((check) => !check.ok && (check.name === 'tests' || check.name === 'test-files'))
+        .map((check) => `${check.summary}\n${check.detail ?? ''}`)
+        .join('\n');
+      const failedPaths = extractFailedTestPaths(failureText);
+      const testSteps = scopedOrder.filter((step) => this.isVModelTestPhase(step.phase));
+      const stepById = new Map(order.map((step) => [step.id, step] as const));
+      for (const failedPath of failedPaths) {
+        const ownerTest = testSteps.find((candidate) =>
+          pairedTestAssetPaths(plan.steps, candidate, plan.language)
+            .map(normalizeGitPath)
+            .includes(failedPath));
+        if (!ownerTest) continue;
+        const sourcePhase =
+          V_MODEL_TEST_TO_SOURCE_PHASE[ownerTest.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE];
+        const sourceCandidates = done.filter((candidate) => candidate.phase === sourcePhase);
+        const source = [...sourceCandidates].reverse().find((candidate) =>
+          stepTransitivelyDependsOn(ownerTest, candidate.id, stepById),
+        ) ?? sourceCandidates.at(-1);
+        if (source) return source;
+      }
+      return latest(['CODE', 'DETAILED_DESIGN', 'HIGH_LEVEL_DESIGN', 'REQUIREMENT_ANALYSIS']);
     }
     if (failedNames.has('build') || failedNames.has('lint') || failedNames.has('package-json')) {
       return latest(['CODE', 'HIGH_LEVEL_DESIGN']);
     }
-    return latest(['FUNCTIONAL_TEST', 'MODULE_TEST', 'INTEGRATION_TEST', 'UNIT_TEST', 'CODE']) ??
-      (iterationId ? this.selectAuditRepairStep(order, auditResult) : undefined);
+    return latest(['CODE', 'DETAILED_DESIGN', 'HIGH_LEVEL_DESIGN', 'REQUIREMENT_ANALYSIS']) ??
+      (iterationId ? this.selectAuditRepairStep(plan, order, auditResult) : undefined);
   }
 
   private auditRepairContextPaths(
@@ -2698,30 +3461,46 @@ export class PhaseEngine {
     debug: DebugAttemptContext,
     failureLog: string,
   ): Promise<{ debugBrief: string; failureLog: string; suggestions: string; debugWikiEntryIds: string[] }> {
-    const issue = debug.issueId ? this.findIssue(debug.issueId) : undefined;
+    const bug = debug.bugTicketId ? this.tickets.findBug(debug.bugTicketId) : undefined;
     const currentBrief = buildDebugBrief({
       reason: debug.reason,
       failureLog,
-      phase: issue?.phase ?? step.phase,
-      targetPhase: issue?.targetPhase ?? step.phase,
+      phase: bug?.source.phase ?? step.phase,
+      targetPhase: bug?.targetPhase ?? step.phase,
     });
-    const rootBrief = issue?.debugBrief && !isSupersededNetworkBrief(issue.debugBrief, currentBrief)
-      ? issue.debugBrief
+    const rootBrief = bug?.debugBrief && !isSupersededNetworkBrief(bug.debugBrief, currentBrief)
+      ? bug.debugBrief
       : undefined;
-    const briefBlocks = rootBrief && rootBrief.summary !== currentBrief.summary
+    const enhancement = bug?.enhanceTicketId
+      ? this.tickets.findEnhance(bug.enhanceTicketId)
+      : undefined;
+    const enhancementBlock = enhancement
       ? [
-          '## root issue brief',
+          '## enhancement finding',
+          `id: ${enhancement.id}`,
+          `kind: ${enhancement.kind}`,
+          `finding: ${enhancement.finding}`,
+          'This identifies the quality gap; it is not a downstream change request.',
+          '',
+        ]
+      : [];
+    const briefBlocks = [
+      ...enhancementBlock,
+      ...(rootBrief && rootBrief.summary !== currentBrief.summary
+      ? [
+          '## root bug ticket brief',
           renderDebugBriefForPrompt(rootBrief),
           '',
           '## current retry brief',
           renderDebugBriefForPrompt(currentBrief),
         ]
-      : [renderDebugBriefForPrompt(currentBrief)];
+      : [renderDebugBriefForPrompt(currentBrief)]),
+    ];
     const evidence = compactFailureEvidence({
       reason: debug.reason,
       failureLog,
-      phase: issue?.phase ?? step.phase,
-      targetPhase: issue?.targetPhase ?? step.phase,
+      phase: bug?.source.phase ?? step.phase,
+      targetPhase: bug?.targetPhase ?? step.phase,
       maxChars: 2600,
       maxLines: 50,
     });
@@ -2737,17 +3516,17 @@ export class PhaseEngine {
     const debugWikiEntryIds = wikiMatches.map((match) => match.entry.id);
     if (debugWikiEntryIds.length > 0) {
       debug.debugWikiEntryIds = dedup([...(debug.debugWikiEntryIds ?? []), ...debugWikiEntryIds]);
-      if (issue) {
-        issue.debugWikiEntryIds = dedup([...(issue.debugWikiEntryIds ?? []), ...debugWikiEntryIds]);
+      if (bug) {
+        bug.debugWikiEntryIds = dedup([...(bug.debugWikiEntryIds ?? []), ...debugWikiEntryIds]);
       }
       await this.withDebugWiki(
         'record-use',
         () => this.debugWiki.recordUse(debugWikiEntryIds, {
           brief: currentBrief,
-          issueId: issue?.id,
+          ticketId: bug?.id,
           stepId: step.id,
           phase: step.phase,
-          targetPhase: issue?.targetPhase,
+          targetPhase: bug?.targetPhase,
           language: this.profile.id,
           solution: 'retrieved for Debugger prompt',
         }),
@@ -2825,6 +3604,52 @@ export class PhaseEngine {
     debug?: DebugAttemptContext,
     attemptOpts: AttemptOptions = {},
   ): Promise<AttemptOutcome> {
+    if (this.isVModelTestPhase(step.phase)) {
+      const completeness = await this.inspectPairedTestAssets(plan, step);
+      if (!completeness.ok) {
+        const reason = `${step.phase} paired test cases are incomplete or invalid`;
+        const assessment: StageQualityAssessment = {
+          ...emptyQualityAssessment(),
+          evidence: [
+            completeness.testPlanPath ?? '',
+            ...completeness.testArgs,
+          ].filter(Boolean),
+          gaps: [
+            ...completeness.missing.map((item) => `missing test asset: ${item}`),
+            ...completeness.invalid.map((item) => `invalid test asset: ${item}`),
+          ],
+        };
+        const evaluation = evaluateQualityGate(step, assessment);
+        await this.qualityAssessments.record(step, step.retries, assessment, evaluation);
+        await this.opts.audit.event('phase.end', `${step.id} ${reason}`, {
+          messageId: 'engine.test_case_completeness_failed',
+          stepId: step.id,
+          phase: step.phase,
+          pairedSourcePhase:
+            V_MODEL_TEST_TO_SOURCE_PHASE[step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE],
+          testPlanPath: completeness.testPlanPath,
+          testArgs: completeness.testArgs,
+          missing: completeness.missing,
+          invalid: completeness.invalid,
+          rollbackToPairedSource: true,
+        });
+        return {
+          ok: false,
+          failureLog: completeness.failureLog,
+          reason,
+          workspaceReverted: false,
+          rollbackToPairedSource: true,
+          evidence: {
+            stage: 'test-case-completeness',
+            testPlanPath: completeness.testPlanPath,
+            testArgs: completeness.testArgs,
+            missing: completeness.missing,
+            invalid: completeness.invalid,
+          },
+          qualityGap: { assessment, evaluation },
+        };
+      }
+    }
     const role = debug ? 'Debugger' : step.role;
     // 解析 step.tools 中的 skill: 引用为底层工具名
     const effectiveToolRefs = ensureEssentialToolRefs(step);
@@ -2844,9 +3669,9 @@ export class PhaseEngine {
     const allowedWrites = debug
       ? dedup([...this.computeDebugAllowedWrites(plan, step), ...(debug.extraAllowedWrites ?? [])])
       : this.computeStepAllowedWrites(plan, step);
-    // Test phases and DEBUG mode grant tests/fixtures/ as a scoped writable root.
-    // 否则 LLM 想 write_file 创建样例输入文件时只能死循环。
-    const augmentedWrites = this.isVModelTestPhase(step.phase) || debug
+    // Test fixtures are authored by left-side phases. Only DEBUG repair receives
+    // a scoped fixtures root; right-side validation phases remain read-only for tests/.
+    const augmentedWrites = debug && !this.isVModelTestPhase(step.phase)
       ? dedup([...allowedWrites, 'tests/fixtures'])
       : allowedWrites;
 
@@ -2890,7 +3715,7 @@ export class PhaseEngine {
       feedbackCharBudget: operationWindow.feedbackCharBudget,
       readChunkBytes: operationWindow.readChunkBytes,
       writeChunkBytes,
-      defaultTestArgs: debug?.testScopeArgs?.length ? debug.testScopeArgs : this.testGateArgsForStep(step),
+      defaultTestArgs: debug?.testScopeArgs?.length ? debug.testScopeArgs : this.testGateArgsForStep(plan, step),
       requestPermission: this.opts.requestPermission,
       onToolEvent: this.opts.onToolEvent,
     };
@@ -2932,6 +3757,7 @@ export class PhaseEngine {
       ctxSnippets = await this.buildContextSnippets(plan, step, debug, attemptOpts.changeRequest);
 
       transitionStep(step, 'RUNNING', 'attempt-started');
+      await this.tickets.syncStepStarted(step);
       await this.persistPlan(plan);
       sha = await this.opts.git.snapshot(step.id, step.retries, debug ? 'debug retry' : 'before');
       if (attemptOpts.archiveOutputs) {
@@ -2941,6 +3767,10 @@ export class PhaseEngine {
       }
       await this.opts.audit.event('phase.start', t().engine.phaseStart(step.id, debug ? 'DEBUG' : step.phase, step.title), {
         messageId: 'engine.phase_start',
+        ticketId: this.tickets.workForStep(step.id)?.id,
+        bugTicketId: debug?.bugTicketId,
+        changeRequestTicketId: attemptOpts.changeRequest?.id,
+        enhanceTicketId: attemptOpts.enhancement?.id,
         role,
         tools: allNames,
         snapshot: sha,
@@ -2976,7 +3806,7 @@ export class PhaseEngine {
         failureLog,
         reason: msg,
         workspaceReverted,
-        issueKind: 'exception',
+        bugKind: 'exception',
         evidence: { stage: 'attempt-preparation', role },
       };
     }
@@ -2998,11 +3828,13 @@ export class PhaseEngine {
         tools: guardedTools,
         ctx,
         contextSnippets: ctxSnippets,
+        ticket: this.tickets.workForStep(step.id),
         changeRequest: attemptOpts.changeRequest,
+        enhancement: attemptOpts.enhancement,
         skillHints: hints,
         debugContext: debug
           ? {
-              issueId: debug.issueId,
+              bugTicketId: debug.bugTicketId,
               reason: debug.reason,
               failureLog: debugPayload?.failureLog ?? debugFailureLog ?? debug.failureLog,
               debugBrief: debugPayload?.debugBrief,
@@ -3017,15 +3849,9 @@ export class PhaseEngine {
         languageProfile: this.profile,
       });
       const verify = await verifyOutputs({ step, tools: guardedTools, ctx });
-      const testArtifactRegression = this.isVModelTestPhase(step.phase) &&
-        isTestArtifactRegressionAfterPassingVerification(step, r.toolCalls);
-      const pendingTestArtifactRepair = this.isVModelTestPhase(step.phase) &&
-        hasPendingTestArtifactRepair(step, r.toolCalls);
       if (
         this.isVModelTestPhase(step.phase) &&
-        shouldRollbackTestPhaseFromToolFailures(step, r.toolCalls) &&
-        !testArtifactRegression &&
-        !pendingTestArtifactRepair
+        shouldRollbackTestPhaseFromToolFailures(r.toolCalls)
       ) {
         const reason = `${step.phase} tool verification failed; rolling back to paired V-model source phase.`;
         const failureLog = [
@@ -3045,7 +3871,7 @@ export class PhaseEngine {
           metrics: r.metrics,
           rollbackToPairedSource: true,
         });
-        await this.preserveFailedTestArtifacts(step, reason);
+        await this.preserveFailedValidationEvidence(step, reason);
         return {
           ok: false,
           failureLog,
@@ -3053,8 +3879,48 @@ export class PhaseEngine {
           workspaceReverted: false,
           metrics: r.metrics,
           rollbackToPairedSource: true,
-          issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
+          bugKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
           evidence: { toolCalls: r.toolCalls },
+        };
+      }
+      if (this.isVModelTestPhase(step.phase) && r.validationDefect) {
+        const reason =
+          `${step.phase} found an incomplete or inconsistent paired test contract; ` +
+          'rolling back to the paired V-model source phase.';
+        const failureLog = [
+          t().engine.reasonLine(reason),
+          `Validation defect: ${r.validationDefect}`,
+          t().engine.roundsLine(r.rounds),
+          t().engine.toolCallsHeader,
+          ...r.toolCalls.map((call) =>
+            t().engine.toolCallLine(call.tool, call.ok, compactToolCallFailureDetail(call)),
+          ),
+        ].join('\n');
+        spin?.fail(t().engine.phaseFailed(step.id, !!debug, reason));
+        await this.opts.audit.event('phase.end', t().engine.phaseFailed(step.id, !!debug, reason), {
+          messageId: 'engine.validation_defect_reported',
+          stepId: step.id,
+          phase: step.phase,
+          validationDefect: r.validationDefect,
+          rounds: r.rounds,
+          retry: step.retries,
+          metrics: r.metrics,
+          rollbackToPairedSource: true,
+        });
+        await this.preserveFailedValidationEvidence(step, reason);
+        return {
+          ok: false,
+          failureLog,
+          reason,
+          workspaceReverted: false,
+          metrics: r.metrics,
+          rollbackToPairedSource: true,
+          bugKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
+          evidence: {
+            stage: 'semantic-test-validation',
+            validationDefect: r.validationDefect,
+            toolCalls: r.toolCalls,
+          },
         };
       }
       if (r.success && verify.ok) {
@@ -3067,6 +3933,20 @@ export class PhaseEngine {
           );
           if (missingTokens.length > 0) {
             const reason = t().engine.archGateReason(missingTokens.length);
+            const assessment: StageQualityAssessment = {
+              completion: Math.max(
+                0,
+                1 - missingTokens.length /
+                  Math.max(1, missingTokens.length + (plan.architectureModules?.length ?? 0)),
+              ),
+              upstreamAlignment: 1,
+              metrics: {},
+              tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+              evidence: [DOC_NAMES.highLevelDesign],
+              gaps: missingTokens.map((token) => `missing architecture contract token: ${token}`),
+            };
+            const evaluation = evaluateQualityGate(step, assessment);
+            await this.qualityAssessments.record(step, step.retries, assessment, evaluation);
             const failureLog = [
               t().engine.reasonLine(reason),
               t().engine.roundsLine(r.rounds),
@@ -3080,15 +3960,18 @@ export class PhaseEngine {
               reason,
               retry: step.retries,
             });
-            await this.opts.git.revertTo(sha);
             return {
               ok: false,
               failureLog,
               reason,
-              workspaceReverted: true,
+              workspaceReverted: false,
               metrics: r.metrics,
-              issueKind: 'architecture-gate',
               evidence: { missingTokens },
+              qualityGap: {
+                assessment,
+                evaluation,
+                remediationTarget: 'same-step',
+              },
             };
           }
         }
@@ -3122,7 +4005,7 @@ export class PhaseEngine {
               reason,
               workspaceReverted: false,
               metrics: r.metrics,
-              issueKind: 'infrastructure',
+              bugKind: 'infrastructure',
               evidence: { stage: 'code-validation', permissionDenied: true, command: command.display },
             };
           }
@@ -3157,7 +4040,7 @@ export class PhaseEngine {
               reason,
               workspaceReverted: false,
               metrics: r.metrics,
-              issueKind: 'phase',
+              bugKind: 'phase',
               evidence: {
                 stage: 'code-validation',
                 command: command.display,
@@ -3179,7 +4062,7 @@ export class PhaseEngine {
             risk: 'Project test commands execute code in the configured sandbox.',
             scope: 'current workspace sandbox',
             skippable: true,
-            denyBehavior: 'Fail this test gate and route the issue through normal V-model debug handling.',
+            denyBehavior: 'Fail this test gate, create a Bug Ticket, and route it through normal V-model debug handling.',
             stepId: step.id,
           });
           if (!permission.approved) {
@@ -3189,7 +4072,7 @@ export class PhaseEngine {
               permission.reason ?? '',
             ].filter(Boolean).join('\n');
             spin?.fail(t().engine.phaseFailed(step.id, !!debug, reason));
-            await this.preserveFailedTestArtifacts(step, reason);
+            await this.preserveFailedValidationEvidence(step, reason);
             return {
               ok: false,
               failureLog,
@@ -3197,11 +4080,11 @@ export class PhaseEngine {
               workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
-              issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
+              bugKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
               evidence: { permissionDenied: true },
             };
           }
-          const testArgs = this.testGateArgsForStep(step);
+          const testArgs = this.testGateArgsForStep(plan, step);
           const pt = await this.opts.sandbox.runTests(testArgs, {});
           if (pt.exitCode !== 0 || pt.timedOut) {
             const tail = (s: string) => s.split('\n').slice(-30).join('\n');
@@ -3223,7 +4106,7 @@ export class PhaseEngine {
               reason,
               retry: step.retries,
             });
-            await this.preserveFailedTestArtifacts(step, reason);
+            await this.preserveFailedValidationEvidence(step, reason);
             return {
               ok: false,
               failureLog,
@@ -3232,7 +4115,7 @@ export class PhaseEngine {
               metrics: r.metrics,
               rollbackToPairedSource: true,
               rollbackTestStepId: ownerTestStep?.id,
-              issueKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
+              bugKind: step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate',
               evidence: {
                 exitCode: pt.exitCode,
                 timedOut: pt.timedOut,
@@ -3249,7 +4132,7 @@ export class PhaseEngine {
         // FUNCTIONAL_TEST 阶段强制验收门：必须能运行入口 `--help` 退出码 0。
         // 配合 autoFixImports 已经把常见 import 错误自动修掉，这里只兜底真实业务错误。
         if (step.phase === 'FUNCTIONAL_TEST') {
-          // gate 前再跑一次 auto-fix（FUNCTIONAL_TEST Step 自身可能新建/改写了入口）
+          // gate 前重跑 auto-fix，覆盖上游修复后遗留的导入路径变化。
           await this.profile.autoFixImports?.(this.opts.ws, this.opts.audit);
           const permission = await this.requestEnginePermission({
             operationType: 'shell_command',
@@ -3258,7 +4141,7 @@ export class PhaseEngine {
             risk: 'This executes project code in the configured sandbox.',
             scope: 'current workspace sandbox',
             skippable: true,
-            denyBehavior: 'Fail the functional gate and route the issue through normal V-model debug handling.',
+            denyBehavior: 'Fail the functional gate, create a Bug Ticket, and route it through normal V-model debug handling.',
             stepId: step.id,
           });
           if (!permission.approved) {
@@ -3268,7 +4151,7 @@ export class PhaseEngine {
               permission.reason ?? '',
             ].filter(Boolean).join('\n');
             spin?.fail(t().engine.phaseFailed(step.id, !!debug, reason));
-            await this.preserveFailedTestArtifacts(step, reason);
+            await this.preserveFailedValidationEvidence(step, reason);
             return {
               ok: false,
               failureLog,
@@ -3276,7 +4159,7 @@ export class PhaseEngine {
               workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
-              issueKind: 'functional-gate',
+              bugKind: 'functional-gate',
               evidence: { permissionDenied: true },
             };
           }
@@ -3302,7 +4185,7 @@ export class PhaseEngine {
               reason,
               retry: step.retries,
             });
-            await this.preserveFailedTestArtifacts(step, reason);
+            await this.preserveFailedValidationEvidence(step, reason);
             return {
               ok: false,
               failureLog,
@@ -3310,7 +4193,7 @@ export class PhaseEngine {
               workspaceReverted: false,
               metrics: r.metrics,
               rollbackToPairedSource: true,
-              issueKind: 'functional-gate',
+              bugKind: 'functional-gate',
               evidence: {
                 command: probe.command,
                 exitCode: probe.exitCode,
@@ -3346,16 +4229,132 @@ export class PhaseEngine {
               reason,
               workspaceReverted: true,
               metrics: r.metrics,
-              issueKind: 'phase',
+              bugKind: 'phase',
               evidence: { completedBeforeDebug: true, repairRequired: true },
             };
           }
         }
+        const qualityAssessment = r.qualityAssessment ?? emptyQualityAssessment();
+        const qualityEvaluation = evaluateQualityGate(step, qualityAssessment);
+        await this.qualityAssessments.record(
+          step,
+          step.retries,
+          qualityAssessment,
+          qualityEvaluation,
+        );
+        await this.opts.audit.event(
+          qualityEvaluation.passed
+            ? 'quality.gate.passed'
+            : qualityEvaluation.bugFailures.length > 0
+              ? 'quality.gate.bug'
+              : 'quality.gate.enhance',
+          `${step.id} ${step.phase} quality gate ${qualityEvaluation.passed ? 'passed' : 'failed'}`,
+          {
+            messageId: 'engine.quality_gate',
+            stepId: step.id,
+            phase: step.phase,
+            policy: step.qualityGate,
+            assessment: qualityAssessment,
+            evaluation: qualityEvaluation,
+          },
+        );
+        if (qualityEvaluation.bugFailures.length > 0) {
+          const reason = `${step.phase} test execution exceeded tolerance`;
+          return {
+            ok: false,
+            reason,
+            failureLog: qualityEvaluation.bugFailures.join('\n'),
+            workspaceReverted: false,
+            metrics: r.metrics,
+            rollbackToPairedSource: this.isVModelTestPhase(step.phase),
+            bugKind: this.isVModelTestPhase(step.phase)
+              ? step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate'
+              : 'phase',
+            evidence: {
+              stage: 'quality-tolerance',
+              assessment: qualityAssessment,
+              failures: qualityEvaluation.bugFailures,
+            },
+          };
+        }
+        if (qualityEvaluation.enhancementFailures.length > 0) {
+          const reason = `${step.phase} quality targets are incomplete`;
+          return {
+            ok: false,
+            reason,
+            failureLog: qualityEvaluation.enhancementFailures.join('\n'),
+            workspaceReverted: false,
+            metrics: r.metrics,
+            rollbackToPairedSource: this.isVModelTestPhase(step.phase),
+            evidence: {
+              stage: 'quality-gate',
+              assessment: qualityAssessment,
+              failures: qualityEvaluation.enhancementFailures,
+            },
+            qualityGap: {
+              assessment: qualityAssessment,
+              evaluation: qualityEvaluation,
+            },
+          };
+        }
+        if (attemptOpts.enhancement && r.metrics.providers.length > 0) {
+          await this.tickets.recordModelAttribution(attemptOpts.enhancement, {
+            providers: r.metrics.providers,
+            role,
+            contribution: 'author',
+            outcome: 'repair-verified',
+            stepId: step.id,
+            phase: step.phase,
+          });
+          this.opts.router.recordTicketOutcome?.(
+            r.metrics.providers,
+            'repair-verified',
+            attemptOpts.enhancement.id,
+          );
+        }
+        const workTicket = this.tickets.workForStep(step.id);
+        if (workTicket && r.metrics.providers.length > 0) {
+          await this.tickets.recordModelAttribution(workTicket, {
+            providers: r.metrics.providers,
+            role,
+            contribution: debug
+              ? 'debugger'
+              : this.isVModelTestPhase(step.phase)
+                ? 'validator'
+                : 'author',
+            outcome: debug ? 'repair-verified' : 'produced',
+            stepId: step.id,
+            phase: step.phase,
+          });
+        }
+        if (debug?.bugTicketId && r.metrics.providers.length > 0) {
+          const bug = this.tickets.findBug(debug.bugTicketId);
+          if (bug) {
+            await this.tickets.recordModelAttribution(bug, {
+              providers: r.metrics.providers,
+              role: 'Debugger',
+              contribution: 'debugger',
+              outcome: 'repair-verified',
+              stepId: step.id,
+              phase: step.phase,
+            });
+          }
+        }
+        if (attemptOpts.changeRequest && r.metrics.providers.length > 0) {
+          await this.tickets.recordModelAttribution(attemptOpts.changeRequest, {
+            providers: r.metrics.providers,
+            role,
+            contribution: 'change-applier',
+            outcome: 'change-applied',
+            stepId: step.id,
+            phase: step.phase,
+          });
+        }
         transitionStep(step, 'DONE', 'attempt-passed');
         await this.refreshCurrentProjectMemory(plan);
-        const repair = debug?.issueId
+        const repair = debug?.bugTicketId
           ? await this.createCompletedPhaseRepairArtifact(
-              debug.issueId,
+              debug.bugTicketId,
               step,
               sha,
               !!debug.completedBeforeDebug,
@@ -3380,14 +4379,14 @@ export class PhaseEngine {
             debug,
             sha,
             completionCommit,
-            r.issueResolutionPlan ?? r.finalThought,
+            r.bugResolutionPlan ?? r.finalThought,
           );
         }
-        if (debug?.issueId) {
+        if (debug?.bugTicketId) {
           if (debug.contextMode === 'test-rollback') {
-            await this.recordIssueRepairReady(debug.issueId, step, repair, r.issueResolutionPlan);
+            await this.recordBugRepairReady(debug.bugTicketId, step, repair, r.bugResolutionPlan);
           } else {
-            await this.markIssueResolved(debug.issueId, step, repair, r.issueResolutionPlan);
+            await this.closeBugTicket(debug.bugTicketId, step, repair, r.bugResolutionPlan);
           }
         }
         spin?.succeed(t().engine.phaseDone(step.id, r.rounds));
@@ -3395,7 +4394,12 @@ export class PhaseEngine {
           messageId: 'engine.phase_done', rounds: r.rounds, retry: step.retries,
         });
         // 不在这里调 markDone：executeStepWithDebug 中统一处理（避免 retry-loop 里双写）。
-        return { ok: true, failureLog: '', issueResolutionPlan: r.issueResolutionPlan };
+        return {
+          ok: true,
+          failureLog: '',
+          bugResolutionPlan: r.bugResolutionPlan,
+          metrics: r.metrics,
+        };
       }
       let reason = r.error ?? t().engine.outputsMissing(verify.missing.join(', '));
       if (
@@ -3427,6 +4431,45 @@ export class PhaseEngine {
         retry: step.retries,
         metrics: m,
       });
+      const completionGap =
+        !debug &&
+        verify.missing.length > 0 &&
+        r.toolCalls.every((call) => call.ok);
+      if (completionGap) {
+        const assessment: StageQualityAssessment = {
+          completion: step.outputs.length === 0
+            ? 0
+            : Math.max(0, 1 - verify.missing.length / step.outputs.length),
+          upstreamAlignment: 1,
+          metrics: r.qualityAssessment?.metrics ?? {},
+          tolerance: r.qualityAssessment?.tolerance ?? {
+            failedTests: 0,
+            skippedTests: 0,
+            warnings: 0,
+          },
+          evidence: step.outputs.filter((output) => !verify.missing.includes(output)),
+          gaps: verify.missing.map((output) => `missing required output: ${output}`),
+        };
+        const evaluation = evaluateQualityGate(step, assessment);
+        await this.qualityAssessments.record(step, step.retries, assessment, evaluation);
+        await this.opts.git.snapshot(step.id, step.retries, 'quality completion gap preserved');
+        return {
+          ok: false,
+          failureLog,
+          reason,
+          workspaceReverted: false,
+          metrics: m,
+          evidence: {
+            stage: 'stage-completion',
+            missingOutputs: verify.missing,
+          },
+          qualityGap: {
+            assessment,
+            evaluation,
+            remediationTarget: 'same-step',
+          },
+        };
+      }
       // 普通阶段失败应回退到本次尝试起点；Debugger 失败则保留已提交的修复进展，
       // 否则下一轮 retry 会丢失上一轮 patch/rewrite，真实项目会在同一错误上反复打转。
       if (debug) {
@@ -3449,8 +4492,8 @@ export class PhaseEngine {
         reason,
         workspaceReverted: !debug,
         metrics: m,
-        issueKind: 'phase',
-        issueResolutionPlan: r.issueResolutionPlan,
+        bugKind: 'phase',
+        bugResolutionPlan: r.bugResolutionPlan,
       };
     } catch (err) {
       const msg = (err as Error).message;
@@ -3478,7 +4521,7 @@ export class PhaseEngine {
         failureLog: rollbackError ? `${stack}\nGit rollback failed: ${rollbackError}` : stack,
         reason: msg,
         workspaceReverted,
-        issueKind: 'exception',
+        bugKind: 'exception',
       };
     } finally {
       void path;
@@ -3489,12 +4532,19 @@ export class PhaseEngine {
     plan: Plan,
     step: Step,
     debug?: DebugAttemptContext,
-    changeRequest?: EngineeringChangeRequest,
+    changeRequest?: ChangeRequestTicket,
   ): Promise<Array<{ path: string; content: string }>> {
     const out = new Map<string, string>();
+    const workTicket = this.tickets.workForStep(step.id);
+    if (workTicket) {
+      out.set(
+        `.xcompiler/tickets/${workTicket.id}.json`,
+        JSON.stringify(workTicket, null, 2),
+      );
+    }
     if (changeRequest) {
       out.set(
-        `.xcompiler/change-requests/${changeRequest.id}.json`,
+        `.xcompiler/tickets/${changeRequest.id}.json`,
         JSON.stringify(changeRequest, null, 2),
       );
     }
@@ -3611,9 +4661,8 @@ export class PhaseEngine {
       this.isVModelTestPhase(step.phase));
     for (const failedPath of failedPaths) {
       const owner = testSteps.find((step) =>
-        step.outputs
-          .filter((out) => typeof out === 'string' && !out.endsWith('/'))
-          .map((out) => normalizeGitPath(out))
+        pairedTestAssetPaths(plan.steps, step, plan.language)
+          .map((testPath) => normalizeGitPath(testPath))
           .includes(failedPath));
       if (owner) return owner;
     }
@@ -3684,9 +4733,13 @@ export class PhaseEngine {
    * DEBUG 模式下扩展 allowedWrites：
    *   - 当前 Step 的 outputs（永远可写）
    *   - outputs owned by CODE/test steps in the dependency closure
+   *   - 右侧验证阶段是例外：即使进入报告修复，也只能写自己的报告 outputs
    *   不放开依赖清单（renderer/HIGH_LEVEL_DESIGN 拥有）以外的非源码产物。
    */
   private computeDebugAllowedWrites(plan: Plan, step: Step): string[] {
+    if (this.isVModelTestPhase(step.phase)) {
+      return [...new Set(step.outputs)];
+    }
     const byId = new Map(plan.steps.map((s) => [s.id, s]));
     const seen = new Set<string>();
     const stack = [...step.dependsOn];
@@ -3848,7 +4901,6 @@ function hasFailedVerificationEvidence(
 }
 
 function shouldRollbackTestPhaseFromToolFailures(
-  step: Step,
   toolCalls: Array<{ tool: string; ok: boolean; summary?: string; error?: string }>,
 ): boolean {
   let unresolvedTestFailure = false;
@@ -3870,119 +4922,10 @@ function shouldRollbackTestPhaseFromToolFailures(
     }
 
     if (!call.ok && isTestVerificationFailure(call.tool, detail)) {
-      if (isTestArtifactDiscoveryFailure(step, detail)) continue;
       unresolvedTestFailure = true;
     }
   }
   return unresolvedTestFailure || unresolvedDependencyToolFailure;
-}
-
-function isTestArtifactDiscoveryFailure(step: Step, detail: string): boolean {
-  const normalized = detail.toLowerCase();
-  if (
-    /no test files? found/u.test(normalized) ||
-    /no tests? found/u.test(normalized) ||
-    /filter:\s+tests?\//u.test(normalized)
-  ) {
-    return true;
-  }
-  const testOutputs = step.outputs
-    .filter((out) => typeof out === 'string' && !out.endsWith('/'))
-    .map((out) => normalizeGitPath(out).toLowerCase())
-    .filter(isTestFilePath);
-  if (testOutputs.length === 0) return false;
-  if (/enoent|no such file or directory|not a file/u.test(normalized)) {
-    return testOutputs.some((out) => normalized.includes(out));
-  }
-  return false;
-}
-
-function isTestArtifactRegressionAfterPassingVerification(
-  step: Step,
-  toolCalls: Array<{ tool: string; ok: boolean; summary?: string; error?: string }>,
-): boolean {
-  const testOutputs = step.outputs
-    .filter((out) => typeof out === 'string' && !out.endsWith('/'))
-    .map((out) => normalizeGitPath(out))
-    .filter(isTestFilePath);
-  if (testOutputs.length === 0) return false;
-  let verified = false;
-  let mutatedAfterVerification = false;
-  for (const call of toolCalls) {
-    const detail = `${call.summary ?? ''}\n${call.error ?? ''}`.toLowerCase();
-    if (call.ok && call.tool === 'run_tests') {
-      verified = true;
-      mutatedAfterVerification = false;
-      continue;
-    }
-    if (
-      verified &&
-      call.ok &&
-      ['write_file', 'append_file', 'replace_in_file', 'apply_patch'].includes(call.tool) &&
-      testOutputs.some((out) => detail.includes(out.toLowerCase()))
-    ) {
-      mutatedAfterVerification = true;
-      continue;
-    }
-    if (verified && mutatedAfterVerification && !call.ok && isTestVerificationFailure(call.tool, detail)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export function hasPendingTestArtifactRepair(
-  step: Step,
-  toolCalls: Array<{ tool: string; ok: boolean; summary?: string; error?: string }>,
-): boolean {
-  const testOutputs = step.outputs
-    .filter((out) => typeof out === 'string' && !out.endsWith('/'))
-    .map((out) => normalizeGitPath(out).toLowerCase())
-    .filter(isTestFilePath);
-  if (testOutputs.length === 0) return false;
-
-  let failedVerification = false;
-  let pendingRepair = false;
-  for (const call of toolCalls) {
-    if (call.tool === 'run_tests') {
-      failedVerification = !call.ok;
-      pendingRepair = false;
-      continue;
-    }
-    if (!failedVerification || !call.ok || !REPAIR_MUTATION_TOOLS.has(call.tool)) continue;
-    const detail = `${call.summary ?? ''}\n${call.error ?? ''}`.toLowerCase();
-    if (testOutputs.some((output) => detail.includes(output))) pendingRepair = true;
-  }
-  return failedVerification && pendingRepair;
-}
-
-function isCachedTestArtifactRegressionAfterPassingVerification(step: Step, failureLog: string): boolean {
-  const testOutputs = step.outputs
-    .filter((out) => typeof out === 'string' && !out.endsWith('/'))
-    .map((out) => normalizeGitPath(out).toLowerCase())
-    .filter(isTestFilePath);
-  if (testOutputs.length === 0) return false;
-  let verified = false;
-  let mutatedAfterVerification = false;
-  for (const line of failureLog.toLowerCase().split(/\r?\n/u)) {
-    if (/run_tests.*(?:成功|ok|done|pytest exit=0)/u.test(line)) {
-      verified = true;
-      mutatedAfterVerification = false;
-      continue;
-    }
-    if (
-      verified &&
-      /(?:write_file|append_file|replace_in_file|apply_patch).*(?:成功|ok|wrote|replaced|patched)/u.test(line) &&
-      testOutputs.some((out) => line.includes(out))
-    ) {
-      mutatedAfterVerification = true;
-      continue;
-    }
-    if (verified && mutatedAfterVerification && /run_tests.*(?:失败|fail|pytest exit=[1-9])/u.test(line)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function isTestVerificationFailure(tool: string, detail: string): boolean {
@@ -3991,8 +4934,7 @@ function isTestVerificationFailure(tool: string, detail: string): boolean {
 
 function isStructuralToolFailure(detail: string): boolean {
   return (
-      detail.includes('write denied: src/') ||
-      detail.includes('append denied: src/')
+    /(?:write|append) denied: (?:src|tests)\//u.test(detail)
   );
 }
 
@@ -4046,6 +4988,16 @@ function isTestFilePath(file: string): boolean {
   );
 }
 
+function hasExecutableTestDeclaration(content: string, language: Plan['language']): boolean {
+  if (language === 'typescript') {
+    return /\b(?:describe|it|test)\s*(?:\.\w+)?\s*\(/u.test(content);
+  }
+  return (
+    /(?:^|\n)\s*(?:async\s+)?def\s+test_[A-Za-z0-9_]*\s*\(/u.test(content) ||
+    /(?:^|\n)\s*class\s+Test[A-Za-z0-9_]*/u.test(content)
+  );
+}
+
 function extractFailedTestPaths(text: string): string[] {
   const found: string[] = [];
   const patterns = [
@@ -4079,7 +5031,7 @@ function testRollbackTriageGuidance(brief: DebugBrief): string {
   return [
     '## V-model test rollback triage',
     'Classify the failure before editing: a bad assertion, mock shape, fixture, test-server lifecycle, or loopback port is a test-artifact defect; a valid assertion exposing wrong product behavior is an implementation/contract defect.',
-    'Test outputs in allowedWrites may be repaired even when the paired rollback step is a requirement/design phase. Do not add product APIs solely to satisfy a test that calls a nonexistent helper.',
+    'The paired source phase owns its test assets and may repair them during rollback. Right-side validation phases must never rewrite tests. Do not add product APIs solely to satisfy a test that calls a nonexistent helper.',
     `Patch the actual defect, then run the inherited scoped test command before done=true.${failedTests}`,
   ].join('\n');
 }

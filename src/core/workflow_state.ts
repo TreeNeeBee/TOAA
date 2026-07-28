@@ -9,6 +9,8 @@ export type StepTransitionReason =
   | 'explicit-reset'
   | 'v-model-rollback'
   | 'downstream-rerun'
+  | 'quality-enhancement'
+  | 'quality-gate-failed'
   | 'cached-gate-passed'
   | 'cached-gate-failed';
 
@@ -29,6 +31,8 @@ const STEP_REASON_TARGETS: Record<StepTransitionReason, StepStatus> = {
   'explicit-reset': 'PENDING',
   'v-model-rollback': 'PENDING',
   'downstream-rerun': 'PENDING',
+  'quality-enhancement': 'PENDING',
+  'quality-gate-failed': 'FAILED',
   'cached-gate-passed': 'DONE',
   'cached-gate-failed': 'FAILED',
 };
@@ -74,7 +78,10 @@ export function transitionStep(
 
 export function resetStepForRerun(
   step: Step,
-  reason: Extract<StepTransitionReason, 'explicit-reset' | 'v-model-rollback' | 'downstream-rerun' | 'interrupted'>,
+  reason: Extract<
+    StepTransitionReason,
+    'explicit-reset' | 'v-model-rollback' | 'downstream-rerun' | 'quality-enhancement' | 'interrupted'
+  >,
 ): boolean {
   const changed = transitionStep(step, 'PENDING', reason);
   step.retries = 0;

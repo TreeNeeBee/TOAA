@@ -107,14 +107,15 @@ describe('calibrateStepShape', () => {
     expect(out.map((s) => s.phase)).toEqual(['DETAILED_DESIGN', 'CODE', 'FUNCTIONAL_TEST', 'UNIT_TEST']);
   });
 
-  it('infers phase from src/ vs tests/ outputs when phase is missing entirely', () => {
+  it('infers src and executable test outputs as CODE-owned when phase is missing', () => {
     const raw = [
       { id: 'S001', title: 'a', description: 'a', systemPrompt: 'x'.repeat(30), role: 'Coder', outputs: ['src/foo.py'] },
       { id: 'S002', title: 'b', description: 'b', systemPrompt: 'x'.repeat(30), role: 'Tester', outputs: ['tests/test_foo.py'] },
     ] as unknown as Step[];
     const out = calibrateStepShape(raw);
     expect(out[0]!.phase).toBe('CODE');
-    expect(out[1]!.phase).toBe('UNIT_TEST');
+    expect(out[1]!.phase).toBe('CODE');
+    expect(out[1]!.role).toBe('Coder');
   });
 
   it('adds delivery documentation bundle paths based on project type', () => {

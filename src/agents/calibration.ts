@@ -2,6 +2,7 @@ import {
   PHASES,
   REQUIRED_V_MODEL_PHASES,
   V_MODEL_SOURCE_TO_TEST_PHASE,
+  V_MODEL_TEST_TO_SOURCE_PHASE,
   type ArchitectureModule,
   type Language,
   type ProjectType,
@@ -17,6 +18,7 @@ import {
 } from '../core/docs.js';
 import { architectureImplementationPaths, pathCoveredByOutputs } from '../core/architecture.js';
 import { getLanguageProfile } from '../core/language.js';
+import { isExecutableTestPath } from '../core/test_assets.js';
 import {
   isLoopbackNetworkFailureLine,
   isTestAssertionDiagnosticLine,
@@ -36,9 +38,9 @@ import {
  *  - calibrateStepIds:            Step id → S### 形式（同步 dependsOn）
  *  - calibrateStepShape:          补齐 schema 必填项（role/acceptance/systemPrompt/title/description）
  *  - calibrateArchitectureStepMappings:
- *                                   将 architectureModules 映射到 CODE / MODULE_TEST 宏 Step 的 subTasks
+ *                                   将 architectureModules 映射到 HIGH_LEVEL_DESIGN / CODE / MODULE_TEST 宏 Step
  *  - calibrateLanguageStepOwnership:
- *                                   归位语言级 manifest / test outputs，避免 CODE 与测试阶段抢产物
+ *                                   归位语言级 manifest / test assets，确保左侧阶段拥有测试
  */
 
 // =============================================================================
@@ -317,8 +319,8 @@ export function calibrateArchitectureModulePaths(
 /**
  * 修正常见的 LLM StepPlan 产物归属漂移：
  *  - TypeScript greenfield 的 package.json / tsconfig.json 必须由 HIGH_LEVEL_DESIGN 拥有；
- *  - CODE 只拥有产品源码与 unit-test-plan，不拥有 tests/** 测试文件；
- *  - 若 CODE 混入测试文件，将其移动到同 iteration 的合适测试阶段。
+ *  - S01-S04 左侧阶段拥有与其配对的测试计划和可执行测试；
+ *  - S05-S08 仅消费测试文件并产出验证报告，不拥有或重写 tests/**。
  *
  * 这是 lint 前的机械校准，不改变需求语义，也不为具体样例硬编码文件名。
  */
@@ -353,13 +355,15 @@ export function calibrateLanguageStepOwnership(
     }
   }
 
-  const movedTests: Array<{ from: Step; output: string }> = [];
+  const movedTests: Array<{ from: Step; output: string; sourcePhase: Step['phase'] }> = [];
   for (const step of out) {
-    if (step.phase !== 'CODE') continue;
+    const sourcePhase =
+      V_MODEL_TEST_TO_SOURCE_PHASE[step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE];
+    if (!sourcePhase) continue;
     const kept: string[] = [];
     for (const output of step.outputs) {
-      if (isTestSourceOutput(output, profile.codeExtensions)) {
-        movedTests.push({ from: step, output });
+      if (isExecutableTestPath(output, args.language)) {
+        movedTests.push({ from: step, output, sourcePhase });
       } else {
         kept.push(output);
       }
@@ -368,11 +372,10 @@ export function calibrateLanguageStepOwnership(
   }
 
   for (const item of movedTests) {
-    const targetPhase = preferredTestOwnerPhase(item.output, args.architectureModules ?? []);
-    const target = findIterationStep(out, item.from.iterationId ?? 'P1', targetPhase) ??
-      findIterationStep(out, item.from.iterationId ?? 'P1', 'UNIT_TEST');
+    const target = findIterationStep(out, item.from.iterationId ?? 'P1', item.sourcePhase);
     if (!target) continue;
     target.outputs = dedup([...target.outputs, item.output]);
+    item.from.inputs = dedup([...item.from.inputs, item.output]);
   }
 
   return out;
@@ -380,20 +383,6 @@ export function calibrateLanguageStepOwnership(
 
 function isSameOrNestedPath(output: string, targetPath: string): boolean {
   return output === targetPath || output.endsWith(`/${targetPath}`);
-}
-
-function isTestSourceOutput(output: string, codeExtensions: readonly string[]): boolean {
-  return output.startsWith('tests/') && codeExtensions.some((extension) => output.endsWith(extension));
-}
-
-function preferredTestOwnerPhase(output: string, modules: ArchitectureModule[]): Step['phase'] {
-  if (/(^|\/)functional[-_/]|functional[-_]?test/i.test(output)) return 'FUNCTIONAL_TEST';
-  if (/(^|\/)integration[-_/]|integration[-_]?test/i.test(output)) return 'INTEGRATION_TEST';
-  if (/(^|\/)modules?[-_/]|module[-_]?test/i.test(output)) return 'MODULE_TEST';
-  if (modules.some((module) => module.testPaths.some((testPath) => pathCoveredByOutputs(testPath, [output])))) {
-    return 'MODULE_TEST';
-  }
-  return 'UNIT_TEST';
 }
 
 function findIterationStep(steps: Step[], iterationId: string, phase: Step['phase']): Step | undefined {
@@ -599,7 +588,7 @@ function ensureChunkedWritePair(tools: string[]): string[] {
  *   1. 原值是合法阶段 → 原样返回
  *   2. PHASE_ALIASES 命中（小写 / 同义词）
  *   3. outputs 中含强路径证据（docs/0N-*.md）
- *   4. outputs 含 src 下源文件 → CODE；含 tests 下测试文件 → 对应测试阶段
+ *   4. outputs 含 src 下源文件 → CODE；含 tests 下测试文件 → 对应左侧测试设计阶段
  *   5. 由 role 兜底（Planner→REQUIREMENT_ANALYSIS 等）
  *   6. 仍无法识别 → 'CODE'（最常见阶段，避免连锁失败）
  */
@@ -615,10 +604,10 @@ function inferPhase(rawPhase: unknown, role: string, outputs: string[]): string 
       if (re.test(out)) return phase;
     }
   }
-  if (outputs.some((o) => /(^|\/)tests\/functional\//i.test(o))) return 'FUNCTIONAL_TEST';
-  if (outputs.some((o) => /(^|\/)tests\/integration\//i.test(o))) return 'INTEGRATION_TEST';
-  if (outputs.some((o) => /(^|\/)tests\/modules?\//i.test(o))) return 'MODULE_TEST';
-  if (outputs.some((o) => /(^|\/)tests\/.*\.(?:py|ts|tsx)$/i.test(o))) return 'UNIT_TEST';
+  if (outputs.some((o) => /(^|\/)tests\/functional\//i.test(o))) return 'REQUIREMENT_ANALYSIS';
+  if (outputs.some((o) => /(^|\/)tests\/integration\//i.test(o))) return 'DETAILED_DESIGN';
+  if (outputs.some((o) => /(^|\/)tests\/modules?\//i.test(o))) return 'HIGH_LEVEL_DESIGN';
+  if (outputs.some((o) => /(^|\/)tests\/.*\.(?:py|ts|tsx)$/i.test(o))) return 'CODE';
   if (outputs.some((o) => /(^|\/)src\/.*\.(?:py|ts|tsx)$/i.test(o))) return 'CODE';
   if (role && PHASE_BY_ROLE[role]) return PHASE_BY_ROLE[role]!;
   return 'CODE';
@@ -740,9 +729,9 @@ function dedup<T>(arr: T[]): T[] {
 // =============================================================================
 
 /**
- * LLM 经常能正确列出 architectureModules，却在 steps 里把多个模块塞进同一个 CODE / MODULE_TEST Step。
+ * LLM 经常能正确列出 architectureModules，却没有把模块测试资产归给 HIGH_LEVEL_DESIGN。
  * 新版计划模型保留“大 Step”执行语义，不再把这些 Step 机械拆碎；模块级细分写入 subTasks。
- * 这样执行器仍按大 Step 运行，但 Step 内有可审计的二级任务清单。
+ * MODULE_TEST 只消费并验证这些测试，不再负责创建测试文件。
  */
 export function calibrateArchitectureStepMappings(
   steps: Step[],
@@ -751,8 +740,8 @@ export function calibrateArchitectureStepMappings(
   if (!modules || modules.length === 0) return steps;
 
   const stepById = new Map(steps.map((step) => [step.id, step]));
-  const initialOutputs = new Set(steps.flatMap((step) => step.outputs));
-  const moduleTestPaths = new Set(modules.flatMap((module) => module.testPaths));
+  const moduleTestPaths = dedup(modules.flatMap((module) => module.testPaths));
+  const highLevelDesignOwner = steps.find((step) => step.phase === 'HIGH_LEVEL_DESIGN');
   const ownerByModule = new Map<string, string>();
   const modulesByCodeStep = new Map<string, ArchitectureModule[]>();
   for (const step of steps.filter((item) => item.phase === 'CODE')) {
@@ -766,30 +755,34 @@ export function calibrateArchitectureStepMappings(
   }
 
   return steps.map((step) => {
-    let dependsOn = step.dependsOn;
-    if (isNonModuleTestPhase(step.phase)) {
-      let outputs = step.outputs.filter((out) => !moduleTestPaths.has(out));
-      if (outputs.length !== step.outputs.length && !outputs.some(isTestImplementationPath)) {
-        outputs = [...outputs, uniquePhaseTestPath(step, modules, initialOutputs)];
-      }
-      return { ...step, outputs };
+    const ownedStep =
+      step.id === highLevelDesignOwner?.id
+        ? step
+        : {
+            ...step,
+            outputs: step.outputs.filter((output) => !moduleTestPaths.includes(output)),
+          };
+    let dependsOn = ownedStep.dependsOn;
+    if (step.id === highLevelDesignOwner?.id) {
+      const outputs = dedup([...ownedStep.outputs, ...moduleTestPaths]);
+      return withModuleSubTasks({ ...ownedStep, outputs }, modules, 'HIGH_LEVEL_DESIGN');
     }
 
-    if (step.phase === 'CODE') {
-      const ownedModules = modulesByCodeStep.get(step.id) ?? [];
+    if (ownedStep.phase === 'CODE') {
+      const ownedModules = modulesByCodeStep.get(ownedStep.id) ?? [];
       const moduleDependencyOwners = ownedModules
         .flatMap((module) => [...module.dependencies, module.id])
         .map((moduleId) => ownerByModule.get(moduleId))
-        .filter((owner): owner is string => Boolean(owner) && owner !== step.id);
+        .filter((owner): owner is string => Boolean(owner) && owner !== ownedStep.id);
       dependsOn = dedup([...dependsOn, ...moduleDependencyOwners]);
-      return withModuleSubTasks({ ...step, dependsOn }, ownedModules, 'CODE');
+      return withModuleSubTasks({ ...ownedStep, dependsOn }, ownedModules, 'CODE');
     }
 
-    if (step.phase === 'MODULE_TEST') {
+    if (ownedStep.phase === 'MODULE_TEST') {
       const explicitModules = modules.filter((module) =>
-        module.testPaths.some((testPath) => pathCoveredByOutputs(testPath, step.outputs)),
+        module.testPaths.some((testPath) => pathCoveredByOutputs(testPath, ownedStep.inputs)),
       );
-      const dependencyIds = collectTransitiveDependencyIds(step, stepById);
+      const dependencyIds = collectTransitiveDependencyIds(ownedStep, stepById);
       const dependencyModules = [...dependencyIds].flatMap((dep) => modulesByCodeStep.get(dep) ?? []);
       const testedModules =
         explicitModules.length > 0
@@ -799,14 +792,15 @@ export function calibrateArchitectureStepMappings(
         .map((module) => ownerByModule.get(module.id))
         .filter((owner): owner is string => Boolean(owner));
       dependsOn = dedup([...dependsOn, ...testedOwners]);
-      const moduleOwnedOutputs = step.outputs.filter(
-        (out) => !isTestImplementationPath(out) || moduleTestPaths.has(out),
+      const inputs = dedup([...ownedStep.inputs, ...testedModules.flatMap((module) => module.testPaths)]);
+      return withModuleSubTasks(
+        { ...ownedStep, dependsOn, inputs },
+        testedModules,
+        'MODULE_TEST',
       );
-      const outputs = dedup([...moduleOwnedOutputs, ...testedModules.flatMap((module) => module.testPaths)]);
-      return withModuleSubTasks({ ...step, dependsOn, outputs }, testedModules, 'MODULE_TEST');
     }
 
-    return { ...step, dependsOn };
+    return { ...ownedStep, dependsOn };
   });
 }
 
@@ -821,44 +815,11 @@ function dedupModules(modules: ArchitectureModule[]): ArchitectureModule[] {
   return out;
 }
 
-function isTestImplementationPath(path: string): boolean {
-  return /^tests\/.+\.(?:py|ts|tsx)$/i.test(path);
-}
-
-function isNonModuleTestPhase(phase: Step['phase']): boolean {
-  return phase === 'UNIT_TEST' || phase === 'INTEGRATION_TEST' || phase === 'FUNCTIONAL_TEST';
-}
-
-function uniquePhaseTestPath(
-  step: Step,
-  modules: ArchitectureModule[],
-  usedPaths: ReadonlySet<string>,
-): string {
-  const extension = inferUnitTestExtension(modules);
-  const prefix = testPathPrefixForPhase(step.phase);
-  const base =
-    extension === '.test.ts'
-      ? `tests/${prefix}_${step.id.toLowerCase()}`
-      : `tests/test_${prefix}_${step.id.toLowerCase()}`;
-  let candidate = `${base}${extension}`;
-  let suffix = 2;
-  while (usedPaths.has(candidate)) {
-    candidate = `${base}_${suffix}${extension}`;
-    suffix += 1;
-  }
-  return candidate;
-}
-
 function testPathPrefixForPhase(phase: Step['phase']): string {
+  if (phase === 'MODULE_TEST') return 'module';
   if (phase === 'INTEGRATION_TEST') return 'integration';
   if (phase === 'FUNCTIONAL_TEST') return 'functional';
   return 'unit';
-}
-
-function inferUnitTestExtension(modules: ArchitectureModule[]): '.py' | '.test.ts' {
-  return modules.some((module) => module.testPaths.some((path) => /\.tsx?$/i.test(path)))
-    ? '.test.ts'
-    : '.py';
 }
 
 function collectTransitiveDependencyIds(
@@ -880,7 +841,7 @@ function collectTransitiveDependencyIds(
 function withModuleSubTasks(
   step: Step,
   modules: ArchitectureModule[],
-  kind: 'CODE' | 'MODULE_TEST',
+  kind: 'HIGH_LEVEL_DESIGN' | 'CODE' | 'MODULE_TEST',
 ): Step {
   if (modules.length === 0) return step;
   const existing = step.subTasks ?? [];
@@ -893,12 +854,21 @@ function withModuleSubTasks(
       description:
         kind === 'CODE'
           ? `${module.responsibility} Implementation paths: ${architectureImplementationPaths(module).join(', ')}.`
-          : `${module.responsibility} Test paths: ${module.testPaths.join(', ')}.`,
+          : kind === 'HIGH_LEVEL_DESIGN'
+            ? `${module.responsibility} Define the module contract and author its module tests: ${module.testPaths.join(', ')}.`
+            : `${module.responsibility} Validate the existing module tests: ${module.testPaths.join(', ')}.`,
       acceptance:
         kind === 'CODE'
           ? `All implementation paths for ${module.id} are complete and usable at runtime.`
-          : `Tests for ${module.id} cover the declared module behaviour and pass.`,
-      outputs: kind === 'CODE' ? architectureImplementationPaths(module) : [...module.testPaths],
+          : kind === 'HIGH_LEVEL_DESIGN'
+            ? `The ${module.id} contract and executable module tests are complete before implementation.`
+            : `Existing tests for ${module.id} cover the declared module behaviour and pass.`,
+      outputs:
+        kind === 'CODE'
+          ? architectureImplementationPaths(module)
+          : kind === 'HIGH_LEVEL_DESIGN'
+            ? [...module.testPaths]
+            : undefined,
     }));
   if (generated.length === 0) return step;
   return { ...step, subTasks: [...existing, ...generated] };
@@ -916,27 +886,29 @@ function flattenSubTaskTexts(tasks: StepSubtask[]): string[] {
 }
 
 // =============================================================================
-// 4b. Plan 覆盖率补齐（自动注入缺失的 UNIT_TEST Step）
+// 4b. Plan 覆盖率补齐（左侧测试资产 + 右侧验证 Step）
 // =============================================================================
 
 /**
- * 兜底自动补 UNIT_TEST 覆盖：lint 规则要求每个 CODE Step 必须有至少一个 UNIT_TEST Step
- * （直接或传递地）依赖它。LLM 经常忘记产出 UNIT_TEST 阶段，或只对最末尾的 CODE 写 UNIT_TEST，
- * 导致前面的 CODE Step 无人覆盖。本函数：
- *  - 找出所有未被覆盖的 CODE Step（排除仅产出 __init__.py 的）；
- *  - 若有，则追加一个 UNIT_TEST Step（id = 末位+1），dependsOn 列出全部未覆盖 CODE Step
- *    的 id；title/description/systemPrompt 由模板生成，让 Tester 自决具体测试文件命名。
- *  - 不修改已有 Step；不影响已有 UNIT_TEST 覆盖的 CODE Step（避免重复）。
- *
- * 这是一个**幂等的安全网**：对已有合规 plan（每个 CODE 都被覆盖）调用此函数等价于 no-op；
- * 真正的目标是让 LLM 输出残缺时 buildPlan 不会一开始就 lint 失败导致整盘重跑。
+ * 兜底保证每个左侧阶段拥有配对的可执行测试资产，右侧测试阶段只消费
+ * 这些测试并产出报告。若缺少 UNIT_TEST 宏 Step，则补充一个验证 Step，
+ * 但测试文件仍由 CODE 阶段拥有。
  */
 export function calibratePlanCoverage(steps: Step[], language: Language = 'python'): Step[] {
-  const withRunnableTestOutputs = ensureRunnableTestPhaseOutputs(steps, language);
-  const stepsChanged = withRunnableTestOutputs !== steps;
-  const stepById = new Map(withRunnableTestOutputs.map((s) => [s.id, s] as const));
-  const isInitOnly = (s: Step): boolean =>
-    s.outputs.length > 0 && s.outputs.every((o) => o === '__init__.py' || o.endsWith('/__init__.py'));
+  const withPairedTestAssets = ensurePairedTestAssets(steps, language);
+  const stepById = new Map(withPairedTestAssets.map((s) => [s.id, s] as const));
+  const codeExtensions = getLanguageProfile(language).codeExtensions;
+  const isInitOnly = (s: Step): boolean => {
+    const implementationOutputs = s.outputs.filter(
+      (output) =>
+        output.startsWith('src/') &&
+        codeExtensions.some((extension) => output.endsWith(extension)),
+    );
+    return (
+      implementationOutputs.length > 0 &&
+      implementationOutputs.every((output) => output.endsWith('/__init__.py'))
+    );
+  };
   const iterationIdOf = (s: Step): string => s.iterationId ?? 'P1';
 
   // 谁能传递地依赖到 codeId？
@@ -954,8 +926,8 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
     return false;
   };
 
-  const codeSteps = withRunnableTestOutputs.filter((s) => s.phase === 'CODE' && !isInitOnly(s));
-  const testSteps = withRunnableTestOutputs.filter((s) => s.phase === 'UNIT_TEST');
+  const codeSteps = withPairedTestAssets.filter((s) => s.phase === 'CODE' && !isInitOnly(s));
+  const testSteps = withPairedTestAssets.filter((s) => s.phase === 'UNIT_TEST');
   const uncoveredByIteration = new Map<string, Step[]>();
   for (const codeStep of codeSteps) {
     const iterationId = iterationIdOf(codeStep);
@@ -968,14 +940,15 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
       uncoveredByIteration.set(iterationId, bucket);
     }
   }
-  if (uncoveredByIteration.size === 0) return stepsChanged ? withRunnableTestOutputs : steps;
+  if (uncoveredByIteration.size === 0) return withPairedTestAssets;
 
   // 取末位编号 + 1 作为新 UNIT_TEST id（保留 S### 三位前导零）
-  let maxNum = withRunnableTestOutputs.reduce((m, s) => {
+  let maxNum = withPairedTestAssets.reduce((m, s) => {
     const mm = String(s.id).match(/^S(\d{3,})$/);
     return mm ? Math.max(m, parseInt(mm[1]!, 10)) : m;
   }, 0);
   const tsMode = language === 'typescript';
+  const usedPaths = new Set(withPairedTestAssets.flatMap((step) => step.outputs));
   const syntheticSteps: Step[] = [];
   const uncoveredIds = new Set<string>();
   for (const [iterationId, uncovered] of uncoveredByIteration) {
@@ -983,9 +956,14 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
     maxNum += 1;
     const newId = 'S' + String(maxNum).padStart(3, '0');
     const unitTestDoc = phaseDocForIteration('UNIT_TEST', iterationId);
-    const testOutput = language === 'typescript'
-      ? `tests/auto_${newId.toLowerCase()}.test.ts`
-      : `tests/test_auto_${newId.toLowerCase()}.py`;
+    const testOutputs = uncovered.map((codeStep) => {
+      const existing = codeStep.outputs.find((output) => isExecutableTestPath(output, language));
+      if (existing) return existing;
+      const testOutput = uniqueRunnableTestPath(codeStep, 'UNIT_TEST', language, usedPaths);
+      usedPaths.add(testOutput);
+      codeStep.outputs = dedup([...codeStep.outputs, testOutput]);
+      return testOutput;
+    });
 
     const targetTitles = uncovered.map((c) => `${c.id} (${c.title})`).join('、');
     syntheticSteps.push({
@@ -995,36 +973,27 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
       title: `自动补齐单元测试：覆盖 ${uncovered.map((c) => c.id).join(' / ')}`,
       description:
         `Planner 未为 ${targetTitles} 显式生成 UNIT_TEST Step，由 calibration 自动追加。` +
-        (tsMode
-          ? `Tester 应为每个目标 CODE Step 在 tests/ 下创建至少一个 Vitest 测试文件（*.test.ts），覆盖正常路径与典型错误路径。`
-          : `Tester 应为每个目标 CODE Step 在 tests/ 下创建至少一个 pytest 测试文件，覆盖正常路径与典型错误路径。`),
+        `Tester 只检查并执行 CODE 阶段已经生成的测试，记录验证结果。`,
       systemPrompt:
-        `本 Step 是 calibration 自动追加的 UNIT_TEST 兜底，覆盖以下 CODE Step：${targetTitles}。\n` +
-        (tsMode
-          ? `范围：仅写 / 调试 ${testOutput}，不得修改 src/ 实现。\n`
-          : `范围：仅写 / 调试 ${testOutput}，不得修改 src/ 实现。\n`) +
-        `输入：上述 CODE Step 产出的 src/ 文件 + docs/。\n` +
-        (tsMode
-          ? `产出：${testOutput}（覆盖每一个目标 CODE Step 的核心 API），运行期 UNIT_TEST gate 会用 npm test / Vitest 自动验证。\n`
-          : `产出：${testOutput}（覆盖每一个目标 CODE Step 的核心 API），运行期 UNIT_TEST gate 会用 pytest 自动验证。\n`) +
-        (tsMode
-          ? `验收：所有新增测试在 npm test / Vitest 下通过；任一目标 CODE 的核心 API 至少有一条断言。`
-          : `验收：所有新增测试 pytest 通过；任一目标 CODE 的核心 API 至少有一条断言。`),
+        `本 Step 是 calibration 自动追加的 UNIT_TEST 验证兜底，覆盖以下 CODE Step：${targetTitles}。\n` +
+        `范围：读取并审查 ${testOutputs.join(', ')}，运行测试，只写 ${unitTestDoc ?? 'UNIT_TEST report'}；` +
+        `禁止创建或修改 tests/** 与 src/**。\n` +
+        `验收：测试完整性检查通过，所有既有测试在 ${tsMode ? 'npm test / Vitest' : 'pytest'} 下通过。`,
       role: 'Tester',
       tools: ['skill:tester'],
-      inputs: uncovered.flatMap((c) => c.outputs),
-      outputs: unitTestDoc ? [unitTestDoc, testOutput] : [testOutput],
+      inputs: dedup(uncovered.flatMap((c) => c.outputs)),
+      outputs: unitTestDoc ? [unitTestDoc] : [],
       dependsOn: uncovered.map((c) => c.id),
       acceptance: tsMode
-        ? `npm test / Vitest 在 tests/ 下能找到至少 ${uncovered.length} 个新测试文件并全部通过，覆盖 ${uncovered.map((c) => c.id).join(' / ')} 的主要 API。`
-        : `pytest 在 tests/ 下能找到至少 ${uncovered.length} 个新测试文件并全部通过，覆盖 ${uncovered.map((c) => c.id).join(' / ')} 的主要 API。`,
+        ? `既有 Vitest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`
+        : `既有 pytest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`,
       status: 'PENDING',
       retries: 0,
       maxRetries: 3,
     });
   }
   const syntheticByIteration = new Map(syntheticSteps.map((step) => [iterationIdOf(step), step]));
-  const rewired = withRunnableTestOutputs.map((step) => {
+  const rewired = withPairedTestAssets.map((step) => {
     if (!(['INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'] as Step['phase'][]).includes(step.phase)) return step;
     const alreadyDependsOnTest = step.dependsOn.some((depId) => stepById.get(depId)?.phase === 'UNIT_TEST');
     if (alreadyDependsOnTest) return step;
@@ -1038,43 +1007,98 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
     };
   });
 
-  return [...rewired, ...syntheticSteps];
+  return ensurePairedTestAssets([...rewired, ...syntheticSteps], language);
 }
 
-const RUNNABLE_TEST_PHASES = new Set<Step['phase']>([
-  'UNIT_TEST',
-  'INTEGRATION_TEST',
-  'MODULE_TEST',
-  'FUNCTIONAL_TEST',
-]);
+function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
+  const out = steps.map((step) => ({
+    ...step,
+    inputs: dedup([...step.inputs]),
+    outputs: dedup([...step.outputs]),
+  }));
+  const usedPaths = new Set(out.flatMap((step) => step.outputs));
+  const iterationIds = dedup(out.map((step) => step.iterationId ?? 'P1'));
 
-function ensureRunnableTestPhaseOutputs(steps: Step[], language: Language): Step[] {
-  const used = new Set(steps.flatMap((step) => step.outputs));
-  let changed = false;
-  const out = steps.map((step) => {
-    if (!RUNNABLE_TEST_PHASES.has(step.phase)) return step;
-    if (step.outputs.some(isTestImplementationPath)) return step;
-    const testOutput = uniqueRunnableTestPath(step, language, used);
-    used.add(testOutput);
-    changed = true;
-    const outputs = dedup([...step.outputs, testOutput]);
-    const testCommand = language === 'typescript' ? 'npm test / Vitest' : 'pytest';
-    return {
-      ...step,
-      outputs,
-      systemPrompt:
-        `${step.systemPrompt}\n\n测试产物要求：本 ${step.phase} Step 必须创建或维护 ${testOutput}，` +
-        `并通过 ${testCommand} 验证；该路径已加入 writable allowlist。`,
-      acceptance:
-        `${step.acceptance} ${testOutput} 存在且对应 ${testCommand} 测试通过；不得只写测试报告而不提供可执行测试。`,
-      tools: ensureEssentialToolRefs({ phase: step.phase, tools: step.tools, outputs }),
-    };
-  });
-  return changed ? out : steps;
+  for (const iterationId of iterationIds) {
+    for (const [sourcePhase, testPhase] of Object.entries(V_MODEL_SOURCE_TO_TEST_PHASE) as Array<
+      [Step['phase'], Step['phase']]
+    >) {
+      const sourceSteps = out.filter(
+        (step) => (step.iterationId ?? 'P1') === iterationId && step.phase === sourcePhase,
+      );
+      const testSteps = out.filter(
+        (step) => (step.iterationId ?? 'P1') === iterationId && step.phase === testPhase,
+      );
+      if (sourceSteps.length === 0) continue;
+
+      const movedFromTests = testSteps.flatMap((step) =>
+        step.outputs.filter((output) => isExecutableTestPath(output, language)),
+      );
+      for (const testStep of testSteps) {
+        testStep.outputs = testStep.outputs.filter(
+          (output) => !isExecutableTestPath(output, language),
+        );
+      }
+
+      const sourceAssets = sourceSteps.flatMap((step) =>
+        step.outputs.filter((output) => isExecutableTestPath(output, language)),
+      );
+      const declaredInputs = testSteps.flatMap((step) =>
+        step.inputs.filter((input) => isExecutableTestPath(input, language)),
+      );
+      let testAssets = dedup([...sourceAssets, ...movedFromTests, ...declaredInputs]);
+      const owner = sourceSteps[0]!;
+      let assetsToAssign = dedup([...movedFromTests, ...declaredInputs])
+        .filter((asset) => !sourceAssets.includes(asset));
+      if (testAssets.length === 0) {
+        const generated = uniqueRunnableTestPath(owner, testPhase, language, usedPaths);
+        usedPaths.add(generated);
+        testAssets = [generated];
+        assetsToAssign = [generated];
+      }
+      owner.outputs = dedup([...owner.outputs, ...assetsToAssign]);
+
+      const testCommand = language === 'typescript' ? 'npm test / Vitest' : 'pytest';
+      const sourceMarker = 'V-model paired test authoring contract';
+      for (const sourceStep of sourceSteps) {
+        if (!sourceStep.systemPrompt.includes(sourceMarker)) {
+          sourceStep.systemPrompt +=
+            `\n\n${sourceMarker}（强制）：本 ${sourcePhase} 阶段必须依据当前阶段契约创建并维护` +
+            `配对 ${testPhase} 的可执行测试，测试路径为 ${testAssets.join(', ')}；` +
+            `测试应在后续 ${testPhase} 阶段运行，不得把编写工作推迟到验证阶段。`;
+          sourceStep.acceptance +=
+            ` 配对 ${testPhase} 测试用例存在、内容非空，并与本阶段的测试计划和验收契约一致。`;
+        }
+        sourceStep.tools = ensureEssentialToolRefs(sourceStep);
+      }
+
+      const validationMarker = 'V-model validation-only contract';
+      for (const testStep of testSteps) {
+        testStep.inputs = dedup([...testStep.inputs, ...testAssets]);
+        if (!testStep.systemPrompt.includes(validationMarker)) {
+          testStep.systemPrompt +=
+            `\n\n${validationMarker}（强制）：本 ${testPhase} 阶段先检查 ${testAssets.join(', ')} ` +
+            `与配对测试计划的完整性和一致性，再使用 ${testCommand} 运行这些既有测试；` +
+            `只写声明的验证报告/交付文档，禁止创建、修改或删除 tests/** 与 src/**。` +
+            `发现缺失、错误或失败时必须报告证据；若现有测试仍可能运行成功但语义覆盖不完整，` +
+            `在 JSON 中填写 validationDefect 并设置 done=false，由 Engine 建立 Bug Ticket 并路由回 ${sourcePhase}。`;
+          testStep.acceptance +=
+            ` 既有测试用例完整性检查通过且 ${testCommand} 执行成功；本阶段未改写测试或产品代码。`;
+        }
+        testStep.tools = ensureEssentialToolRefs(testStep);
+      }
+    }
+  }
+  return out;
 }
 
-function uniqueRunnableTestPath(step: Step, language: Language, usedPaths: ReadonlySet<string>): string {
-  const prefix = testPathPrefixForPhase(step.phase);
+function uniqueRunnableTestPath(
+  step: Step,
+  testPhase: Step['phase'],
+  language: Language,
+  usedPaths: ReadonlySet<string>,
+): string {
+  const prefix = testPathPrefixForPhase(testPhase);
   const stepId = step.id.toLowerCase();
   const base = language === 'typescript'
     ? `tests/${prefix}_${stepId}`

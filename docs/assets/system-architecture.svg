@@ -89,7 +89,7 @@
   <text class="label" x="680" y="583" text-anchor="middle">V-Model Engine</text>
   <text class="small" x="680" y="600" text-anchor="middle">stage order, rollback, resume</text>
   <rect class="box workflow" x="956" y="564" width="240" height="46"/>
-  <text class="label" x="1076" y="583" text-anchor="middle">Issue Router</text>
+  <text class="label" x="1076" y="583" text-anchor="middle">Ticket Workflow</text>
   <text class="small" x="1076" y="600" text-anchor="middle">stage-aware debug routing</text>
 
   <path class="line" d="M442 432 C426 474 360 520 284 564"/>

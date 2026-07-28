@@ -11,6 +11,7 @@ import { DOC_NAMES, deliveryDocsForIteration, phaseDocForIteration, testPlanDocF
 import { getLanguageProfile } from './language.js';
 import { analyzeArchitectureDemand, validateArchitectureContract } from './architecture.js';
 import { stepTransitivelyDependsOn } from './workflow_state.js';
+import { isExecutableTestPath } from './test_assets.js';
 
 export interface LintIssue {
   level: 'error' | 'warn';
@@ -169,7 +170,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
         message:
           `CODE step ${c.id} has no corresponding UNIT_TEST step. ` +
           `Add a UNIT_TEST step (e.g. id="${suggestedId}", phase="UNIT_TEST", role="Tester", dependsOn=["${c.id}"], ` +
-          `outputs=["${testFile}"]) so plan lint rule S004/S005 passes; ` +
+          `inputs=["${testFile}"], outputs=["${phaseDocForIteration('UNIT_TEST', stepIterationId(c)) ?? 'docs/05-unit-test.md'}"]) ` +
+          `and keep "${testFile}" in CODE outputs so plan lint rule S004/S005 passes; ` +
           `or have an existing UNIT_TEST step include "${c.id}" in its dependsOn (chain-style coverage is allowed).`,
       });
     }
@@ -223,21 +225,25 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
-  // 7. phase purity — 需求/设计阶段不得产出实现/测试源码；功能测试阶段不得产出 src 实现代码。
-  const SRC_RE = /^(?:src|tests)\//;
-  const DOC_ONLY_PHASES = new Set(['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN']);
+  // 7. phase purity — 左侧需求/设计阶段可产出 tests/，但不得提前写 src/；
+  //    右侧测试阶段只写报告/交付文档，不得拥有 src/ 或可执行测试。
+  const DESIGN_PHASES = new Set(['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN']);
+  const TEST_PHASES = new Set(['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST']);
   for (const s of plan.steps) {
-    const docOnly = DOC_ONLY_PHASES.has(s.phase);
-    const functionalTestSrcWrite = s.phase === 'FUNCTIONAL_TEST';
-    if (!docOnly && !functionalTestSrcWrite) continue;
     for (const out of s.outputs) {
-      const isCodeOrTestPath = SRC_RE.test(out) && (profile.codeExtensions.some((e) => out.endsWith(e)) || out.endsWith('/'));
       const isImplementationPath = out.startsWith('src/') && (profile.codeExtensions.some((e) => out.endsWith(e)) || out.endsWith('/'));
-      if ((docOnly && isCodeOrTestPath) || (functionalTestSrcWrite && isImplementationPath)) {
+      const isTestAsset = isExecutableTestPath(out, plan.language);
+      if (
+        (DESIGN_PHASES.has(s.phase) && isImplementationPath) ||
+        (TEST_PHASES.has(s.phase) && (isImplementationPath || isTestAsset))
+      ) {
         issues.push({
           level: 'error',
           stepId: s.id,
-          message: `${s.phase} step must not output implementation/test code: ${out}`,
+          message:
+            TEST_PHASES.has(s.phase)
+              ? `${s.phase} is validation-only and must not output implementation/test code: ${out}`
+              : `${s.phase} must not output implementation product code: ${out}`,
         });
       }
     }
@@ -303,19 +309,55 @@ export function lintPlan(plan: Plan): LintIssue[] {
           message: `${sourcePhase} must synchronously output paired ${testPhase} plan: ${expectedTestPlan}`,
         });
       }
+      const sourceTestAssets = dedup(
+        sourceSteps.flatMap((step) =>
+          step.outputs.filter((output) => isExecutableTestPath(output, plan.language)),
+        ),
+      );
+      if (sourceTestAssets.length === 0) {
+        issues.push({
+          level: 'error',
+          stepId: sourceSteps[0]!.id,
+          message:
+            `${sourcePhase} must synchronously author executable ${testPhase} test cases under tests/.`,
+        });
+      }
       for (const sourceStep of sourceSteps) {
-        const covered = plan.steps.some(
+        const pairedTestSteps = plan.steps.filter(
           (candidate) =>
             candidate.phase === testPhase &&
             stepIterationId(candidate) === iteration.id &&
             stepTransitivelyDependsOn(candidate, sourceStep.id, stepById),
         );
-        if (!covered) {
+        if (pairedTestSteps.length === 0) {
           issues.push({
             level: 'error',
             stepId: sourceStep.id,
             message: `${sourceStep.phase} step ${sourceStep.id} must be covered by a paired ${testPhase} step in ${iteration.id}.`,
           });
+          continue;
+        }
+        for (const testStep of pairedTestSteps) {
+          const ownedTestOutputs = testStep.outputs.filter((output) =>
+            isExecutableTestPath(output, plan.language),
+          );
+          if (ownedTestOutputs.length > 0) {
+            issues.push({
+              level: 'error',
+              stepId: testStep.id,
+              message:
+                `${testPhase} is validation-only; move executable tests to ${sourcePhase}: ${ownedTestOutputs.join(', ')}`,
+            });
+          }
+          const missingInputs = sourceTestAssets.filter((asset) => !testStep.inputs.includes(asset));
+          if (missingInputs.length > 0) {
+            issues.push({
+              level: 'error',
+              stepId: testStep.id,
+              message:
+                `${testPhase} must consume its paired ${sourcePhase} test assets as inputs: ${missingInputs.join(', ')}`,
+            });
+          }
         }
       }
     }
@@ -363,7 +405,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
-  // 13. V 模型可追踪性：HIGH_LEVEL_DESIGN 模块必须落到 CODE 宏 Step，并被对应 MODULE_TEST 宏 Step 验证。
+  // 13. V 模型可追踪性：HIGH_LEVEL_DESIGN 产出模块契约与模块测试，
+  //     CODE 实现模块，MODULE_TEST 消费既有模块测试完成验证。
   const architectureModules = plan.architectureModules ?? [];
   if (demand.nonTrivial && architectureModules.length === 0) {
     issues.push({

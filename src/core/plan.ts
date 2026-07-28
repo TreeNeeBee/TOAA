@@ -90,7 +90,8 @@ export type Role = (typeof ROLES)[number];
  * HIGH_LEVEL_DESIGN 阶段的结构化模块契约。
  *
  * Planner 在执行 V 模型前先声明本次要新增/修改的架构模块；HIGH_LEVEL_DESIGN Step 将其展开为
- * docs/02-high-level-design.md，后续 CODE / MODULE_TEST Step 则必须完整覆盖这里登记的路径。
+ * docs/02-high-level-design.md 并创建 testPaths，后续 CODE 实现 sourcePaths/assetPaths，
+ * MODULE_TEST 则消费既有 testPaths 完成验证。
  * 字段保持在 Plan 顶层，是为了让 lint 能在真正执行前发现“架构有模块、实现却漏文件”的问题。
  */
 export const ArchitectureModuleSchema = z
@@ -182,6 +183,24 @@ export const ImplementationPhaseSchema = z
 
 export type ImplementationPhase = z.infer<typeof ImplementationPhaseSchema>;
 
+export const QualityToleranceSchema = z.object({
+  metricShortfall: z.number().min(0).max(0.25).default(0),
+  maxFailedTests: z.number().int().nonnegative().default(0),
+  maxSkippedTests: z.number().int().nonnegative().default(0),
+  maxWarnings: z.number().int().nonnegative().default(0),
+}).strict();
+
+export type QualityTolerance = z.infer<typeof QualityToleranceSchema>;
+
+export const StageQualityGateSchema = z.object({
+  completionMin: z.number().min(0).max(1).optional(),
+  upstreamAlignmentMin: z.number().min(0).max(1).optional(),
+  metrics: z.record(z.string().min(1), z.number().min(0).max(1)).default({}),
+  tolerance: QualityToleranceSchema,
+}).strict();
+
+export type StageQualityGate = z.infer<typeof StageQualityGateSchema>;
+
 function maxSubtaskDepth(task: StepSubtask): number {
   const children = task.subTasks ?? [];
   if (children.length === 0) return 1;
@@ -207,6 +226,8 @@ export const StepSchema = z
     subTasks: z.array(StepSubtaskSchema).optional(),
     dependsOn: z.array(z.string()).default([]),
     acceptance: z.string().min(1),
+    /** Engineering delivery thresholds evaluated before the Step can become DONE. */
+    qualityGate: StageQualityGateSchema.optional(),
     status: z.enum(STEP_STATUSES).default('PENDING'),
     retries: z.number().int().nonnegative().default(0),
     maxRetries: z.number().int().positive().default(3),

@@ -459,7 +459,7 @@ export interface Messages {
     executorFeedbackReadOnlyLoopWarning: (rounds: number, targets: string) => string;
     executorFeedbackReadOnlyRecoveryRequired: string;
     executorFeedbackRepairEvidenceMissing: string;
-    executorFeedbackIssueResolutionPlanMissing: string;
+    executorFeedbackBugResolutionPlanMissing: string;
   };
 
   // ───────── Skill prompts ─────────

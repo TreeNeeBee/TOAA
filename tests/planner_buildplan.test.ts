@@ -84,8 +84,9 @@ describe('buildPlan — Step id 规整', () => {
     const plan = buildPlan(draft, { language: 'typescript' });
     const synthetic = plan.steps[1];
     expect(synthetic?.phase).toBe('UNIT_TEST');
-    expect(synthetic?.description).toContain('Vitest');
-    expect(synthetic?.acceptance).toContain('npm test');
+    expect(synthetic?.systemPrompt).toContain('npm test / Vitest');
+    expect(synthetic?.acceptance).toContain('Vitest');
+    expect(plan.steps[0]?.outputs).toContain('tests/unit_s001.test.ts');
   });
 
   it('校准 TypeScript greenfield 的 package.json 与测试文件产物归属', () => {
@@ -158,7 +159,9 @@ describe('buildPlan — Step id 规整', () => {
     expect(code?.outputs).not.toContain('package.json');
     expect(code?.outputs).not.toContain('tsconfig.json');
     expect(code?.outputs).not.toContain('tests/news-fetcher.test.ts');
-    expect(moduleTest?.outputs).toContain('tests/news-fetcher.test.ts');
+    expect(hld?.outputs).toContain('tests/news-fetcher.test.ts');
+    expect(moduleTest?.outputs).not.toContain('tests/news-fetcher.test.ts');
+    expect(moduleTest?.inputs).toContain('tests/news-fetcher.test.ts');
     expect(lintPlan(plan).filter((issue) => issue.level === 'error')).toEqual([]);
   });
 
@@ -256,7 +259,7 @@ describe('buildPlan — Step id 规整', () => {
     const plan = buildPlan(draft);
     expect(plan.steps[0]?.systemPrompt).toContain('M001 api');
     expect(plan.steps[1]?.systemPrompt).toContain('本 CODE Step 仅实现架构模块');
-    expect(plan.steps[2]?.systemPrompt).toContain('本 MODULE_TEST Step 验证架构模块');
+    expect(plan.steps[2]?.systemPrompt).toContain('本 MODULE_TEST Step 只检查并运行');
   });
 
   it('把误放在 architectureModules.dependencies 的外部包迁移到顶层 dependencies', () => {

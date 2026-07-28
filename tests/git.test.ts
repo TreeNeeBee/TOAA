@@ -66,7 +66,7 @@ describe('GitService', () => {
     await git.ensureRepo();
     await ws.writeFile('src/main.ts', 'export const value = 1;\n');
     await ws.writeFile('.xcompiler/audit.jsonl', '{"event":"before"}\n');
-    await ws.writeFile('.xcompiler/issues/ISSUE-1.json', '{"status":"open"}\n');
+    await ws.writeFile('.xcompiler/tickets/BUG-1.json', '{"status":"open"}\n');
     await ws.writeFile('.xcompiler/debug-wiki/external/entry.md', '# before\n');
     await ws.writeFile('logs/run.log', 'before\n');
     await ws.writeFile('docs/process_log.md', '# before\n');
@@ -75,7 +75,7 @@ describe('GitService', () => {
 
     await ws.writeFile('src/main.ts', 'export const value = 2;\n');
     await ws.writeFile('.xcompiler/audit.jsonl', '{"event":"after"}\n');
-    await ws.writeFile('.xcompiler/issues/ISSUE-1.json', '{"status":"resolved"}\n');
+    await ws.writeFile('.xcompiler/tickets/BUG-1.json', '{"status":"resolved"}\n');
     await ws.writeFile('.xcompiler/debug-wiki/external/entry.md', '# after\n');
     await ws.writeFile('logs/run.log', 'after\n');
     await ws.writeFile('docs/process_log.md', '# after\n');
@@ -85,7 +85,7 @@ describe('GitService', () => {
 
     expect(await ws.readFile('src/main.ts')).toContain('value = 1');
     expect(await ws.readFile('.xcompiler/audit.jsonl')).toContain('"after"');
-    expect(await ws.readFile('.xcompiler/issues/ISSUE-1.json')).toContain('resolved');
+    expect(await ws.readFile('.xcompiler/tickets/BUG-1.json')).toContain('resolved');
     expect(await ws.readFile('.xcompiler/debug-wiki/external/entry.md')).toContain('# after');
     expect(await ws.readFile('logs/run.log')).toBe('after\n');
     expect(await ws.readFile('docs/process_log.md')).toBe('# after\n');
@@ -94,7 +94,7 @@ describe('GitService', () => {
     const tracked = await git.raw().raw(['ls-files']);
     expect(tracked).toContain('.xcompiler/.gitkeep');
     expect(tracked).not.toContain('.xcompiler/audit.jsonl');
-    expect(tracked).not.toContain('.xcompiler/issues/ISSUE-1.json');
+    expect(tracked).not.toContain('.xcompiler/tickets/BUG-1.json');
     expect(tracked).not.toContain('logs/run.log');
     expect(tracked).not.toContain('docs/process_log.md');
     expect(tracked).not.toContain('sample.xc');

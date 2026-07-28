@@ -324,6 +324,21 @@ describe('LLMRouter fallback chain', () => {
     expect(scores.get('ollama_code')).toBe(0.4);
   });
 
+  it('scores providers from verified Ticket outcomes instead of CR creation alone', () => {
+    const cfg = mkCfg({});
+    const scores = new ScoreStore('/tmp/x/config.yaml');
+    const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
+
+    router.recordTicketOutcome(['ollama_code'], 'quality-gap', 'ENHANCE-P1-001');
+    expect(scores.get('ollama_code')).toBe(0.5);
+
+    router.recordTicketOutcome(['ollama_code'], 'repair-verified', 'ENHANCE-P1-001');
+    expect(scores.get('ollama_code')).toBeCloseTo(0.6, 5);
+
+    router.recordTicketOutcome(['unknown-provider'], 'change-verified', 'CR-P1-001');
+    expect(scores.snapshot()).not.toHaveProperty('unknown-provider');
+  });
+
   it('retries the same provider once for transient stream failures', async () => {
     const cfg = mkCfg({});
     const scores = new ScoreStore('/tmp/x/config.yaml');

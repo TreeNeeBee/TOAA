@@ -10,7 +10,6 @@ import {
   PhaseEngine,
   codeValidationCommand,
   collectRollbackRepairOutputs,
-  hasPendingTestArtifactRepair,
   shouldRunCodeValidation,
   type EngineResult,
 } from '../src/core/engine.js';
@@ -35,22 +34,48 @@ class ScriptedLLM implements LLMClient {
   async chat(messages: ChatMessage[], _options?: ChatOptions): Promise<string> {
     const out = this.script[this.idx++];
     if (out === undefined) throw new Error('script exhausted');
-    return addDefaultDebugIssuePlan(out, messages);
+    return addDefaultBugTicketPlan(out, messages);
   }
 }
 
-function addDefaultDebugIssuePlan(out: string, messages: ChatMessage[]): string {
-  if (!messages.some((m) => m.role === 'user' && m.content.includes('## issue'))) return out;
+function addDefaultBugTicketPlan(out: string, messages: ChatMessage[]): string {
   try {
     const parsed = JSON.parse(out) as Record<string, unknown>;
-    if (parsed && typeof parsed === 'object' && typeof parsed.issueResolutionPlan !== 'string') {
-      parsed.issueResolutionPlan = 'Test scripted issue plan: identify the failing contract, patch the declared target, and rerun the relevant gate.';
-      return JSON.stringify(parsed);
+    if (
+      messages.some((m) => m.role === 'user' && m.content.includes('## bug ticket')) &&
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.bugResolutionPlan !== 'string'
+    ) {
+      parsed.bugResolutionPlan = 'Test scripted bug plan: identify the failing contract, patch the declared target, and rerun the relevant gate.';
     }
+    parsed.qualityAssessment ??= {
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {
+        lineCoverage: 1,
+        branchCoverage: 1,
+        testCasePassRate: 1,
+        interfaceCoverage: 1,
+        integrationScenarioCoverage: 1,
+        moduleCoverage: 1,
+        contractCoverage: 1,
+        functionalCoverage: 1,
+        requirementCoverage: 1,
+        endToEndPassRate: 1,
+      },
+      tolerance: {
+        failedTests: 0,
+        skippedTests: 0,
+        warnings: 0,
+      },
+      evidence: ['scripted test evidence'],
+      gaps: [],
+    };
+    return JSON.stringify(parsed);
   } catch {
     return out;
   }
-  return out;
 }
 
 class CapturingScriptedLLM extends ScriptedLLM {
@@ -74,11 +99,25 @@ class ThrowingLLM implements LLMClient {
 }
 
 class FakeRouter {
+  readonly scoreOutcomes: Array<{
+    providers: string[];
+    outcome: string;
+    ticketId: string;
+  }> = [];
+
   constructor(private readonly clients: Record<string, LLMClient>) {}
   for(role: Role | 'default' = 'default'): LLMClient {
     const c = this.clients[role];
     if (!c) throw new Error(`no scripted llm for role ${role}`);
     return c;
+  }
+
+  recordTicketOutcome(
+    providers: readonly string[],
+    outcome: string,
+    ticketId: string,
+  ): void {
+    this.scoreOutcomes.push({ providers: [...providers], outcome, ticketId });
   }
 }
 
@@ -262,38 +301,6 @@ class FirstNoTestFilesThenPassSandbox implements Sandbox {
           ].join('\n'),
         })
       : okExec({ stdout: 'tests passed after test artifact generation\n' });
-  }
-
-  async installDeps(): Promise<ExecResult> {
-    return okExec();
-  }
-}
-
-class TestArtifactRegressionSandbox implements Sandbox {
-  readonly kind = 'subprocess' as const;
-  private testRuns = 0;
-
-  async build(): Promise<{ rebuilt: boolean; reason: string }> {
-    return { rebuilt: false, reason: 'stubbed' };
-  }
-
-  async exec(): Promise<ExecResult> {
-    return okExec();
-  }
-
-  async runProgram(): Promise<ExecResult> {
-    return okExec({ stdout: 'usage: test artifact app\n' });
-  }
-
-  async runTests(): Promise<ExecResult> {
-    this.testRuns += 1;
-    if (this.testRuns === 2) {
-      return okExec({
-        exitCode: 1,
-        stdout: 'FAILED tests/test_unit_s005.py::test_bad_assertion - AssertionError: stale test artifact\n',
-      });
-    }
-    return okExec({ stdout: 'unit tests passed\n' });
   }
 
   async installDeps(): Promise<ExecResult> {
@@ -511,6 +518,14 @@ beforeEach(async () => {
     limits: { cpu: 1, memory_mb: 512, wall_seconds: 10, network: 'off' },
     audit,
   });
+  await ws.writeFile('docs/tests/functional-test-plan.md', '# functional test plan\n');
+  await ws.writeFile('docs/tests/module-test-plan.md', '# module test plan\n');
+  await ws.writeFile('docs/tests/integration-test-plan.md', '# integration test plan\n');
+  await ws.writeFile('docs/tests/unit-test-plan.md', '# unit test plan\n');
+  await ws.writeFile('tests/test_functional.py', 'def test_functional():\n    assert True\n');
+  await ws.writeFile('tests/test_module.py', 'def test_module():\n    assert True\n');
+  await ws.writeFile('tests/test_integration.py', 'def test_integration():\n    assert True\n');
+  await ws.writeFile('tests/test_hello.py', 'def test_hello():\n    assert True\n');
 });
 
 function fakePlan(): Plan {
@@ -572,19 +587,220 @@ function fakePlan(): Plan {
       },
     ],
     steps: [
-      step('S001', 'REQUIREMENT_ANALYSIS', 'Planner', ['docs/01-requirement-analysis.md', 'docs/tests/functional-test-plan.md']),
-      step('S002', 'HIGH_LEVEL_DESIGN', 'Architect', ['docs/02-high-level-design.md', 'docs/tests/module-test-plan.md'], ['S001']),
-      step('S003', 'DETAILED_DESIGN', 'Architect', ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'], ['S002']),
-      step('S004', 'CODE', 'Coder', ['src/hello.py', 'docs/tests/unit-test-plan.md'], ['S003']),
-      step('S005', 'UNIT_TEST', 'Tester', ['docs/05-unit-test.md', 'tests/test_hello.py'], ['S004'], ['src/hello.py']),
-      step('S006', 'INTEGRATION_TEST', 'Tester', ['docs/06-integration-test.md', 'tests/test_integration.py'], ['S005']),
-      step('S007', 'MODULE_TEST', 'Tester', ['docs/07-module-test.md', 'tests/test_module.py'], ['S006']),
-      step('S008', 'FUNCTIONAL_TEST', 'Tester', ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'], ['S007']),
+      step('S001', 'REQUIREMENT_ANALYSIS', 'Planner', [
+        'docs/01-requirement-analysis.md',
+        'docs/tests/functional-test-plan.md',
+        'tests/test_functional.py',
+      ]),
+      step('S002', 'HIGH_LEVEL_DESIGN', 'Architect', [
+        'docs/02-high-level-design.md',
+        'docs/tests/module-test-plan.md',
+        'tests/test_module.py',
+      ], ['S001']),
+      step('S003', 'DETAILED_DESIGN', 'Architect', [
+        'docs/03-detailed-design.md',
+        'docs/tests/integration-test-plan.md',
+        'tests/test_integration.py',
+      ], ['S002']),
+      step('S004', 'CODE', 'Coder', [
+        'src/hello.py',
+        'docs/tests/unit-test-plan.md',
+        'tests/test_hello.py',
+      ], ['S003']),
+      step('S005', 'UNIT_TEST', 'Tester', ['docs/05-unit-test.md'], ['S004'], ['src/hello.py', 'tests/test_hello.py']),
+      step('S006', 'INTEGRATION_TEST', 'Tester', ['docs/06-integration-test.md'], ['S005'], ['tests/test_integration.py']),
+      step('S007', 'MODULE_TEST', 'Tester', ['docs/07-module-test.md'], ['S006'], ['tests/test_module.py']),
+      step('S008', 'FUNCTIONAL_TEST', 'Tester', ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'], ['S007'], ['tests/test_functional.py']),
     ],
   };
 }
 
+async function seedPairedTestAssets(plan: Plan): Promise<void> {
+  for (const step of plan.steps) {
+    if (!['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE'].includes(step.phase)) {
+      continue;
+    }
+    for (const output of step.outputs) {
+      if (output.includes('test-plan.md')) {
+        if (!(await ws.exists(output))) await ws.writeFile(output, `# ${step.phase} test plan\n`);
+      } else if (output.startsWith('tests/') && output.endsWith('.py')) {
+        if (!(await ws.exists(output))) {
+          await ws.writeFile(output, 'def test_declared_case():\n    assert True\n');
+        }
+      }
+    }
+  }
+}
+
 describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
+  it('routes a source-stage completion gap through an Enhance Ticket and incremental rerun', async () => {
+    const plan = fakePlan();
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    codeStep.dependsOn = [];
+    codeStep.outputs = ['src/hello.py'];
+    plan.steps = [codeStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    const coder = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'write the initial implementation but report the missing branch',
+        actions: [{
+          tool: 'write_file',
+          args: { path: 'src/hello.py', content: 'def hi():\n    return "partial"\n' },
+        }],
+        qualityAssessment: {
+          completion: 0.5,
+          upstreamAlignment: 1,
+          metrics: {},
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['src/hello.py'],
+          gaps: ['error handling branch is missing'],
+        },
+        done: true,
+      }),
+      JSON.stringify({
+        thoughts: 'append only the missing branch required by the enhancement',
+        actions: [{
+          tool: 'write_file',
+          args: {
+            path: 'src/hello.py',
+            content: 'def hi(value=None):\n    if value is None:\n        return "fallback"\n    return value\n',
+          },
+        }],
+        qualityAssessment: {
+          completion: 1,
+          upstreamAlignment: 1,
+          metrics: {},
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['src/hello.py'],
+          gaps: [],
+        },
+        done: true,
+      }),
+    ]);
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: new FakeRouter({ Coder: coder }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+    });
+
+    const result = await engine.run(plan);
+
+    expect(result.failedStepId).toBeUndefined();
+    expect(codeStep.status).toBe('DONE');
+    expect(coder.calls[1]?.find((message) => message.role === 'user')?.content)
+      .toContain('## active enhancement ticket');
+    const tickets = JSON.parse(await ws.readFile('.xcompiler/tickets/index.json')) as Array<{
+      type: string;
+      status: string;
+      sourceQualityGateStepId?: string;
+    }>;
+    expect(tickets).toContainEqual(expect.objectContaining({
+      type: 'enhance',
+      status: 'closed',
+      sourceQualityGateStepId: codeStep.id,
+    }));
+  });
+
+  it('routes UNIT_TEST coverage shortfall to CODE as Enhance without opening a Bug', async () => {
+    const plan = fakePlan();
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
+    codeStep.dependsOn = [];
+    codeStep.status = 'DONE';
+    unitStep.dependsOn = [codeStep.id];
+    plan.steps = [codeStep, unitStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    await ws.writeFile('src/hello.py', 'def hi(value=None):\n    return value\n');
+
+    const tester = new ScriptedLLM([
+      JSON.stringify({
+        thoughts: 'tests pass but coverage is below the engineering threshold',
+        actions: [{
+          tool: 'write_file',
+          args: { path: 'docs/05-unit-test.md', content: '# Unit coverage gap\n' },
+        }],
+        qualityAssessment: {
+          metrics: {
+            lineCoverage: 0.65,
+            branchCoverage: 0.5,
+            testCasePassRate: 1,
+          },
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['docs/05-unit-test.md'],
+          gaps: [],
+        },
+        done: true,
+      }),
+      JSON.stringify({
+        thoughts: 'coverage now satisfies the gate',
+        actions: [{
+          tool: 'write_file',
+          args: { path: 'docs/05-unit-test.md', content: '# Unit coverage passed\n' },
+        }],
+        qualityAssessment: {
+          metrics: {
+            lineCoverage: 0.9,
+            branchCoverage: 0.8,
+            testCasePassRate: 1,
+          },
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['docs/05-unit-test.md'],
+          gaps: [],
+        },
+        done: true,
+      }),
+    ]);
+    const coder = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'add the missing branch test only',
+        actions: [{
+          tool: 'write_file',
+          args: {
+            path: 'tests/test_hello.py',
+            content: 'def test_value():\n    assert True\n\ndef test_none_branch():\n    assert True\n',
+          },
+        }],
+        done: true,
+      }),
+    ]);
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox: new CapturingTestArgsSandbox(),
+      router: new FakeRouter({
+        Coder: coder,
+        Tester: tester,
+      }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+    });
+
+    const result = await engine.run(plan);
+
+    expect(result.failedStepId).toBeUndefined();
+    expect(coder.lastUser).toContain('## active enhancement ticket');
+    const tickets = JSON.parse(await ws.readFile('.xcompiler/tickets/index.json')) as Array<{
+      type: string;
+      status: string;
+      targetStepId?: string;
+      verificationStepId?: string;
+    }>;
+    expect(tickets.filter((ticket) => ticket.type === 'bug')).toEqual([]);
+    expect(tickets).toContainEqual(expect.objectContaining({
+      type: 'enhance',
+      status: 'closed',
+      targetStepId: codeStep.id,
+      verificationStepId: unitStep.id,
+    }));
+  });
+
   it('validates CODE outputs and routes compiler errors to same-phase Debugger', async () => {
     const plan = fakePlan();
     const code = plan.steps.find((step) => step.phase === 'CODE')!;
@@ -630,7 +846,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       codeValidationCommand('python').args,
     ]);
     expect(await ws.readFile('src/hello.py')).toContain('def hi');
-    expect(await ws.readFile('.xcompiler/issues/issues.jsonl')).toContain('CODE validation failed');
+    expect(await ws.readFile('.xcompiler/tickets/events.jsonl')).toContain('CODE validation failed');
   });
 
   it('defers project-wide CODE validation until the final CODE step in an iteration', () => {
@@ -797,10 +1013,10 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     expect(result.failedStepId).toBe('S004');
     expect(debuggerLlm.calls).toBe(0);
-    expect(await ws.readFile('.xcompiler/issues/issues.jsonl')).toContain('permission denied for CODE validation');
+    expect(await ws.readFile('.xcompiler/tickets/events.jsonl')).toContain('permission denied for CODE validation');
   });
 
-  it('allows DEBUG mode to edit dependency-chain src/tests outputs while keeping design docs scoped', async () => {
+  it('keeps right-side validation DEBUG writes scoped to its own report outputs', async () => {
     const plan = fakePlan();
     const debugSourceStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     const engine = new PhaseEngine({
@@ -816,8 +1032,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       computeDebugAllowedWrites(p: Plan, s: typeof debugSourceStep): string[];
     }).computeDebugAllowedWrites(plan, debugSourceStep);
     expect(allowed).toEqual(expect.arrayContaining(debugSourceStep.outputs));
-    expect(allowed).toContain('src/hello.py');
-    expect(allowed).toContain('tests/test_hello.py');
+    expect(allowed).not.toContain('src/hello.py');
+    expect(allowed).not.toContain('tests/test_hello.py');
     expect(allowed).not.toContain('docs/03-detailed-design.md');
   });
 
@@ -857,6 +1073,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         actions: [
           { tool: 'write_file', args: { path: 'docs/01-requirement-analysis.md', content: '# req' } },
           { tool: 'write_file', args: { path: 'docs/tests/functional-test-plan.md', content: '# functional plan' } },
+          { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'def test_functional():\n    assert True\n' } },
         ],
         done: true,
       })]),
@@ -881,6 +1098,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       'tool.after',
       'tool.before',
       'tool.after',
+      'tool.before',
+      'tool.after',
       'step.attempt.after',
       'step.after',
       'run.after',
@@ -890,7 +1109,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
   it('walks all phases and persists plan with DONE statuses', async () => {
     const plan = fakePlan();
     const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
-    codeStep.outputs = ['src/hello.py', 'src/main.py', 'docs/tests/unit-test-plan.md'];
+    codeStep.outputs = ['src/hello.py', 'src/main.py', 'docs/tests/unit-test-plan.md', 'tests/test_hello.py'];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
 
@@ -916,6 +1135,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             { tool: 'write_file', args: { path: 'docs/01-requirement-analysis.md', content: '# req' } },
             { tool: 'write_file', args: { path: 'docs/tests/functional-test-plan.md', content: '# functional plan' } },
+            { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'def test_functional():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -926,6 +1146,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             { tool: 'write_file', args: { path: 'docs/02-high-level-design.md', content: '# high level\n' } },
             { tool: 'write_file', args: { path: 'docs/tests/module-test-plan.md', content: '# module plan\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_module.py', content: 'def test_module():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -934,6 +1155,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             { tool: 'write_file', args: { path: 'docs/03-detailed-design.md', content: '# detailed\n' } },
             { tool: 'write_file', args: { path: 'docs/tests/integration-test-plan.md', content: '# integration plan\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_integration():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -945,6 +1167,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
             { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return 1\n' } },
             { tool: 'write_file', args: { path: 'src/main.py', content: 'import argparse\n\nif __name__ == "__main__":\n    argparse.ArgumentParser(description="demo").parse_args()\n' } },
             { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# unit plan\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from src.hello import hi\n\ndef test_hi():\n    assert hi() == 1\n' } },
           ],
           done: true,
         }),
@@ -953,10 +1176,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         JSON.stringify({
           thoughts: 'add unit test',
           actions: [
-            {
-              tool: 'write_file',
-              args: { path: 'tests/test_hello.py', content: 'from src.hello import hi\n\ndef test_hi():\n    assert hi() == 1\n' },
-            },
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# unit test\n' } },
           ],
           done: true,
@@ -964,7 +1183,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         JSON.stringify({
           thoughts: 'add integration test',
           actions: [
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_integration():\n    assert True\n' } },
             { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# integration test\n' } },
           ],
           done: true,
@@ -972,7 +1190,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         JSON.stringify({
           thoughts: 'add module test',
           actions: [
-            { tool: 'write_file', args: { path: 'tests/test_module.py', content: 'def test_module():\n    assert True\n' } },
             { tool: 'write_file', args: { path: 'docs/07-module-test.md', content: '# module test\n' } },
           ],
           done: true,
@@ -1021,23 +1238,24 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(saved.steps.every((s) => s.status === 'DONE')).toBe(true);
   });
 
-  it('scopes V-model test gates to the current test step outputs', async () => {
+  it('scopes V-model test gates to the current test step inputs', async () => {
     const plan = fakePlan();
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     plan.steps = [{
       ...unitStep,
       dependsOn: [],
-      outputs: ['docs/05-unit-test.md', 'tests/test_unit_s005.py'],
+      inputs: ['tests/test_unit_s005.py'],
+      outputs: ['docs/05-unit-test.md'],
     }];
+    await ws.writeFile('tests/test_unit_s005.py', 'def test_unit():\n    assert True\n');
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
     const router = new FakeRouter({
       Tester: new ScriptedLLM([
         JSON.stringify({
-          thoughts: 'write unit test outputs',
+          thoughts: 'write the unit validation report',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_unit():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -1067,17 +1285,18 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       ...unitStep,
       dependsOn: [],
       tools: ['write_file', 'run_tests'],
-      outputs: ['docs/05-unit-test.md', 'tests/test_unit_s005.py'],
+      inputs: ['tests/test_unit_s005.py'],
+      outputs: ['docs/05-unit-test.md'],
     }];
+    await ws.writeFile('tests/test_unit_s005.py', 'def test_unit():\n    assert True\n');
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
     const router = new FakeRouter({
       Tester: new ScriptedLLM([
         JSON.stringify({
-          thoughts: 'write unit test outputs, observe one failure, then verify the repair',
+          thoughts: 'write the unit validation report, observe one failure, then verify the repair',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_unit():\n    assert True\n' } },
             { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
             { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
           ],
@@ -1108,8 +1327,10 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       ...unitStep,
       dependsOn: [],
       tools: ['write_file', 'run_tests'],
-      outputs: ['docs/05-unit-test.md', 'tests/test_unit_s005.py'],
+      inputs: ['tests/test_unit_s005.py'],
+      outputs: ['docs/05-unit-test.md'],
     }];
+    await ws.writeFile('tests/test_unit_s005.py', 'def test_unit():\n    assert True\n');
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
     const router = new FakeRouter({
@@ -1118,7 +1339,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'coverage is optional; use the configured test command after dependency denial',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_unit():\n    assert True\n' } },
             { tool: 'add_dependency', args: { name: '@vitest/coverage-v8', dev: true } },
             { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
           ],
@@ -1144,46 +1364,32 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(auditLog).not.toContain('rolling back to paired V-model source phase');
   });
 
-  it('repairs test artifacts in the same test phase when they regress after passing verification', async () => {
+  it('rejects a validation phase when its paired test asset is missing before any LLM call', async () => {
     const plan = fakePlan();
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     plan.steps = [{
       ...unitStep,
       dependsOn: [],
       tools: ['write_file', 'run_tests'],
-      outputs: ['docs/05-unit-test.md', 'tests/test_unit_s005.py'],
+      inputs: ['tests/test_unit_s005.py'],
+      outputs: ['docs/05-unit-test.md'],
     }];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
+    const tester = new CapturingScriptedLLM([
+      JSON.stringify({ thoughts: 'must not run', actions: [], done: true }),
+    ]);
+    const debuggerLlm = new CapturingScriptedLLM([
+      JSON.stringify({ thoughts: 'must not run', actions: [], done: true }),
+    ]);
     const router = new FakeRouter({
-      Tester: new ScriptedLLM([
-        JSON.stringify({
-          thoughts: 'write tests, verify, accidentally rewrite the test artifact, then observe failure',
-          actions: [
-            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_unit():\n    assert True\n' } },
-            { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_bad_assertion():\n    assert False\n' } },
-            { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
-          ],
-          done: false,
-        }),
-      ]),
-      Debugger: new ScriptedLLM([
-        JSON.stringify({
-          thoughts: 'repair the unit test artifact in the same phase',
-          actions: [
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_unit():\n    assert True\n' } },
-            { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
-          ],
-          done: true,
-        }),
-      ]),
+      Tester: tester,
+      Debugger: debuggerLlm,
     });
     const engine = new PhaseEngine({
       ws,
       git,
-      sandbox: new TestArtifactRegressionSandbox(),
+      sandbox: new CapturingTestArgsSandbox(),
       router: router as unknown as LLMRouter,
       audit,
       planPath,
@@ -1193,23 +1399,24 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const result = await engine.run(plan);
 
-    expect(result.failedStepId).toBeUndefined();
-    expect(plan.steps[0]?.status).toBe('DONE');
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"targetStepId":"S005"');
-    expect(issueLog).not.toContain('"targetStepId":"S004"');
+    expect(result.failedStepId).toBe('S005');
+    expect(tester.calls).toHaveLength(0);
+    expect(debuggerLlm.calls).toHaveLength(0);
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"stepId":"S005"');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
-    expect(auditLog).not.toContain('engine.test_phase_rollback');
+    expect(auditLog).toContain('engine.test_case_completeness_failed');
   });
 
-  it('resumes cached test artifact regressions in the same test phase', async () => {
+  it('does not let cached test history bypass the paired test completeness gate', async () => {
     const plan = fakePlan();
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     plan.steps = [{
       ...unitStep,
       dependsOn: [],
       tools: ['write_file', 'run_tests'],
-      outputs: ['docs/05-unit-test.md', 'tests/test_unit_s005.py'],
+      inputs: ['tests/test_unit_s005.py'],
+      outputs: ['docs/05-unit-test.md'],
       status: 'FAILED',
     }];
     const planPath = path.join(tmp, 'plan.json');
@@ -1242,18 +1449,15 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       'utf8',
     );
 
-    const router = new FakeRouter({
-      Debugger: new ScriptedLLM([
+    const debuggerLlm = new CapturingScriptedLLM([
         JSON.stringify({
-          thoughts: 'repair cached test artifact regression in S005',
-          actions: [
-            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_unit_s005.py', content: 'def test_unit():\n    assert True\n' } },
-            { tool: 'run_tests', args: { args: ['tests/test_unit_s005.py'] } },
-          ],
+          thoughts: 'must not bypass completeness',
+          actions: [],
           done: true,
         }),
-      ]),
+      ]);
+    const router = new FakeRouter({
+      Debugger: debuggerLlm,
     });
     const engine = new PhaseEngine({
       ws,
@@ -1268,10 +1472,10 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const result = await engine.run(plan);
 
-    expect(result.failedStepId).toBeUndefined();
+    expect(result.failedStepId).toBe('S005');
+    expect(debuggerLlm.calls).toHaveLength(0);
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
-    expect(auditLog).not.toContain('engine.test_phase_rollback');
-    expect(auditLog).not.toContain('rolling back to the paired V-model source phase');
+    expect(auditLog).toContain('engine.rollback_validation_test_cases_incomplete');
   });
 
   it('rolls back a test-phase run_tests tool failure to the paired CODE step', async () => {
@@ -1280,9 +1484,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     plan.steps = [codeStep, unitStep];
     codeStep.dependsOn = [];
-    codeStep.outputs = ['src/hello.py'];
-    unitStep.inputs = ['src/hello.py'];
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    codeStep.outputs = ['src/hello.py', 'docs/tests/unit-test-plan.md', 'tests/test_hello.py'];
+    unitStep.inputs = ['src/hello.py', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     unitStep.tools = ['write_file', 'run_tests'];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -1332,6 +1536,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'write broken implementation',
           actions: [
             { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "broken"\n' } },
+            { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# Unit plan\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from src.hello import hi\n\ndef test_hi():\n    assert hi() == "fixed"\n' } },
           ],
           done: true,
         }),
@@ -1341,10 +1547,17 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'write unit test and verify',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from src.hello import hi\n\ndef test_hi():\n    assert hi() == "fixed"\n' } },
             { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
           ],
           done: false,
+        }),
+        JSON.stringify({
+          thoughts: 'formally rerun the repaired unit gate and report quality evidence',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit verified\n' } },
+            { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
+          ],
+          done: true,
         }),
       ]),
       Debugger: debuggerLlm,
@@ -1371,44 +1584,58 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(debuggerLlm.lastUser).not.toContain('stale provider noise');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.test_phase_rollback');
-    expect(auditLog).toContain('engine.failed_test_artifacts_preserved');
-    expect(await ws.exists('.xcompiler/change-requests/index.json')).toBe(false);
-    const issueEvents = (await ws.readFile('.xcompiler/issues/issues.jsonl'))
+    expect(auditLog).toContain('engine.failed_validation_evidence_preserved');
+    expect(auditLog).toContain('engine.rollback_validation_deferred');
+    const qualityRecords = JSON.parse(
+      await ws.readFile('.xcompiler/quality/assessments.json'),
+    ) as Array<{ stepId: string; evaluation: { passed: boolean } }>;
+    expect(qualityRecords).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        stepId: unitStep.id,
+        evaluation: { passed: true, enhancementFailures: [], bugFailures: [] },
+      }),
+    ]));
+    const allTickets = JSON.parse(await ws.readFile('.xcompiler/tickets/index.json')) as Array<{ type: string }>;
+    expect(allTickets.filter((ticket) => ticket.type === 'change-request')).toHaveLength(0);
+    const bugEvents = (await ws.readFile('.xcompiler/tickets/events.jsonl'))
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as {
         event: string;
-        issueId: string;
+        ticketId: string;
+        ticketType: string;
         status: string;
         stepId?: string;
         targetStepId?: string;
         verificationStepId?: string;
       });
-    const testIssueId = issueEvents.find((event) =>
-      event.event === 'recorded' && event.stepId === unitStep.id)?.issueId;
-    expect(testIssueId).toBeTruthy();
-    expect(issueEvents).toEqual(expect.arrayContaining([
+    const bugTicketId = bugEvents.find((event) =>
+      event.event === 'created' &&
+      event.ticketType === 'bug' &&
+      event.stepId === unitStep.id)?.ticketId;
+    expect(bugTicketId).toBeTruthy();
+    expect(bugEvents).toEqual(expect.arrayContaining([
       expect.objectContaining({
         event: 'verification-required',
-        issueId: testIssueId,
+        ticketId: bugTicketId,
         targetStepId: codeStep.id,
         verificationStepId: unitStep.id,
       }),
       expect.objectContaining({
         event: 'repair-ready',
-        issueId: testIssueId,
-        status: 'routed',
+        ticketId: bugTicketId,
+        status: 'verification',
       }),
       expect.objectContaining({
         event: 'resolved',
-        issueId: testIssueId,
+        ticketId: bugTicketId,
         status: 'resolved',
       }),
     ]));
-    const repairReadyIndex = issueEvents.findIndex((event) =>
-      event.event === 'repair-ready' && event.issueId === testIssueId);
-    const resolvedIndex = issueEvents.findIndex((event) =>
-      event.event === 'resolved' && event.issueId === testIssueId);
+    const repairReadyIndex = bugEvents.findIndex((event) =>
+      event.event === 'repair-ready' && event.ticketId === bugTicketId);
+    const resolvedIndex = bugEvents.findIndex((event) =>
+      event.event === 'resolved' && event.ticketId === bugTicketId);
     expect(repairReadyIndex).toBeGreaterThanOrEqual(0);
     expect(resolvedIndex).toBeGreaterThan(repairReadyIndex);
   });
@@ -1418,7 +1645,12 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
     plan.steps = [codeStep, unitStep];
-    codeStep.outputs = ['src/hello.py', 'src/support.py', 'docs/tests/unit-test-plan.md'];
+    codeStep.outputs = [
+      'src/hello.py',
+      'src/support.py',
+      'docs/tests/unit-test-plan.md',
+      'tests/test_hello.py',
+    ];
     unitStep.inputs = ['docs/tests/unit-test-plan.md'];
     await ws.writeFile('src/hello.py', 'def hi():\n    return "hello"\n');
     await ws.writeFile('src/support.py', 'VALUE = 1\n');
@@ -1524,10 +1756,14 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const integrationStep = plan.steps.find((step) => step.phase === 'INTEGRATION_TEST')!;
     plan.steps = [detailedStep, integrationStep];
     detailedStep.dependsOn = [];
-    detailedStep.outputs = ['docs/03-detailed-design.md'];
+    detailedStep.outputs = [
+      'docs/03-detailed-design.md',
+      'docs/tests/integration-test-plan.md',
+      'tests/test_integration.py',
+    ];
     integrationStep.dependsOn = [detailedStep.id];
-    integrationStep.inputs = ['docs/03-detailed-design.md'];
-    integrationStep.outputs = ['docs/06-integration-test.md', 'tests/test_integration.py'];
+    integrationStep.inputs = ['docs/03-detailed-design.md', 'tests/test_integration.py'];
+    integrationStep.outputs = ['docs/06-integration-test.md'];
     integrationStep.tools = ['write_file', 'run_tests'];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -1535,19 +1771,17 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const testerLlm = new CapturingScriptedLLM([
       JSON.stringify({
         thoughts: 'write integration test and verify',
-        actions: [
-          { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration\n' } },
-          { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
-          { tool: 'run_tests', args: { args: ['tests/test_integration.py'] } },
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration\n' } },
+            { tool: 'run_tests', args: { args: ['tests/test_integration.py'] } },
         ],
         done: false,
       }),
       JSON.stringify({
         thoughts: 'apply and verify only the detailed design change',
-        actions: [
-          { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration fixed\n' } },
-          { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
-        ],
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration fixed\n' } },
+          ],
         done: true,
       }),
     ]);
@@ -1557,6 +1791,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'write initial detailed design',
           actions: [
             { tool: 'write_file', args: { path: 'docs/03-detailed-design.md', content: '# Detail\ninitial-contract\n' } },
+            { tool: 'write_file', args: { path: 'docs/tests/integration-test-plan.md', content: '# Integration plan\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -1586,16 +1822,19 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     expect(result.failedStepId).toBeUndefined();
     expect(await ws.readFile('docs/03-detailed-design.md')).toContain('fixed-detail-contract');
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"targetStepId":"S003"');
-    expect(issueLog).toContain('"targetPhase":"DETAILED_DESIGN"');
-    expect(issueLog).not.toContain('"targetStepId":"S002"');
-    const requests = JSON.parse(await ws.readFile('.xcompiler/change-requests/index.json')) as Array<{
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"targetStepId":"S003"');
+    expect(ticketLog).toContain('"targetPhase":"DETAILED_DESIGN"');
+    expect(ticketLog).not.toContain('"targetStepId":"S002"');
+    const requests = (JSON.parse(await ws.readFile('.xcompiler/tickets/index.json')) as Array<{
+      type: string;
       status: string;
-      issueId: string;
+      triggerTicketId: string;
+      originBugTicketId: string;
+      sourceEnhanceTicketId: string;
       affectedSteps: Array<{ stepId: string }>;
       applications: Array<{ stepId: string; kind: string; commit: string }>;
-    }>;
+    }>).filter((ticket) => ticket.type === 'change-request');
     expect(requests).toHaveLength(1);
     expect(requests[0]).toMatchObject({
       status: 'closed',
@@ -1605,12 +1844,39 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       expect.objectContaining({ stepId: detailedStep.id, kind: 'design-change' }),
       expect.objectContaining({ stepId: integrationStep.id, kind: 'verification' }),
     ]));
-    const issue = JSON.parse(await ws.readFile(
-      `.xcompiler/issues/${requests[0]!.issueId}.json`,
-    )) as { status: string };
-    expect(issue.status).toBe('resolved');
-    expect(issueLog.indexOf('"event":"change-pending"')).toBeLessThan(
-      issueLog.indexOf('"event":"resolved"'),
+    expect(requests[0]?.triggerTicketId).toBe(requests[0]?.sourceEnhanceTicketId);
+    const bug = JSON.parse(await ws.readFile(
+      `.xcompiler/tickets/${requests[0]!.originBugTicketId}.json`,
+    )) as { status: string; enhanceTicketId: string };
+    expect(bug.status).toBe('closed');
+    expect(bug.enhanceTicketId).toBe(requests[0]?.sourceEnhanceTicketId);
+    const enhancement = JSON.parse(await ws.readFile(
+      `.xcompiler/tickets/${requests[0]!.sourceEnhanceTicketId}.json`,
+    )) as {
+      type: string;
+      status: string;
+      disposition: string;
+      changeRequestTicketIds: string[];
+    };
+    expect(enhancement).toMatchObject({
+      type: 'enhance',
+      status: 'closed',
+      disposition: 'change-request',
+      changeRequestTicketIds: [expect.stringMatching(/^CR-P1-/u)],
+    });
+    const summary = JSON.parse(await ws.readFile('.xcompiler/tickets/summary.json')) as {
+      byType: Record<string, number>;
+      changeRequests: { total: number; totalRevisions: number };
+    };
+    expect(summary.byType.enhance).toBe(1);
+    expect(summary.changeRequests).toMatchObject({ total: 1, totalRevisions: 1 });
+    expect(router.scoreOutcomes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ outcome: 'quality-gap', ticketId: expect.stringMatching(/^ENHANCE-P1-/u) }),
+      expect.objectContaining({ outcome: 'change-verified', ticketId: expect.stringMatching(/^CR-P1-/u) }),
+      expect.objectContaining({ outcome: 'repair-verified', ticketId: expect.stringMatching(/^ENHANCE-P1-/u) }),
+    ]));
+    expect(ticketLog.indexOf('"event":"change-request-linked"')).toBeLessThan(
+      ticketLog.indexOf('"event":"resolved"'),
     );
   });
 
@@ -1620,11 +1886,15 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const integrationStep = plan.steps.find((step) => step.phase === 'INTEGRATION_TEST')!;
     plan.steps = [detailedStep, integrationStep];
     detailedStep.dependsOn = [];
-    detailedStep.outputs = ['docs/03-detailed-design.md'];
+    detailedStep.outputs = [
+      'docs/03-detailed-design.md',
+      'docs/tests/integration-test-plan.md',
+      'tests/test_integration.py',
+    ];
     detailedStep.status = 'DONE';
     integrationStep.dependsOn = [detailedStep.id];
-    integrationStep.inputs = ['docs/03-detailed-design.md'];
-    integrationStep.outputs = ['docs/06-integration-test.md', 'tests/test_integration.py'];
+    integrationStep.inputs = ['docs/03-detailed-design.md', 'tests/test_integration.py'];
+    integrationStep.outputs = ['docs/06-integration-test.md'];
     integrationStep.tools = ['write_file', 'run_tests'];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -1666,7 +1936,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'rerun integration after source rollback',
           actions: [
             { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -1686,10 +1955,10 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const result = await engine.run(plan);
 
     expect(result.failedStepId).toBeUndefined();
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"targetStepId":"S003"');
-    expect(issueLog).toContain('"targetPhase":"DETAILED_DESIGN"');
-    expect(issueLog).not.toContain('"targetStepId":"S006"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"targetStepId":"S003"');
+    expect(ticketLog).toContain('"targetPhase":"DETAILED_DESIGN"');
+    expect(ticketLog).not.toContain('"targetStepId":"S006"');
     expect(debuggerLlm.lastUser).toContain('integration contract failed: expected fixed detailed design');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.rollback_validation_started');
@@ -1705,19 +1974,26 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const moduleStep = plan.steps.find((step) => step.phase === 'MODULE_TEST')!;
     plan.steps = [detailedStep, codeStep, unitStep, integrationStep, moduleStep];
     detailedStep.dependsOn = [];
-    detailedStep.outputs = ['docs/03-detailed-design.md'];
+    detailedStep.outputs = [
+      'docs/03-detailed-design.md',
+      'docs/tests/integration-test-plan.md',
+      'tests/test_integration.py',
+    ];
     detailedStep.status = 'DONE';
     codeStep.dependsOn = [detailedStep.id];
-    codeStep.outputs = ['src/hello.py', 'docs/tests/unit-test-plan.md'];
+    codeStep.outputs = ['src/hello.py', 'docs/tests/unit-test-plan.md', 'tests/test_hello.py'];
     codeStep.status = 'DONE';
     unitStep.dependsOn = [codeStep.id];
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.inputs = ['src/hello.py', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     unitStep.status = 'DONE';
     integrationStep.dependsOn = [unitStep.id];
-    integrationStep.outputs = ['docs/06-integration-test.md', 'tests/test_integration.py'];
+    integrationStep.inputs = ['tests/test_integration.py'];
+    integrationStep.outputs = ['docs/06-integration-test.md'];
     integrationStep.status = 'FAILED';
     moduleStep.dependsOn = [integrationStep.id];
-    moduleStep.outputs = ['docs/07-module-test.md', 'tests/test_module.py'];
+    moduleStep.inputs = ['tests/test_module.py'];
+    moduleStep.outputs = ['docs/07-module-test.md'];
     moduleStep.status = 'PENDING';
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -1756,6 +2032,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         actions: [
           { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "fresh"\n' } },
           { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# Unit plan rerun\n' } },
+          { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
         ],
         done: true,
       }),
@@ -1783,16 +2060,22 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'apply unit verification for the design CR',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit rerun\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
             { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
           ],
           done: false,
         }),
         JSON.stringify({
+          thoughts: 'formally rerun unit verification after the CODE bug repair',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit verified\n' } },
+            { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
+          ],
+          done: true,
+        }),
+        JSON.stringify({
           thoughts: 'rerun integration tests',
           actions: [
             { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration rerun\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_contract():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -1800,7 +2083,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'run module tests after integration',
           actions: [
             { tool: 'write_file', args: { path: 'docs/07-module-test.md', content: '# Module\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_module.py', content: 'def test_module():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -1840,16 +2122,17 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       .toBeLessThan(phaseStarts.findIndex((message) => message.includes('S006 INTEGRATION_TEST')));
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.rollback_validation_deferred');
-    expect(coderLlm.lastUser).toContain('## active engineering change request');
+    expect(coderLlm.lastUser).toContain('## active change-request ticket');
     expect(coderLlm.lastUser).toContain('Apply only the affected contract');
-    expect(coderLlm.lastUser).toContain('.xcompiler/change-requests/CR-P1-001.json');
-    const requests = JSON.parse(await ws.readFile('.xcompiler/change-requests/index.json')) as Array<{
+    expect(coderLlm.lastUser).toContain('.xcompiler/tickets/CR-P1-001.json');
+    const requests = (JSON.parse(await ws.readFile('.xcompiler/tickets/index.json')) as Array<{
+      type: string;
       status: string;
       revision: number;
-      parentChangeRequestId?: string;
-      relatedIssueIds: string[];
+      parentTicketId?: string;
+      relatedTicketIds: string[];
       applications: Array<{ revision: number; stepId: string }>;
-    }>;
+    }>).filter((ticket) => ticket.type === 'change-request');
     expect(requests).toHaveLength(1);
     expect(requests[0]?.applications.map((application) => application.stepId))
       .toEqual(expect.arrayContaining([
@@ -1863,7 +2146,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       status: 'closed',
       revision: 2,
     });
-    expect(requests[0]?.relatedIssueIds).toHaveLength(2);
+    expect(requests[0]?.relatedTicketIds.length).toBeGreaterThanOrEqual(2);
     expect(requests[0]?.applications).toEqual(expect.arrayContaining([
       expect.objectContaining({ revision: 2, stepId: codeStep.id }),
       expect.objectContaining({ revision: 2, stepId: unitStep.id }),
@@ -1878,7 +2161,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     codeStep.status = 'DONE';
     unitStep.dependsOn = [codeStep.id];
     unitStep.status = 'FAILED';
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     plan.steps = [codeStep, unitStep];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -1906,12 +2189,19 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       }),
       'utf8',
     );
+    const testerLlm = new ScriptedLLM([
+      JSON.stringify({
+        thoughts: 'record the successful cached test revalidation with quality evidence',
+        actions: [],
+        done: true,
+      }),
+    ]);
     const debuggerLlm = new ThrowingLLM(new Error('stale cached test failure must not invoke Debugger'));
     const engine = new PhaseEngine({
       ws,
       git,
       sandbox: new UnitRollbackSandbox(ws),
-      router: new FakeRouter({ Debugger: debuggerLlm }) as unknown as LLMRouter,
+      router: new FakeRouter({ Tester: testerLlm, Debugger: debuggerLlm }) as unknown as LLMRouter,
       audit,
       planPath,
       maxRoundsPerStep: 1,
@@ -1940,7 +2230,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     codeStep.status = 'DONE';
     unitStep.dependsOn = [codeStep.id];
     unitStep.status = 'FAILED';
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     unitStep.tools = ['write_file', 'run_tests'];
     plan.steps = [codeStep, unitStep];
     const planPath = path.join(tmp, 'plan.json');
@@ -2014,7 +2304,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     codeStep.status = 'DONE';
     unitStep.dependsOn = [codeStep.id];
     unitStep.status = 'FAILED';
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     plan.steps = [codeStep, unitStep];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -2073,14 +2363,18 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const functionalStep = plan.steps.find((step) => step.phase === 'FUNCTIONAL_TEST')!;
     plan.steps = [detailedStep, integrationStep, functionalStep];
     detailedStep.dependsOn = [];
-    detailedStep.outputs = ['docs/03-detailed-design.md'];
+    detailedStep.outputs = [
+      'docs/03-detailed-design.md',
+      'docs/tests/integration-test-plan.md',
+      'tests/test_integration.py',
+    ];
     detailedStep.status = 'DONE';
     integrationStep.dependsOn = [detailedStep.id];
-    integrationStep.inputs = ['docs/03-detailed-design.md'];
-    integrationStep.outputs = ['docs/06-integration-test.md', 'tests/test_integration.py'];
+    integrationStep.inputs = ['docs/03-detailed-design.md', 'tests/test_integration.py'];
+    integrationStep.outputs = ['docs/06-integration-test.md'];
     integrationStep.status = 'DONE';
     functionalStep.dependsOn = [integrationStep.id];
-    functionalStep.outputs = ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md', 'tests/test_functional.py'];
+    functionalStep.outputs = ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
     await ws.writeFile('src/main.py', 'import argparse\nargparse.ArgumentParser().parse_args()\n');
@@ -2096,7 +2390,13 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
             { tool: 'write_file', args: { path: 'README.md', content: '# App\n' } },
             { tool: 'write_file', args: { path: 'docs/quickstart.md', content: '# Quickstart\n' } },
             { tool: 'write_file', args: { path: 'docs/08-functional-test.md', content: '# Functional\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'def test_functional():\n    assert True\n' } },
+          ],
+          done: true,
+        }),
+        JSON.stringify({
+          thoughts: 'formally rerun the repaired integration quality gate',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# Integration verified\n' } },
           ],
           done: true,
         }),
@@ -2106,7 +2406,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
             { tool: 'write_file', args: { path: 'README.md', content: '# App\n' } },
             { tool: 'write_file', args: { path: 'docs/quickstart.md', content: '# Quickstart\n' } },
             { tool: 'write_file', args: { path: 'docs/08-functional-test.md', content: '# Functional\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'def test_functional():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -2135,11 +2434,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     expect(result.failedStepId).toBeUndefined();
     expect(await ws.readFile('docs/03-detailed-design.md')).toContain('fixed-detail-contract');
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"stepId":"S008"');
-    expect(issueLog).toContain('"targetStepId":"S003"');
-    expect(issueLog).toContain('"targetPhase":"DETAILED_DESIGN"');
-    expect(issueLog).not.toContain('"targetStepId":"S001"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"stepId":"S008"');
+    expect(ticketLog).toContain('"targetStepId":"S003"');
+    expect(ticketLog).toContain('"targetPhase":"DETAILED_DESIGN"');
+    expect(ticketLog).not.toContain('"targetStepId":"S001"');
   });
 
   it('resumes a cached source Debugger from the latest actionable failure instead of the final read-only loop', async () => {
@@ -2292,12 +2591,12 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(r.failedStepId).toBeUndefined();
     expect(plan.steps[0]?.status).toBe('DONE');
 
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"event":"recorded"');
-    expect(issueLog).toContain('"event":"routed"');
-    expect(issueLog).toContain('"event":"resolved"');
-    expect(issueLog).toContain('no scripted llm for role Coder');
-    expect(issueLog).toContain('"targetPhase":"CODE"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"event":"created"');
+    expect(ticketLog).toContain('"event":"routed"');
+    expect(ticketLog).toContain('"event":"resolved"');
+    expect(ticketLog).toContain('no scripted llm for role Coder');
+    expect(ticketLog).toContain('"targetPhase":"CODE"');
   });
 
   it('does not route LLM transport failures into code Debugger retries', async () => {
@@ -2339,10 +2638,10 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(plan.steps[0]?.retries).toBe(0);
     await expect(ws.exists('src/hello.py')).resolves.toBe(false);
     await expect(ws.readFile('docs/tests/unit-test-plan.md')).resolves.toBe('# previous unit plan\n');
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"event":"recorded"');
-    expect(issueLog).toContain('"event":"unresolved"');
-    expect(issueLog).not.toContain('"event":"routed"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"event":"created"');
+    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).not.toContain('"event":"routed"');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('audit.llm_chat_aborted');
 
@@ -2430,13 +2729,13 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(coder.calls).toBe(1);
     expect(plan.steps[0]?.retries).toBe(0);
     await expect(ws.exists('src/hello.py')).resolves.toBe(false);
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"event":"recorded"');
-    expect(issueLog).toContain('"event":"unresolved"');
-    expect(issueLog).not.toContain('"event":"routed"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"event":"created"');
+    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).not.toContain('"event":"routed"');
   });
 
-  it('relinks and resolves the prior issue when a provider-failed declarative Step succeeds on resume', async () => {
+  it('relinks and closes the prior Bug Ticket when a provider-failed declarative Step succeeds on resume', async () => {
     const plan = fakePlan();
     const designStep = plan.steps.find((step) => step.phase === 'DETAILED_DESIGN')!;
     designStep.dependsOn = [];
@@ -2492,15 +2791,15 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const resumed = await resumedEngine.run(plan);
     expect(resumed.failedStepId).toBeUndefined();
 
-    const issueFiles = (await fs.readdir(path.join(tmp, '.xcompiler/issues')))
-      .filter((file) => /^ISSUE-.*\.json$/u.test(file));
-    expect(issueFiles).toHaveLength(1);
-    const issue = JSON.parse(
-      await fs.readFile(path.join(tmp, '.xcompiler/issues', issueFiles[0]!), 'utf8'),
-    ) as { status: string; debugBrief?: { category?: string }; issueResolutionPlan?: string };
-    expect(issue.status).toBe('resolved');
-    expect(issue.debugBrief?.category).toBe('llm_provider');
-    expect(issue.issueResolutionPlan).toContain('retry the same Step');
+    const bugFiles = (await fs.readdir(path.join(tmp, '.xcompiler/tickets')))
+      .filter((file) => /^BUG-.*\.json$/u.test(file));
+    expect(bugFiles).toHaveLength(1);
+    const bug = JSON.parse(
+      await fs.readFile(path.join(tmp, '.xcompiler/tickets', bugFiles[0]!), 'utf8'),
+    ) as { status: string; debugBrief?: { category?: string }; bugResolutionPlan?: string };
+    expect(bug.status).toBe('closed');
+    expect(bug.debugBrief?.category).toBe('llm_provider');
+    expect(bug.bugResolutionPlan).toContain('retry the same Step');
   });
 
   it('does not route LLM provider rate limits from test phases into Debugger retries', async () => {
@@ -2547,12 +2846,12 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(result.failedStepId).toBe('S005');
     expect(tester.calls).toBe(1);
     expect(unitStep.retries).toBe(0);
-    await expect(ws.exists('tests/test_hello.py')).resolves.toBe(false);
+    await expect(ws.exists('tests/test_hello.py')).resolves.toBe(true);
     await expect(ws.exists('src/hello.py')).resolves.toBe(false);
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"event":"recorded"');
-    expect(issueLog).toContain('"event":"unresolved"');
-    expect(issueLog).not.toContain('"event":"routed"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"event":"created"');
+    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).not.toContain('"event":"routed"');
 
     const resumedTester = new ThrowingLLM(
       new Error(
@@ -2576,8 +2875,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(resumedTester.calls).toBe(1);
     expect(resumedResult.failureReason).toMatch(/OpenAI HTTP 429|provider|rate/i);
     expect(resumedResult.failureReason).not.toMatch(/rolling back to the paired/i);
-    const resumedIssueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(resumedIssueLog).not.toContain('"event":"routed"');
+    const resumedTicketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(resumedTicketLog).not.toContain('"event":"routed"');
   });
 
   it('resumes cached test-phase quality failures in the same test step', async () => {
@@ -2588,7 +2887,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     codeStep.dependsOn = [];
     unitStep.dependsOn = ['S004'];
     unitStep.tools = ['write_file', 'run_tests'];
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     plan.steps = [codeStep, unitStep];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -2624,10 +2923,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const debuggerLlm = new CapturingScriptedLLM([
       JSON.stringify({
-        thoughts: 'repair the unit test phase outputs directly',
+        thoughts: 'repair the unit validation report and rerun the existing paired test',
         actions: [
           { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
-          { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
           { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
         ],
         done: true,
@@ -2656,7 +2954,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(auditLog).not.toContain('rolling back to the paired V-model source phase');
   });
 
-  it('keeps test artifact generation failures in the same test phase instead of rolling back to source', async () => {
+  it('keeps validation report generation failures in the same test phase', async () => {
     const plan = fakePlan();
     const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
@@ -2664,7 +2962,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     codeStep.dependsOn = [];
     unitStep.dependsOn = ['S004'];
     unitStep.tools = ['write_file'];
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     plan.steps = [codeStep, unitStep];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -2674,7 +2972,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const tester = new ScriptedLLM([
       JSON.stringify({
-        thoughts: 'malformed write leaves required test outputs missing',
+        thoughts: 'malformed write leaves the validation report missing',
         actions: [{ tool: 'write_file', args: { content: '# missing path\n' } }],
         done: false,
       }),
@@ -2707,7 +3005,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(auditLog).not.toContain('rolling back to paired CODE');
   });
 
-  it('keeps no-test-files verification failures in the same test phase', async () => {
+  it('routes no-test-files verification failures back to the paired CODE step', async () => {
     const plan = fakePlan();
     const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
@@ -2715,7 +3013,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     codeStep.dependsOn = [];
     unitStep.dependsOn = ['S004'];
     unitStep.tools = ['write_file', 'run_tests'];
-    unitStep.outputs = ['docs/05-unit-test.md', 'tests/test_hello.py'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
     plan.steps = [codeStep, unitStep];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -2723,16 +3021,25 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const tester = new ScriptedLLM([
       JSON.stringify({
-        thoughts: 'run tests before generating the test artifact',
-        actions: [{ tool: 'run_tests', args: { args: ['tests/test_hello.py'] } }],
+        thoughts: 'run the paired unit test',
+        actions: [
+          { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
+          { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
+        ],
         done: false,
+      }),
+      JSON.stringify({
+        thoughts: 'rerun unit validation after the paired source repaired its test asset',
+        actions: [
+          { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test verified\n' } },
+        ],
+        done: true,
       }),
     ]);
     const debuggerLlm = new ScriptedLLM([
       JSON.stringify({
-        thoughts: 'generate the missing test artifact in the same test phase',
+        thoughts: 'repair the CODE-owned unit test artifact',
         actions: [
-          { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
           { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
           { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
         ],
@@ -2755,14 +3062,97 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(result.failedStepId).toBeUndefined();
     expect(unitStep.status).toBe('DONE');
     expect(codeStep.status).toBe('DONE');
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"targetStepId":"S005"');
-    expect(issueLog).not.toContain('"targetStepId":"S004"');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"targetStepId":"S004"');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
-    expect(auditLog).not.toContain('rolling back to paired V-model source phase');
+    expect(auditLog).toContain('engine.test_phase_rollback');
   });
 
-  it('honors explicit rollback even when the failure log contains no-tests text', () => {
+  it('routes a semantic validationDefect to the paired source even when existing tests can pass', async () => {
+    const plan = fakePlan();
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
+    codeStep.status = 'DONE';
+    codeStep.dependsOn = [];
+    unitStep.dependsOn = [codeStep.id];
+    unitStep.tools = ['write_file'];
+    unitStep.outputs = ['docs/05-unit-test.md'];
+    plan.steps = [codeStep, unitStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    await ws.writeFile('src/hello.py', 'def hi(value):\n    return value\n');
+
+    const router = new FakeRouter({
+      Tester: new ScriptedLLM([
+        JSON.stringify({
+          thoughts: 'the paired unit test is runnable but omits the required invalid-input case',
+          validationDefect:
+            'tests/test_hello.py omits invalid-input behavior required by docs/tests/unit-test-plan.md',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test gap\n' } },
+          ],
+          done: false,
+        }),
+        JSON.stringify({
+          thoughts: 'the repaired paired test now covers the required behavior',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test verified\n' } },
+          ],
+          done: true,
+        }),
+      ]),
+      Debugger: new ScriptedLLM([
+        JSON.stringify({
+          thoughts: 'add the missing CODE-owned test case',
+          actions: [
+            {
+              tool: 'write_file',
+              args: {
+                path: 'tests/test_hello.py',
+                content:
+                  'def test_hello():\n    assert True\n\n' +
+                  'def test_invalid_input():\n    assert True\n',
+              },
+            },
+          ],
+          done: true,
+        }),
+      ]),
+    });
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox: new CapturingTestArgsSandbox(),
+      router: router as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+      maxDebugRetries: 1,
+    });
+
+    const result = await engine.run(plan);
+
+    expect(result.failedStepId).toBeUndefined();
+    expect(await ws.readFile('tests/test_hello.py')).toContain('test_invalid_input');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"targetStepId":"S004"');
+    const enhancements = (JSON.parse(await ws.readFile(
+      '.xcompiler/tickets/index.json',
+    )) as Array<{
+      type: string;
+      kind?: string;
+      status: string;
+      disposition?: string;
+    }>).filter((ticket) => ticket.type === 'enhance');
+    expect(enhancements).toEqual([]);
+    const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
+    expect(auditLog).toContain('engine.validation_defect_reported');
+    expect(auditLog).toContain('engine.test_phase_rollback');
+    expect(auditLog).not.toContain('"kind":"ticket.enhance.created"');
+    expect(router.scoreOutcomes).toEqual([]);
+  });
+
+  it('treats explicit rollback and no-test discovery as paired-source failures', () => {
     expect(
       shouldRollbackTestPhaseFailure(
         'INTEGRATION_TEST tool verification failed; rolling back to paired V-model source phase.',
@@ -2782,26 +3172,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           'No test files found, exiting with code 1',
         ].join('\n'),
       ),
-    ).toBe(false);
-  });
-
-  it('keeps a changed test artifact in the test phase until the repair is verified', () => {
-    const step = fakePlan().steps.find((candidate) => candidate.phase === 'INTEGRATION_TEST')!;
-    step.outputs = ['tests/integration/web-server-flow.test.ts'];
-
-    expect(hasPendingTestArtifactRepair(step, [
-      { tool: 'run_tests', ok: false, error: 'ECONNREFUSED 127.0.0.1:80' },
-      { tool: 'write_file', ok: true, summary: 'wrote tests/integration/web-server-flow.test.ts (2400B)' },
-    ])).toBe(true);
-    expect(hasPendingTestArtifactRepair(step, [
-      { tool: 'run_tests', ok: false, error: 'assertion failed' },
-      { tool: 'write_file', ok: true, summary: 'wrote src/web-server.ts (2400B)' },
-    ])).toBe(false);
-    expect(hasPendingTestArtifactRepair(step, [
-      { tool: 'run_tests', ok: false, error: 'assertion failed' },
-      { tool: 'write_file', ok: true, summary: 'wrote tests/integration/web-server-flow.test.ts (2400B)' },
-      { tool: 'run_tests', ok: true, summary: '11 tests passed' },
-    ])).toBe(false);
+    ).toBe(true);
   });
 
   it('allows rollback Debugger repairs across declared outputs on the affected V-model chain', () => {
@@ -2810,9 +3181,19 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const code = plan.steps.find((step) => step.phase === 'CODE')!;
     const unit = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     const integration = plan.steps.find((step) => step.phase === 'INTEGRATION_TEST')!;
-    code.outputs = ['src/app.ts', 'package.json'];
-    unit.outputs = ['tests/app.unit.test.ts'];
-    integration.outputs = ['tests/app.integration.test.ts'];
+    detailed.outputs = [
+      'docs/03-detailed-design.md',
+      'docs/tests/integration-test-plan.md',
+      'tests/app.integration.test.ts',
+    ];
+    code.outputs = [
+      'src/app.ts',
+      'package.json',
+      'docs/tests/unit-test-plan.md',
+      'tests/app.unit.test.ts',
+    ];
+    unit.outputs = ['docs/05-unit-test.md'];
+    integration.outputs = ['docs/06-integration-test.md'];
 
     const writes = collectRollbackRepairOutputs(
       plan.steps,
@@ -3016,7 +3397,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     plan.steps = [{
       ...codeStep,
       dependsOn: [],
-      outputs: ['src/hello.py', 'docs/tests/unit-test-plan.md'],
+      outputs: ['src/hello.py', 'docs/tests/unit-test-plan.md', 'tests/test_hello.py'],
     }];
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -3128,10 +3509,10 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     expect(ok).toBe(false);
     expect(plan.steps[0]?.status).toBe('FAILED');
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('"event":"unresolved"');
-    expect(issueLog).not.toContain('"event":"resolved"');
-    expect(issueLog).toContain('without a successful repair mutation or verification tool call');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).not.toContain('"event":"resolved"');
+    expect(ticketLog).toContain('without a successful repair mutation or verification tool call');
   });
 
   it('treats failed verification without mutation as missing completed-phase repair evidence', async () => {
@@ -3203,8 +3584,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     });
 
     expect(ok).toBe(false);
-    const issueLog = await ws.readFile('.xcompiler/issues/issues.jsonl');
-    expect(issueLog).toContain('failed verification but without a successful repair mutation');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('failed verification but without a successful repair mutation');
   });
 
   it('resolves completed-phase debug with successful verification evidence', async () => {
@@ -3573,7 +3954,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     });
     const seed = await seedWiki.recordResolution({
       brief: seedBrief,
-      issueId: 'SEED-ISSUE',
+      ticketId: 'SEED-BUG',
       stepId: 'S004',
       phase: 'CODE',
       targetPhase: 'CODE',
@@ -3609,7 +3990,13 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'write unit tests',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# unit\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
+          ],
+          done: true,
+        }),
+        JSON.stringify({
+          thoughts: 'formally rerun unit tests after the CODE repair',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# unit verified\n' } },
           ],
           done: true,
         }),
@@ -3617,7 +4004,6 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           thoughts: 'write integration tests after unit passes',
           actions: [
             { tool: 'write_file', args: { path: 'docs/06-integration-test.md', content: '# integration\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_integration():\n    assert True\n' } },
           ],
           done: true,
         }),
@@ -3644,45 +4030,54 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(await ws.readFile('tests/test_hello.py')).toContain('hi() == "fixed"');
     expect(plan.steps.every((step) => step.status === 'DONE')).toBe(true);
     expect(await ws.exists('docs/06-integration-test.md')).toBe(true);
-    const issueEvents = (await ws.readFile('.xcompiler/issues/issues.jsonl'))
+    const bugEvents = (await ws.readFile('.xcompiler/tickets/events.jsonl'))
       .trim()
       .split('\n')
-      .map((line) => JSON.parse(line) as { event: string; issueId: string; targetStepId?: string; targetPhase?: string });
-    const issueId = issueEvents[0]!.issueId;
-    expect(issueEvents.map((event) => event.event)).toEqual(expect.arrayContaining(['recorded', 'routed', 'resolved']));
-    expect(issueEvents.find((event) => event.event === 'routed')).toMatchObject({
+      .map((line) => JSON.parse(line) as {
+        event: string;
+        ticketId: string;
+        ticketType: string;
+        targetStepId?: string;
+        targetPhase?: string;
+      })
+      .filter((event) => event.ticketType === 'bug');
+    const ticketId = bugEvents[0]!.ticketId;
+    expect(bugEvents.map((event) => event.event)).toEqual(
+      expect.arrayContaining(['created', 'routed', 'resolved', 'closed-after-wiki']),
+    );
+    expect(bugEvents.find((event) => event.event === 'routed')).toMatchObject({
       targetStepId: 'S004',
       targetPhase: 'CODE',
     });
-    const issue = JSON.parse(await ws.readFile(`.xcompiler/issues/${issueId}.json`)) as {
+    const bug = JSON.parse(await ws.readFile(`.xcompiler/tickets/${ticketId}.json`)) as {
       status: string;
       kind: string;
       rawFailureLogPath?: string;
       failureLogBytes?: number;
       debugBrief?: { category: string; summary: string; debugDemand: string };
-      issueResolutionPlan?: string;
+      bugResolutionPlan?: string;
       repair?: { completedBeforeDebug: boolean; mode: string; patchPath?: string; summaryPath?: string };
     };
-    expect(issue.status).toBe('resolved');
-    expect(issue.kind).toBe('test-gate');
-    expect(issue.rawFailureLogPath).toBe(`.xcompiler/issues/${issueId}/failure.raw.log`);
-    expect(issue.failureLogBytes).toBeGreaterThan(0);
-    expect(issue.debugBrief).toMatchObject({ category: 'test_failure' });
-    expect(issue.debugBrief?.debugDemand).toContain('Fix the root implementation/contract defect');
-    expect(issue.issueResolutionPlan).toContain('Test scripted issue plan');
-    const rawIssueLog = await ws.readFile(issue.rawFailureLogPath!);
-    expect(rawIssueLog).toContain('Test gate: tests exit=1');
-    expect(rawIssueLog).toContain('unit regression failed: expected fixed implementation');
-    expect(issue.repair).toMatchObject({ completedBeforeDebug: true });
-    expect(issue.repair?.mode).toMatch(/rewrite|patch/);
-    expect(await ws.readFile(issue.repair!.patchPath!)).toContain('fixed');
-    expect(await ws.readFile(issue.repair!.summaryPath!)).toContain('Repair');
+    expect(bug.status).toBe('closed');
+    expect(bug.kind).toBe('test-gate');
+    expect(bug.rawFailureLogPath).toBe(`.xcompiler/tickets/${ticketId}/failure.raw.log`);
+    expect(bug.failureLogBytes).toBeGreaterThan(0);
+    expect(bug.debugBrief).toMatchObject({ category: 'test_failure' });
+    expect(bug.debugBrief?.debugDemand).toContain('Fix the root implementation/contract defect');
+    expect(bug.bugResolutionPlan).toContain('Test scripted bug plan');
+    const rawBugLog = await ws.readFile(bug.rawFailureLogPath!);
+    expect(rawBugLog).toContain('Test gate: tests exit=1');
+    expect(rawBugLog).toContain('unit regression failed: expected fixed implementation');
+    expect(bug.repair).toMatchObject({ completedBeforeDebug: true });
+    expect(bug.repair?.mode).toMatch(/rewrite|patch/);
+    expect(await ws.readFile(bug.repair!.patchPath!)).toContain('fixed');
+    expect(await ws.readFile(bug.repair!.summaryPath!)).toContain('Repair');
     const reloadedWiki = new DebugWiki(debugWikiPath);
     const seeded = (await reloadedWiki.search(seedBrief, { language: 'python' }))
       .find((match) => match.entry.id === seedId)?.entry;
     expect(seeded?.stats.uses).toBeGreaterThan(0);
     expect(seeded?.stats.successes).toBeGreaterThan(1);
-    expect(seeded?.resolutionPlan).toContain('Test scripted issue plan');
+    expect(seeded?.resolutionPlan).toContain('Test scripted bug plan');
   });
 
   it('bubbles test rollback signals raised during same-phase Debugger retries to the V-model source phase', async () => {
@@ -3691,7 +4086,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const codeStep = {
       ...plan.steps.find((step) => step.phase === 'CODE')!,
       dependsOn: [],
-      outputs: ['src/hello.py', 'docs/tests/unit-test-plan.md'],
+      outputs: ['src/hello.py', 'docs/tests/unit-test-plan.md', 'tests/test_hello.py'],
       status: 'DONE' as const,
       retries: 0,
     };
@@ -3699,7 +4094,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       ...plan.steps.find((step) => step.phase === 'UNIT_TEST')!,
       dependsOn: ['S004'],
       tools: ['write_file', 'run_tests'],
-      outputs: ['docs/05-unit-test.md', 'tests/test_hello.py'],
+      inputs: ['src/hello.py', 'tests/test_hello.py'],
+      outputs: ['docs/05-unit-test.md'],
       status: 'PENDING' as const,
       retries: 0,
     };
@@ -3712,25 +4108,27 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const router = new FakeRouter({
       Tester: new ScriptedLLM([
         JSON.stringify({
-          thoughts: 'fail to produce required unit outputs in the first normal attempt',
-          actions: [],
+          thoughts: 'produce the report and run the unit gate, exposing a source defect',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# unit failed\n' } },
+            { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
+          ],
           done: false,
         }),
         JSON.stringify({
-          thoughts: 'rewrite unit tests after source repair',
+          thoughts: 'rewrite the unit validation report after source repair',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# unit\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from hello import hi\n\ndef test_hi():\n    assert hi() == "fixed"\n' } },
           ],
           done: true,
         }),
       ]),
       Debugger: new ScriptedLLM([
         JSON.stringify({
-          thoughts: 'same-phase unit Debugger writes tests, but verification exposes a source bug',
+          thoughts: 'same-phase unit Debugger writes only the report, but verification exposes a source bug',
           actions: [
             { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# unit\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from hello import hi\n\ndef test_hi():\n    assert hi() == "fixed"\n' } },
+            { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
           ],
           done: true,
         }),
@@ -3877,7 +4275,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const repair = await engine.repairProjectAuditFailure(plan, auditResult);
     expect(repair.failedStepId).toBeUndefined();
     expect(await ws.readFile('src/holiday.py')).not.toContain('timor.tech');
-    expect(plan.steps[1]?.status).toBe('DONE');
+    expect(repair.restartIndex).toBe(0);
+    expect(plan.steps[1]?.status).toBe('PENDING');
     const probe = await repairSandbox.runProgram(['src/main.py']);
     expect(probe.stderr).toBe('');
     expect(probe.stdout).toContain('Spring Festival countdown');
@@ -3889,7 +4288,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
     const functionalStep = plan.steps.find((step) => step.phase === 'FUNCTIONAL_TEST')!;
     codeStep.dependsOn = [];
-    codeStep.outputs = ['src/hello.py', 'docs/tests/unit-test-plan.md'];
+    codeStep.outputs = ['src/hello.py', 'docs/tests/unit-test-plan.md', 'tests/test_hello.py'];
     codeStep.status = 'DONE';
     unitStep.dependsOn = [codeStep.id];
     unitStep.status = 'DONE';
@@ -3944,6 +4343,77 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(auditLog).toContain('engine.audit_repair_downstream_reset');
   });
 
+  it('routes project-audit test failures to the source phase that owns the failed test', async () => {
+    const plan = fakePlan();
+    const detailedStep = plan.steps.find((step) => step.phase === 'DETAILED_DESIGN')!;
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
+    const integrationStep = plan.steps.find((step) => step.phase === 'INTEGRATION_TEST')!;
+    detailedStep.dependsOn = [];
+    detailedStep.status = 'DONE';
+    codeStep.dependsOn = [detailedStep.id];
+    codeStep.status = 'DONE';
+    unitStep.dependsOn = [codeStep.id];
+    unitStep.status = 'DONE';
+    integrationStep.dependsOn = [unitStep.id];
+    integrationStep.status = 'DONE';
+    plan.steps = [detailedStep, codeStep, unitStep, integrationStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    await ws.writeFile('docs/03-detailed-design.md', '# Detail\nstale contract\n');
+
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox: new CapturingTestArgsSandbox(),
+      router: new FakeRouter({
+        Debugger: new ScriptedLLM([
+          JSON.stringify({
+            thoughts: 'repair the detailed-design contract that owns the failed integration test',
+            actions: [
+              {
+                tool: 'write_file',
+                args: {
+                  path: 'docs/03-detailed-design.md',
+                  content: '# Detail\nfixed integration contract\n',
+                },
+              },
+            ],
+            done: true,
+          }),
+        ]),
+      }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+    });
+    const auditResult: ProjectAuditResult = {
+      ok: false,
+      warnings: 0,
+      errors: 1,
+      checks: [{
+        name: 'tests',
+        severity: 'error',
+        ok: false,
+        summary: 'integration tests failed',
+        detail: 'FAILED tests/test_integration.py::test_contract - AssertionError: stale contract',
+      }],
+    };
+
+    const repair = await engine.repairProjectAuditFailure(plan, auditResult);
+
+    expect(repair.failedStepId).toBeUndefined();
+    expect(repair.restartIndex).toBe(0);
+    expect(await ws.readFile('docs/03-detailed-design.md')).toContain('fixed integration contract');
+    expect(detailedStep.status).toBe('DONE');
+    expect(codeStep.status).toBe('PENDING');
+    expect(unitStep.status).toBe('PENDING');
+    expect(integrationStep.status).toBe('PENDING');
+    const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
+    expect(ticketLog).toContain('"targetStepId":"S003"');
+    expect(ticketLog).toContain('"targetPhase":"DETAILED_DESIGN"');
+  });
+
   it('runs an iteration gate after FUNCTIONAL_TEST and routes failures back through Debugger repair', async () => {
     const plan = fakePlan();
     plan.implementationPhases = [
@@ -3968,7 +4438,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         id: 'S004',
         iterationId: 'P1',
         phase: 'CODE',
-        outputs: ['src/main.py'],
+        outputs: ['src/main.py', 'docs/tests/unit-test-plan.md', 'tests/test_main.py'],
         dependsOn: [],
         status: 'DONE',
       },
@@ -3977,7 +4447,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         id: 'S005',
         iterationId: 'P1',
         phase: 'UNIT_TEST',
-        outputs: ['docs/05-unit-test.md', 'tests/test_main.py'],
+        inputs: ['src/main.py', 'tests/test_main.py'],
+        outputs: ['docs/05-unit-test.md'],
         dependsOn: ['S004'],
         status: 'DONE',
       },
@@ -4017,6 +4488,13 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           done: true,
         }),
         JSON.stringify({
+          thoughts: 'rerun unit validation after the repaired code phase',
+          actions: [
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit Test\n' } },
+          ],
+          done: true,
+        }),
+        JSON.stringify({
           thoughts: 'rerun functional docs after the repaired unit phase',
           actions: [
             { tool: 'write_file', args: { path: 'README.md', content: '# Gate App\n' } },
@@ -4052,7 +4530,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const result = await engine.run(plan);
     expect(result.failedStepId).toBeUndefined();
-    expect(result.executedSteps).toBe(3);
+    expect(result.executedSteps).toBe(4);
     expect(await ws.readFile('tests/test_main.py')).toContain('fixed');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('engine.audit_repair_downstream_reset');
@@ -4134,7 +4612,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         description: 'Add invoice export orchestration to the reporting service.',
         systemPrompt: 'Only extend the existing reporting module.',
         role: 'Coder',
-        outputs: ['src/reporting/export.ts'],
+        outputs: [
+          'src/reporting/export.ts',
+          'docs/tests/unit-test-plan.md',
+          'tests/reporting/export.test.ts',
+        ],
         dependsOn: [],
       },
       {
@@ -4144,8 +4626,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         title: 'Verify reporting export',
         description: 'Consume the reporting export API from tests.',
         role: 'Tester',
-        inputs: ['src/reporting/export.ts'],
-        outputs: ['tests/reporting/export.test.ts'],
+        inputs: ['src/reporting/export.ts', 'tests/reporting/export.test.ts'],
+        outputs: ['docs/05-unit-test.md'],
         dependsOn: ['S003'],
         acceptance: 'export API is covered by tests',
       },
@@ -4165,6 +4647,14 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         thoughts: 'extend reporting',
         actions: [
           { tool: 'write_file', args: { path: 'src/reporting/export.ts', content: 'export const exportReport = () => "ok";\n' } },
+          { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# Reporting unit test plan\n' } },
+          {
+            tool: 'write_file',
+            args: {
+              path: 'tests/reporting/export.test.ts',
+              content: 'import { describe, it, expect } from "vitest";\ndescribe("export", () => { it("works", () => expect(true).toBe(true)); });\n',
+            },
+          },
         ],
         done: true,
       }),
@@ -4175,7 +4665,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         JSON.stringify({
           thoughts: 'add export test',
           actions: [
-            { tool: 'write_file', args: { path: 'tests/reporting/export.test.ts', content: 'export {};\n' } },
+            { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Reporting unit validation\n' } },
           ],
           done: true,
         }),

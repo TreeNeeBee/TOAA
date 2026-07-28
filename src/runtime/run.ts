@@ -20,6 +20,9 @@ import {
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
 import { runProjectAudit, shouldRunProjectAudit } from '../core/project_audit.js';
+import {
+  generateProjectDevelopmentReport,
+} from '../core/project_report.js';
 import { refreshProjectMemory } from '../core/project_memory.js';
 import { updateProjectFile } from '../core/project_file.js';
 import { DOC_NAMES } from '../core/docs.js';
@@ -74,6 +77,7 @@ export interface ExecuteResult {
   audit?: ProjectAuditResult;
   message?: string;
   exitCode?: number;
+  reportPath?: string;
 }
 
 export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
@@ -385,6 +389,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       return { status: 'failed', engine: r, message: reason, exitCode: 4 };
     }
     let auditWarnings = 0;
+    let finalProjectAudit: ProjectAuditResult | undefined;
     if (shouldRunProjectAudit(plan, { onlyPhase: opts.onlyPhase })) {
       if (io.requestPermission) {
         const request: ToolPermissionRequest = {
@@ -496,6 +501,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         return { status: 'failed', engine: r, audit: auditResult, exitCode: 4 };
       }
       auditWarnings = auditResult.warnings;
+      finalProjectAudit = auditResult;
     }
     const allStepsDone = plan.steps.every((step) => step.status === 'DONE');
     const phaseAdvance = target.phasePlan && target.phasePlanPath && !opts.onlyPhase && allStepsDone
@@ -511,6 +517,23 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         })
       : undefined;
     const projectPlan = phaseAdvance?.nextPlan ?? plan;
+    const reportPath = allStepsDone
+      ? await generateProjectDevelopmentReport({
+          workspace: ws,
+          plan,
+          phasePlan: phaseAdvance?.phasePlan ?? target.phasePlan,
+          projectAudit: finalProjectAudit,
+          finalDelivery: !phaseAdvance?.nextPlan,
+        })
+      : undefined;
+    if (reportPath) {
+      await audit.event('project.report.generated', `generated ${reportPath}`, {
+        messageId: 'execute.project_report_generated',
+        reportPath,
+        finalDelivery: !phaseAdvance?.nextPlan,
+        completedPhaseId: phaseAdvance?.completedPhaseId,
+      });
+    }
     if (phaseAdvance?.nextPlan) {
       await runtimeLog(
         io,
@@ -547,8 +570,9 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       totalSteps: r.totalSteps,
       completedPhaseId: phaseAdvance?.completedPhaseId,
       nextPhaseId: phaseAdvance?.nextPlan?.phaseId,
+      reportPath,
     });
-    return { status: 'ok', engine: r };
+    return { status: 'ok', engine: r, audit: finalProjectAudit, reportPath };
   } catch (err) {
     const msg = (err as Error).message;
     const stack = (err as Error).stack;
@@ -607,7 +631,7 @@ async function completeAndPrepareNextPhase(args: {
   io: RuntimeIO;
   currentPlanPath: string;
   currentPlan: Plan;
-}): Promise<{ completedPhaseId: string; nextPlan?: Plan }> {
+}): Promise<{ completedPhaseId: string; phasePlan: PhasePlan; nextPlan?: Plan }> {
   const incomplete = args.currentPlan.steps.filter((step) => step.status !== 'DONE');
   if (incomplete.length > 0) {
     throw new Error(
@@ -624,7 +648,10 @@ async function completeAndPrepareNextPhase(args: {
       phaseId: transition.completedPhaseId,
       phasePlanPath: args.phasePlanPath,
     });
-    return { completedPhaseId: transition.completedPhaseId };
+    return {
+      completedPhaseId: transition.completedPhaseId,
+      phasePlan: transition.phasePlan,
+    };
   }
 
   next.planPath ??= phasePlanFileName(next.id);
@@ -699,7 +726,11 @@ async function completeAndPrepareNextPhase(args: {
     nextPlanPath,
     phasePlanPath: args.phasePlanPath,
   });
-  return { completedPhaseId: transition.completedPhaseId, nextPlan };
+  return {
+    completedPhaseId: transition.completedPhaseId,
+    phasePlan: transition.phasePlan,
+    nextPlan,
+  };
 }
 
 function assertWorkspacePath(workspace: string, target: string): void {

@@ -3,8 +3,16 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { jsonrepair } from 'jsonrepair';
 import type { ChatOptions, LLMClient } from '../llm/types.js';
-import type { Step } from '../core/plan.js';
-import type { EngineeringChangeRequest } from '../core/change_request.js';
+import { V_MODEL_TEST_PHASES, type Step } from '../core/plan.js';
+import {
+  normalizeQualityAssessment,
+  type StageQualityAssessment,
+} from '../core/quality_gate.js';
+import type {
+  ChangeRequestTicket,
+  EnhanceTicket,
+  WorkTicket,
+} from '../core/ticket.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
 import type {
   Tool,
@@ -23,8 +31,8 @@ const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
  * Executor 把一个 Step 交给对应角色的 LLM，要求其用一组 tool calls 完成产出。
  *
  * 协议：LLM 必须严格返回 JSON：
- *   { "thoughts": "短说明", "actions": [ { "tool": "name", "args": {...} }, ... ], "done": true|false }
- * DEBUG issue 场景还必须额外返回 issueResolutionPlan，供 issue/debug-wiki 持久化。
+ *   { "thoughts": "短说明", "validationDefect": "可选验证缺陷", "qualityAssessment": {...}, "actions": [...], "done": true|false }
+ * DEBUG Bug Ticket 场景还必须额外返回 bugResolutionPlan，供 Ticket/debug-wiki 持久化。
  *
  * 主循环：
  *   while not done and rounds < maxRounds:
@@ -59,13 +67,17 @@ export interface ExecutorRunInput {
   ctx: ToolContext;
   /** 注入到 user prompt 的额外上下文（如已有 inputs 内容）。 */
   contextSnippets?: Array<{ path: string; content: string }>;
+  /** Canonical task handoff for this execution boundary. */
+  ticket?: WorkTicket;
   /** Active engineering CR. The Step must apply only this delta to the existing baseline. */
-  changeRequest?: EngineeringChangeRequest;
+  changeRequest?: ChangeRequestTicket;
+  /** Active quality-gap remediation. The Step appends only the missing or under-target work. */
+  enhancement?: EnhanceTicket;
   /** 来自 Skill 的提示词，拼接到 system prompt 后。 */
   skillHints?: string[];
   /** debug 模式下传入上一轮失败记录（错误文本 / 失败测试 / 上下文）。 */
   debugContext?: {
-    issueId?: string;
+    bugTicketId?: string;
     reason: string;
     failureLog: string;
     debugBrief?: string;
@@ -83,8 +95,12 @@ export interface ExecutorRunResult {
   rounds: number;
   toolCalls: Array<{ tool: string; ok: boolean; summary?: string; error?: string }>;
   finalThought?: string;
-  /** Debugger 处理 issue 时输出的可复用处理方案，成功后写回 issue/debug-wiki。 */
-  issueResolutionPlan?: string;
+  /** Debugger 处理 Bug Ticket 时输出的可复用方案，成功后写回 Ticket/debug-wiki。 */
+  bugResolutionPlan?: string;
+  /** Right-side validation found a semantic test/contract defect that must route to the paired source phase. */
+  validationDefect?: string;
+  /** Structured completion/alignment/coverage evidence evaluated by the Runtime quality gate. */
+  qualityAssessment?: StageQualityAssessment;
   error?: string;
   /** 健康度统计：用于调用方做"滑动窗口"自适应重试决策。 */
   metrics: ExecutorRunMetrics;
@@ -103,6 +119,8 @@ export interface ExecutorRunMetrics {
   progressRatio: number;
   /** [0..1] 健康度得分；越高越值得继续重试。 */
   healthScore: number;
+  /** Providers that produced accepted response turns during this attempt. */
+  providers: string[];
 }
 
 interface LLMAction {
@@ -118,11 +136,17 @@ export interface AdvisoryFailureRule {
 
 interface LLMTurn {
   thoughts?: string;
-  issueResolutionPlan?: string;
-  issue_resolution_plan?: string;
+  bugResolutionPlan?: string;
+  bug_resolution_plan?: string;
   resolutionPlan?: string;
   handlingPlan?: string;
   fixPlan?: string;
+  validationDefect?: string | null;
+  validation_defect?: string | null;
+  validationFailure?: string | null;
+  validation_failure?: string | null;
+  qualityAssessment?: unknown;
+  quality_assessment?: unknown;
   actions?: unknown;
   done?: boolean;
 }
@@ -136,7 +160,7 @@ interface TurnFeedbackContext {
   readOnlyRecoveryWarning?: boolean;
   noProgressWarning?: { rounds: number };
   repairEvidenceMissing?: boolean;
-  issueResolutionPlanMissing?: boolean;
+  bugResolutionPlanMissing?: boolean;
 }
 
 export class StepExecutor {
@@ -186,7 +210,8 @@ export class StepExecutor {
     ];
     const calls: ExecutorRunResult['toolCalls'] = [];
     let finalThought: string | undefined;
-    let issueResolutionPlan: string | undefined;
+    let bugResolutionPlan: string | undefined;
+    let qualityAssessment: StageQualityAssessment | undefined;
 
     // 健康度信号采集
     const initialMissing = initialVerify.missing.length;
@@ -213,6 +238,7 @@ export class StepExecutor {
     let readOnlyRecoveryRounds = 0;
     const advisoryFailureTools = new Set(this.opts.advisoryFailureTools ?? []);
     const advisoryFailureRules = this.opts.advisoryFailureRules ?? [];
+    const providers = new Set<string>();
 
     for (let round = 1; round <= roundLimit; round++) {
       const rep = makeStreamReporter(
@@ -270,6 +296,7 @@ export class StepExecutor {
           },
         };
         text = await this.opts.llm.chat(chatMessages, chatOptions);
+        providers.add(provider ?? this.opts.llm.name);
       } catch (err) {
         rep.done('failed');
         const errMsg = (err as Error).message;
@@ -316,13 +343,14 @@ export class StepExecutor {
             calls,
             initialMissing,
             currentMissing: verify.missing.length,
+            providers: [...providers],
           });
           return {
             success: false,
             rounds: round,
             toolCalls: calls,
             finalThought,
-            issueResolutionPlan,
+            bugResolutionPlan,
             error: errMsg,
             metrics,
           };
@@ -332,7 +360,10 @@ export class StepExecutor {
       rep.done();
       const turn = parseTurn(text);
       finalThought = turn.thoughts;
-      issueResolutionPlan = extractIssueResolutionPlan(turn) ?? issueResolutionPlan;
+      bugResolutionPlan = extractBugResolutionPlan(turn) ?? bugResolutionPlan;
+      qualityAssessment =
+        normalizeQualityAssessment(turn.qualityAssessment ?? turn.quality_assessment) ??
+        qualityAssessment;
       const normalizedActions = normalizeActions(turn.actions, toolMap);
       let actions = normalizedActions.actions;
       if (role === 'Debugger' && (readOnlyRecoveryMode || directRepairMode)) {
@@ -411,7 +442,7 @@ export class StepExecutor {
       // 把 LLM 本轮的"思考过程 + 计划行动"写入审计，作为交付时的可追溯材料
       await inp.ctx.audit?.executorTurn(inp.step.id, role, round, {
         thoughts: turn.thoughts,
-        issueResolutionPlan,
+        bugResolutionPlan,
         actions,
         done: turn.done === true,
         raw: text,
@@ -529,11 +560,47 @@ export class StepExecutor {
       if (turnResults.some((r) => r.tool === 'run_tests' && !r.ok) && !advisoryFailureTools.has('run_tests')) {
         failedTestRunRounds++;
       }
+      const validationDefect = extractValidationDefect(turn);
+      if (
+        validationDefect &&
+        (V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase)
+      ) {
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        await inp.ctx.audit?.event(
+          'note',
+          `${inp.step.id} reported a validation defect that requires paired-source repair`,
+          {
+            messageId: 'audit.executor_validation_defect',
+            stepId: inp.step.id,
+            phase: inp.step.phase,
+            round,
+            validationDefect,
+          },
+        );
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          validationDefect,
+          error: `validation defect reported: ${validationDefect}`,
+          metrics,
+        };
+      }
       const repairGateOk = !repairRequired ||
         repairEvidence ||
         canAcceptOutputCompletionRecovery(inp, initialMissing);
-      const issueResolutionPlanRequired = role === 'Debugger' && !!inp.debugContext?.issueId;
-      const issueResolutionPlanOk = !issueResolutionPlanRequired || !!issueResolutionPlan?.trim();
+      const bugResolutionPlanRequired = role === 'Debugger' && !!inp.debugContext?.bugTicketId;
+      const bugResolutionPlanOk = !bugResolutionPlanRequired || !!bugResolutionPlan?.trim();
       const verifiedCompletion = !turn.done && hasSuccessfulCompletionVerification(calls);
       const outputCompletionRecovery = verify.ok && canAcceptOutputCompletionRecovery(inp, initialMissing);
       const declarativeOutputCompletion =
@@ -559,7 +626,7 @@ export class StepExecutor {
         verify.ok &&
         unresolvedFailuresOk &&
         repairGateOk &&
-        issueResolutionPlanOk
+        bugResolutionPlanOk
       ) {
         if (declarativeOutputCompletion) {
           await inp.ctx.audit?.event(
@@ -581,8 +648,17 @@ export class StepExecutor {
           calls,
           initialMissing,
           currentMissing: verify.missing.length,
+          providers: [...providers],
         });
-        return { success: true, rounds: round, toolCalls: calls, finalThought, issueResolutionPlan, metrics };
+        return {
+          success: true,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          qualityAssessment,
+          metrics,
+        };
       }
       if (this.opts.maxFailedTestRuns && failedTestRunRounds >= this.opts.maxFailedTestRuns) {
         const metrics = computeMetrics({
@@ -592,6 +668,7 @@ export class StepExecutor {
           calls,
           initialMissing,
           currentMissing: verify.missing.length,
+          providers: [...providers],
         });
         const error =
           `run_tests failed ${failedTestRunRounds} time(s) in this step; ` +
@@ -603,7 +680,7 @@ export class StepExecutor {
           failedTestRunRounds,
           maxFailedTestRuns: this.opts.maxFailedTestRuns,
         });
-        return { success: false, rounds: round, toolCalls: calls, finalThought, issueResolutionPlan, error, metrics };
+        return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
       if (missingOutputStallRounds >= MISSING_OUTPUT_STALL_ROUND_LIMIT) {
         repeatedTurns++;
@@ -614,6 +691,7 @@ export class StepExecutor {
           calls,
           initialMissing,
           currentMissing: verify.missing.length,
+          providers: [...providers],
         });
         const error =
           `write/progress actions did not reduce missing outputs for ${missingOutputStallRounds} rounds; ` +
@@ -626,7 +704,7 @@ export class StepExecutor {
           missingOutputStallRounds,
           missingOutputs: verify.missing,
         });
-        return { success: false, rounds: round, toolCalls: calls, finalThought, issueResolutionPlan, error, metrics };
+        return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
       const readOnlyRecoveryViolation = readOnlyRecoveryMode && readOnlyRecoveryRounds >= 2;
       const readOnlyRoundLimit = directRepairMode ? 2 : 3;
@@ -639,6 +717,7 @@ export class StepExecutor {
           calls,
           initialMissing,
           currentMissing: verify.missing.length,
+          providers: [...providers],
         });
         const targets = actions.flatMap((action) => actionTargetPaths(action.tool, action.args)).join(', ');
         const error =
@@ -654,7 +733,7 @@ export class StepExecutor {
           consecutiveReadOnlyRounds,
           actions,
         });
-        return { success: false, rounds: round, toolCalls: calls, finalThought, issueResolutionPlan, error, metrics };
+        return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
       if (consecutiveNoProgressRounds >= 2) {
         repeatedTurns++;
@@ -665,6 +744,7 @@ export class StepExecutor {
           calls,
           initialMissing,
           currentMissing: verify.missing.length,
+          providers: [...providers],
         });
         const blockers = [
           verify.missing.length > 0
@@ -686,7 +766,7 @@ export class StepExecutor {
           missingOutputs: verify.missing,
           unresolvedToolFailures: [...unresolvedToolFailures.values()],
         });
-        return { success: false, rounds: round, toolCalls: calls, finalThought, issueResolutionPlan, error, metrics };
+        return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
       if (
         round >= roundLimit &&
@@ -742,12 +822,12 @@ export class StepExecutor {
             verify.ok &&
             unresolvedToolFailures.size === 0 &&
             !repairEvidence,
-          issueResolutionPlanMissing:
-            issueResolutionPlanRequired &&
+          bugResolutionPlanMissing:
+            bugResolutionPlanRequired &&
             turn.done === true &&
             verify.ok &&
             unresolvedToolFailures.size === 0 &&
-            !issueResolutionPlanOk,
+            !bugResolutionPlanOk,
         }, {
           feedbackCharBudget: inp.ctx.feedbackCharBudget,
           readChunkBytes: inp.ctx.readChunkBytes,
@@ -763,18 +843,20 @@ export class StepExecutor {
       calls,
       initialMissing,
       currentMissing: finalVerify.missing.length,
+      providers: [...providers],
     });
     return {
       success: false,
       rounds: actualRounds || roundLimit,
       toolCalls: calls,
       finalThought,
-      issueResolutionPlan,
+      bugResolutionPlan,
+      qualityAssessment,
       error:
         role === 'Debugger' &&
-          !!inp.debugContext?.issueId &&
-          !issueResolutionPlan?.trim()
-          ? 'DEBUG issue completion missing issueResolutionPlan; provide a concrete handling plan before marking the issue resolved.'
+          !!inp.debugContext?.bugTicketId &&
+          !bugResolutionPlan?.trim()
+          ? 'DEBUG bug-ticket completion missing bugResolutionPlan; provide a concrete handling plan before closing the ticket.'
           :
         repairRequired &&
           finalVerify.ok &&
@@ -1011,7 +1093,7 @@ function compactTurnForHistory(turn: LLMTurn, toolMap?: Map<string, Tool>): stri
     : '';
   return JSON.stringify({
     thoughts: truncate(`${turn.thoughts ?? ''}${omittedSummary}`, 900),
-    issueResolutionPlan: truncate(extractIssueResolutionPlan(turn) ?? '', 900),
+    bugResolutionPlan: truncate(extractBugResolutionPlan(turn) ?? '', 900),
     actions: safeActions.map((action) => ({
       tool: action.tool,
       args: compactActionArgs(action.tool, action.args),
@@ -1495,6 +1577,7 @@ function computeMetrics(p: {
   calls: ExecutorRunResult['toolCalls'];
   initialMissing: number;
   currentMissing: number;
+  providers: string[];
 }): ExecutorRunMetrics {
   const rounds = Math.max(1, p.rounds);
   const totalCalls = p.calls.length;
@@ -1515,6 +1598,7 @@ function computeMetrics(p: {
     toolFailRatio,
     progressRatio,
     healthScore: score,
+    providers: [...new Set(p.providers)],
   };
 }
 
@@ -1557,7 +1641,7 @@ function renderUserPrompt(
       `### ${s.path}\n\`\`\`\n${truncate(
         s.content,
         s.path === '.xcompiler/architecture-contract.json' ||
-          s.path.startsWith('.xcompiler/change-requests/')
+          s.path.startsWith('.xcompiler/tickets/')
           ? architectureLimit
           : snippetLimit,
       )}\n\`\`\``,
@@ -1565,7 +1649,7 @@ function renderUserPrompt(
     .join('\n\n');
   const dbg = inp.debugContext
     ? [
-        inp.debugContext.issueId ? `## issue\nid: ${inp.debugContext.issueId}\n` : '',
+        inp.debugContext.bugTicketId ? `## bug ticket\nid: ${inp.debugContext.bugTicketId}\n` : '',
         inp.debugContext.debugBrief ? `${inp.debugContext.debugBrief}\n` : '',
         `## compact failure evidence\n\`\`\`\n${truncate(inp.debugContext.failureLog, failureLogLimit)}\n\`\`\`\n`,
         inp.debugContext.suggestions ? `\n${inp.debugContext.suggestions}\n` : '',
@@ -1583,15 +1667,43 @@ function renderUserPrompt(
     : '';
   const changeRequestBlock = inp.changeRequest
     ? [
-        '## active engineering change request',
+        '## active change-request ticket',
         `id: ${inp.changeRequest.id}`,
         `revision: ${inp.changeRequest.revision}`,
         `status: ${inp.changeRequest.status}`,
+        `source enhancement: ${inp.changeRequest.sourceEnhanceTicketId}`,
+        `origin bug: ${inp.changeRequest.originBugTicketId}`,
         `objective: ${inp.changeRequest.objective}`,
         `contract delta: ${inp.changeRequest.contractChange.summary}`,
+        'This CR carries an accepted upstream contract change. It is not an enhancement finding.',
         'This is incremental CR execution against the existing project baseline.',
         'Apply only the affected contract and artifacts for this Step. Preserve unrelated files and accepted behavior.',
         'Do not regenerate the whole phase, project, design, or test suite.',
+        '',
+      ].join('\n')
+    : '';
+  const enhancementBlock = inp.enhancement
+    ? [
+        '## active enhancement ticket',
+        `id: ${inp.enhancement.id}`,
+        `kind: ${inp.enhancement.kind}`,
+        `finding: ${inp.enhancement.finding}`,
+        `quality gaps: ${(inp.enhancement.qualityFailures ?? []).join(' | ') || 'see finding'}`,
+        `verification: ${inp.enhancement.verificationStepId ?? inp.step.id} ${inp.enhancement.verificationPhase ?? inp.step.phase}`,
+        'Append or patch only the missing, incomplete, or below-threshold content.',
+        'Preserve accepted baseline behavior and artifacts. Do not regenerate the whole phase or project.',
+        '',
+      ].join('\n')
+    : '';
+  const workTicketBlock = inp.ticket
+    ? [
+        '## active work ticket',
+        `id: ${inp.ticket.id}`,
+        `type: ${inp.ticket.type}`,
+        `status: ${inp.ticket.status}`,
+        `parent: ${inp.ticket.parentTicketId ?? 'none'}`,
+        `acceptance: ${inp.ticket.acceptance.join(' | ') || inp.step.acceptance}`,
+        'Complete only this ticket and its declared sub-tasks/artifacts.',
         '',
       ].join('\n')
     : '';
@@ -1602,6 +1714,8 @@ function renderUserPrompt(
     `acceptance: ${inp.step.acceptance}`,
     '',
     missingOutputPriority,
+    workTicketBlock,
+    enhancementBlock,
     changeRequestBlock,
     '## description',
     inp.step.description,
@@ -1734,8 +1848,8 @@ function renderFeedback(
       'The next response must run a concrete tool action or return done=true only when completion is already verified.',
     );
   }
-  if (turn.issueResolutionPlanMissing) {
-    lines.push(M.executorFeedbackIssueResolutionPlanMissing);
+  if (turn.bugResolutionPlanMissing) {
+    lines.push(M.executorFeedbackBugResolutionPlanMissing);
   }
   if (failureDetails.some((failure) => /path must be a non-empty string/i.test(failure))) {
     lines.push(
@@ -1985,13 +2099,28 @@ function isTurnObject(value: unknown): LLMTurn | null {
   return value as LLMTurn;
 }
 
-function extractIssueResolutionPlan(turn: LLMTurn): string | undefined {
+function extractBugResolutionPlan(turn: LLMTurn): string | undefined {
   const candidates = [
-    turn.issueResolutionPlan,
-    turn.issue_resolution_plan,
+    turn.bugResolutionPlan,
+    turn.bug_resolution_plan,
     turn.resolutionPlan,
     turn.handlingPlan,
     turn.fixPlan,
+  ];
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return truncate(value.trim(), 2400);
+    }
+  }
+  return undefined;
+}
+
+function extractValidationDefect(turn: LLMTurn): string | undefined {
+  const candidates = [
+    turn.validationDefect,
+    turn.validation_defect,
+    turn.validationFailure,
+    turn.validation_failure,
   ];
   for (const value of candidates) {
     if (typeof value === 'string' && value.trim().length > 0) {

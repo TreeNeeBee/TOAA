@@ -46,14 +46,21 @@ XCompiler combines a phase iteration model with the V-model. The planner first c
 
 V-model behavior:
 
-- `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, and `CODE` generate their paired downstream test expectations.
+- `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, and `CODE` each generate the paired test plan and executable test cases: functional, module/contract, integration, and unit respectively.
 - `HIGH_LEVEL_DESIGN` defines system-level interfaces, external APIs, third-party libraries, and dependencies.
 - `DETAILED_DESIGN` defines internal module structure and implementation details.
-- Test failures are first recorded as issues, then routed back to the matching upstream stage for Debugger repair.
-- A repair routed to `HIGH_LEVEL_DESIGN` or `DETAILED_DESIGN` opens an engineering CR. The issue stays `change_pending`; downstream stages apply only the CR delta and record change/verification commits.
-- A downstream failure returns the same CR to `rework`. A child CR is created only when the correction materially expands contract or scope. CR and issue close only after every affected gate passes.
+- `UNIT_TEST`, `INTEGRATION_TEST`, `MODULE_TEST`, and `FUNCTIONAL_TEST` are validation-only: they inspect the existing paired tests, run the scoped gate, and write reports without modifying `src/` or `tests/`.
+- Every S1-S4 delivery gate records stage completion and alignment with its upstream requirement/design contract. Missing or under-aligned work opens an `enhance` Ticket and reruns the owning stage in incremental mode.
+- S5 enforces line, branch, and test-case pass coverage; S6 enforces interface and integration-scenario coverage; S7 enforces module and contract coverage; S8 enforces functional, requirement, and end-to-end coverage. Each plan can override thresholds and bounded `tolerance`.
+- A metric shortfall, skipped-test excess, warning excess, or missing quality evidence opens an `enhance`; an actual failed test, command error, or semantic `validationDefect` opens a `bug`.
+- Runtime materializes every planned iteration as a `feature`; each macro Step is a `task`, and its two-level `subTasks` become parent-linked `sub-task` Tickets.
+- A concrete failure creates a `bug` for Debugger execution. Quality findings are independent `enhance` Tickets with kind `defect`, `functional-gap`, or `test-incomplete`; they are not disguised as Bugs.
+- Only an accepted upstream design/contract delta creates a `change-request`. Its trigger is the Enhance finding; `originBugTicketId` is present only when a Bug initiated that finding. Downstream stages apply only the delta and record change/verification commits.
+- A downstream failure creates another linked Bug and increments the same change-request revision. A child change-request is created only when the correction materially expands contract or scope.
+- Bug closure order is fixed: repair -> verification -> debug-wiki persistence -> `closed`. A design Bug remains blocked by its change-request until every affected gate passes.
 - Completed-phase debug must provide a real patch/rewrite or successful verification evidence.
 - Network/API failures are treated as real gates: if the project API fails, the run must repair or switch API instead of hiding the failure.
+- Every quality assessment is persisted in `.xcompiler/quality/assessments.json`. Successful delivery writes `docs/project-development-report.md` with iteration status, S1-S8 thresholds and measurements, tolerance observations, Ticket totals, audit results, and the final delivery verdict.
 
 ---
 
@@ -67,12 +74,15 @@ Layer responsibilities:
 
 - **Adapters**: argument/protocol parsing, config loading, user interaction, output rendering, exit codes.
 - **Runtime**: Runtime API, Build Service, Run Service, Event Stream, and Permission Broker; the only business entry point.
-- **Workflow and planning**: phase iteration, V-model scheduling, rollback/debug routing, iteration gates, resume.
-- **State policy**: one transition guard with separate Step, Phase, Issue, and CR transition tables; no adapter or agent mutates persisted workflow state directly.
+- **Workflow and planning**: phase iteration, V-model scheduling, Ticket registration/routing, rollback, iteration gates, resume.
+- **State policy**: one Ticket lifecycle for `feature`, `enhance`, `task`, `sub-task`, `bug`, and `change-request`; Step and implementation-phase cursors remain execution state. No adapter or agent mutates persisted workflow state directly.
 - **Agents / Skills**: role-specific prompts plus allowed tools for each stage.
 - **Tools**: guarded file edits, program/test execution, API fetches, dependency edits, git snapshots.
 - **LLM Router**: role chains, provider scores, cluster fallbacks, OpenAI-compatible/Ollama clients, audit.
-- **Workspace**: `phasePlan.json`, `plan.P<N>.json`, `<name>.xc`, `.xcompiler/audit.jsonl`, `.xcompiler/issues/`, `.xcompiler/change-requests/`, debug cache, project memory.
+- **Workspace**: `phasePlan.json`, `plan.P<N>.json`, `<name>.xc`, `.xcompiler/audit.jsonl`, `.xcompiler/tickets/`, `.xcompiler/quality/assessments.json`, debug cache, project memory, and `docs/project-development-report.md`.
+
+Ticket state is persisted in `.xcompiler/tickets/index.json`, per-ticket JSON/Markdown snapshots, and the append-only `.xcompiler/tickets/events.jsonl`. Bug evidence and repair patches live under the Bug Ticket directory, so every handoff keeps its trigger, parent/root relationship, blockers, affected artifacts, acceptance gates, and final resolution.
+`.xcompiler/tickets/summary.json` separates enhancement kinds, CR revisions, status counts, and per-provider model impact. A quality gap penalizes the attributed author provider; a validated finding rewards its validator; verified Debug and CR work rewards the providers that produced the accepted repair. Creating a CR by itself never changes a model score.
 
 ---
 
@@ -169,7 +179,7 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **Languages**: Python and TypeScript project generation, testing, execution, and entry checks.
 - **Sandbox**: `subprocess` by default with an isolated environment (`inherit_env: false`); optional `docker` mode for enforceable network/resource isolation. `network: off` is rejected in subprocess mode because a host child process cannot enforce it.
 - **Audit**: every run writes `.xcompiler/audit.jsonl`, LLM stream traces, `docs/process_log.md`, debug cache, debug wiki feedback, and project memory.
-- **Debug wiki**: Debugger issue repairs retrieve LLM-wiki style prior fixes by compact `DebugBrief`. The wiki is a layered Markdown knowledge base: bundled `wiki/system` policy pages, bundled `wiki/agent` calibration pages, and local `wiki/external` issue-resolution pages. Runtime regenerates `index.md` for review, `index.json` for retrieval, and `log.md` for append-only operations. By default it is copied to the XCompiler path (`$XC_PATH/.xcompiler/debug-wiki` when `XC_PATH` is set, otherwise the package/repo root); use `--debug-wiki-path <dir>` to share a different root. Successful issue repairs persist the LLM's `issueResolutionPlan` in `external`; failed reused fixes are marked `needs_review` through feedback overlays and later successful repairs create/correct external entries.
+- **Debug wiki**: Bug Ticket repairs retrieve LLM-wiki style prior fixes by compact `DebugBrief`. The wiki is a layered Markdown knowledge base: bundled `wiki/system` policy pages, bundled `wiki/agent` calibration pages, and local `wiki/external` resolved-Bug knowledge. Runtime regenerates `index.md` for review, `index.json` for retrieval, and `log.md` for append-only operations. By default it is copied to the XCompiler path (`$XC_PATH/.xcompiler/debug-wiki` when `XC_PATH` is set, otherwise the package/repo root); use `--debug-wiki-path <dir>` to share a different root. A Bug closes only after its `bugResolutionPlan` and evidence are persisted; failed reused fixes are marked `needs_review`.
 - **Security gates**: project file access is guarded, write tools are scoped to declared outputs, and sensitive actions can be surfaced as permission events in adapter scenarios.
 
 ---

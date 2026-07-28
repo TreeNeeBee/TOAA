@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1360" height="900" viewBox="0 0 1360 900" role="img" aria-labelledby="title desc">
   <title id="title">XCompiler iterative V-model pipeline</title>
-  <desc id="desc">A phase iteration plan expands one active phase into a V-model workflow. Failed verification stages feed back to paired upstream stages, while issue recording and debug patching are shown as generic recovery steps.</desc>
+  <desc id="desc">A phase iteration plan expands one active phase into a V-model workflow. Failed verification stages create Bug and Enhance Tickets and feed back to paired upstream stages. A change request is opened only when an upstream contract delta must propagate downstream.</desc>
   <defs>
     <filter id="soft-shadow" x="-20%" y="-20%" width="140%" height="160%">
       <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.10"/>
@@ -39,7 +39,7 @@
       .coding { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; rx: 12; }
       .test { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; rx: 12; }
       .gate { fill: #fffbeb; stroke: #d97706; stroke-width: 1.5; rx: 12; }
-      .issue { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; rx: 12; }
+      .ticket { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; rx: 12; }
       .debug { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.5; rx: 12; }
       .tag { fill: #fff; stroke: #fecaca; stroke-width: 1; rx: 8; }
       .flow { fill: none; stroke: #2563eb; stroke-width: 2.5; marker-end: url(#arrow-blue); }
@@ -155,10 +155,10 @@
   <rect class="future" x="1098" y="472" width="180" height="284"/>
   <text class="section" x="1188" y="498" text-anchor="middle">Generic error</text>
   <text class="section" x="1188" y="517" text-anchor="middle">handling</text>
-  <rect class="issue" x="1113" y="540" width="150" height="36"/>
-  <text class="label" x="1188" y="563" text-anchor="middle">Record issue</text>
-  <rect class="issue" x="1113" y="596" width="150" height="36"/>
-  <text class="label" x="1188" y="619" text-anchor="middle">Classify stage</text>
+  <rect class="ticket" x="1113" y="540" width="150" height="36"/>
+  <text class="label" x="1188" y="563" text-anchor="middle">Bug + Enhance</text>
+  <rect class="ticket" x="1113" y="596" width="150" height="36"/>
+  <text class="label" x="1188" y="619" text-anchor="middle">CR for design delta</text>
   <rect class="debug" x="1113" y="652" width="150" height="36"/>
   <text class="label" x="1188" y="675" text-anchor="middle">Patch / rewrite</text>
   <rect class="debug" x="1113" y="708" width="150" height="36"/>
