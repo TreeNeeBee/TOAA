@@ -98,6 +98,34 @@ V 模型流程：
 
 Ticket 只持久化到 `.xcompiler/tickets/`。旧 Issue Journal、独立 CR Store 及其目录不再读取、转换或镜像，Runtime 内不存在兼容双轨。
 
+### 3.2 Phase Engine 内部边界
+
+`src/core/engine.ts` 只保留执行状态机的编排职责：选择可执行 Step、推进 Plan 状态、建立单次尝试的事务边界，以及按 V 模型执行回退和下游重跑。可复用规则与持久化流程位于 `src/core/engine/`：
+
+| 模块 | 单一职责 |
+| --- | --- |
+| `attempt_types.ts` | Attempt、Debug 上下文和结果的内部契约 |
+| `attempt_environment.ts` | 解析 Skill/Tool、计算动态窗口、应用 EditGuard 并构建 Executor 上下文 |
+| `attempt_policy.ts` | 判断修复动作、验证证据、失败工具和 Patch 结果 |
+| `v_model_policy.ts` | V 模型配对、测试范围、代码校验和回退提示等无状态规则 |
+| `context.ts` | 构建 Agent 上下文并计算 Step/Debug 写入边界 |
+| `audit_repair.ts` | 将最终项目审计失败映射到负责修复的 Step |
+| `debug_prompt.ts` | 压缩 Debug 证据、合并 Ticket/Enhance 信息并检索 Debug Wiki |
+| `debug_wiki_feedback.ts` | 隔离 Debug Wiki 的加载、检索及正负反馈持久化 |
+| `failure_presenter.ts` | 渲染 CLI 终态失败、指标和校准建议，不参与状态跳转 |
+| `work_ticket_lifecycle.ts` | Feature、Task、Sub-task 的注册、执行同步和父子关闭 |
+| `bug_lifecycle.ts` | Bug Ticket 的创建、路由、修复验证和关闭 |
+| `enhancement_lifecycle.ts` | Enhance Ticket 的质量缺口、模型归因和关闭 |
+| `change_request_opening.ts` | 从设计修复或质量缺口建立增量 CR |
+| `change_request_lifecycle.ts` | CR 返工、逐站应用、验证关闭和父子 CR 收敛 |
+| `lifecycle_registry.ts` | 编译期保证每种 Ticket 类型都有唯一 lifecycle owner |
+| `test_phase_validator.ts` | 检查配对测试资产并复验已有测试与功能入口 |
+| `repair_artifact.ts` | 生成 Debug Patch/摘要并验证已完成阶段的修复证据 |
+
+六种 Ticket 的 lifecycle owner 固定为：`feature/task/sub-task -> WorkTicketLifecycle`、`bug -> BugLifecycle`、`enhance -> EnhancementLifecycle`、`change-request -> ChangeRequestLifecycle`。三个 Work Ticket 共享生命周期，是因为它们组成同一棵计划工作树，而不是三个互相独立的状态机。
+
+模块化边界遵循两条约束：只有 Phase Engine 推进 `Step.status`；Ticket lifecycle 只推进 Ticket 图。`TicketStore` 仅保留创建、查询、通用状态转换、关联和持久化原语，不承载某一种 Ticket 的专属流程。测试应直接验证对应模块的公开函数或服务，不依赖 Phase Engine 的私有方法。
+
 ---
 
 ## 4. 核心命令：`xcompiler build` 与 `xcompiler run`

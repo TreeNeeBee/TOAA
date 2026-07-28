@@ -17,7 +17,13 @@ import { shouldRollbackTestPhaseFailure } from '../src/core/debug_policy.js';
 import { savePlan } from '../src/core/storage.js';
 import { buildDebugBrief } from '../src/core/debug_brief.js';
 import { DebugWiki } from '../src/core/debug_wiki.js';
+import {
+  buildContextSnippets,
+  computeDebugAllowedWrites,
+} from '../src/core/engine/context.js';
+import { getLanguageProfile } from '../src/core/language.js';
 import type { Plan } from '../src/core/plan.js';
+import { TicketStore } from '../src/core/ticket.js';
 import type { LLMRouter } from '../src/llm/router.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 import type { Role } from '../src/core/plan.js';
@@ -1019,18 +1025,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
   it('keeps right-side validation DEBUG writes scoped to its own report outputs', async () => {
     const plan = fakePlan();
     const debugSourceStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
-    const engine = new PhaseEngine({
-      ws,
-      git,
-      sandbox,
-      router: new FakeRouter({}) as unknown as LLMRouter,
-      audit,
-      planPath: path.join(tmp, 'plan.json'),
-      maxRoundsPerStep: 1,
-    });
-    const allowed = (engine as unknown as {
-      computeDebugAllowedWrites(p: Plan, s: typeof debugSourceStep): string[];
-    }).computeDebugAllowedWrites(plan, debugSourceStep);
+    const allowed = computeDebugAllowedWrites(
+      plan,
+      debugSourceStep,
+      getLanguageProfile(plan.language),
+    );
     expect(allowed).toEqual(expect.arrayContaining(debugSourceStep.outputs));
     expect(allowed).not.toContain('src/hello.py');
     expect(allowed).not.toContain('tests/test_hello.py');
@@ -1655,23 +1654,15 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await ws.writeFile('src/hello.py', 'def hi():\n    return "hello"\n');
     await ws.writeFile('src/support.py', 'VALUE = 1\n');
     await ws.writeFile('docs/tests/unit-test-plan.md', '# Unit plan\n');
-    const engine = new PhaseEngine({
-      ws,
-      git,
-      sandbox,
-      router: {
-        primaryContextWindow: () => 16 * 1024,
-      } as unknown as LLMRouter,
-      audit,
-      planPath: path.join(tmp, 'plan.json'),
+    const snippets = await buildContextSnippets({
+      workspace: ws,
+      plan,
+      step: unitStep,
+      tickets: new TicketStore(ws),
+      projectMemory: null,
+      profile: getLanguageProfile(plan.language),
+      contextWindowTokens: 16 * 1024,
     });
-
-    const snippets = await (engine as unknown as {
-      buildContextSnippets: (
-        p: Plan,
-        s: Plan['steps'][number],
-      ) => Promise<Array<{ path: string; content: string }>>;
-    }).buildContextSnippets(plan, unitStep);
 
     expect(snippets).toEqual(expect.arrayContaining([
       expect.objectContaining({ path: 'src/hello.py', content: expect.stringContaining('return "hello"') }),

@@ -9,6 +9,9 @@ import {
   type BugTicket,
 } from '../src/core/ticket.js';
 import type { Plan, Step } from '../src/core/plan.js';
+import { ChangeRequestLifecycle } from '../src/core/engine/change_request_lifecycle.js';
+import { TICKET_LIFECYCLE_OWNERS } from '../src/core/engine/lifecycle_registry.js';
+import { WorkTicketLifecycle } from '../src/core/engine/work_ticket_lifecycle.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
 function codeStep(): Step {
@@ -54,9 +57,10 @@ async function setup() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-ticket-'));
   const workspace = new Workspace(root);
   const store = new TicketStore(workspace);
+  const workTickets = new WorkTicketLifecycle(store);
   const step = codeStep();
-  await store.registerPlan(plan(step));
-  return { root, workspace, store, step };
+  await workTickets.registerPlan(plan(step));
+  return { root, workspace, store, workTickets, step };
 }
 
 async function createBug(store: TicketStore, step: Step): Promise<BugTicket> {
@@ -90,6 +94,17 @@ async function createBug(store: TicketStore, step: Step): Promise<BugTicket> {
 }
 
 describe('ticket workflow', () => {
+  it('assigns every Ticket type to an explicit lifecycle owner', () => {
+    expect(TICKET_LIFECYCLE_OWNERS).toEqual({
+      feature: 'work',
+      task: 'work',
+      'sub-task': 'work',
+      bug: 'bug',
+      enhance: 'enhancement',
+      'change-request': 'change-request',
+    });
+  });
+
   it('materializes feature, task, and sub-task tickets from the plan hierarchy', async () => {
     const { root, store, step } = await setup();
     const tickets = store.all();
@@ -123,10 +138,11 @@ describe('ticket workflow', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-ticket-refactor-'));
     const workspace = new Workspace(root);
     const store = new TicketStore(workspace);
+    const workTickets = new WorkTicketLifecycle(store);
     const refactorPlan = plan();
     refactorPlan.intent = 'refactor';
 
-    await store.registerPlan(refactorPlan);
+    await workTickets.registerPlan(refactorPlan);
 
     expect(store.all().filter((ticket) => ticket.type === 'feature')).toHaveLength(1);
     expect(store.all().filter((ticket) => ticket.type === 'enhance')).toHaveLength(0);
@@ -164,16 +180,16 @@ describe('ticket workflow', () => {
   });
 
   it('reopens closed ancestor tickets when completed work starts again', async () => {
-    const { store, step } = await setup();
+    const { store, workTickets, step } = await setup();
     const work = store.workForStep(step.id)!;
     const root = store.find(work.rootTicketId!)!;
 
-    await store.syncStepStarted(step);
-    await store.syncStepCompleted(step);
+    await workTickets.startStep(step);
+    await workTickets.completeStep(step);
     expect(work.status).toBe('closed');
     expect(root.status).toBe('closed');
 
-    await store.syncStepStarted(step);
+    await workTickets.startStep(step);
     expect(work.status).toBe('in_progress');
     expect(root.status).toBe('in_progress');
   });
@@ -288,7 +304,15 @@ describe('ticket workflow', () => {
       },
     });
 
-    await store.recordApplication(request, {
+    const changes = new ChangeRequestLifecycle(
+      store,
+      null as never,
+      null as never,
+      null as never,
+      null as never,
+      null as never,
+    );
+    await changes.recordApplication(request, {
       stepId: step.id,
       phase: step.phase,
       kind: 'implementation-change',
@@ -296,7 +320,7 @@ describe('ticket workflow', () => {
       changedFiles: ['src/main.ts'],
       summary: 'Applied the service result delta.',
     });
-    await store.requestChangeRework(request, 'BUG-P1-002', 'unit verification failed');
+    await changes.requestRework(request, 'BUG-P1-002', 'unit verification failed');
 
     const persisted = ChangeRequestTicketSchema.parse(JSON.parse(await fs.readFile(
       path.join(root, '.xcompiler/tickets', `${request.id}.json`),

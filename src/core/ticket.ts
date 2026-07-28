@@ -8,7 +8,6 @@ import {
   type Phase,
   type Plan,
   type Step,
-  type StepSubtask,
 } from './plan.js';
 
 export const TICKET_VERSION = 2;
@@ -649,63 +648,6 @@ export class TicketStore {
     );
   }
 
-  async registerPlan(plan: Plan): Promise<void> {
-    await this.load();
-    const iterationIds = [...new Set(plan.steps.map((step) => step.iterationId ?? 'P1'))];
-    for (const iterationId of iterationIds) {
-      let root = this.tickets.find(
-        (ticket): ticket is WorkTicket =>
-          ticket.type === 'feature' &&
-          ticket.iterationId === iterationId &&
-          ticket.source.externalId === `${plan.requirementDigest}:${iterationId}`,
-      );
-      if (!root) {
-        root = await this.createWork({
-          type: 'feature',
-          iterationId,
-          title: `${iterationId} ${plan.intent}`,
-          description: plan.requirementDigest,
-          priority: 'high',
-          source: { kind: 'plan', externalId: `${plan.requirementDigest}:${iterationId}` },
-          acceptance: ['All V-model tasks and verification gates in this iteration are complete.'],
-          artifacts: [],
-        });
-      }
-
-      for (const step of plan.steps.filter((candidate) => (candidate.iterationId ?? 'P1') === iterationId)) {
-        let task = this.workForStep(step.id);
-        if (!task) {
-          task = await this.createWork({
-            type: 'task',
-            iterationId,
-            title: `${step.id} ${step.title}`,
-            description: step.description,
-            priority: 'high',
-            parentTicketId: root.id,
-            rootTicketId: root.id,
-            source: {
-              kind: 'plan',
-              externalId: step.id,
-              stepId: step.id,
-              phase: step.phase,
-              role: step.role,
-            },
-            acceptance: [step.acceptance],
-            artifacts: [...step.outputs],
-          });
-          root.relatedTicketIds = dedup([...root.relatedTicketIds, task.id]);
-          await this.persist(root, 'linked', { relatedTicketId: task.id });
-        }
-        await this.registerSubTasks(step, step.subTasks ?? [], task, root, []);
-        if (step.status === 'DONE' && task.status !== 'closed') {
-          await this.syncStepCompleted(step);
-        } else if (step.status === 'RUNNING' && task.status !== 'in_progress') {
-          await this.syncStepStarted(step);
-        }
-      }
-    }
-  }
-
   async createWork(input: {
     type: WorkTicket['type'];
     iterationId: string;
@@ -808,11 +750,6 @@ export class TicketStore {
     }) as EnhanceTicket;
     this.tickets.push(ticket);
     await this.persist(ticket, 'created');
-    await this.reopenAncestors(ticket, 'enhancement-opened', {
-      enhanceTicketId: ticket.id,
-      sourceBugTicketId: ticket.sourceBugTicketId,
-      sourceQualityGateStepId: ticket.sourceQualityGateStepId,
-    });
     return ticket;
   }
 
@@ -920,30 +857,6 @@ export class TicketStore {
     });
   }
 
-  async linkEnhanceToChange(
-    ticket: EnhanceTicket,
-    changeRequestTicketId: string,
-  ): Promise<void> {
-    ticket.changeRequestTicketIds = dedup([
-      ...ticket.changeRequestTicketIds,
-      changeRequestTicketId,
-    ]);
-    ticket.relatedTicketIds = dedup([
-      ...ticket.relatedTicketIds,
-      changeRequestTicketId,
-    ]);
-    ticket.disposition = 'change-request';
-    if (ticket.status === 'open' || ticket.status === 'triaged') {
-      transitionTicket(ticket, 'in_progress');
-    }
-    await this.persist(ticket, 'change-request-linked', { changeRequestTicketId });
-  }
-
-  async closeEnhance(ticket: EnhanceTicket): Promise<void> {
-    await this.resolveAndClose(ticket, 'enhancement-verified');
-    await this.maybeCloseParent(ticket);
-  }
-
   async block(ticket: Ticket, blockerId: string, reason: string): Promise<void> {
     ticket.blockedByTicketIds = dedup([...ticket.blockedByTicketIds, blockerId]);
     ticket.failureReason = reason;
@@ -960,110 +873,6 @@ export class TicketStore {
       transitionTicket(ticket, 'in_progress');
     }
     await this.persist(ticket, 'unblocked', { blockerId });
-  }
-
-  async syncStepStarted(step: Step): Promise<void> {
-    const ticket = this.workForStep(step.id);
-    if (!ticket) return;
-    await this.reopenAncestors(ticket, 'child-work-started', {
-      childTicketId: ticket.id,
-      stepId: step.id,
-      phase: step.phase,
-    });
-    if (ticket.status !== 'blocked') {
-      transitionTicket(ticket, 'in_progress');
-    }
-    await this.persist(
-      ticket,
-      ticket.status === 'blocked' ? 'blocked-work-repair-started' : 'work-started',
-      { stepId: step.id, phase: step.phase },
-    );
-    for (const child of this.descendantsOf(ticket.id)) {
-      transitionTicket(child, 'in_progress');
-      await this.persist(child, 'work-started', { stepId: step.id, phase: step.phase });
-    }
-  }
-
-  async syncStepFailed(step: Step, bugTicketId: string): Promise<void> {
-    const ticket = this.workForStep(step.id);
-    if (!ticket) return;
-    await this.link(ticket, bugTicketId, 'bug-linked');
-    await this.block(ticket, bugTicketId, `${step.id} is blocked by ${bugTicketId}`);
-  }
-
-  async syncStepCompleted(step: Step): Promise<void> {
-    const ticket = this.workForStep(step.id);
-    if (!ticket) return;
-    for (const child of this.descendantsOf(ticket.id).reverse()) {
-      await this.resolveAndClose(child, 'work-completed', { stepId: step.id });
-    }
-    await this.resolveAndClose(ticket, 'work-completed', { stepId: step.id, phase: step.phase });
-    await this.maybeCloseParent(ticket);
-  }
-
-  async syncStepReset(step: Step, reason: string): Promise<void> {
-    const ticket = this.workForStep(step.id);
-    if (!ticket) return;
-    if (ticket.status !== 'open') transitionTicket(ticket, 'in_progress');
-    ticket.failureReason = reason;
-    await this.persist(ticket, 'work-reopened', { stepId: step.id, reason });
-    for (const child of this.descendantsOf(ticket.id)) {
-      if (child.status !== 'open') transitionTicket(child, 'in_progress');
-      await this.persist(child, 'work-reopened', { stepId: step.id, reason });
-    }
-    await this.reopenAncestors(ticket, 'child-work-reopened', {
-      childTicketId: ticket.id,
-      stepId: step.id,
-      reason,
-    });
-  }
-
-  async recordApplication(
-    ticket: ChangeRequestTicket,
-    application: Omit<ChangeRequestApplication, 'revision' | 'appliedAt'>,
-  ): Promise<void> {
-    transitionTicket(ticket, application.kind === 'verification' ? 'verification' : 'in_progress');
-    ticket.applications.push({
-      ...application,
-      revision: ticket.revision,
-      appliedAt: new Date().toISOString(),
-    });
-    ticket.execution.currentStepId = application.stepId;
-    ticket.execution.completedStepIds = dedup([
-      ...ticket.execution.completedStepIds,
-      application.stepId,
-    ]);
-    await this.persist(ticket, 'application-recorded', { application });
-  }
-
-  async requestChangeRework(
-    ticket: ChangeRequestTicket,
-    triggerTicketId: string,
-    reason: string,
-  ): Promise<void> {
-    transitionTicket(ticket, 'in_progress');
-    ticket.revision += 1;
-    ticket.relatedTicketIds = dedup([...ticket.relatedTicketIds, triggerTicketId]);
-    ticket.execution.currentStepId = undefined;
-    ticket.revisionReason = reason;
-    await this.persist(ticket, 'rework-requested', { triggerTicketId, reason });
-  }
-
-  async blockChangeOnChild(
-    ticket: ChangeRequestTicket,
-    childTicketId: string,
-    bugTicketId: string,
-    reason: string,
-  ): Promise<void> {
-    if (!ticket.relatedTicketIds.includes(bugTicketId)) {
-      await this.requestChangeRework(ticket, bugTicketId, reason);
-    }
-    await this.block(ticket, childTicketId, reason);
-  }
-
-  async closeChange(ticket: ChangeRequestTicket): Promise<void> {
-    ticket.revisionReason = undefined;
-    await this.resolveAndClose(ticket, 'change-completed');
   }
 
   async persist(
@@ -1142,103 +951,6 @@ export class TicketStore {
       '.xcompiler/tickets/summary.json',
       `${JSON.stringify(this.summary(), null, 2)}\n`,
     );
-  }
-
-  private async registerSubTasks(
-    step: Step,
-    subTasks: StepSubtask[],
-    parent: WorkTicket,
-    root: WorkTicket,
-    ancestry: number[],
-  ): Promise<void> {
-    for (const [index, subTask] of subTasks.entries()) {
-      const path = [...ancestry, index + 1];
-      const externalId = `${step.id}/${path.join('.')}/${subTask.id}`;
-      let ticket = this.tickets.find(
-        (candidate): candidate is WorkTicket =>
-          candidate.type === 'sub-task' &&
-          candidate.source.externalId === externalId,
-      );
-      if (!ticket) {
-        ticket = await this.createWork({
-          type: 'sub-task',
-          iterationId: step.iterationId ?? 'P1',
-          title: `${subTask.id} ${subTask.title}`,
-          description: subTask.description,
-          parentTicketId: parent.id,
-          rootTicketId: root.id,
-          source: {
-            kind: 'plan',
-            externalId,
-            stepId: step.id,
-            phase: step.phase,
-            role: step.role,
-          },
-          acceptance: subTask.acceptance ? [subTask.acceptance] : [],
-          artifacts: subTask.outputs ?? [],
-        });
-        parent.relatedTicketIds = dedup([...parent.relatedTicketIds, ticket.id]);
-        await this.persist(parent, 'linked', { relatedTicketId: ticket.id });
-      }
-      await this.registerSubTasks(step, subTask.subTasks ?? [], ticket, root, path);
-    }
-  }
-
-  private descendantsOf(parentId: string): WorkTicket[] {
-    const direct = this.tickets.filter(
-      (ticket): ticket is WorkTicket =>
-        ticket.type === 'sub-task' && ticket.parentTicketId === parentId,
-    );
-    return direct.flatMap((ticket) => [ticket, ...this.descendantsOf(ticket.id)]);
-  }
-
-  private async resolveAndClose(
-    ticket: Ticket,
-    event: string,
-    extra: Record<string, unknown> = {},
-  ): Promise<void> {
-    if (ticket.status === 'open' || ticket.status === 'triaged' || ticket.status === 'failed') {
-      transitionTicket(ticket, 'in_progress');
-      await this.persist(ticket, `${event}:started`, extra);
-    }
-    if (ticket.status !== 'resolved' && ticket.status !== 'closed') {
-      transitionTicket(ticket, 'resolved');
-      await this.persist(ticket, `${event}:resolved`, extra);
-    }
-    if (ticket.status !== 'closed') {
-      transitionTicket(ticket, 'closed');
-      await this.persist(ticket, `${event}:closed`, extra);
-    }
-  }
-
-  private async maybeCloseParent(ticket: Ticket): Promise<void> {
-    if (!ticket.parentTicketId) return;
-    const parent = this.find(ticket.parentTicketId);
-    if (!parent || parent.type !== 'feature') return;
-    const children = this.tickets.filter((candidate) => candidate.parentTicketId === parent.id);
-    if (children.length > 0 && children.every((candidate) => candidate.status === 'closed')) {
-      await this.resolveAndClose(parent, 'all-child-work-completed');
-    }
-  }
-
-  private async reopenAncestors(
-    ticket: Ticket,
-    event: string,
-    extra: Record<string, unknown>,
-  ): Promise<void> {
-    let child = ticket;
-    while (child.parentTicketId) {
-      const parent = this.find(child.parentTicketId);
-      if (!parent) return;
-      if (parent.status === 'resolved' || parent.status === 'closed') {
-        transitionTicket(parent, 'in_progress');
-        await this.persist(parent, event, {
-          ...extra,
-          directChildTicketId: child.id,
-        });
-      }
-      child = parent;
-    }
   }
 
   private nextId(type: TicketType, iterationId: string): string {
