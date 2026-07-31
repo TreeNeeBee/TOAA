@@ -12,6 +12,7 @@ import {
   isOpenAICompatibleProvider,
   normalizeBaseUrl,
   probeLLMProviderAvailability,
+  resolveLLMProbeTimeoutMs,
   type LLMProbeResult,
 } from './health.js';
 import {
@@ -48,7 +49,7 @@ export class LLMRouter {
     private readonly unavailable: ReadonlySet<string> = new Set(),
     private readonly plugins?: PluginHost,
     private readonly probe: ProviderAvailabilityProbe = (name, provider) =>
-      probeLLMProviderAvailability(provider),
+      probeLLMProviderAvailability(provider, resolveLLMProbeTimeoutMs(provider)),
   ) {
     for (const [name, p] of Object.entries(cfg.llm.providers)) {
       const client = createClient(name, p);
@@ -186,7 +187,11 @@ export class LLMRouter {
   }
 }
 
-/** 顺序尝试 provider，第一个成功即返回；全部失败则抛最后一个错。 */
+/**
+ * 顺序尝试 provider，第一个成功即返回。
+ * Provider/transport 故障可以切换候选；调用方契约校验失败必须原样返回调用方，
+ * 由拥有该契约的 Planner/Executor 携带精确反馈重试。
+ */
 class FallbackClient implements LLMClient {
   readonly name: string;
   private static readonly MAX_TRANSIENT_PROVIDER_ATTEMPTS = 2;
@@ -315,7 +320,7 @@ class FallbackClient implements LLMClient {
             }
             continue;
           }
-          // 规则 3：连接类瞬时错误（含首 token 超时等不在常规重试集内的错误）→
+          // 规则 3：连接类瞬时错误（不含首 token 超时）→
           // 用可用性检查门控一次重试：端点确认在线才重试（流式降级为非流式），
           // 端点不可达则立即故障转移。
           if (
@@ -374,6 +379,10 @@ class FallbackClient implements LLMClient {
               },
             );
             this.scores?.decay(c.name, `validate failed in role ${this.role}`);
+            // A structurally valid response can still be unusable for the current
+            // workflow (for example a Debugger that repeats read-only probes).
+            // Treat that as a provider-quality failure for this call and let the
+            // next configured model attempt the same well-defined turn.
             lastErr = vErr;
             failures.push(formatProviderFailure(c.name, c.client.name, vErr));
             break;
@@ -444,9 +453,15 @@ function isRetryableLLMError(err: unknown): boolean {
   );
 }
 
-/** 连接类瞬时错误：首 token/空闲超时、建连失败、连接被断等；经可用性检查确认端点在线后可重试一次。 */
+/**
+ * 可安全重试的连接类瞬时错误。
+ *
+ * 首 token 超时表示端点可达但当前模型没有及时产出。健康探针无法证明同一模型
+ * 的下一次生成会更快，因此必须立即切换 provider，避免再等待一个完整首 token 窗口。
+ */
 function isTransientConnectivityLLMError(err: unknown): boolean {
   const msg = errorMessage(err).toLowerCase();
+  if (msg.includes('stream idle before first token')) return false;
   return (
     msg.includes('stream idle') ||
     msg.includes('stream wall-clock') ||

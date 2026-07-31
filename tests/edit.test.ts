@@ -75,6 +75,34 @@ describe('replace_in_file', () => {
     expect(r.ok).toBe(false);
     expect(r.error).toContain('path must be a non-empty string');
   });
+
+  it('rejects replacing a substantial file with an empty or tiny result', async () => {
+    const original = `export class Pipeline {\n${'  run(): void { return; }\n'.repeat(40)}}\n`;
+    await ws.writeFile('src/pipeline.ts', original);
+
+    const r = await replaceInFileTool.run(
+      { path: 'src/pipeline.ts', find: original, replace: '' },
+      ctx,
+    );
+
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/suspicious truncation/);
+    expect(await ws.readFile('src/pipeline.ts')).toBe(original);
+  });
+
+  it('rejects empty replacement of a single-line token as an incomplete edit', async () => {
+    const original = 'export function getNextExecution(): Date { return new Date(); }\n';
+    await ws.writeFile('src/scheduler.ts', original);
+
+    const r = await replaceInFileTool.run(
+      { path: 'src/scheduler.ts', find: ' getNextExecution', replace: '' },
+      ctx,
+    );
+
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/truncated model response/);
+    expect(await ws.readFile('src/scheduler.ts')).toBe(original);
+  });
 });
 
 describe('code_search', () => {
@@ -153,5 +181,59 @@ describe('add_dependency', () => {
     const r = await addDependencyTool.run({ packages: ['x'] }, ctx);
     expect(r.ok).toBe(true);
     expect(await ws.readFile('requirements.txt')).toBe('x\n');
+  });
+
+  it('restores the dependency manifest when the sandbox rebuild fails', async () => {
+    await ws.writeFile('requirements.txt', 'pytest\n');
+    ctx.sandbox = {
+      build: async () => {
+        throw new Error('pip resolver rejected hallucinated-package');
+      },
+    } as never;
+
+    const r = await addDependencyTool.run({ packages: ['hallucinated-package'] }, ctx);
+
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('were restored');
+    expect(await ws.readFile('requirements.txt')).toBe('pytest\n');
+  });
+
+  it('restores package.json and lockfiles when an npm rebuild fails', async () => {
+    const packageJson = '{\n  "name": "fixture",\n  "dependencies": { "yaml": "^2.0.0" }\n}\n';
+    await ws.writeFile('package.json', packageJson);
+    await ws.writeFile('package-lock.json', '{"lockfileVersion":3}\n');
+    ctx.language = 'typescript';
+    ctx.sandbox = {
+      build: async () => {
+        await ws.writeFile('package-lock.json', '{"polluted":true}\n');
+        await ws.writeFile('npm-shrinkwrap.json', '{"polluted":true}\n');
+        throw new Error('npm 404 package not found');
+      },
+    } as never;
+
+    const r = await addDependencyTool.run({ packages: ['cron-par'] }, ctx);
+
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('were restored');
+    expect(await ws.readFile('package.json')).toBe(packageJson);
+    expect(await ws.readFile('package-lock.json')).toBe('{"lockfileVersion":3}\n');
+    await expect(fs.stat(path.join(tmp, 'npm-shrinkwrap.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('skips sandbox rebuild when every requested dependency already exists', async () => {
+    await ws.writeFile('requirements.txt', 'pytest\n');
+    let buildCalls = 0;
+    ctx.sandbox = {
+      build: async () => {
+        buildCalls++;
+        return { rebuilt: false, reason: 'not expected' };
+      },
+    } as never;
+
+    const r = await addDependencyTool.run({ packages: ['pytest'] }, ctx);
+
+    expect(r.ok).toBe(true);
+    expect(r.summary).toContain('rebuild skipped');
+    expect(buildCalls).toBe(0);
   });
 });

@@ -31,6 +31,8 @@ export const PhasePlanSchema = z.object({
   globalPrompt: z.string().default(''),
   baselineSummary: z.string().default(''),
   userAddenda: z.string().default(''),
+  /** SHA-256 of the frozen topic and planning context used to create this checkpoint. */
+  sourceDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
   phases: z.array(PhasePlanPhaseSchema).min(1),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
@@ -62,6 +64,46 @@ export function phasePlanFileName(phaseId: string): string {
 
 export function defaultPhasePlanStepPath(workspace: string, phaseId: string): string {
   return path.join(path.resolve(workspace), phasePlanFileName(phaseId));
+}
+
+export function buildPhasePlanCheckpoint(args: {
+  language: Plan['language'];
+  intent: Plan['intent'];
+  projectType: Plan['projectType'];
+  requirementDigest: string;
+  complexityAssessment: NonNullable<Plan['complexityAssessment']>;
+  implementationPhases: NonNullable<Plan['implementationPhases']>;
+  globalPrompt?: string;
+  baselineSummary?: string;
+  userAddenda?: string;
+  sourceDigest: string;
+  existing?: PhasePlan;
+}): PhasePlan {
+  const now = new Date().toISOString();
+  const current = args.implementationPhases.find((phase) => phase.status === 'current') ??
+    args.implementationPhases[0];
+  if (!current) throw new Error('Cannot checkpoint an empty PhasePlan.');
+  const existingById = new Map((args.existing?.phases ?? []).map((phase) => [phase.id, phase]));
+  return {
+    kind: PHASE_PLAN_KIND,
+    version: PHASE_PLAN_VERSION,
+    language: args.language,
+    intent: args.intent,
+    projectType: args.projectType,
+    requirementDigest: args.requirementDigest,
+    complexityAssessment: args.complexityAssessment,
+    currentPhaseId: current.id,
+    globalPrompt: args.globalPrompt ?? '',
+    baselineSummary: args.baselineSummary ?? '',
+    userAddenda: args.userAddenda ?? '',
+    sourceDigest: args.sourceDigest,
+    phases: args.implementationPhases.map((phase) => ({
+      ...phase,
+      planPath: existingById.get(phase.id)?.planPath ?? phasePlanFileName(phase.id),
+    })),
+    createdAt: args.existing?.createdAt ?? now,
+    updatedAt: now,
+  };
 }
 
 export function buildPhasePlanFromCurrentPlan(args: {
@@ -97,6 +139,7 @@ export function buildPhasePlanFromCurrentPlan(args: {
     globalPrompt: args.plan.globalPrompt ?? '',
     baselineSummary: args.plan.baselineSummary ?? '',
     userAddenda: args.plan.userAddenda ?? '',
+    sourceDigest: args.existing?.sourceDigest,
     phases,
     createdAt: args.existing?.createdAt ?? args.plan.createdAt ?? now,
     updatedAt: now,

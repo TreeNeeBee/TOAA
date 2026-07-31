@@ -14,6 +14,7 @@ import {
   type Plan,
   type Step,
 } from '../plan.js';
+import { inspectPairedSourceTests } from '../paired_test_contract.js';
 import { pairedTestAssetPaths } from '../test_assets.js';
 import {
   hasExecutableTestDeclaration,
@@ -90,6 +91,18 @@ export class TestPhaseValidator {
       ) {
         invalid.push(`${file}: no executable test case declaration found`);
       }
+    }
+    for (const sourceStep of plan.steps.filter((candidate) =>
+      (candidate.iterationId ?? 'P1') === iterationId &&
+      candidate.phase === V_MODEL_TEST_TO_SOURCE_PHASE[
+        step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE
+      ])) {
+      const sourceContract = await inspectPairedSourceTests(
+        this.workspace,
+        plan,
+        sourceStep,
+      );
+      invalid.push(...sourceContract.invalid);
     }
 
     const ok = missing.length === 0 && invalid.length === 0;

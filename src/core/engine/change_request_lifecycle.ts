@@ -8,6 +8,7 @@ import {
   type BugTicket,
   type ChangeRequestApplication,
   type ChangeRequestTicket,
+  type EnhanceTicket,
 } from '../ticket.js';
 import {
   V_MODEL_TEST_PHASES,
@@ -143,6 +144,27 @@ export class ChangeRequestLifecycle {
     }
     const applied = new Set(request.applications.map((application) => application.stepId));
     if (!request.affectedSteps.every((affected) => applied.has(affected.stepId))) return;
+    const linkedEnhancements = this.store.all().filter(
+      (ticket): ticket is EnhanceTicket =>
+        ticket.type === 'enhance' &&
+        (
+          ticket.id === request.sourceEnhanceTicketId ||
+          ticket.changeRequestTicketIds.includes(request.id)
+        ) &&
+        !['closed', 'cancelled', 'failed'].includes(ticket.status),
+    );
+    const enhancementVerificationSteps = linkedEnhancements.map((enhancement) => {
+      if (!enhancement.verificationStepId) return { enhancement, step: completedStep };
+      return {
+        enhancement,
+        step: byId.get(enhancement.verificationStepId),
+      };
+    });
+    if (enhancementVerificationSteps.some(
+      ({ step }) => !step || !this.workTickets.isStepComplete(step),
+    )) {
+      return;
+    }
 
     const verifiedProviders = dedup(
       request.modelAttributions
@@ -169,10 +191,6 @@ export class ChangeRequestLifecycle {
       });
     }
     await this.closeTicket(request);
-    const sourceEnhancement = this.store.findEnhance(request.sourceEnhanceTicketId);
-    if (sourceEnhancement?.sourceQualityGateStepId) {
-      await this.enhancements.close(sourceEnhancement, completedStep);
-    }
     this.router.recordTicketOutcome?.(
       verifiedProviders,
       'change-verified',
@@ -191,6 +209,9 @@ export class ChangeRequestLifecycle {
         bug.repair,
         bug.bugResolutionPlan,
       );
+    }
+    for (const { enhancement, step } of enhancementVerificationSteps) {
+      await this.enhancements.close(enhancement, step ?? completedStep);
     }
     await this.audit.event(
       'ticket.change-request.closed',

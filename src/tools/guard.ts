@@ -132,7 +132,7 @@ export class EditGuard {
         }
         const approx = approxLineDelta(t.name, args);
         const r = await t.run(args, ctx);
-        if (r.ok) this.accumulatedLines += approx;
+        if (r.ok && toolResultChanged(r)) this.accumulatedLines += approx;
         await this.record({
           tool: t.name,
           args,
@@ -155,6 +155,11 @@ export class EditGuard {
       /* swallow */
     }
   }
+}
+
+function toolResultChanged(result: ToolResult): boolean {
+  if (!result.data || typeof result.data !== 'object' || Array.isArray(result.data)) return true;
+  return (result.data as { changed?: unknown }).changed !== false;
 }
 
 /** 粗略估计本次写操作影响的行数。 */

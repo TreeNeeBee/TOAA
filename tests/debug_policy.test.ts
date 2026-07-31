@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   adjustDebugRetryWindow,
   classifyDebugFailure,
+  latestActionableDebugAttempt,
   shouldRollbackTestPhaseFailure,
 } from '../src/core/debug_policy.js';
 
@@ -79,5 +80,22 @@ describe('debug policy', () => {
       consecutiveBad: 2,
       earlyAbort: true,
     });
+  });
+
+  it('resumes from newer compiler evidence even when a probe-loop wrapped that attempt', () => {
+    const old = {
+      reason: 'CODE validation failed',
+      failureLogTail: "error TS6059: File 'tests/a.ts' is not under rootDir 'src'",
+    };
+    const current = {
+      reason: 'repeated read-only/probe actions without progress for 3 rounds',
+      failureLogTail: [
+        'repeated read-only/probe actions without progress for 3 rounds',
+        '- run_program 失败 npx tsc --noEmit exit=2',
+        `src/scheduler.ts(1,10): error TS2724: package has no exported member named 'Parser'`,
+      ].join('\n'),
+    };
+
+    expect(latestActionableDebugAttempt([old, current])).toBe(current);
   });
 });

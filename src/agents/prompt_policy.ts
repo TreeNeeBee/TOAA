@@ -29,9 +29,9 @@ function renderEnPolicy({ debug, changeRequest }: ExecutionPromptPolicyOptions):
 4. Fixtures: change a fixture only when evidence shows it is missing, malformed, or itself fails parsing. Behavioural assertion failures require diagnosis of source, contract, or assertion semantics.
 5. Network APIs: after a failed endpoint, perform at most two focused probes, reject empty/unusable 2xx responses, patch the selected integration, then verify the real entrypoint and tests.
 6. Completion evidence: done=true requires all declared outputs plus successful mutation/verification evidence appropriate to this Step.${debug
-    ? '\n7. DEBUG mode: produce a bugResolutionPlan before closing the Bug Ticket, make the smallest scoped repair, and verify it. Read-only inspection alone is not completion.'
+    ? '\n7. DEBUG mode: before the first repair or verification action, provide bugResolutionPlan with the root-cause hypothesis, repair target, and validation command. Reuse that plan through the attempt, make the smallest scoped repair, and verify it. Read-only inspection alone is not completion.\n8. Contract reconciliation: treat accepted upstream specifications, tests, and real consumers as one contract set. If multiple call forms are semantically compatible, preserve them with one coherent implementation using optional parameters, overloads, or adapters. If they are genuinely incompatible, report the contract defect and route it upstream; never alternate between mutually exclusive rewrites.'
     : ''}${changeRequest
-    ? `\n${debug ? 8 : 7}. CR mode: treat existing outputs as the accepted baseline. Apply only the active change request delta, preserve unrelated behavior, and produce focused change or verification evidence. Never regenerate the whole phase or project.`
+    ? `\n${debug ? 9 : 7}. CR mode: treat existing outputs as the accepted baseline. Apply only the active change request delta, preserve unrelated behavior, and produce focused change or verification evidence. Never regenerate the whole phase or project.`
     : ''}`;
 }
 
@@ -45,8 +45,8 @@ function renderZhPolicy({ debug, changeRequest }: ExecutionPromptPolicyOptions):
 4. Fixture：只有证据明确表明 fixture 缺失、格式错误或自身解析失败时才修改；行为断言失败应检查源码、契约和断言语义。
 5. 网络 API：接口失败后最多进行两次有目标的探测；HTTP 2xx 但内容为空或不可用不算成功；选定接口后必须修改真实集成，并验证实际入口和测试。
 6. 完成证据：done=true 前必须完成全部声明产物，并取得与当前 Step 匹配的成功修改或验证证据。${debug
-    ? '\n7. DEBUG 模式：关闭 Bug Ticket 前必须输出 bugResolutionPlan，执行最小范围修复并验证；仅只读检查不能算完成。'
+    ? '\n7. DEBUG 模式：首次执行修复或验证动作之前，必须输出 bugResolutionPlan，包含根因假设、修复目标和验证命令；同一次尝试持续复用该方案，执行最小范围修复并验证。仅只读检查不能算完成。\n8. 契约协调：将已验收的上游规范、测试和真实调用方视为同一组契约。多种调用形式语义兼容时，应以可选参数、重载或适配器形成一个统一实现并全部保留；确实不可兼容时，报告契约缺陷并回退上游，禁止在互斥实现之间反复覆盖。'
     : ''}${changeRequest
-    ? `\n${debug ? 8 : 7}. CR 模式：已有产物是已验收基线，只实施当前变更请求的增量差异，保留无关行为，并提供聚焦的变更或验证证据；禁止重新生成整个阶段或工程。`
+    ? `\n${debug ? 9 : 7}. CR 模式：已有产物是已验收基线，只实施当前变更请求的增量差异，保留无关行为，并提供聚焦的变更或验证证据；禁止重新生成整个阶段或工程。`
     : ''}`;
 }

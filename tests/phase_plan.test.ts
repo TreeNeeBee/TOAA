@@ -6,6 +6,7 @@ import { buildPlan } from '../src/agents/planner.js';
 import type { Phase, Step } from '../src/core/plan.js';
 import {
   advancePhasePlan,
+  buildPhasePlanCheckpoint,
   buildPhasePlanFromCurrentPlan,
   defaultPhasePlanPath,
   defaultPhasePlanStepPath,
@@ -14,6 +15,60 @@ import {
 import { loadPlanTarget, savePhasePlan, savePlan } from '../src/core/storage.js';
 
 describe('phase plan persistence', () => {
+  it('persists a source-bound checkpoint before the current phase is materialized', () => {
+    const sourceDigest = 'a'.repeat(64);
+    const checkpoint = buildPhasePlanCheckpoint({
+      language: 'typescript',
+      intent: 'greenfield',
+      projectType: 'application',
+      requirementDigest: 'Build a news briefing CLI.',
+      complexityAssessment: {
+        level: 'moderate',
+        rationale: 'Core delivery followed by one enhancement phase.',
+        splitRecommended: true,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [
+        {
+          id: 'P1',
+          title: 'Core',
+          objective: 'Deliver the briefing CLI.',
+          status: 'current',
+          scope: ['CLI'],
+          deliverables: ['Runnable application'],
+          dependsOn: [],
+          verificationGate: {
+            summary: 'Core works.',
+            checks: ['npm test'],
+            failurePolicy: 'Repair P1.',
+          },
+        },
+        {
+          id: 'P2',
+          title: 'Enhancement',
+          objective: 'Improve summaries.',
+          status: 'planned',
+          scope: ['summaries'],
+          deliverables: ['Summary extension'],
+          dependsOn: ['P1'],
+          verificationGate: {
+            summary: 'Enhancement works.',
+            checks: ['npm test'],
+            failurePolicy: 'Repair P2.',
+          },
+        },
+      ],
+      sourceDigest,
+    });
+
+    expect(checkpoint.sourceDigest).toBe(sourceDigest);
+    expect(checkpoint.currentPhaseId).toBe('P1');
+    expect(checkpoint.phases.map((phase) => phase.planPath)).toEqual([
+      'plan.P1.json',
+      'plan.P2.json',
+    ]);
+  });
+
   it('loads phasePlan.json as the current phase plan target', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-phase-plan-'));
     const plan = buildPlan(

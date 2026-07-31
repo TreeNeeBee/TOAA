@@ -147,7 +147,7 @@ describe('LLMRouter fallback chain', () => {
       .rejects.toThrow(/all LLM providers failed.*ollama_code\/fake-primary.*openai\/fake-secondary.*429/su);
   });
 
-  it('retries a switched-to provider once when the availability check confirms the endpoint is reachable', async () => {
+  it('falls through immediately after first-token timeout even when the endpoint is reachable', async () => {
     const cfg = mkCfg({ fallbacks: ['openai'] });
     const probed: string[] = [];
     const router = new LLMRouter(cfg, undefined, undefined, undefined, undefined, async (name) => {
@@ -171,9 +171,6 @@ describe('LLMRouter fallback chain', () => {
       chat: async (_messages, options) => {
         secondaryCalls++;
         secondaryStreamingFlags.push(!!options?.onToken);
-        if (options?.onToken) {
-          throw new Error('OpenAI stream idle before first token for 300000ms; aborting');
-        }
         return 'rescued';
       },
     });
@@ -183,11 +180,9 @@ describe('LLMRouter fallback chain', () => {
     });
 
     expect(out).toBe('rescued');
-    // 首 token 超时不走无条件重试：可用性检查确认端点在线后才各补一次非流式重试。
-    expect(primaryCalls).toBe(2);
-    expect(secondaryCalls).toBe(2);
-    expect(secondaryStreamingFlags).toEqual([true, false]);
-    expect(probed).toContain('ollama_code');
+    expect(primaryCalls).toBe(1);
+    expect(secondaryCalls).toBe(1);
+    expect(secondaryStreamingFlags).toEqual([true]);
     expect(probed).toContain('openai');
   });
 
@@ -266,7 +261,7 @@ describe('LLMRouter fallback chain', () => {
     expect(secondaryCalls).toBe(1);
   });
 
-  it('falls back when validate rejects a superficially successful response', async () => {
+  it('falls back when a provider response fails the caller output contract', async () => {
     const cfg = mkCfg({ fallbacks: ['openai'] });
     const scores = new ScoreStore('/tmp/x/config.yaml');
     const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
@@ -289,18 +284,14 @@ describe('LLMRouter fallback chain', () => {
       },
     });
 
-    let selectedProvider: string | undefined;
-    const out = await router.for('Coder').chat([{ role: 'user', content: 'hi' }], {
+    const output = await router.for('Coder').chat([{ role: 'user', content: 'hi' }], {
       validate: (text) => {
         if (text.includes('read-only')) throw new Error('low-quality read-only response');
       },
-      onProvider: (name) => { selectedProvider = name; },
     });
-
-    expect(out).toBe('repair patch');
+    expect(output).toBe('repair patch');
     expect(firstCalls).toBe(1);
     expect(secondCalls).toBe(1);
-    expect(selectedProvider).toBe('openai');
     expect(scores.get('ollama_code')).toBeLessThan(ScoreStore.DEFAULT);
   });
 
@@ -399,7 +390,7 @@ describe('LLMRouter fallback chain', () => {
     expect(chunks).toEqual([]);
   });
 
-  it('skips the same-provider streaming retry on first-token idle unless the availability check confirms the endpoint', async () => {
+  it('never retries the same provider after first-token idle', async () => {
     const cfg = mkCfg({});
     const router = new LLMRouter(cfg, undefined, undefined, undefined, undefined, async () => ({
       ok: true,
@@ -422,8 +413,7 @@ describe('LLMRouter fallback chain', () => {
         onToken: () => {},
       }),
     ).rejects.toThrow(/before first token/u);
-    // 不再有无条件的同 provider 流式重试；可用性检查确认在线后补一次非流式重试。
-    expect(sawStreaming).toEqual([true, false]);
+    expect(sawStreaming).toEqual([true]);
   });
 
   it('waits and retries short provider 429 retry-after errors once', async () => {

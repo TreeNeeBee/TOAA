@@ -5,7 +5,10 @@ import {
   buildDebugBrief,
   compactFailureEvidence,
 } from '../debug_brief.js';
-import { cleanFailureLogForDebugContext } from '../debug_policy.js';
+import {
+  cleanFailureLogForDebugContext,
+  isNonDebuggableInfrastructureFailure,
+} from '../debug_policy.js';
 import {
   V_MODEL_TEST_PHASES,
   type Plan,
@@ -275,6 +278,7 @@ export class BugLifecycle {
     if (
       this.lastBug?.source.stepId === stepId &&
       this.lastBug.iterationId === iterationId &&
+      this.lastBug.kind !== 'infrastructure' &&
       !['resolved', 'closed', 'cancelled'].includes(this.lastBug.status)
     ) {
       return this.lastBug;
@@ -284,6 +288,18 @@ export class BugLifecycle {
         ticket.type === 'bug' &&
         ticket.iterationId === iterationId &&
         ticket.source.stepId === stepId &&
+        ticket.kind !== 'infrastructure' &&
+        !['resolved', 'closed', 'cancelled'].includes(ticket.status),
+    );
+  }
+
+  openBugTargetingStep(stepId: string, iterationId: string): BugTicket | undefined {
+    return [...this.store.all()].reverse().find(
+      (ticket): ticket is BugTicket =>
+        ticket.type === 'bug' &&
+        ticket.iterationId === iterationId &&
+        ticket.targetStepId === stepId &&
+        ticket.kind !== 'infrastructure' &&
         !['resolved', 'closed', 'cancelled'].includes(ticket.status),
     );
   }
@@ -294,7 +310,14 @@ export class BugLifecycle {
         ticket.type === 'bug' &&
         ticket.iterationId === (step.iterationId ?? 'P1') &&
         !['resolved', 'closed', 'cancelled'].includes(ticket.status) &&
-        ticket.verificationStepId === step.id,
+        (
+          ticket.verificationStepId === step.id ||
+          (
+            ticket.verificationStepId === undefined &&
+            ticket.source.stepId === step.id &&
+            (ticket.targetStepId === undefined || ticket.targetStepId === step.id)
+          )
+        ),
     );
     for (const bug of bugs) {
       if (bug.activeChangeRequestTicketId) continue;
@@ -318,8 +341,16 @@ export class BugLifecycle {
 
   classifyBugKind(
     step: Step,
-    outcome: { bugKind?: BugKind; rollbackToPairedSource?: boolean },
+    outcome: {
+      bugKind?: BugKind;
+      rollbackToPairedSource?: boolean;
+      reason?: string;
+      failureLog?: string;
+    },
   ): BugKind {
+    if (isNonDebuggableInfrastructureFailure(outcome.reason, outcome.failureLog)) {
+      return 'infrastructure';
+    }
     if (outcome.bugKind) return outcome.bugKind;
     if (isVModelTestPhase(step.phase) && outcome.rollbackToPairedSource) {
       return step.phase === 'FUNCTIONAL_TEST' ? 'functional-gate' : 'test-gate';

@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { analyzeArchitectureDemand } from '../src/core/architecture.js';
 import { lintPlan, topoSort } from '../src/core/lint.js';
 import { PlanSchema, type Plan } from '../src/core/plan.js';
 
@@ -412,18 +411,15 @@ describe('lintPlan', () => {
     expect(errs.some((e) => e.message.includes('systemPrompt too short'))).toBe(true);
   });
 
-  it('rejects trivial single-module plans for clearly multi-surface requirements', () => {
+  it('requires an architecture contract for clearly multi-surface requirements', () => {
     const plan = makePlan({
       requirementDigest: 'Build an OpenAPI server with CLI import/export commands and SQLite persistence.',
     });
-    const demand = analyzeArchitectureDemand(plan, plan.language);
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
-    expect(errs.some((e) => e.message.includes('Non-trivial request detected'))).toBe(true);
-    expect(errs.some((e) => e.message.includes(`expected at least ${demand.minModules}`))).toBe(true);
-    expect(errs.some((e) => e.message.includes('moduleDemand='))).toBe(true);
+    expect(errs.some((e) => e.message.includes('require architectureModules'))).toBe(true);
   });
 
-  it('rejects incremental plans that ignore a large existing baseline', () => {
+  it('requires an architecture contract for multi-surface incremental work', () => {
     const plan = makePlan({
       language: 'typescript',
       intent: 'feature',
@@ -438,10 +434,7 @@ describe('lintPlan', () => {
       ].join('\n'),
     });
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
-    const demand = analyzeArchitectureDemand(plan, plan.language);
-    expect(errs.some((e) => e.message.includes('Non-trivial request detected'))).toBe(true);
-    expect(errs.some((e) => e.message.includes(`expected at least ${demand.minModules}`))).toBe(true);
-    expect(errs.some((e) => e.message.includes('moduleDemand='))).toBe(true);
+    expect(errs.some((e) => e.message.includes('require architectureModules'))).toBe(true);
   });
 
   it('allows a surgical incremental change on a small baseline', () => {

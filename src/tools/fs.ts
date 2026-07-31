@@ -6,6 +6,7 @@ import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
   resolveSkillOperationWindow,
 } from '../llm/window.js';
+import { suspiciousTextTruncationError } from './content_guard.js';
 
 interface ReadFileData {
   content: string;
@@ -128,11 +129,18 @@ function utf8SafeEnd(buffer: Buffer): number {
   return buffer.length - lead < expectedLength ? lead : buffer.length;
 }
 
-export const writeFileTool: Tool<{ path: string; content: string }, { bytes: number }> = {
+interface WriteFileData {
+  bytes: number;
+  previousBytes: number;
+  changed: boolean;
+}
+
+export const writeFileTool: Tool<{ path: string; content: string }, WriteFileData> = {
   name: 'write_file',
   description:
     '在当前 Step writable allowlist 内创建或覆盖文件。必须提供非空 args.path 和字符串 args.content；path 使用具体的 workspace 相对路径。' +
     '单次 content 受运行时 chunk limit 限制；大文件按模块/函数/类边界用 write_file 首段 + append_file 续写。' +
+    '覆盖已有文件时必须提供完整内容；异常缩短会被拒绝，此时应优先用 replace_in_file/apply_patch 精确修改。' +
     '注意：runtime 管理的依赖清单请用 add_dependency 维护。',
   argsSchema: { path: 'string', content: 'string' },
   async run(args, ctx) {
@@ -166,12 +174,49 @@ export const writeFileTool: Tool<{ path: string; content: string }, { bytes: num
     }
     try {
       const abs = resolved.abs;
+      let previous: Buffer | undefined;
+      try {
+        const stat = await fs.stat(abs);
+        if (!stat.isFile()) {
+          return { ok: false, error: `write denied: ${resolved.rel} is not a regular file` };
+        }
+        previous = await fs.readFile(abs);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') throw err;
+      }
+
+      const next = Buffer.from(args.content, 'utf8');
+      const previousBytes = previous?.byteLength ?? 0;
+      const truncationError = previous
+        ? suspiciousTextTruncationError({
+            tool: 'write_file',
+            path: resolved.rel,
+            originalBytes: previousBytes,
+            replacementBytes: size,
+          })
+        : undefined;
+      if (truncationError) {
+        return {
+          ok: false,
+          error: truncationError,
+        };
+      }
+
+      if (previous?.equals(next)) {
+        return {
+          ok: true,
+          data: { bytes: size, previousBytes, changed: false },
+          summary: `unchanged ${resolved.rel} (${size}B; content identical)`,
+        };
+      }
+
       await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, args.content, 'utf8');
+      await fs.writeFile(abs, next);
       return {
         ok: true,
-        data: { bytes: size },
-        summary: `wrote ${resolved.rel} (${size}B)`,
+        data: { bytes: size, previousBytes, changed: true },
+        summary: `wrote ${resolved.rel} (${size}B, was ${previousBytes}B)`,
       };
     } catch (err) {
       return { ok: false, error: (err as Error).message };

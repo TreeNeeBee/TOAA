@@ -177,7 +177,7 @@ export class Planner {
       intent: input.intent ?? 'greenfield' as PlanIntent,
     };
     const intent = input.intent ?? 'greenfield';
-    const phasePlan = await this.planPhases(input, qa, addenda, parseContext, intent);
+    const phasePlan = await this.planPhasePlan(input);
     const currentPhase = phasePlan.implementationPhases.find((phase) => phase.status === 'current') ??
       phasePlan.implementationPhases[0];
     if (!currentPhase) {
@@ -208,13 +208,18 @@ export class Planner {
     return this.decomposeCurrentPhase(input, qa, addenda, parseContext, intent, phasePlan, currentPhase);
   }
 
-  private async planPhases(
-    input: PlannerInput,
-    qa: string,
-    addenda: string,
-    parseContext: DraftParseContext,
-    intent: PlanIntent,
-  ): Promise<DraftPhasePlan> {
+  /** Generate only the project-level PhasePlan so callers can persist a recovery checkpoint. */
+  async planPhasePlan(input: PlannerInput): Promise<DraftPhasePlan> {
+    const qa = formatClarificationTranscript(input.clarifications);
+    const addenda = (input.userAddenda ?? '').trim();
+    const intent = input.intent ?? 'greenfield';
+    const parseContext: DraftParseContext = {
+      language: this.language,
+      rawRequirement: input.rawRequirement,
+      userAddenda: addenda,
+      baselineSummary: input.baselineContext ?? '',
+      intent,
+    };
     const prompt = t().prompts.plannerPhasePlan(input.rawRequirement, qa, addenda, {
       intent,
       baseline: input.baselineContext ?? '',
@@ -350,7 +355,8 @@ function formatPlannerValidationFeedback(err: unknown): string {
     `校验错误：${message}`,
     '修正要求：',
     '- 保留已确认的 PhasePlan 约束；只生成当前 current phase 的内容。',
-    '- architectureModules 必须满足错误中要求的模块数量、sourcePaths/testPaths 和 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 可追踪性。',
+    '- architectureModules 必须满足 sourcePaths/testPaths 和 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 可追踪性；不要为凑数量拆散内聚模块。',
+    '- architectureModules.testPaths 是 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 消费的模块契约测试，不能同时出现在 CODE 的单元测试输出中。',
     '- 若一个 CODE 宏 Step 覆盖多个模块，必须在该 CODE Step 的 subTasks 中逐一列出对应模块。',
     '- 不要删除标准 V 模型 8 个宏 Step。',
   ].join('\n');
@@ -500,10 +506,10 @@ function injectArchitectureContractPrompts(
     let contractBlock = '';
     if (step.phase === 'HIGH_LEVEL_DESIGN') {
       contractBlock =
-        `\n\nHIGH_LEVEL_DESIGN 契约（强制）：docs/02-high-level-design.md 必须逐项写明本开发模块在整体系统中的定位、系统级对外接口、外部 API、第三方库选型、依赖确认，以及以下模块的职责、源码路径、测试路径和依赖；本阶段同时创建这些 testPaths 对应的可执行模块测试，不得推迟到 MODULE_TEST：\n${inventory}`;
+        `\n\nHIGH_LEVEL_DESIGN 契约（强制）：docs/02-high-level-design.md 必须逐项写明本开发模块在整体系统中的定位、系统级对外接口、外部 API、第三方库选型、依赖确认，以及以下模块的职责、源码路径、测试路径和依赖；本阶段同时创建这些 testPaths 对应的可执行模块测试，不得推迟到 MODULE_TEST。每个模块测试必须导入或执行该模块声明的真实 sourcePaths 与公开接口，禁止在测试内复制一套业务实现来自测：\n${inventory}`;
     } else if (step.phase === 'DETAILED_DESIGN') {
       contractBlock =
-        `\n\nDETAILED_DESIGN 契约（强制）：docs/03-detailed-design.md 必须定义模块内部具体功能实现、内部架构、数据结构/控制流，并为以下每个模块保留独立 CODE/INTEGRATION_TEST 任务及验收映射：\n${inventory}`;
+        `\n\nDETAILED_DESIGN 契约（强制）：docs/03-detailed-design.md 必须定义模块内部具体功能实现、内部架构、数据结构/控制流，并为以下每个模块保留独立 CODE/INTEGRATION_TEST 任务及验收映射。每个集成测试必须导入或执行至少两个参与集成的真实 sourcePaths 与公开接口（Plan 仅声明一个源码时除外），禁止在测试内重写任一侧业务逻辑。测试可以引用将在 CODE 阶段实现、当前尚不存在的 sourcePaths；本阶段禁止创建 src/** stub、占位实现或产品代码：\n${inventory}`;
     } else if (step.phase === 'CODE') {
       const owned = modules.filter((module) =>
         architectureImplementationPaths(module).every((path) => pathCoveredByOutputs(path, step.outputs)),
@@ -908,6 +914,19 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
   );
   const architectureModules = architectureDependencyCalibration.architectureModules;
   dependencies = architectureDependencyCalibration.dependencies;
+  const moduleTestPaths = new Set(architectureModules.flatMap((module) => module.testPaths));
+  const codeOwnedModuleTests = normalizedDraftStepsForValidation
+    .filter((step) => step.phase === 'CODE')
+    .flatMap((step) => step.outputs)
+    .filter((output) => moduleTestPaths.has(output));
+  if (codeOwnedModuleTests.length > 0) {
+    throw new Error(
+      `Planner architecture test ownership invalid: architectureModules.testPaths are module contract tests ` +
+      `authored by HIGH_LEVEL_DESIGN and consumed by MODULE_TEST; CODE must author separate unit tests. ` +
+      `Remove these paths from CODE outputs or replace architectureModules.testPaths with the corresponding ` +
+      `HIGH_LEVEL_DESIGN module-contract test paths: ${[...new Set(codeOwnedModuleTests)].join(', ')}.`,
+    );
+  }
   const parsedComplexityAssessment = parseComplexityAssessment(obj.complexityAssessment);
   if (context && !parsedComplexityAssessment) {
     throw new Error('Planner JSON missing valid complexityAssessment; complexity must be assessed during plan decomposition.');
@@ -969,7 +988,7 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     if (demand.nonTrivial && architectureModules.length === 0) {
       throw new Error(
         `Planner omitted architectureModules for a non-trivial request (${demand.reasonLabel}); ` +
-        `expected at least ${demand.minModules} modules with HIGH_LEVEL_DESIGN/CODE/MODULE_TEST traceability.`,
+        'the architecture contract must provide HIGH_LEVEL_DESIGN/CODE/MODULE_TEST traceability.',
       );
     }
     if (architectureModules.length > 0) {

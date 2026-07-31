@@ -31,6 +31,22 @@ describe('debug brief extraction', () => {
     expect(renderDebugBriefForPrompt(brief)).toContain('debugDemand');
   });
 
+  it('prioritizes concrete TypeScript compiler errors over a surrounding probe-loop reason', () => {
+    const brief = buildDebugBrief({
+      reason: 'repeated read-only/probe actions without progress for 3 rounds',
+      failureLog: [
+        'repeated read-only/probe actions without progress for 3 rounds',
+        '- run_program 失败 npx tsc --noEmit exit=2',
+        `src/scheduler.ts(1,10): error TS2724: package has no exported member named 'Parser'`,
+      ].join('\n'),
+      phase: 'CODE',
+    });
+
+    expect(brief.category).toBe('exception');
+    expect(brief.primaryError).toContain('error TS2724');
+    expect(brief.debugDemand).toContain('smallest allowed repair');
+  });
+
   it('turns API failures into explicit debug demands without hiding status codes', () => {
     const brief = buildDebugBrief({
       reason: 'functional probe failed',

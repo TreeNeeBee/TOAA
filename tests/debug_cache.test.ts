@@ -51,15 +51,28 @@ describe('DebugCache', () => {
       reason: 'integration tests still fail',
       failureLogTail: 'FAIL tests/integration/web-server-flow.test.ts',
       contextMode: 'test-rollback',
+      bugTicketId: 'BUG-P1-004',
+      completedBeforeDebug: true,
+      contextPaths: ['src/pipeline.ts', 'tests/integration/web-server-flow.test.ts'],
+      extraAllowedWrites: ['src/pipeline.ts', 'src/pipeline.ts'],
       testScopeArgs: ['tests/integration/web-server-flow.test.ts'],
     });
 
     const c2 = new DebugCache(file);
     await c2.load();
     expect(c2.hasUnresolvedFailure('S006')).toBe(false);
+    expect(c2.hasRunningAttempt('S006')).toBe(true);
     expect(await c2.markInterrupted('S006', 'process interrupted')).toBe(true);
+    expect(c2.hasRunningAttempt('S006')).toBe(false);
     expect(c2.hasUnresolvedFailure('S006')).toBe(true);
     expect(c2.attempts('S006')[0]?.contextMode).toBe('test-rollback');
+    expect(c2.attempts('S006')[0]).toMatchObject({
+      bugTicketId: 'BUG-P1-004',
+      completedBeforeDebug: true,
+      contextPaths: ['src/pipeline.ts', 'tests/integration/web-server-flow.test.ts'],
+      extraAllowedWrites: ['src/pipeline.ts'],
+      testScopeArgs: ['tests/integration/web-server-flow.test.ts'],
+    });
   });
 
   it('truncates long failure logs and caps stored attempts', async () => {

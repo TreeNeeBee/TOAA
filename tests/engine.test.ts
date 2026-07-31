@@ -21,6 +21,9 @@ import {
   buildContextSnippets,
   computeDebugAllowedWrites,
 } from '../src/core/engine/context.js';
+import { CodePhaseValidator } from '../src/core/engine/code_phase_validator.js';
+import type { BugLifecycle } from '../src/core/engine/bug_lifecycle.js';
+import type { WorkTicketLifecycle } from '../src/core/engine/work_ticket_lifecycle.js';
 import { getLanguageProfile } from '../src/core/language.js';
 import { stepExecutionKey, type Plan } from '../src/core/plan.js';
 import { TicketStore } from '../src/core/ticket.js';
@@ -224,6 +227,7 @@ class UnitRollbackSandbox implements Sandbox {
 class CodeValidationSandbox implements Sandbox {
   readonly kind = 'subprocess' as const;
   public readonly validationArgs: string[][] = [];
+  public readonly testArgs: string[][] = [];
   constructor(private readonly workspace: Workspace) {}
 
   async build(): Promise<{ rebuilt: boolean; reason: string }> {
@@ -242,7 +246,8 @@ class CodeValidationSandbox implements Sandbox {
     return okExec();
   }
 
-  async runTests(): Promise<ExecResult> {
+  async runTests(args: string[] = []): Promise<ExecResult> {
+    this.testArgs.push(args);
     return okExec();
   }
 
@@ -528,10 +533,11 @@ beforeEach(async () => {
   await ws.writeFile('docs/tests/module-test-plan.md', '# module test plan\n');
   await ws.writeFile('docs/tests/integration-test-plan.md', '# integration test plan\n');
   await ws.writeFile('docs/tests/unit-test-plan.md', '# unit test plan\n');
-  await ws.writeFile('tests/test_functional.py', 'def test_functional():\n    assert True\n');
-  await ws.writeFile('tests/test_module.py', 'def test_module():\n    assert True\n');
-  await ws.writeFile('tests/test_integration.py', 'def test_integration():\n    assert True\n');
-  await ws.writeFile('tests/test_hello.py', 'def test_hello():\n    assert True\n');
+  const productTest = 'import hello\n\n\ndef test_product_contract():\n    assert hello is not None\n';
+  await ws.writeFile('tests/test_functional.py', productTest);
+  await ws.writeFile('tests/test_module.py', productTest);
+  await ws.writeFile('tests/test_integration.py', productTest);
+  await ws.writeFile('tests/test_hello.py', productTest);
 });
 
 function fakePlan(): Plan {
@@ -631,7 +637,10 @@ async function seedPairedTestAssets(plan: Plan): Promise<void> {
         if (!(await ws.exists(output))) await ws.writeFile(output, `# ${step.phase} test plan\n`);
       } else if (output.startsWith('tests/') && output.endsWith('.py')) {
         if (!(await ws.exists(output))) {
-          await ws.writeFile(output, 'def test_declared_case():\n    assert True\n');
+          await ws.writeFile(
+            output,
+            'import hello\n\n\ndef test_declared_case():\n    assert hello is not None\n',
+          );
         }
       }
     }
@@ -674,12 +683,14 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           },
         }],
         qualityAssessment: {
-          completion: 1,
+          // The model emitted this assessment before its write action. The
+          // runtime must reconcile the now-stale output gap with disk state.
+          completion: 0,
           upstreamAlignment: 1,
           metrics: {},
           tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
-          evidence: ['src/hello.py'],
-          gaps: [],
+          evidence: [],
+          gaps: ['missing required output: src/hello.py'],
         },
         done: true,
       }),
@@ -709,6 +720,184 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       type: 'enhance',
       status: 'closed',
       sourceQualityGateStepId: codeStep.id,
+    }));
+  });
+
+  it('preserves the document baseline and adds read/patch tools for an Enhance rerun', async () => {
+    const plan = fakePlan();
+    const requirementStep = plan.steps.find(
+      (step) => step.phase === 'REQUIREMENT_ANALYSIS',
+    )!;
+    requirementStep.dependsOn = [];
+    requirementStep.tools = ['write_file'];
+    requirementStep.outputs = ['docs/requirements-baseline.md'];
+    plan.steps = [requirementStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    const planner = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'write the baseline and report the missing error scenarios',
+        actions: [{
+          tool: 'write_file',
+          args: {
+            path: 'docs/requirements-baseline.md',
+            content: '# Requirements\n',
+          },
+        }],
+        qualityAssessment: {
+          completion: 0.7,
+          upstreamAlignment: 1,
+          metrics: {},
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['docs/requirements-baseline.md'],
+          gaps: ['error scenarios are incomplete'],
+        },
+        done: true,
+      }),
+      JSON.stringify({
+        thoughts: 'inspect and patch only the missing section',
+        actions: [
+          {
+            tool: 'read_file',
+            args: { path: 'docs/requirements-baseline.md' },
+          },
+          {
+            tool: 'replace_in_file',
+            args: {
+              path: 'docs/requirements-baseline.md',
+              find: '# Requirements\n',
+              replace: '# Requirements\n\n## Error scenarios\n- timeout\n',
+            },
+          },
+        ],
+        qualityAssessment: {
+          completion: 1,
+          upstreamAlignment: 1,
+          metrics: {},
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['docs/requirements-baseline.md'],
+          gaps: [],
+        },
+        done: true,
+      }),
+    ]);
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: new FakeRouter({ Planner: planner }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+    });
+
+    const result = await engine.run(plan);
+
+    expect(result.failedStepId).toBeUndefined();
+    expect(await ws.readFile('docs/requirements-baseline.md')).toContain(
+      '## Error scenarios',
+    );
+    expect(planner.calls[1]?.find((message) => message.role === 'user')?.content)
+      .toContain('## active enhancement ticket');
+    expect(planner.calls[1]?.find((message) => message.role === 'user')?.content)
+      .toContain('### docs/requirements-baseline.md');
+    expect(await ws.exists('docs/history')).toBe(false);
+  });
+
+  it('resumes an interrupted Enhance inspection as incremental validation instead of Debugger', async () => {
+    const plan = fakePlan();
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    codeStep.dependsOn = [];
+    codeStep.outputs = ['src/hello.py'];
+    plan.steps = [codeStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+
+    const interruptedCoder = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'write the complete output but request an independent quality review',
+        actions: [{
+          tool: 'write_file',
+          args: { path: 'src/hello.py', content: 'def hi():\n    return "complete"\n' },
+        }],
+        qualityAssessment: {
+          completion: 0.8,
+          upstreamAlignment: 1,
+          metrics: {},
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['src/hello.py'],
+          gaps: ['independent output review is still required'],
+        },
+        done: true,
+      }),
+      ...Array.from({ length: 3 }, () => JSON.stringify({
+        thoughts: 'inspect the existing output before completing the quality review',
+        actions: [{ tool: 'read_file', args: { path: 'src/hello.py' } }],
+        done: false,
+      })),
+    ]);
+    const firstRun = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: new FakeRouter({ Coder: interruptedCoder }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 3,
+      maxDebugRetries: 0,
+    });
+
+    const interrupted = await firstRun.run(plan);
+    expect(interrupted.failedStepId).toBe(codeStep.id);
+
+    const resumedCoder = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'the existing output satisfies the enhancement after direct inspection',
+        actions: [{ tool: 'read_file', args: { path: 'src/hello.py' } }],
+        qualityAssessment: {
+          completion: 1,
+          upstreamAlignment: 1,
+          metrics: {},
+          tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+          evidence: ['src/hello.py contains the complete implementation'],
+          gaps: [],
+        },
+        done: true,
+      }),
+    ]);
+    const resumedRun = new PhaseEngine({
+      ws,
+      git,
+      sandbox,
+      router: new FakeRouter({
+        Coder: resumedCoder,
+        Debugger: new ThrowingLLM(new Error('Debugger must not handle an inspection-only Enhance loop')),
+      }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+      maxDebugRetries: 1,
+    });
+
+    const resumed = await resumedRun.run(plan);
+
+    expect(resumed.failedStepId).toBeUndefined();
+    expect(resumedCoder.calls).toHaveLength(1);
+    expect(resumedCoder.lastUser).toContain('## active enhancement ticket');
+    const tickets = JSON.parse(await ws.readFile('.xcompiler/tickets/index.json')) as Array<{
+      type: string;
+      status: string;
+      source?: { stepId?: string };
+    }>;
+    expect(tickets).toContainEqual(expect.objectContaining({
+      type: 'enhance',
+      status: 'closed',
+      source: expect.objectContaining({ stepId: codeStep.id }),
+    }));
+    expect(tickets).toContainEqual(expect.objectContaining({
+      type: 'bug',
+      status: 'closed',
+      source: expect.objectContaining({ stepId: codeStep.id }),
     }));
   });
 
@@ -769,7 +958,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           tool: 'write_file',
           args: {
             path: 'tests/test_hello.py',
-            content: 'def test_value():\n    assert True\n\ndef test_none_branch():\n    assert True\n',
+            content:
+              'from hello import hi\n\n\ndef test_value():\n    assert hi("value") == "value"\n\n' +
+              'def test_none_branch():\n    assert hi() is None\n',
           },
         }],
         done: true,
@@ -853,6 +1044,47 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     ]);
     expect(await ws.readFile('src/hello.py')).toContain('def hi');
     expect(await ws.readFile('.xcompiler/tickets/events.jsonl')).toContain('CODE validation failed');
+  });
+
+  it('revalidates preserved CODE state before resuming cached Debugger evidence', async () => {
+    const plan = fakePlan();
+    const code = plan.steps.find((step) => step.phase === 'CODE')!;
+    plan.steps = [{ ...code, dependsOn: [] }];
+    const validationSandbox = new CodeValidationSandbox(ws);
+    const validator = new CodePhaseValidator(
+      ws,
+      validationSandbox,
+      audit,
+      async () => ({ approved: true }),
+    );
+    await ws.writeFile('src/hello.py', 'syntax_error\n');
+
+    const failed = await validator.validateExisting(
+      plan,
+      plan.steps[0]!,
+      getLanguageProfile('python'),
+      (candidate) => candidate.status === 'DONE',
+    );
+
+    expect(failed.status).toBe('failed');
+    if (failed.status === 'failed') {
+      expect(failed.reason).toContain('CODE revalidation failed');
+      expect(failed.failureLog).toContain('SyntaxError: invalid syntax in src/hello.py');
+    }
+
+    await ws.writeFile('src/hello.py', 'def hi():\n    return 1\n');
+    const passed = await validator.validateExisting(
+      plan,
+      plan.steps[0]!,
+      getLanguageProfile('python'),
+      (candidate) => candidate.status === 'DONE',
+    );
+
+    expect(passed.status).toBe('passed');
+    expect(validationSandbox.validationArgs).toEqual([
+      codeValidationCommand('python').args,
+      codeValidationCommand('python').args,
+    ]);
   });
 
   it('defers project-wide CODE validation until the final CODE step in an iteration', () => {
@@ -1072,7 +1304,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         actions: [
           { tool: 'write_file', args: { path: 'docs/01-requirement-analysis.md', content: '# req' } },
           { tool: 'write_file', args: { path: 'docs/tests/functional-test-plan.md', content: '# functional plan' } },
-          { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'def test_functional():\n    assert True\n' } },
+          { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'import hello\n\n\ndef test_functional():\n    assert hello is not None\n' } },
         ],
         done: true,
       })]),
@@ -1134,7 +1366,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             { tool: 'write_file', args: { path: 'docs/01-requirement-analysis.md', content: '# req' } },
             { tool: 'write_file', args: { path: 'docs/tests/functional-test-plan.md', content: '# functional plan' } },
-            { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'def test_functional():\n    assert True\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_functional.py', content: 'import hello\n\n\ndef test_functional():\n    assert hello is not None\n' } },
           ],
           done: true,
         }),
@@ -1145,7 +1377,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             { tool: 'write_file', args: { path: 'docs/02-high-level-design.md', content: '# high level\n' } },
             { tool: 'write_file', args: { path: 'docs/tests/module-test-plan.md', content: '# module plan\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_module.py', content: 'def test_module():\n    assert True\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_module.py', content: 'import hello\n\n\ndef test_module():\n    assert hello is not None\n' } },
           ],
           done: true,
         }),
@@ -1154,7 +1386,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             { tool: 'write_file', args: { path: 'docs/03-detailed-design.md', content: '# detailed\n' } },
             { tool: 'write_file', args: { path: 'docs/tests/integration-test-plan.md', content: '# integration plan\n' } },
-            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'def test_integration():\n    assert True\n' } },
+            { tool: 'write_file', args: { path: 'tests/test_integration.py', content: 'import hello\nimport main\n\n\ndef test_integration():\n    assert hello is not None\n    assert main is not None\n' } },
           ],
           done: true,
         }),
@@ -1428,7 +1660,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         steps: {
           [stepExecutionKey(unitStep)]: {
             lastUpdated: new Date().toISOString(),
-            lastStatus: 'FAILED',
+            lastStatus: 'RUNNING',
             lastReason: 'UNIT_TEST tool verification failed; rolling back to paired V-model source phase.',
             attempts: [{
               attempt: 0,
@@ -1992,9 +2224,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await ws.writeFile('src/hello.py', 'def hi():\n    return "old"\n');
     await ws.writeFile('docs/tests/unit-test-plan.md', '# Unit plan\n');
     await ws.writeFile('docs/05-unit-test.md', '# Unit\n');
-    await ws.writeFile('tests/test_hello.py', 'def test_hi():\n    assert True\n');
+    await ws.writeFile('tests/test_hello.py', 'from hello import hi\n\n\ndef test_hi():\n    assert hi() == "old"\n');
     await ws.writeFile('docs/06-integration-test.md', '# Integration\n');
-    await ws.writeFile('tests/test_integration.py', 'def test_contract():\n    assert True\n');
+    await ws.writeFile('tests/test_integration.py', 'import hello\n\n\ndef test_contract():\n    assert hello is not None\n');
     await fs.mkdir(path.join(tmp, '.xcompiler'), { recursive: true });
     await fs.writeFile(
       path.join(tmp, '.xcompiler/debug_cache.json'),
@@ -2023,7 +2255,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         actions: [
           { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "fresh"\n' } },
           { tool: 'write_file', args: { path: 'docs/tests/unit-test-plan.md', content: '# Unit plan rerun\n' } },
-          { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
+          { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from hello import hi\n\n\ndef test_hi():\n    assert hi() == "fresh"\n' } },
         ],
         done: true,
       }),
@@ -2158,7 +2390,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await savePlan(planPath, plan);
     await ws.writeFile('src/hello.py', 'def hi():\n    return "fixed"\n');
     await ws.writeFile('docs/05-unit-test.md', '# Unit\n');
-    await ws.writeFile('tests/test_hello.py', 'def test_hi():\n    assert True\n');
+    await ws.writeFile('tests/test_hello.py', 'from hello import hi\n\n\ndef test_hi():\n    assert hi() == "fixed"\n');
     await fs.mkdir(path.join(tmp, '.xcompiler'), { recursive: true });
     await fs.writeFile(
       path.join(tmp, '.xcompiler/debug_cache.json'),
@@ -2227,7 +2459,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
     await ws.writeFile('src/hello.py', 'def hi():\n    return "fixed"\n');
-    await ws.writeFile('tests/test_hello.py', 'def test_hi():\n    assert True\n');
+    await ws.writeFile('tests/test_hello.py', 'from hello import hi\n\n\ndef test_hi():\n    assert hi() == "fixed"\n');
     await fs.mkdir(path.join(tmp, '.xcompiler'), { recursive: true });
     await fs.writeFile(
       path.join(tmp, '.xcompiler/debug_cache.json'),
@@ -2301,7 +2533,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await savePlan(planPath, plan);
     await ws.writeFile('src/hello.py', 'def hi():\n    return "fixed"\n');
     await ws.writeFile('docs/05-unit-test.md', '# Unit\n');
-    await ws.writeFile('tests/test_hello.py', 'def test_hi():\n    assert True\n');
+    await ws.writeFile('tests/test_hello.py', 'from hello import hi\n\n\ndef test_hi():\n    assert hi() == "fixed"\n');
     await fs.mkdir(path.join(tmp, '.xcompiler'), { recursive: true });
     await fs.writeFile(
       path.join(tmp, '.xcompiler/debug_cache.json'),
@@ -2432,7 +2664,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(ticketLog).not.toContain('"targetStepId":"S001"');
   });
 
-  it('resumes a cached source Debugger from the latest actionable failure instead of the final read-only loop', async () => {
+  it('preserves the latest actionable cached failure across a failed resumed Debugger attempt', async () => {
     const plan = fakePlan();
     const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
     plan.steps = [codeStep];
@@ -2448,7 +2680,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         steps: {
           [stepExecutionKey(codeStep)]: {
             lastUpdated: new Date().toISOString(),
-            lastStatus: 'FAILED',
+            lastStatus: 'RUNNING',
             lastReason: 'read-only recovery mode repeated probe actions for 2 rounds',
             attempts: [
               {
@@ -2484,6 +2716,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const debuggerLlm = new CapturingScriptedLLM([
       JSON.stringify({
+        thoughts: 'need another turn before applying the repair',
+        actions: [],
+        done: false,
+      }),
+      JSON.stringify({
         thoughts: 'repair from cached pytest syntax failure',
         actions: [
           { tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "fixed"\n' } },
@@ -2492,10 +2729,11 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
         done: true,
       }),
     ]);
+    const rollbackSandbox = new CodeValidationSandbox(ws);
     const engine = new PhaseEngine({
       ws,
       git,
-      sandbox,
+      sandbox: rollbackSandbox,
       router: new FakeRouter({ Debugger: debuggerLlm }) as unknown as LLMRouter,
       audit,
       planPath,
@@ -2514,6 +2752,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(failureBlock).not.toContain('request timed out after 900000ms');
     expect(debuggerLlm.lastUser).toContain('omitted 2 noisy provider/read-only/recovery attempt');
     expect(debuggerLlm.lastUser).not.toContain('read-only recovery mode repeated probe actions');
+    expect(debuggerLlm.calls).toHaveLength(2);
     expect(plan.steps[0]?.status).toBe('DONE');
   });
 
@@ -2631,7 +2870,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await expect(ws.readFile('docs/tests/unit-test-plan.md')).resolves.toBe('# previous unit plan\n');
     const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
     expect(ticketLog).toContain('"event":"created"');
-    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).toContain('"event":"stage-feature-deferred"');
+    expect(ticketLog).not.toContain('"ticketType":"bug"');
     expect(ticketLog).not.toContain('"event":"routed"');
     const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
     expect(auditLog).toContain('audit.llm_chat_aborted');
@@ -2722,11 +2962,12 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await expect(ws.exists('src/hello.py')).resolves.toBe(false);
     const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
     expect(ticketLog).toContain('"event":"created"');
-    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).toContain('"event":"stage-feature-deferred"');
+    expect(ticketLog).not.toContain('"ticketType":"bug"');
     expect(ticketLog).not.toContain('"event":"routed"');
   });
 
-  it('relinks and closes the prior Bug Ticket when a provider-failed declarative Step succeeds on resume', async () => {
+  it('resumes a provider-failed declarative Step without creating a project Bug Ticket', async () => {
     const plan = fakePlan();
     const designStep = plan.steps.find((step) => step.phase === 'DETAILED_DESIGN')!;
     designStep.dependsOn = [];
@@ -2784,13 +3025,9 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
 
     const bugFiles = (await fs.readdir(path.join(tmp, '.xcompiler/tickets')))
       .filter((file) => /^BUG-.*\.json$/u.test(file));
-    expect(bugFiles).toHaveLength(1);
-    const bug = JSON.parse(
-      await fs.readFile(path.join(tmp, '.xcompiler/tickets', bugFiles[0]!), 'utf8'),
-    ) as { status: string; debugBrief?: { category?: string }; bugResolutionPlan?: string };
-    expect(bug.status).toBe('closed');
-    expect(bug.debugBrief?.category).toBe('llm_provider');
-    expect(bug.bugResolutionPlan).toContain('retry the same Step');
+    expect(bugFiles).toHaveLength(0);
+    const auditLog = await ws.readFile('.xcompiler/audit.jsonl');
+    expect(auditLog).toContain('engine.infrastructure_failure_deferred');
   });
 
   it('does not route LLM provider rate limits from test phases into Debugger retries', async () => {
@@ -2841,7 +3078,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     await expect(ws.exists('src/hello.py')).resolves.toBe(false);
     const ticketLog = await ws.readFile('.xcompiler/tickets/events.jsonl');
     expect(ticketLog).toContain('"event":"created"');
-    expect(ticketLog).toContain('"event":"debug-failed"');
+    expect(ticketLog).toContain('"event":"stage-feature-deferred"');
+    expect(ticketLog).not.toContain('"ticketType":"bug"');
     expect(ticketLog).not.toContain('"event":"routed"');
 
     const resumedTester = new ThrowingLLM(
@@ -3031,7 +3269,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       JSON.stringify({
         thoughts: 'repair the CODE-owned unit test artifact',
         actions: [
-          { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'def test_hi():\n    assert True\n' } },
+          { tool: 'write_file', args: { path: 'tests/test_hello.py', content: 'from hello import hi\n\n\ndef test_hi():\n    assert hi() == "fixed"\n' } },
           { tool: 'run_tests', args: { args: ['tests/test_hello.py'] } },
         ],
         done: true,
@@ -3101,8 +3339,8 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
               args: {
                 path: 'tests/test_hello.py',
                 content:
-                  'def test_hello():\n    assert True\n\n' +
-                  'def test_invalid_input():\n    assert True\n',
+                  'from hello import hi\n\n\ndef test_hello():\n    assert hi("ok") == "ok"\n\n' +
+                  'def test_invalid_input():\n    assert hi(None) is None\n',
               },
             },
           ],
@@ -3730,14 +3968,16 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       }),
       JSON.stringify({
         thoughts: 'repair after seeing the original pytest failure again',
+        bugResolutionPlan: 'Repair src/hello.py for the original pytest assertion, then rerun the inherited unit gate.',
         actions: [{ tool: 'write_file', args: { path: 'src/hello.py', content: 'def hi():\n    return "fixed"\n' } }],
         done: true,
       }),
     ]);
+    const rollbackSandbox = new CodeValidationSandbox(ws);
     const engine = new PhaseEngine({
       ws,
       git,
-      sandbox,
+      sandbox: rollbackSandbox,
       router: new FakeRouter({ Debugger: debuggerLlm }) as unknown as LLMRouter,
       audit,
       planPath,
@@ -3775,6 +4015,73 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
     expect(secondPrompt).toContain('test_parse_dbc_ecu_filtering');
     expect(secondPrompt).toContain('assert 0 > 0');
     expect(secondPrompt).not.toContain('latest Debugger attempt failure');
+  });
+
+  it('recovers an interrupted test rollback from its routed Bug Ticket as Debugger', async () => {
+    const plan = fakePlan();
+    const codeStep = plan.steps.find((step) => step.phase === 'CODE')!;
+    const unitStep = plan.steps.find((step) => step.phase === 'UNIT_TEST')!;
+    codeStep.dependsOn = [];
+    codeStep.outputs = ['src/hello.py'];
+    unitStep.dependsOn = [codeStep.id];
+    unitStep.inputs = ['src/hello.py', 'tests/test_hello.py'];
+    plan.steps = [codeStep, unitStep];
+    const planPath = path.join(tmp, 'plan.json');
+    await savePlan(planPath, plan);
+    await ws.writeFile('src/hello.py', 'def hi():\n    return "broken"\n');
+
+    const debuggerLlm = new CapturingScriptedLLM([
+      JSON.stringify({
+        thoughts: 'apply the routed Bug Ticket repair and verify its inherited unit gate',
+        actions: [{
+          tool: 'write_file',
+          args: { path: 'src/hello.py', content: 'def hi():\n    return "fixed"\n' },
+        }],
+        done: true,
+      }),
+    ]);
+    const routedRollbackSandbox = new CodeValidationSandbox(ws);
+    const engine = new PhaseEngine({
+      ws,
+      git,
+      sandbox: routedRollbackSandbox,
+      router: new FakeRouter({ Debugger: debuggerLlm }) as unknown as LLMRouter,
+      audit,
+      planPath,
+      maxRoundsPerStep: 1,
+      maxDebugRetries: 1,
+    });
+    const internal = engine as unknown as {
+      ensureExecutionGraph: (p: Plan) => Promise<void>;
+      workTickets: WorkTicketLifecycle;
+      bugLifecycle: BugLifecycle;
+      executeStepWithDebug: (p: Plan, s: Plan['steps'][number]) => Promise<boolean>;
+    };
+    await internal.ensureExecutionGraph(plan);
+    await internal.workTickets.completeStep(codeStep);
+    const bug = await internal.bugLifecycle.recordBug(plan, unitStep, {
+      kind: 'test-gate',
+      reason: 'UNIT_TEST failed; rolling back to the paired CODE phase.',
+      failureLog: 'FAIL tests/test_hello.py::test_product_contract\nexpected fixed implementation',
+    });
+    await internal.bugLifecycle.routeBug(
+      bug,
+      codeStep,
+      'UNIT_TEST failure belongs to the paired CODE phase',
+    );
+    bug.verificationStepId = unitStep.id;
+    bug.verificationPhase = unitStep.phase;
+    await internal.bugLifecycle.persistBug(bug, 'verification-required');
+    await internal.workTickets.startStep(codeStep);
+
+    const ok = await internal.executeStepWithDebug(plan, codeStep);
+
+    expect(ok).toBe(true);
+    expect(debuggerLlm.calls).toHaveLength(1);
+    expect(debuggerLlm.lastUser).toContain(bug.id);
+    expect(debuggerLlm.lastUser).toContain('test_product_contract');
+    expect(routedRollbackSandbox.testArgs).toContainEqual(['tests/test_hello.py']);
+    expect(await ws.readFile('src/hello.py')).toContain('"fixed"');
   });
 
   it('records the original test rollback failure in source Debugger cache after failed retries', async () => {
@@ -4465,7 +4772,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
       },
     ];
     await ws.writeFile('src/main.py', 'def main(): print("usage: gate app")\n');
-    await ws.writeFile('tests/test_main.py', 'def test_gate(): assert False\n');
+    await ws.writeFile('tests/test_main.py', 'import main\n\n\ndef test_gate(): assert main is None\n');
     await ws.writeFile('docs/05-unit-test.md', '# Unit Test\n');
     const planPath = path.join(tmp, 'plan.json');
     await savePlan(planPath, plan);
@@ -4504,7 +4811,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
           actions: [
             {
               tool: 'write_file',
-              args: { path: 'tests/test_main.py', content: 'def test_gate():\n    assert "fixed"\n' },
+              args: { path: 'tests/test_main.py', content: 'import main\n\n\ndef test_gate():\n    assert main is not None  # fixed\n' },
             },
           ],
           done: true,
@@ -4646,7 +4953,7 @@ describe('PhaseEngine end-to-end (no real LLM, no real sandbox build)', () => {
             tool: 'write_file',
             args: {
               path: 'tests/reporting/export.test.ts',
-              content: 'import { describe, it, expect } from "vitest";\ndescribe("export", () => { it("works", () => expect(true).toBe(true)); });\n',
+              content: 'import { describe, it, expect } from "vitest";\nimport { exportReport } from "../../src/reporting/export.ts";\ndescribe("export", () => { it("works", () => expect(exportReport()).toBe("ok")); });\n',
             },
           },
         ],

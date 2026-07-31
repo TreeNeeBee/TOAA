@@ -1,6 +1,7 @@
 import type { Workspace } from '../workspace/workspace.js';
 import {
   V_MODEL_DEVELOPMENT_PHASES,
+  V_MODEL_SOURCE_TO_TEST_PHASE,
   V_MODEL_TEST_PHASES,
   type Phase,
   type StageQualityGate,
@@ -129,6 +130,60 @@ export function emptyQualityAssessment(): StageQualityAssessment {
   };
 }
 
+/**
+ * Reconcile a development-stage LLM assessment with output verification
+ * performed after its tool actions. Stale "missing required output" gaps and
+ * explicitly deferred paired-test execution are removed; semantic, alignment,
+ * coverage, and tolerance findings remain.
+ */
+export function reconcileDevelopmentQualityAssessment(
+  step: Step,
+  assessment: StageQualityAssessment | undefined,
+  missingOutputs: readonly string[],
+): StageQualityAssessment | undefined {
+  if (
+    !assessment ||
+    !(V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase)
+  ) {
+    return assessment;
+  }
+  const missing = new Set(missingOutputs);
+  const verifiedOutputs = step.outputs.filter(
+    (output) => !output.endsWith('/') && !missing.has(output),
+  );
+  const staleOutputGaps = assessment.gaps.filter((gap) =>
+    isVerifiedMissingOutputGap(gap, step.outputs, missing),
+  );
+  const deferredVerificationGaps = assessment.gaps.filter((gap) =>
+    isDeferredPairedTestExecutionGap(step, gap),
+  );
+  const reconciledGaps = new Set([
+    ...staleOutputGaps,
+    ...deferredVerificationGaps,
+  ]);
+  const gaps = assessment.gaps.filter((gap) => !reconciledGaps.has(gap));
+  const evidence = dedup([...assessment.evidence, ...verifiedOutputs]);
+  const completion =
+    missing.size === 0 &&
+    reconciledGaps.size > 0 &&
+    gaps.length === 0
+      ? 1
+      : assessment.completion;
+  if (
+    reconciledGaps.size === 0 &&
+    evidence.length === assessment.evidence.length &&
+    completion === assessment.completion
+  ) {
+    return assessment;
+  }
+  return {
+    ...assessment,
+    completion,
+    evidence,
+    gaps,
+  };
+}
+
 export function evaluateQualityGate(
   step: Step,
   assessment: StageQualityAssessment | undefined,
@@ -194,6 +249,52 @@ export function evaluateQualityGate(
     enhancementFailures,
     bugFailures,
   };
+}
+
+function isDeferredPairedTestExecutionGap(step: Step, gap: string): boolean {
+  if (
+    !(V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase) ||
+    step.tools.includes('run_tests')
+  ) {
+    return false;
+  }
+  const pairedPhase = V_MODEL_SOURCE_TO_TEST_PHASE[
+    step.phase as keyof typeof V_MODEL_SOURCE_TO_TEST_PHASE
+  ];
+  const normalized = gap.toLowerCase();
+  const deniedCurrentTool =
+    /\brun_tests\b/u.test(normalized) &&
+    /not (?:authori[sz]ed|allowed)|unauthori[sz]ed|未授权|不允许|未开放/u.test(normalized);
+  const scheduledForPairedPhase =
+    normalized.includes(pairedPhase.toLowerCase()) ||
+    /will be executed|deferred to|scheduled for|留到|将在|后续.*(?:执行|测试)/u.test(normalized);
+  const plannedCodeImplementation =
+    /\b(?:product\s+)?src\/?.*\b(?:will be|is)\s+(?:created|implemented)\b.*\bcode\b/u.test(normalized) ||
+    /(?:产品)?源码.*(?:将在|留到|由).*\bcode\b.*(?:创建|实现)/u.test(normalized);
+  const actualDefect =
+    /\b(?:bug|error|fail(?:ed|ing|ure)?|invalid|incorrect|incomplete|missing|omit(?:s|ted)?|mismatch|uncovered|unsupported|blocked)\b/u.test(normalized) ||
+    /\b(?:coverage|contract|alignment|requirement)\b.*\b(?:gap|missing|below|fail|insufficient)\b/u.test(normalized) ||
+    /错误|失败|无效|不正确|不完整|缺失|遗漏|不一致|未覆盖|覆盖率不足|契约缺陷|需求缺陷|阻塞/u.test(normalized);
+  return !actualDefect && (
+    (deniedCurrentTool && scheduledForPairedPhase) ||
+    scheduledForPairedPhase ||
+    plannedCodeImplementation
+  );
+}
+
+function isVerifiedMissingOutputGap(
+  gap: string,
+  outputs: readonly string[],
+  missing: ReadonlySet<string>,
+): boolean {
+  if (!/(?:missing required outputs?|缺失\s+required outputs?)/iu.test(gap)) {
+    return false;
+  }
+  return outputs.some((output) => gap.includes(output) && !missing.has(output));
+}
+
+function dedup(values: readonly string[]): string[] {
+  return [...new Set(values)];
 }
 
 export class QualityAssessmentStore {

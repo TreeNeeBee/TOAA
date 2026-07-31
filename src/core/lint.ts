@@ -385,25 +385,10 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
-  // 12. 架构规模门槛：按需求关注面线性扩展，不再把复杂工程的最低要求固定封顶为 3。
+  // 12. Analyze architecture demand for the contract checks below. The
+  // estimated module count is planning guidance, not a file/module quota:
+  // cohesive modules may legitimately own more than one requirement surface.
   const demand = analyzeArchitectureDemand(plan, plan.language);
-  if (demand.nonTrivial) {
-    const codeSteps = plan.steps.filter((s) => s.phase === 'CODE');
-    const sourceOutputs = dedup(
-      codeSteps.flatMap((s) =>
-        s.outputs.filter((out) => out.startsWith('src/') && profile.codeExtensions.some((ext) => out.endsWith(ext))),
-      ),
-    );
-    if (sourceOutputs.length < demand.minModules) {
-      issues.push({
-        level: 'error',
-        stepId: codeSteps[0]?.id,
-        message:
-          `Non-trivial request detected (${demand.reasonLabel}). ` +
-          `CODE outputs currently cover only ${sourceOutputs.length} source module(s); expected at least ${demand.minModules}.`,
-      });
-    }
-  }
 
   // 13. V 模型可追踪性：HIGH_LEVEL_DESIGN 产出模块契约与模块测试，
   //     CODE 实现模块，MODULE_TEST 消费既有模块测试完成验证。

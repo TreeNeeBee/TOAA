@@ -2,6 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
+import { suspiciousTextTruncationError } from './content_guard.js';
 
 /**
  * 字符串替换工具：在已有文件内查找 `find` 并替换为 `replace`。
@@ -38,6 +39,15 @@ export const replaceInFileTool: Tool<
         ok: false,
         error:
           'no-op edit refused: find === replace（替换前后字符串完全相同）。请确认你真正要修改的差异；如只想读取文件请改用 read_file，如要整文件重写请用 write_file。',
+      };
+    }
+    if (args.replace.length === 0 && !args.find.includes('\n')) {
+      return {
+        ok: false,
+        error:
+          'replace_in_file refused an empty replacement for a single-line fragment. ' +
+          'This commonly indicates a truncated model response and can corrupt a declaration. ' +
+          'Use one atomic replacement containing the complete intended code, or apply_patch with surrounding context.',
       };
     }
     const abs = resolved.abs;
@@ -82,6 +92,13 @@ export const replaceInFileTool: Tool<
       return { ok: false, error: hint.join('\n') };
     }
     const next = parts.join(args.replace);
+    const truncationError = suspiciousTextTruncationError({
+      tool: 'replace_in_file',
+      path: resolved.rel,
+      originalBytes: Buffer.byteLength(original),
+      replacementBytes: Buffer.byteLength(next),
+    });
+    if (truncationError) return { ok: false, error: truncationError };
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, next, 'utf8');
     return {

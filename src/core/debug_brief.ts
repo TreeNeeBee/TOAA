@@ -192,6 +192,12 @@ function classify(
   ) {
     return 'test_failure';
   }
+  if (
+    /\berror ts\d{4}\b/u.test(lower) ||
+    /\b(?:tsc|compileall)\b[^\n]*(?:exit\s*=\s*[1-9]|failed|失败)/u.test(lower)
+  ) {
+    return 'exception';
+  }
   if (/openai|ollama|openrouter|llm provider|provider_call_failed|all llm providers failed|prefill_memory_exceeded|context window|token limit|prompt too long/u.test(lower)) {
     return 'llm_provider';
   }
@@ -225,6 +231,8 @@ function findPrimaryError(
   toolFailures: string[],
 ): string {
   if (failedTests.length > 0 && category === 'test_failure') return `failed test: ${failedTests[0]}`;
+  const compilerError = text.match(/[^\n]*\berror TS\d{4}:[^\n]+/u)?.[0];
+  if (compilerError) return oneLine(compilerError);
   if (toolFailures.length > 0 && (category === 'tool_loop' || category === 'exception')) return toolFailures[0]!;
   const categoryPatterns: Partial<Record<DebugFailureCategory, RegExp[]>> = {
     test_failure: [
@@ -244,6 +252,7 @@ function findPrimaryError(
     tool_loop: [/repeated read-only\/probe actions[^\n]*/iu],
   };
   const genericPatterns: RegExp[] = [
+    /[^\n]*\berror TS\d{4}:[^\n]+/u,
     /(?:SyntaxError|IndentationError|TabError|ModuleNotFoundError|ImportError|AssertionError|TypeError|ValueError|FileNotFoundError|AttributeError|RuntimeError):[^\n]+/u,
     /\bFAILED\s+[^\n]+/u,
     /\b(?:pytest|vitest)[^\n]*(?:exit|failed|FAIL)[^\n]*/iu,

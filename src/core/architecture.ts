@@ -283,14 +283,6 @@ export function validateArchitectureContract(
   const testSteps = steps.filter((step) => step.phase === 'MODULE_TEST');
   const stepById = new Map(steps.map((step) => [step.id, step]));
 
-  if (demand.nonTrivial && modules.length < demand.minModules) {
-    issues.push({
-      message:
-        `Architecture contract has ${modules.length} module(s); requirement scale expects at least ${demand.minModules} ` +
-        `(${demand.reasonLabel}).`,
-    });
-  }
-
   const moduleIds = new Set<string>();
   const allSourcePaths = new Set<string>();
   const allAssetPaths = new Set<string>();

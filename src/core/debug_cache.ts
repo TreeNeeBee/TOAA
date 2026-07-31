@@ -22,6 +22,14 @@ export interface DebugAttemptEntry {
   debugBrief?: DebugBrief;
   /** Debug 场景来源；用于跨会话恢复时保留测试回退/审计修复语义。 */
   contextMode?: 'audit-repair' | 'iteration-gate' | 'test-rollback';
+  /** 关联的 Bug Ticket；中断恢复后继续同一 Ticket，而不是创建或选择错误 Ticket。 */
+  bugTicketId?: string;
+  /** 进入 Debugger 前源阶段是否已完成；测试回退恢复时必须保留增量修复语义。 */
+  completedBeforeDebug?: boolean;
+  /** 中断恢复所需的精简上下文路径。 */
+  contextPaths?: string[];
+  /** 测试回退时允许修复的受影响 V-model 产物。 */
+  extraAllowedWrites?: string[];
   /** 测试回退 Debugger 的默认验证范围，避免 resume 后无参 run_tests 退化成全量测试。 */
   testScopeArgs?: string[];
   /** Calibrator 给出的修复建议（一行一条）。 */
@@ -170,6 +178,12 @@ export class DebugCache {
     return !!e && e.lastStatus === 'FAILED' && e.attempts.length > 0;
   }
 
+  /** A prior process recorded debug evidence but exited before writing a terminal cache status. */
+  hasRunningAttempt(stepId: string): boolean {
+    const e = this.data.steps[stepId];
+    return !!e && e.lastStatus === 'RUNNING' && e.attempts.length > 0;
+  }
+
   /** 仅由运行入口在计划确有 stale RUNNING 时调用，保留 attempts 并转成可恢复失败。 */
   async markInterrupted(stepId: string, reason: string): Promise<boolean> {
     await this.load();
@@ -208,6 +222,10 @@ export class DebugCache {
       failureLogTail: tail(compactFailureLog),
       debugBrief,
       contextMode: entry.contextMode,
+      bugTicketId: entry.bugTicketId,
+      completedBeforeDebug: entry.completedBeforeDebug,
+      contextPaths: dedupPaths(entry.contextPaths),
+      extraAllowedWrites: dedupPaths(entry.extraAllowedWrites),
       testScopeArgs: entry.testScopeArgs,
       suggestions: entry.suggestions,
       snapshotSha: entry.snapshotSha,
@@ -297,7 +315,7 @@ export class DebugCache {
       ...omitted,
       ...noActionable,
       ...lines,
-      '请基于以上历史，提出**新的诊断假设**与**新的修改方向**；优先 read_file 看真实代码，再做最小修改。',
+      '请基于以上历史，提出**新的诊断假设**与**新的修改方向**。优先使用当前 prompt 中已注入的完整 debug repair packet；只有关键文件未注入或明确标记为 truncated 时才补充 read_file，然后立即做最小修改。',
     ].join('\n');
   }
 
@@ -305,6 +323,11 @@ export class DebugCache {
     await fs.mkdir(path.dirname(this.file), { recursive: true });
     await fs.writeFile(this.file, JSON.stringify(this.data, null, 2), 'utf8');
   }
+}
+
+function dedupPaths(paths: string[] | undefined, max = 200): string[] | undefined {
+  if (!paths || paths.length === 0) return undefined;
+  return [...new Set(paths.map((value) => value.trim()).filter(Boolean))].slice(0, max);
 }
 
 function isNoisyDebugReason(reason: string): boolean {

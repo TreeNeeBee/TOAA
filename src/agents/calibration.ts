@@ -1065,7 +1065,14 @@ function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
           sourceStep.systemPrompt +=
             `\n\n${sourceMarker}（强制）：本 ${sourcePhase} 阶段必须依据当前阶段契约创建并维护` +
             `配对 ${testPhase} 的可执行测试，测试路径为 ${testAssets.join(', ')}；` +
-            `测试应在后续 ${testPhase} 阶段运行，不得把编写工作推迟到验证阶段。`;
+            `测试应在后续 ${testPhase} 阶段运行，不得把编写工作推迟到验证阶段。` +
+            `测试必须导入或执行 Plan 声明的真实产品模块与公开接口；禁止在测试文件内复制业务类型、` +
+            `类、算法、渲染器、解析器或调度逻辑来构造不依赖产品代码的自测通过。` +
+            `这些测试可以引用将在 CODE 阶段实现、当前尚不存在的 sourcePaths；` +
+            `REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN 禁止为此提前创建 src/** stub、占位实现或产品代码。` +
+            (sourcePhase === 'DETAILED_DESIGN'
+              ? `每个集成测试必须实际引用至少两个参与集成的已声明产品源码（Plan 仅声明一个源码时除外）。`
+              : '');
           sourceStep.acceptance +=
             ` 配对 ${testPhase} 测试用例存在、内容非空，并与本阶段的测试计划和验收契约一致。`;
         }

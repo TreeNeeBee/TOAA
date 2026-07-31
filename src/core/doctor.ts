@@ -16,6 +16,7 @@ import {
   isOllamaProvider,
   isOpenAICompatibleProvider,
   normalizeBaseUrl,
+  resolveLLMProbeTimeoutMs,
 } from '../llm/health.js';
 import { execRaw } from '../sandbox/subprocess.js';
 import { isRunningInContainer } from '../sandbox/factory.js';
@@ -45,7 +46,7 @@ export interface DoctorReport {
 
 export interface DoctorOptions {
   configPath?: string;
-  /** Probe timeout for LLM endpoints (ms). Default 3000. */
+  /** Override every LLM endpoint probe timeout (ms). Defaults to provider-aware connection budgets. */
   probeTimeoutMs?: number;
   /** Skip outbound network probes (used by tests). */
   skipNetwork?: boolean;
@@ -60,7 +61,6 @@ export interface DoctorOptions {
 export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorReport> {
   const M = t().doctor;
   const sections: CheckSection[] = [];
-  const probeTimeoutMs = opts.probeTimeoutMs ?? 3000;
 
   // 1) config
   const cfgSection: CheckSection = { title: M.sectionConfig, items: [] };
@@ -83,7 +83,7 @@ export async function runDoctor(opts: DoctorOptions = {}): Promise<DoctorReport>
   await scores.load().catch(() => undefined);
 
   // 2) LLM
-  sections.push(await checkLlm(cfg, scores, probeTimeoutMs, !!opts.skipNetwork));
+  sections.push(await checkLlm(cfg, scores, opts.probeTimeoutMs, !!opts.skipNetwork));
 
   // 3) sandbox
   sections.push(await checkSandbox(cfg, !!opts.skipNetwork));
@@ -109,7 +109,7 @@ function finalize(sections: CheckSection[]): DoctorReport {
 async function checkLlm(
   cfg: XCompilerConfig,
   scores: ScoreStore,
-  probeTimeoutMs: number,
+  probeTimeoutMs: number | undefined,
   skipNetwork: boolean,
 ): Promise<CheckSection> {
   const M = t().doctor;
@@ -128,13 +128,27 @@ async function checkLlm(
   ]);
 
   // Group ollama providers by base_url so we only probe each server once.
-  const ollamaByUrl = new Map<string, Array<{ name: string; model: string }>>();
-  const openaiList: Array<{ name: string; baseUrl: string; apiKey: string; model: string; requiresApiKey: boolean }> = [];
+  const ollamaByUrl = new Map<
+    string,
+    Array<{ name: string; model: string; probeTimeoutMs: number }>
+  >();
+  const openaiList: Array<{
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    requiresApiKey: boolean;
+    probeTimeoutMs: number;
+  }> = [];
   for (const [name, p] of providers) {
     if (isOllamaProvider(p)) {
       const url = normalizeBaseUrl(p.base_url, 'http://localhost:11434');
       const arr = ollamaByUrl.get(url) ?? [];
-      arr.push({ name, model: p.model });
+      arr.push({
+        name,
+        model: p.model,
+        probeTimeoutMs: resolveLLMProbeTimeoutMs(p, probeTimeoutMs),
+      });
       ollamaByUrl.set(url, arr);
     } else if (isOpenAICompatibleProvider(p)) {
       const baseUrl = normalizeBaseUrl(p.base_url, 'https://api.openai.com/v1');
@@ -144,6 +158,7 @@ async function checkLlm(
         apiKey: p.api_key ?? '',
         model: p.model,
         requiresApiKey: openAIEndpointRequiresApiKey(baseUrl),
+        probeTimeoutMs: resolveLLMProbeTimeoutMs(p, probeTimeoutMs),
       });
     }
   }
@@ -156,7 +171,8 @@ async function checkLlm(
       continue;
     }
     try {
-      const tags = await fetchOllamaTags(baseUrl, probeTimeoutMs);
+      const timeoutMs = Math.max(...group.map((provider) => provider.probeTimeoutMs));
+      const tags = await fetchOllamaTags(baseUrl, timeoutMs);
       ollamaTags.set(baseUrl, tags);
       sec.items.push({ level: 'ok', message: M.ollamaReachable(baseUrl, tags.length) });
     } catch (err) {
@@ -185,7 +201,7 @@ async function checkLlm(
     }
     if (skipNetwork) continue;
     try {
-      const models = await fetchOpenAIModels(p.baseUrl, p.apiKey, probeTimeoutMs);
+      const models = await fetchOpenAIModels(p.baseUrl, p.apiKey, p.probeTimeoutMs);
       sec.items.push({ level: 'ok', message: M.openaiReachable(p.name, p.baseUrl) });
       if (models.length > 0 && !models.includes(p.model)) {
         sec.items.push({ level: 'warn', message: M.openaiModelListMissing(p.name, p.model) });

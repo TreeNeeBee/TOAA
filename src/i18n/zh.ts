@@ -142,6 +142,9 @@ const PYTHON_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只能�
    - 【时间稳定性】时间相关测试必须冻结系统时钟（例如 \`vi.setSystemTime\` / patch datetime）或根据当前时钟推导期望值；禁止在调用 \`new Date()\` / \`date.today()\` 的同时硬编码某个年份。
 4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空，并提交有具体证据支撑的 qualityAssessment。
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE 必须报告 completion 和 upstreamAlignment。
+   这四个开发阶段负责编写配对测试，但只有当前 Step 明确授权验证工具时才运行；测试按计划留到 UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 执行不属于当前阶段缺陷，禁止写入 qualityAssessment.gaps。
+   每个配对测试必须导入或执行 Plan 声明的真实产品模块与公开接口；禁止在测试文件内复制产品类型、类、算法、渲染器、解析器、调度器或其它业务行为来制造脱离产品代码的自测通过。
+   当 Plan 声明至少两个产品源码时，每个 DETAILED_DESIGN 集成测试必须实际使用至少两个已声明产品源码；任一侧使用内联替身都不属于集成证据。
    UNIT_TEST 报告 lineCoverage、branchCoverage、testCasePassRate；INTEGRATION_TEST 报告 interfaceCoverage、integrationScenarioCoverage、testCasePassRate；MODULE_TEST 报告 moduleCoverage、contractCoverage、testCasePassRate；FUNCTIONAL_TEST 报告 functionalCoverage、requirementCoverage、endToEndPassRate。
    所有比率使用 0..1；禁止编造测量结果，无法取得的证据必须写入 gaps，由 Runtime 建立 Enhance Ticket。
    UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 不得修复测试或产品代码；若检查发现测试执行未必能暴露的语义性测试缺陷，必须填写 validationDefect、设置 done=false，由 Runtime 建立 Bug Ticket 并路由到配对源阶段。
@@ -226,6 +229,9 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只�
    - 【时间稳定性】时间相关测试必须冻结系统时钟（例如 \`vi.setSystemTime\` / patch datetime）或根据当前时钟推导期望值；禁止在调用 \`new Date()\` / \`date.today()\` 的同时硬编码某个年份。
 4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空，并提交有具体证据支撑的 qualityAssessment。
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE 必须报告 completion 和 upstreamAlignment。
+   这四个开发阶段负责编写配对测试，但只有当前 Step 明确授权验证工具时才运行；测试按计划留到 UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 执行不属于当前阶段缺陷，禁止写入 qualityAssessment.gaps。
+   每个配对测试必须导入或执行 Plan 声明的真实产品模块与公开接口；禁止在测试文件内复制产品类型、类、算法、渲染器、解析器、调度器或其它业务行为来制造脱离产品代码的自测通过。
+   当 Plan 声明至少两个产品源码时，每个 DETAILED_DESIGN 集成测试必须实际使用至少两个已声明产品源码；任一侧使用内联替身都不属于集成证据。
    UNIT_TEST 报告 lineCoverage、branchCoverage、testCasePassRate；INTEGRATION_TEST 报告 interfaceCoverage、integrationScenarioCoverage、testCasePassRate；MODULE_TEST 报告 moduleCoverage、contractCoverage、testCasePassRate；FUNCTIONAL_TEST 报告 functionalCoverage、requirementCoverage、endToEndPassRate。
    所有比率使用 0..1；禁止编造测量结果，无法取得的证据必须写入 gaps，由 Runtime 建立 Enhance Ticket。
    UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 不得修复测试或产品代码；若检查发现测试执行未必能暴露的语义性测试缺陷，必须填写 validationDefect、设置 done=false，由 Runtime 建立 Bug Ticket 并路由到配对源阶段。
@@ -326,7 +332,7 @@ const messages: Messages = {
     coderDebuggerSameModel: (model, coderProvider, debuggerProvider) =>
       `模型配置建议：Coder（${coderProvider}）和 Debugger（${debuggerProvider}）当前都使用 ${model}。建议配置不同模型，让调试阶段获得独立的推理路径。`,
     invalidBaseUrl: (raw, fallback) => `[xcompiler] base_url 无效（${raw}）；请配置有效的 HTTP(S) URL（默认值：${fallback}）`,
-    providerValidationFailed: (role, model) => `[${role}] provider ${model} 输出验证失败，切换到下一个`,
+    providerValidationFailed: (role, model) => `[${role}] provider ${model} 输出契约校验失败，返回调用方纠错`,
     providerCallFailed: (role, model) => `[${role}] provider ${model} 调用失败，切换到下一个`,
     scoreReadFailed: (p, message) => `读取 ${p} 失败：${message}`,
     scoreChanged: (provider, score, previous) => `评分（${provider}）=${score}（原值 ${previous}）`,
@@ -655,6 +661,8 @@ const messages: Messages = {
     testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
       `  ↳ ${testId} ${testPhase} 门禁失败；按 V 模型回退 → ${sourceId} ${sourcePhase} Debugger。`,
     debugResumeInfraRetry: (id, n) => `  ↻ ${id} 上次会话仅留下 LLM 断连/限流等基础设施错误（${n} 次），已清理陈旧 debug 缓存，本次按正常流程重新执行该 Step。`,
+    enhanceResumeRevalidationNotice: (id, ticketId, n) =>
+      `  ↻ ${id} 从 ${ticketId} 的只读核验循环恢复（${n} 次），本次基于既有产物重新执行增量质量校验。`,
     spinDebugRetry: (id, attempt, budget, cap, reason) => `🛠  ${id} DEBUG retry ${attempt}/${budget} (cap=${cap}) — ${reason}`,
     retryException: (a, b, msg) => `retry ${a}/${b} 抛出异常：${msg}`,
     fixSucceeded: (id, a) => `${id} 修复成功 (retry=${a})`,
@@ -866,6 +874,7 @@ ${opts.phasePlan}
 - 禁止输出其他 planned phase 的 Step；P2/P3 的详细计划留到它们成为 current phase 时再生成。
 - 如果 ${opts.phaseId} 横跨多个关注点（领域逻辑、CLI/API、文件 I/O、外部集成、流程编排、测试），必须在 architectureModules 中体现当前 phase 的模块边界，并在 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 的 subTasks 下分解模块级工作。
 - architectureModules.sourcePaths 只能是 src/ 下的产品源码文件；随产品交付的运行时非代码资产写入 assetPaths。不要把 tests/fixtures、tests/utils、样例输入、临时输出、目录或文档登记为架构模块。
+- architectureModules.testPaths 只能填写由 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 读取执行的模块契约测试（通常为 tests/modules/*）；CODE 必须另行输出单元测试，禁止与这些 testPaths 重复。
 - dependencies 只写当前 phase 需要的包名；Python 必须包含 pytest；不要输出 requirements.txt。
 - 当前 phase 必须包含标准 V 模型 8 个宏 Step，并满足同步测试设计规则。
 
@@ -891,10 +900,15 @@ ${opts.phasePlan}
       '。下一轮必须包含一次成功的修复动作（apply_patch / replace_in_file / write_file / add_dependency）或明确的验证动作（run_tests / run_program）。不要继续只调用 read_file、list_dir、code_search 或 http_fetch。',
     executorFeedbackReadOnlyRecoveryRequired:
       '只读恢复模式已启用：上一轮已经因为持续探测失败。本轮必须基于已有 failure log 直接 patch/write/改依赖或执行验证；如果下一轮仍然只有只读/探测动作，本次重试会失败并回退。',
+    executorFeedbackDiagnosticProbeAllowance: (remainingRounds, maxActionsPerRound) =>
+      `仍允许 ${remainingRounds} 轮有界诊断读取，每轮最多 ${maxActionsPerRound} 个新的读取/探测动作。` +
+      '只能读取当前失败证据明确涉及的路径或窗口；重复读取已看过的目标会被拒绝。证据足够后必须立即提交聚焦修复。',
     executorFeedbackRepairEvidenceMissing:
       'DEBUG 完成无效：本次重试还没有产生修复证据。设置 done=true 前，必须至少完成一次成功的修复动作或成功的验证运行；否则只能在 thoughts 中给出具体 blocker 后停止。',
     executorFeedbackBugResolutionPlanMissing:
-      'DEBUG Bug Ticket 完成无效：关闭 Ticket 前必须提供 bugResolutionPlan。请返回包含简明处理方案的 JSON，并同时给出必要修复或验证动作。',
+      'DEBUG Bug Ticket 动作无效：首次修复或验证前必须提供 bugResolutionPlan。请在同一 JSON 中给出根因假设、修复目标、验证命令以及必要动作。',
+    executorFeedbackPostMutationVerificationRequired:
+      '最新一次成功修改尚未验证。保留当前文件，下一步直接运行最小相关编译/测试门禁；不要再用一轮只读检查或重复改写。',
   },
   skills: {
     patcher:
@@ -915,7 +929,7 @@ ${opts.phasePlan}
       '复杂领域格式连续失败后必须停止凭记忆生成，改为请求用户样例或网络参考；严禁去改被测模块或断言。',
     dep_resolver: '当出现 ModuleNotFoundError 时，用 add_dependency 写回 requirements.txt 并重建沙盒。',
     debugger:
-      '先用 run_tests/run_program 复现，必要时用 analyze_error，随后执行最小范围 patch 或依赖修改，并重跑失败门禁。同一文件替换连续失败两次后，先读取当前内容再切换编辑方式。',
+      '没有具体失败日志时先用 run_tests/run_program 复现；已有明确错误和完整 debug repair packet 时直接执行最小范围 patch 或依赖修改，再重跑失败门禁。只有关键文件未注入、片段明确截断或替换连续失败两次时才补充读取当前内容。',
     refactorer:
       '重构必须保证行为不变；先跑回归测试 → 修改 → 再跑回归测试。' +
       '所有文件工具必须提供具体的 workspace 相对 args.path；局部替换前先 read_file 确认同一路径和当前字节。',

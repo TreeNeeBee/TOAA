@@ -3,9 +3,15 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { jsonrepair } from 'jsonrepair';
 import type { ChatOptions, LLMClient } from '../llm/types.js';
-import { V_MODEL_TEST_PHASES, type Step } from '../core/plan.js';
+import {
+  V_MODEL_DEVELOPMENT_PHASES,
+  V_MODEL_TEST_PHASES,
+  type Step,
+} from '../core/plan.js';
 import {
   normalizeQualityAssessment,
+  reconcileDevelopmentQualityAssessment,
+  resolveQualityGate,
   type StageQualityAssessment,
 } from '../core/quality_gate.js';
 import type {
@@ -26,6 +32,8 @@ import { updateOperationWindow } from '../llm/window.js';
 import { renderExecutionPromptPolicy } from './prompt_policy.js';
 
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
+const RECOVERY_PROBE_ACTIONS_PER_ROUND = 4;
+const MAX_DIRECT_REPAIR_PROBE_ROUNDS = 4;
 
 /**
  * Executor 把一个 Step 交给对应角色的 LLM，要求其用一组 tool calls 完成产出。
@@ -158,9 +166,15 @@ interface TurnFeedbackContext {
   readOnlyLoopWarning?: { rounds: number; targets: string };
   missingOutputStallWarning?: { rounds: number; missing: string };
   readOnlyRecoveryWarning?: boolean;
+  diagnosticProbeAllowance?: {
+    remainingRounds: number;
+    maxActionsPerRound: number;
+  };
   noProgressWarning?: { rounds: number };
   repairEvidenceMissing?: boolean;
   bugResolutionPlanMissing?: boolean;
+  postMutationVerificationRequired?: boolean;
+  qualityAssessmentMissing?: string[];
 }
 
 export class StepExecutor {
@@ -170,6 +184,7 @@ export class StepExecutor {
     const maxRounds = this.opts.maxRounds ?? 6;
     let roundLimit = maxRounds;
     const role = inp.executionRole ?? inp.step.role;
+    const bugResolutionPlanRequired = role === 'Debugger' && !!inp.debugContext?.bugTicketId;
     const toolMap = new Map(inp.tools.map((t) => [t.name, t]));
     const toolDocs = inp.tools
       .map((t) => `- ${t.name}: ${describeToolForStep(t, inp.ctx, inp.step)} args=${JSON.stringify(t.argsSchema)}`)
@@ -212,6 +227,9 @@ export class StepExecutor {
     let finalThought: string | undefined;
     let bugResolutionPlan: string | undefined;
     let qualityAssessment: StageQualityAssessment | undefined;
+    let qualityAssessmentRound = 0;
+    let lastToolActionRound = 0;
+    let completionSignaled = false;
 
     // 健康度信号采集
     const initialMissing = initialVerify.missing.length;
@@ -220,10 +238,14 @@ export class StepExecutor {
     let missingOutputStallRounds = 0;
     let parseFailures = 0;
     let repeatedTurns = 0;
+    let consecutiveLowQualityRejections = 0;
     let lastActionsKey: string | null = null;
     /** 每个 (tool+args) 指纹被尝试过的累计次数；用于检测"换汤不换药"。 */
     const actionFingerprints = new Map<string, number>();
     const unresolvedToolFailures = new Map<string, string>();
+    const failedVerificationAttempts = new Map<string, number>();
+    const failedMutationAttempts = new Map<string, number>();
+    let mutationGeneration = 0;
     let actualRounds = 0;
     let consecutiveReadOnlyRounds = 0;
     let consecutiveNoProgressRounds = 0;
@@ -231,11 +253,17 @@ export class StepExecutor {
     let repairEvidence = false;
     const repairRequired = inp.debugContext?.repairRequired === true;
     const readOnlyRecoveryMode = isReadOnlyLoopFailure(inp.debugContext?.reason ?? '');
+    const strictReadOnlyRecoveryMode = isRejectedReadOnlyRecovery(inp.debugContext?.reason ?? '');
     const directRepairMode =
       role === 'Debugger' &&
       repairRequired &&
       (initialMissing > 0 || hasActionableDebuggerFailure(inp.debugContext));
+    const directRepairProbeRoundBudget = directRepairMode
+      ? resolveDirectRepairProbeRoundBudget(inp.debugContext)
+      : 0;
     let readOnlyRecoveryRounds = 0;
+    const directRepairProbeRoundsByGeneration = new Map<number, number>();
+    const recoveryProbeFingerprints = new Set<string>();
     const advisoryFailureTools = new Set(this.opts.advisoryFailureTools ?? []);
     const advisoryFailureRules = this.opts.advisoryFailureRules ?? [];
     const providers = new Set<string>();
@@ -254,6 +282,25 @@ export class StepExecutor {
       let text: string;
       try {
         const chatMessages = compactMessagesForChat(messages, !!inp.debugContext);
+        const directRepairProbeRounds =
+          directRepairProbeRoundsByGeneration.get(mutationGeneration) ?? 0;
+        const allowNovelDirectRepairProbe =
+          directRepairMode &&
+          directRepairProbeRounds < directRepairProbeRoundBudget &&
+          (!strictReadOnlyRecoveryMode || mutationGeneration > 0);
+        const enforceRecoveryContract =
+          role === 'Debugger' && (
+            strictReadOnlyRecoveryMode ||
+            (readOnlyRecoveryMode && recoveryProbeFingerprints.size > 0) ||
+            (
+              directRepairMode &&
+              (
+                consecutiveReadOnlyRounds >= 1 ||
+                unresolvedToolFailures.size > 0 ||
+                directRepairProbeRounds > 0
+              )
+            )
+          );
         const chatOptions: ChatOptions = {
           responseFormat: 'json',
           temperature: 0.1,
@@ -261,10 +308,18 @@ export class StepExecutor {
           scoreSuccess: false,
           validate:
             role === 'Debugger' && (
-              (readOnlyRecoveryMode && readOnlyRecoveryRounds >= 1) ||
-              (directRepairMode && consecutiveReadOnlyRounds >= 1)
+              enforceRecoveryContract ||
+              (bugResolutionPlanRequired && !bugResolutionPlan?.trim())
             )
-              ? (text) => validateDebuggerRecoveryTurn(text, toolMap)
+              ? (text) => validateDebuggerRecoveryTurn(text, toolMap, {
+                  enforceRecoveryContract,
+                  requireBugResolutionPlanBeforeAction:
+                    bugResolutionPlanRequired && !bugResolutionPlan?.trim(),
+                  allowNovelReadOnlyProbes:
+                    (readOnlyRecoveryMode && !directRepairMode) ||
+                    allowNovelDirectRepairProbe,
+                  seenProbeFingerprints: recoveryProbeFingerprints,
+                })
               : undefined,
           onProvider: (name) => { provider = name; },
           onProviderStart: (name, model, providerWindow) => {
@@ -335,7 +390,45 @@ export class StepExecutor {
         );
         if (isLowQualityLLMResponseError(errMsg)) {
           repeatedTurns++;
+          consecutiveLowQualityRejections++;
           const verify = await verifyOutputs(inp);
+          if (
+            consecutiveLowQualityRejections < 2 &&
+            round < hardRoundLimit
+          ) {
+            if (round >= roundLimit) {
+              roundLimit = Math.min(hardRoundLimit, roundLimit + 1);
+            }
+            messages.push({
+              role: 'assistant',
+              content: JSON.stringify({
+                thoughts: 'provider output rejected by the Debugger recovery contract',
+                actions: [],
+                done: false,
+              }),
+            });
+            messages.push({
+              role: 'user',
+              content:
+                `The previous provider output was rejected: ${truncate(errMsg, 1600)}\n` +
+                'Keep the concrete file/tool evidence already present in this conversation. ' +
+                'Do not reread those files. The next response must apply a focused patch/write, ' +
+                'run the required post-repair verification, or state a concrete blocker.',
+            });
+            await inp.ctx.audit?.event(
+              'note',
+              `${inp.step.id} retained Debugger context after a low-quality provider response`,
+              {
+                messageId: 'audit.executor_low_quality_context_retained',
+                stepId: inp.step.id,
+                role,
+                round,
+                consecutiveLowQualityRejections,
+                nextRoundLimit: roundLimit,
+              },
+            );
+            continue;
+          }
           const metrics = computeMetrics({
             rounds: actualRounds,
             parseFailures,
@@ -358,12 +451,17 @@ export class StepExecutor {
         throw err;
       }
       rep.done();
+      consecutiveLowQualityRejections = 0;
       const turn = parseTurn(text);
       finalThought = turn.thoughts;
       bugResolutionPlan = extractBugResolutionPlan(turn) ?? bugResolutionPlan;
-      qualityAssessment =
-        normalizeQualityAssessment(turn.qualityAssessment ?? turn.quality_assessment) ??
-        qualityAssessment;
+      const turnQualityAssessment = normalizeQualityAssessment(
+        turn.qualityAssessment ?? turn.quality_assessment,
+      );
+      if (turnQualityAssessment) {
+        qualityAssessment = turnQualityAssessment;
+        qualityAssessmentRound = round;
+      }
       const normalizedActions = normalizeActions(turn.actions, toolMap);
       let actions = normalizedActions.actions;
       if (role === 'Debugger' && (readOnlyRecoveryMode || directRepairMode)) {
@@ -401,6 +499,83 @@ export class StepExecutor {
           },
         );
       }
+      const repairOrVerificationRequested = actions.some((action) =>
+        isRepairEvidenceTool(action.tool),
+      );
+      if (
+        bugResolutionPlanRequired &&
+        !bugResolutionPlan?.trim() &&
+        (repairOrVerificationRequested || turn.done === true)
+      ) {
+        actualRounds = round;
+        await inp.ctx.audit?.executorTurn(inp.step.id, role, round, {
+          thoughts: turn.thoughts,
+          actions: [],
+          done: false,
+          raw: text,
+          provider,
+        });
+        await inp.ctx.audit?.event(
+          'note',
+          `${inp.step.id} rejected Debugger repair actions submitted before bugResolutionPlan`,
+          {
+            messageId: 'audit.executor_bug_resolution_plan_required_before_action',
+            stepId: inp.step.id,
+            role,
+            round,
+            rejectedActions: actions.map((action) => action.tool),
+          },
+        );
+        if (round >= roundLimit && roundLimit < hardRoundLimit) {
+          roundLimit = Math.min(hardRoundLimit, roundLimit + 1);
+        }
+        if (round < roundLimit) {
+          messages.push({ role: 'assistant', content: compactTurnForHistory(turn, toolMap) });
+          messages.push({ role: 'user', content: t().prompts.executorFeedbackBugResolutionPlanMissing });
+          continue;
+        }
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: (await verifyOutputs(inp)).missing.length,
+          providers: [...providers],
+        });
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          error: 'DEBUG bug-ticket repair rejected: bugResolutionPlan is required before repair or verification actions.',
+          metrics,
+        };
+      }
+      const automaticCodeVerifications = await automaticCodeDebugVerificationActions({
+        actions,
+        role,
+        phase: inp.step.phase,
+        language: profile.id,
+        toolMap,
+        ctx: inp.ctx,
+      });
+      if (automaticCodeVerifications.length > 0) {
+        actions = [...actions, ...automaticCodeVerifications];
+        await inp.ctx.audit?.event(
+          'note',
+          `${inp.step.id} appended CODE verification gate(s) after Debugger mutation`,
+          {
+            messageId: 'audit.executor_automatic_code_verification',
+            stepId: inp.step.id,
+            role,
+            round,
+            language: profile.id,
+            actions: automaticCodeVerifications,
+          },
+        );
+      }
       actualRounds = round;
       // 解析失败 / 空响应：关键的"不健康"信号。
       if (!turn || (turn.thoughts === undefined && actions.length === 0 && turn.done === undefined)) {
@@ -424,6 +599,25 @@ export class StepExecutor {
       // 一轮里有 ≥ 2 个 action 是旧指纹的重复 → 强信号；只 1 个不计入避免误伤。
       if (perActionRepeats >= 2) repeatedTurns++;
       const readOnlyRound = actions.length > 0 && actions.every(isReadOnlyOrProbeAction);
+      const probeFingerprints = readOnlyRound
+        ? actions.flatMap(recoveryProbeActionFingerprints)
+        : [];
+      const novelProbeFingerprints = probeFingerprints.filter(
+        (fingerprint) => !recoveryProbeFingerprints.has(fingerprint),
+      );
+      const novelDiagnosticProbeRound =
+        role === 'Debugger' &&
+        readOnlyRound &&
+        novelProbeFingerprints.length > 0;
+      if (directRepairMode && novelDiagnosticProbeRound) {
+        directRepairProbeRoundsByGeneration.set(
+          mutationGeneration,
+          (directRepairProbeRoundsByGeneration.get(mutationGeneration) ?? 0) + 1,
+        );
+      }
+      for (const fingerprint of probeFingerprints) {
+        recoveryProbeFingerprints.add(fingerprint);
+      }
       const noProgressRound = actions.length === 0 && turn.done !== true;
       if (noProgressRound) {
         consecutiveNoProgressRounds++;
@@ -431,9 +625,14 @@ export class StepExecutor {
         consecutiveNoProgressRounds = 0;
       }
       if (readOnlyRound) {
-        consecutiveReadOnlyRounds++;
-        if (readOnlyRecoveryMode) {
-          readOnlyRecoveryRounds++;
+        if (novelDiagnosticProbeRound) {
+          consecutiveReadOnlyRounds = 0;
+          readOnlyRecoveryRounds = readOnlyRecoveryMode ? 1 : 0;
+        } else {
+          consecutiveReadOnlyRounds++;
+          if (readOnlyRecoveryMode) {
+            readOnlyRecoveryRounds++;
+          }
         }
       } else if (actions.length > 0) {
         consecutiveReadOnlyRounds = 0;
@@ -452,6 +651,8 @@ export class StepExecutor {
         ...item.result,
         tool: item.result.tool,
       }));
+      let repeatedVerificationFailure: string | undefined;
+      let repeatedMutationFailure: string | undefined;
       for (const item of normalizedActions.invalid) {
         calls.push({ tool: item.result.tool, ok: false, error: item.result.error });
       }
@@ -520,7 +721,43 @@ export class StepExecutor {
         const r = await safeRunTool(selectedTool, a.args, inp.ctx);
         toolReporter.done(r.ok ? 'done' : 'failed');
         updateUnresolvedToolFailures(unresolvedToolFailures, a, r, advisoryFailureTools, advisoryFailureRules);
-        if (r.ok && isRepairEvidenceTool(a.tool)) {
+        const successfulMutation = didPerformSuccessfulMutation(a, r);
+        if (successfulMutation) {
+          mutationGeneration++;
+        }
+        if (isOutputMutationTool(a.tool)) {
+          const mutationKey = `${mutationGeneration}:${JSON.stringify({ tool: a.tool, args: a.args })}`;
+          if (successfulMutation) {
+            failedMutationAttempts.delete(mutationKey);
+          } else if (!r.ok && shouldTrackRepeatedMutationFailure(r)) {
+            const count = (failedMutationAttempts.get(mutationKey) ?? 0) + 1;
+            failedMutationAttempts.set(mutationKey, count);
+            if (count >= 2 && !advisoryFailureTools.has(a.tool)) {
+              repeatedMutationFailure =
+                `mutation action repeated without a successful mutation: ${a.tool} ${truncate(stableActionValue(a.args), 600)}; ` +
+                `latest failure: ${truncate(r.error ?? r.summary ?? 'unknown error', 1000)}; ` +
+                'next attempt must use corrected arguments or a different repair strategy.';
+            }
+          }
+        }
+        if (COMPLETION_VERIFICATION_TOOLS.has(a.tool)) {
+          const verificationKey = `${mutationGeneration}:${verificationActionKey(a)}`;
+          if (r.ok) {
+            failedVerificationAttempts.delete(verificationKey);
+          } else {
+            const count = (failedVerificationAttempts.get(verificationKey) ?? 0) + 1;
+            failedVerificationAttempts.set(verificationKey, count);
+            if (count >= 2 && !advisoryFailureTools.has(a.tool)) {
+              repeatedVerificationFailure =
+                `verification command repeated without a successful mutation: ${verificationActionLabel(a)}; ` +
+                `latest failure: ${truncate(r.error ?? r.summary ?? 'unknown error', 1000)}; ` +
+                'next attempt must patch/write before rerunning this command.';
+            }
+          }
+        }
+        if (r.ok && isRepairEvidenceTool(a.tool) && (
+          !isOutputMutationTool(a.tool) || successfulMutation
+        )) {
           repairEvidence = true;
         }
         await inp.ctx.audit?.event('tool.result', t().audit.toolResult(a.tool, r.ok, r.summary ?? r.error ?? ''), {
@@ -543,8 +780,18 @@ export class StepExecutor {
         calls.push({ tool: a.tool, ok: r.ok, summary: r.summary, error: r.error });
         turnResults.push({ ...r, tool: a.tool });
       }
+      if (actions.length > 0 || normalizedActions.invalid.length > 0) {
+        lastToolActionRound = round;
+      }
       const verify = await verifyOutputs(inp);
-      const mutationSucceededThisRound = turnResults.some((r) => r.ok && isRepairEvidenceTool(r.tool));
+      qualityAssessment = reconcileDevelopmentQualityAssessment(
+        inp.step,
+        qualityAssessment,
+        verify.missing,
+      );
+      const mutationSucceededThisRound = actions.some((action, index) =>
+        didPerformSuccessfulMutation(action, turnResults[normalizedActions.invalid.length + index]!)
+      );
       if (verify.missing.length < lastMissingCount) {
         lastMissingCount = verify.missing.length;
         missingOutputStallRounds = 0;
@@ -559,6 +806,34 @@ export class StepExecutor {
       }
       if (turnResults.some((r) => r.tool === 'run_tests' && !r.ok) && !advisoryFailureTools.has('run_tests')) {
         failedTestRunRounds++;
+      }
+      if (repeatedMutationFailure) {
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        await inp.ctx.audit?.event('note', repeatedMutationFailure, {
+          messageId: 'audit.executor_repeated_mutation_without_progress',
+          stepId: inp.step.id,
+          phase: inp.step.phase,
+          round,
+          mutationGeneration,
+        });
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          qualityAssessment,
+          error: repeatedMutationFailure,
+          metrics,
+        };
       }
       const validationDefect = extractValidationDefect(turn);
       if (
@@ -599,7 +874,6 @@ export class StepExecutor {
       const repairGateOk = !repairRequired ||
         repairEvidence ||
         canAcceptOutputCompletionRecovery(inp, initialMissing);
-      const bugResolutionPlanRequired = role === 'Debugger' && !!inp.debugContext?.bugTicketId;
       const bugResolutionPlanOk = !bugResolutionPlanRequired || !!bugResolutionPlan?.trim();
       const verifiedCompletion = !turn.done && hasSuccessfulCompletionVerification(calls);
       const outputCompletionRecovery = verify.ok && canAcceptOutputCompletionRecovery(inp, initialMissing);
@@ -608,25 +882,38 @@ export class StepExecutor {
         verify.ok &&
         isDeclarativeOutputPhase(inp.step.phase) &&
         turnResults.some((result) => result.ok && isOutputMutationTool(result.tool));
+      const qualityAssessmentMissing = missingQualityAssessmentFields(
+        inp.step,
+        qualityAssessment,
+        qualityAssessmentRound > lastToolActionRound,
+      );
       const supersededContractFailures =
         repairEvidence &&
         hasSuccessfulCompletionVerification(calls) &&
         hasOnlySupersededToolContractFailures(unresolvedToolFailures);
+      const nonBlockingPhaseVerificationFailures =
+        verify.ok &&
+        (V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(inp.step.phase) &&
+        qualityAssessmentMissing.length === 0 &&
+        hasOnlyUnauthorizedVerificationFailures(unresolvedToolFailures);
       const unresolvedFailuresOk =
         unresolvedToolFailures.size === 0 ||
         (outputCompletionRecovery && hasOnlyUntargetedToolContractFailures(unresolvedToolFailures)) ||
-        supersededContractFailures;
+        supersededContractFailures ||
+        nonBlockingPhaseVerificationFailures;
       const completionSignal =
         turn.done ||
         verifiedCompletion ||
         outputCompletionRecovery ||
         declarativeOutputCompletion;
+      completionSignaled = completionSignaled || completionSignal;
       if (
         completionSignal &&
         verify.ok &&
         unresolvedFailuresOk &&
         repairGateOk &&
-        bugResolutionPlanOk
+        bugResolutionPlanOk &&
+        qualityAssessmentMissing.length === 0
       ) {
         if (declarativeOutputCompletion) {
           await inp.ctx.audit?.event(
@@ -681,6 +968,34 @@ export class StepExecutor {
           maxFailedTestRuns: this.opts.maxFailedTestRuns,
         });
         return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
+      }
+      if (repeatedVerificationFailure) {
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        await inp.ctx.audit?.event('note', repeatedVerificationFailure, {
+          messageId: 'audit.executor_repeated_verification_without_mutation',
+          stepId: inp.step.id,
+          phase: inp.step.phase,
+          round,
+          mutationGeneration,
+        });
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          qualityAssessment,
+          error: repeatedVerificationFailure,
+          metrics,
+        };
       }
       if (missingOutputStallRounds >= MISSING_OUTPUT_STALL_ROUND_LIMIT) {
         repeatedTurns++;
@@ -768,28 +1083,49 @@ export class StepExecutor {
         });
         return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
+      const needsQualityHandshake =
+        completionSignal &&
+        verify.ok &&
+        qualityAssessmentMissing.length > 0;
+      const postMutationVerificationRequired = hasUnverifiedSuccessfulMutation(calls);
       if (
         round >= roundLimit &&
         roundLimit < hardRoundLimit &&
-        shouldExtendProductiveRun({
-          parseFailures,
-          repeatedTurns,
-          calls,
-          initialMissing,
-          currentMissing: verify.missing.length,
-          consecutiveReadOnlyRounds,
-          unresolvedFailures: unresolvedToolFailures.size,
-        })
+        (
+          postMutationVerificationRequired ||
+          needsQualityHandshake ||
+          novelDiagnosticProbeRound ||
+          shouldExtendProductiveRun({
+            parseFailures,
+            repeatedTurns,
+            calls,
+            initialMissing,
+            currentMissing: verify.missing.length,
+            consecutiveReadOnlyRounds,
+            unresolvedFailures: unresolvedToolFailures.size,
+          })
+        )
       ) {
         const nextLimit = Math.min(hardRoundLimit, roundLimit + 2);
-        await inp.ctx.audit?.event('note', `productive step progress detected; extending round budget ${roundLimit}→${nextLimit}`, {
-          messageId: 'audit.executor_productive_round_extension',
+        await inp.ctx.audit?.event('note', postMutationVerificationRequired
+          ? `successful mutation needs verification; extending round budget ${roundLimit}→${nextLimit}`
+          : needsQualityHandshake
+            ? `verified outputs need quality evidence; extending round budget ${roundLimit}→${nextLimit}`
+            : `productive step progress detected; extending round budget ${roundLimit}→${nextLimit}`, {
+          messageId: postMutationVerificationRequired
+            ? 'audit.executor_post_mutation_verification_extension'
+            : needsQualityHandshake
+              ? 'audit.executor_quality_handshake_extension'
+              : 'audit.executor_productive_round_extension',
           stepId: inp.step.id,
           round,
           previousLimit: roundLimit,
           nextLimit,
           initialMissing,
           currentMissing: verify.missing.length,
+          qualityAssessmentMissing: needsQualityHandshake
+            ? qualityAssessmentMissing
+            : undefined,
         });
         roundLimit = nextLimit;
       }
@@ -812,7 +1148,22 @@ export class StepExecutor {
                 missing: verify.missing.join(', '),
               }
             : undefined,
-          readOnlyRecoveryWarning: (readOnlyRecoveryMode || directRepairMode) && readOnlyRound,
+          readOnlyRecoveryWarning:
+            (readOnlyRecoveryMode || directRepairMode) &&
+            readOnlyRound,
+          diagnosticProbeAllowance:
+            directRepairMode &&
+            readOnlyRound &&
+            (!strictReadOnlyRecoveryMode || mutationGeneration > 0) &&
+            (directRepairProbeRoundsByGeneration.get(mutationGeneration) ?? 0) <
+              directRepairProbeRoundBudget
+              ? {
+                  remainingRounds:
+                    directRepairProbeRoundBudget -
+                    (directRepairProbeRoundsByGeneration.get(mutationGeneration) ?? 0),
+                  maxActionsPerRound: RECOVERY_PROBE_ACTIONS_PER_ROUND,
+                }
+              : undefined,
           noProgressWarning: noProgressRound
             ? { rounds: consecutiveNoProgressRounds }
             : undefined,
@@ -828,6 +1179,11 @@ export class StepExecutor {
             verify.ok &&
             unresolvedToolFailures.size === 0 &&
             !bugResolutionPlanOk,
+          postMutationVerificationRequired,
+          qualityAssessmentMissing:
+            completionSignal && verify.ok && qualityAssessmentMissing.length > 0
+              ? qualityAssessmentMissing
+              : undefined,
         }, {
           feedbackCharBudget: inp.ctx.feedbackCharBudget,
           readChunkBytes: inp.ctx.readChunkBytes,
@@ -845,6 +1201,12 @@ export class StepExecutor {
       currentMissing: finalVerify.missing.length,
       providers: [...providers],
     });
+    const finalQualityAssessmentMissing = missingQualityAssessmentFields(
+      inp.step,
+      qualityAssessment,
+      qualityAssessmentRound > lastToolActionRound,
+    );
+    const unresolvedFailureDetails = [...unresolvedToolFailures.values()];
     return {
       success: false,
       rounds: actualRounds || roundLimit,
@@ -853,6 +1215,12 @@ export class StepExecutor {
       bugResolutionPlan,
       qualityAssessment,
       error:
+        finalVerify.missing.length > 0
+          ? `max rounds exceeded without satisfying outputs; missing outputs: ${finalVerify.missing.join(', ')}`
+          :
+        unresolvedFailureDetails.length > 0
+          ? `max rounds exceeded; unresolved tool failures remain: ${unresolvedFailureDetails.join('; ')}`
+          :
         role === 'Debugger' &&
           !!inp.debugContext?.bugTicketId &&
           !bugResolutionPlan?.trim()
@@ -865,9 +1233,12 @@ export class StepExecutor {
           !canAcceptOutputCompletionRecovery(inp, initialMissing)
           ? 'DEBUG retry ended without repair evidence; run a successful patch/write/dependency change or verification command before done=true.'
           :
-        finalVerify.ok && unresolvedToolFailures.size > 0
-          ? `unresolved tool failures remain: ${[...unresolvedToolFailures.values()].join('; ')}`
-          : 'max rounds exceeded without satisfying outputs',
+        completionSignaled && finalQualityAssessmentMissing.length > 0
+          ? `qualityAssessment is incomplete; missing: ${finalQualityAssessmentMissing.join(', ')}`
+          :
+        hasUnverifiedSuccessfulMutation(calls)
+          ? 'max rounds exceeded before completion; the latest successful repair has not been followed by a successful verification.'
+          : 'max rounds exceeded before completion',
       metrics,
     };
   }
@@ -881,7 +1252,7 @@ function isReadOnlyOrProbeAction(action: LLMAction): boolean {
 
 function boundRecoveryProbeActions(
   actions: LLMAction[],
-  maxReadOnlyActions = 4,
+  maxReadOnlyActions = RECOVERY_PROBE_ACTIONS_PER_ROUND,
 ): { actions: LLMAction[]; kept: number; omitted: number } {
   let kept = 0;
   let omitted = 0;
@@ -897,9 +1268,28 @@ function boundRecoveryProbeActions(
   return { actions: bounded, kept, omitted };
 }
 
+function recoveryProbeActionFingerprints(action: LLMAction): string[] {
+  if (!isReadOnlyOrProbeAction(action)) return [];
+  const targets = actionTargetPaths(action.tool, action.args)
+    .map(normalizeRelPath)
+    .filter((target) => target && target !== '.');
+  if (targets.length === 0) return [];
+  const qualifier =
+    action.tool === 'read_file'
+      ? `offset=${typeof action.args.offset === 'number' ? action.args.offset : 0}`
+      : action.tool === 'code_search'
+        ? `query=${typeof action.args.query === 'string' ? action.args.query : ''}`
+        : '';
+  return targets.map((target) => `${action.tool}:${target}:${qualifier}`);
+}
+
 function isReadOnlyLoopFailure(reason: string): boolean {
   return /repeated read-only\/probe actions without progress/i.test(reason) ||
     /read-only recovery mode repeated probe actions/i.test(reason);
+}
+
+function isRejectedReadOnlyRecovery(reason: string): boolean {
+  return /low-quality Debugger response: read-only\/probe actions in read-only recovery mode/i.test(reason);
 }
 
 function isLowQualityLLMResponseError(message: string): boolean {
@@ -916,10 +1306,46 @@ function hasActionableDebuggerFailure(debugContext: ExecutorRunInput['debugConte
   ].join('\n');
   return /content must be a string/i.test(text) ||
     /invalid (?:write_file|append_file|replace_in_file|apply_patch) args/i.test(text) ||
+    /\berror\s+TS\d{4}\b/i.test(text) ||
+    /\b(?:SyntaxError|TypeError|ReferenceError|AssertionError)\b/u.test(text) ||
+    /\b(?:pytest|vitest|npm test|tsc|typecheck|build)\b[^\n]*(?:exit[=\s]\d+|failed)/i.test(text) ||
+    /\b(?:tests?|test suites?)\s+failed\b/i.test(text) ||
     /outputs?\s+(?:still\s+missing|missing)/i.test(text) ||
     /missing\s+(?:required\s+)?outputs?/i.test(text) ||
     /outputs?\s*(?:仍缺失|缺失)/u.test(text) ||
     /仍缺失[:：]/u.test(text);
+}
+
+function resolveDirectRepairProbeRoundBudget(
+  debugContext: ExecutorRunInput['debugContext'],
+): number {
+  if (!debugContext) return 1;
+  const text = [
+    debugContext.reason,
+    debugContext.failureLog,
+    debugContext.suggestions ?? '',
+  ].join('\n');
+  const paths = new Set<string>();
+  const pathPattern =
+    /(?:^|[\s"'`(])((?:\.{1,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8})(?=[(:\s"'`\]])/gmu;
+  for (const match of text.matchAll(pathPattern)) {
+    const candidate = normalizeRelPath(match[1] ?? '');
+    if (
+      candidate &&
+      candidate !== '.' &&
+      !candidate.startsWith('node_modules/') &&
+      !candidate.startsWith('.xcompiler/')
+    ) {
+      paths.add(candidate);
+    }
+  }
+  return Math.max(
+    1,
+    Math.min(
+      MAX_DIRECT_REPAIR_PROBE_ROUNDS,
+      Math.ceil(Math.max(1, paths.size) / RECOVERY_PROBE_ACTIONS_PER_ROUND),
+    ),
+  );
 }
 
 function canAcceptOutputCompletionRecovery(inp: ExecutorRunInput, initialMissing: number): boolean {
@@ -948,6 +1374,14 @@ function hasOnlySupersededToolContractFailures(unresolved: Map<string, string>):
   );
 }
 
+function hasOnlyUnauthorizedVerificationFailures(unresolved: Map<string, string>): boolean {
+  if (unresolved.size === 0) return false;
+  return [...unresolved.entries()].every(([key, detail]) =>
+    (key.startsWith('verification:run_tests:') || key.startsWith('verification:run_program:')) &&
+    /tool not allowed for this step: (?:run_tests|run_program)/i.test(detail),
+  );
+}
+
 function isOutputCompletionFailure(reason = '', failureLog = ''): boolean {
   const text = `${reason}\n${failureLog}`;
   return /max rounds exceeded without satisfying outputs/i.test(text) ||
@@ -957,7 +1391,16 @@ function isOutputCompletionFailure(reason = '', failureLog = ''): boolean {
     /仍缺失[:：]/u.test(text);
 }
 
-function validateDebuggerRecoveryTurn(text: string, toolMap: Map<string, Tool>): void {
+function validateDebuggerRecoveryTurn(
+  text: string,
+  toolMap: Map<string, Tool>,
+  options: {
+    enforceRecoveryContract?: boolean;
+    requireBugResolutionPlanBeforeAction?: boolean;
+    allowNovelReadOnlyProbes?: boolean;
+    seenProbeFingerprints?: ReadonlySet<string>;
+  } = {},
+): void {
   const turn = parseTurn(text);
   const normalized = normalizeActions(turn.actions, toolMap);
   const actions = normalized.actions;
@@ -979,6 +1422,17 @@ function validateDebuggerRecoveryTurn(text: string, toolMap: Map<string, Tool>):
       'produce valid tool arguments for a repair action, verification action, or concrete blocker',
     );
   }
+  if (
+    options.requireBugResolutionPlanBeforeAction &&
+    !extractBugResolutionPlan(turn)?.trim() &&
+    (allowedActions.some((action) => isRepairEvidenceTool(action.tool)) || turn.done === true)
+  ) {
+    throw new Error(
+      'low-quality Debugger response: bugResolutionPlan is required before repair or verification actions; ' +
+      'include the root-cause hypothesis, repair target, and validation command in the same JSON response',
+    );
+  }
+  if (!options.enforceRecoveryContract) return;
   if (actions.length === 0 && turn.done === true) return;
   if (actions.length === 0) {
     throw new Error(
@@ -995,9 +1449,16 @@ function validateDebuggerRecoveryTurn(text: string, toolMap: Map<string, Tool>):
     );
   }
   if (allowedActions.every(isReadOnlyOrProbeAction)) {
+    const fingerprints = allowedActions.flatMap(recoveryProbeActionFingerprints);
+    if (
+      options.allowNovelReadOnlyProbes &&
+      fingerprints.some((fingerprint) => !options.seenProbeFingerprints?.has(fingerprint))
+    ) {
+      return;
+    }
     throw new Error(
       'low-quality Debugger response: read-only/probe actions in read-only recovery mode; ' +
-      'produce a repair action, verification action, or concrete blocker instead',
+      'read a new concrete error-related path/window, produce a repair action, run verification, or provide a concrete blocker instead',
     );
   }
 }
@@ -1026,6 +1487,60 @@ function isRepairEvidenceTool(tool: string): boolean {
 
 function isOutputMutationTool(tool: string): boolean {
   return OUTPUT_MUTATION_TOOLS.has(tool);
+}
+
+async function automaticCodeDebugVerificationActions(input: {
+  actions: LLMAction[];
+  role: string;
+  phase: Step['phase'];
+  language: LanguageProfile['id'];
+  toolMap: Map<string, Tool>;
+  ctx: ToolContext;
+}): Promise<LLMAction[]> {
+  if (input.role !== 'Debugger' || input.phase !== 'CODE') return [];
+  if (!input.actions.some((action) => isOutputMutationTool(action.tool))) return [];
+  const automatic: LLMAction[] = [];
+  const requestedTools = new Set(input.actions.map((action) => action.tool));
+  const hasStaticPrerequisites =
+    input.language === 'typescript' || await input.ctx.ws.exists('src');
+  if (
+    hasStaticPrerequisites &&
+    input.toolMap.has('run_program') &&
+    !requestedTools.has('run_program')
+  ) {
+    automatic.push({
+      tool: 'run_program',
+      args: input.language === 'typescript'
+        ? { args: ['npx', 'tsc', '--noEmit'] }
+        : { args: ['-m', 'compileall', '-q', 'src'] },
+    });
+  }
+  if (
+    (input.ctx.defaultTestArgs?.length ?? 0) > 0 &&
+    input.toolMap.has('run_tests') &&
+    !requestedTools.has('run_tests')
+  ) {
+    automatic.push({ tool: 'run_tests', args: {} });
+  }
+  return automatic;
+}
+
+function didPerformSuccessfulMutation(action: LLMAction, result: ToolResult): boolean {
+  if (!result.ok || !isOutputMutationTool(action.tool)) return false;
+  if (action.tool === 'write_file') {
+    if (!isPlainRecord(result.data)) return true;
+    return result.data.changed !== false;
+  }
+  if (action.tool === 'append_file') {
+    return typeof action.args.content === 'string' && action.args.content.length > 0;
+  }
+  if (action.tool !== 'add_dependency') return true;
+  if (!isPlainRecord(result.data)) return false;
+  return Array.isArray(result.data.added) && result.data.added.length > 0;
+}
+
+function shouldTrackRepeatedMutationFailure(result: ToolResult): boolean {
+  return !/not in step writable allowlist/i.test(result.error ?? '');
 }
 
 function isDeclarativeOutputPhase(phase: Step['phase']): boolean {
@@ -1145,7 +1660,9 @@ function updateUnresolvedToolFailures(
   const keys = actionResolutionKeys(action);
   if (result.ok) {
     for (const key of keys) unresolved.delete(key);
-    unresolved.delete(`tool:${action.tool}`);
+    if (!COMPLETION_VERIFICATION_TOOLS.has(action.tool)) {
+      unresolved.delete(`tool:${action.tool}`);
+    }
     return;
   }
   if (advisoryFailureTools.has(action.tool)) return;
@@ -1183,9 +1700,40 @@ function isIgnorableReadOnlyToolFailure(action: LLMAction, result: ToolResult): 
 }
 
 function actionResolutionKeys(action: LLMAction): string[] {
+  if (COMPLETION_VERIFICATION_TOOLS.has(action.tool)) {
+    return [`verification:${verificationActionKey(action)}`];
+  }
   const targets = actionTargetPaths(action.tool, action.args);
   if (targets.length > 0) return targets.map((target) => `path:${target}`);
   return [`tool:${action.tool}`];
+}
+
+function verificationActionKey(action: LLMAction): string {
+  return `${action.tool}:${stableActionValue(action.args)}`;
+}
+
+function verificationActionLabel(action: LLMAction): string {
+  if (!isPlainRecord(action.args)) return verificationActionKey(action);
+  const command = typeof action.args.command === 'string'
+    ? action.args.command
+    : Array.isArray(action.args.args)
+      ? action.args.args.map(String).join(' ')
+      : undefined;
+  const cwd = typeof action.args.cwd === 'string' ? action.args.cwd : '.';
+  return command ? `${action.tool} ${command} (cwd=${cwd})` : verificationActionKey(action);
+}
+
+function stableActionValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableActionValue).join(',')}]`;
+  }
+  if (isPlainRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableActionValue(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 function actionTargetPaths(tool: string, args: unknown): string[] {
@@ -1633,20 +2181,45 @@ function renderUserPrompt(
 ): string {
   const role = inp.executionRole ?? inp.step.role;
   const compactContext = !!inp.debugContext;
+  const snippets = inp.contextSnippets ?? [];
+  const debugRepairSnippetCount = Math.max(
+    1,
+    snippets.filter((snippet) => isDebugRepairSnippet(snippet.path)).length,
+  );
+  const debugRepairBudgetChars = Math.floor(
+    (inp.ctx.contextWindowTokens ?? 128 * 1024) * 3 * 0.3,
+  );
+  const debugRepairSnippetLimit = Math.max(
+    1_800,
+    Math.min(6_000, Math.floor(debugRepairBudgetChars / debugRepairSnippetCount)),
+  );
   const snippetLimit = compactContext ? 900 : 2200;
   const architectureLimit = compactContext ? 3000 : 8000;
   const failureLogLimit = compactContext ? 2200 : 4000;
-  const ctxBlock = (inp.contextSnippets ?? [])
+  const ctxBlock = snippets
     .map((s) =>
       `### ${s.path}\n\`\`\`\n${truncate(
         s.content,
         s.path === '.xcompiler/architecture-contract.json' ||
           s.path.startsWith('.xcompiler/tickets/')
           ? architectureLimit
-          : snippetLimit,
+          : compactContext && isDebugRepairSnippet(s.path)
+            ? debugRepairSnippetLimit
+            : snippetLimit,
       )}\n\`\`\``,
     )
     .join('\n\n');
+  const debugRepairPacket = compactContext && snippets.some((snippet) =>
+    isDebugRepairSnippet(snippet.path)
+  )
+    ? [
+        '## debug repair packet',
+        'The source, test, manifest, and config snippets below were loaded from the current workspace for this attempt.',
+        'Use any complete snippet directly for patch/write actions; do not spend another turn rereading it.',
+        'Only read a file again when its snippet explicitly ends with a truncation marker and the missing section is required for the repair.',
+        '',
+      ].join('\n')
+    : '';
   const dbg = inp.debugContext
     ? [
         inp.debugContext.bugTicketId ? `## bug ticket\nid: ${inp.debugContext.bugTicketId}\n` : '',
@@ -1723,6 +2296,8 @@ function renderUserPrompt(
     '## required outputs',
     inp.step.outputs.map((o) => `- ${o}`).join('\n'),
     '',
+    renderPhaseWriteBoundary(inp.step),
+    '',
     '## writable paths (tool allowlist)',
     inp.ctx.allowedWrites.map((o) => `- ${o}`).join('\n'),
     '',
@@ -1742,12 +2317,31 @@ function renderUserPrompt(
     inp.step.inputs.length > 0
       ? `## inputs (already produced):\n${inp.step.inputs.map((i) => `- ${i}`).join('\n')}\n`
       : '',
+    debugRepairPacket,
     ctxBlock ? `## context\nTreat these existing files as the current project truth. Extend or refactor them in place; do not replace the project with a tiny parallel implementation.\n\n${ctxBlock}\n` : '',
     dbg,
     t().prompts.executorUserPromptOutro,
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+function isDebugRepairSnippet(rel: string): boolean {
+  const normalized = rel.replaceAll('\\', '/');
+  return normalized.startsWith('src/') ||
+    normalized.startsWith('tests/') ||
+    /^(?:package\.json|tsconfig(?:\.[^/]+)?\.json|requirements(?:-[^/]+)?\.txt|pyproject\.toml)$/u.test(normalized) ||
+    /^(?:config|src\/config)\/.+\.(?:json|toml|ya?ml)$/u.test(normalized);
+}
+
+function renderPhaseWriteBoundary(step: Step): string {
+  if (!isDeclarativeOutputPhase(step.phase)) return '';
+  return [
+    '## phase write boundary',
+    'Only the paths listed under writable paths may be created or changed in this phase.',
+    'REQUIREMENT_ANALYSIS, HIGH_LEVEL_DESIGN, and DETAILED_DESIGN own specifications and their paired executable tests; product implementation belongs to CODE.',
+    'A paired test may import planned product source paths before those source files exist. Do not create src/** stubs, placeholder implementations, or production behavior merely to make those imports resolve in this phase.',
+  ].join('\n');
 }
 
 function renderStepSubTasks(tasks: NonNullable<Step['subTasks']>, depth: number): string {
@@ -1833,7 +2427,16 @@ function renderFeedback(
     );
   }
   if (turn.readOnlyRecoveryWarning) {
-    lines.push(M.executorFeedbackReadOnlyRecoveryRequired);
+    if (turn.diagnosticProbeAllowance) {
+      lines.push(
+        M.executorFeedbackDiagnosticProbeAllowance(
+          turn.diagnosticProbeAllowance.remainingRounds,
+          turn.diagnosticProbeAllowance.maxActionsPerRound,
+        ),
+      );
+    } else {
+      lines.push(M.executorFeedbackReadOnlyRecoveryRequired);
+    }
     if (!verify.ok && verify.missing.length > 0) {
       lines.push(
         `Direct repair target: required outputs are still missing: ${verify.missing.join(', ')}. ` +
@@ -1850,6 +2453,17 @@ function renderFeedback(
   }
   if (turn.bugResolutionPlanMissing) {
     lines.push(M.executorFeedbackBugResolutionPlanMissing);
+  }
+  if (turn.postMutationVerificationRequired) {
+    lines.push(M.executorFeedbackPostMutationVerificationRequired);
+  }
+  if (turn.qualityAssessmentMissing && turn.qualityAssessmentMissing.length > 0) {
+    lines.push(
+      `Quality gate protocol is incomplete. Required fields/evidence are missing: ` +
+      `${turn.qualityAssessmentMissing.join(', ')}. ` +
+      'Do not rewrite verified outputs. Return actions=[] and done=true with a complete qualityAssessment ' +
+      'backed by the existing artifact, test-report, or command evidence.',
+    );
   }
   if (failureDetails.some((failure) => /path must be a non-empty string/i.test(failure))) {
     lines.push(
@@ -1888,6 +2502,39 @@ function renderFeedback(
     }
   }
   return lines.join('\n');
+}
+
+function missingQualityAssessmentFields(
+  step: Step,
+  assessment: StageQualityAssessment | undefined,
+  freshAfterTools = true,
+): string[] {
+  // Legacy/programmatic Step objects without an explicit gate retain the
+  // lightweight Executor contract. Plans produced by Planner always persist
+  // the resolved gate, so real V-model execution enforces the evidence fields.
+  if (!step.qualityGate) return [];
+  if (!assessment) return ['qualityAssessment'];
+  const missing: string[] = [];
+  if (!freshAfterTools) {
+    missing.push('qualityAssessment.postToolEvidence');
+  }
+  if ((V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase)) {
+    if (typeof assessment.completion !== 'number') {
+      missing.push('qualityAssessment.completion');
+    }
+    if (typeof assessment.upstreamAlignment !== 'number') {
+      missing.push('qualityAssessment.upstreamAlignment');
+    }
+  }
+  for (const metric of Object.keys(resolveQualityGate(step).metrics)) {
+    if (typeof assessment.metrics[metric] !== 'number') {
+      missing.push(`qualityAssessment.metrics.${metric}`);
+    }
+  }
+  if (assessment.evidence.length === 0) {
+    missing.push('qualityAssessment.evidence');
+  }
+  return missing;
 }
 
 function renderToolResultDetail(
@@ -2069,6 +2716,10 @@ function truncate(s: string, n: number): string {
 function tryParseTurnCandidate(candidate: string): LLMTurn | null {
   const exact = isTurnObject(tryParseJson(candidate));
   if (exact) return exact;
+  const trimmed = candidate.trim();
+  if (extractFirstJsonObject(trimmed) !== trimmed) {
+    return null;
+  }
   const repaired = repairJsonCandidate(candidate);
   if (repaired !== candidate) {
     const parsed = isTurnObject(tryParseJson(repaired));
@@ -2096,7 +2747,43 @@ function repairJsonCandidate(text: string): string {
 
 function isTurnObject(value: unknown): LLMTurn | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  return value as LLMTurn;
+  const record = value as Record<string, unknown>;
+  const nativeTool = normalizeNativeToolUse(record);
+  if (nativeTool) {
+    return {
+      thoughts: 'execute provider-native tool request',
+      actions: [nativeTool],
+      done: false,
+    };
+  }
+  return record as LLMTurn;
+}
+
+function normalizeNativeToolUse(value: Record<string, unknown>): LLMAction | undefined {
+  if (
+    (value.type === 'tool_use' || value.type === 'tool_call') &&
+    typeof value.name === 'string' &&
+    isPlainRecord(value.input ?? value.arguments)
+  ) {
+    return {
+      tool: value.name,
+      args: (value.input ?? value.arguments) as Record<string, unknown>,
+    };
+  }
+  if (typeof value.tool === 'string' && isPlainRecord(value.args)) {
+    return { tool: value.tool, args: value.args };
+  }
+  if (value.type === 'tool_call' && isPlainRecord(value.function)) {
+    const fn = value.function;
+    if (typeof fn.name !== 'string') return undefined;
+    const rawArgs = fn.arguments;
+    if (isPlainRecord(rawArgs)) return { tool: fn.name, args: rawArgs };
+    if (typeof rawArgs === 'string') {
+      const parsed = tryParseJson(rawArgs);
+      if (isPlainRecord(parsed)) return { tool: fn.name, args: parsed };
+    }
+  }
+  return undefined;
 }
 
 function extractBugResolutionPlan(turn: LLMTurn): string | undefined {

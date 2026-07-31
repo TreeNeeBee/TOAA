@@ -25,9 +25,27 @@ export interface ProbeableLLMProvider {
   type: string;
   base_url?: string;
   api_key?: string;
+  connect_timeout_ms?: number;
 }
 
 export const DEFAULT_LLM_PROBE_TIMEOUT_MS = 3000;
+export const DEFAULT_OPENAI_PROBE_TIMEOUT_MS = 60_000;
+
+/**
+ * Resolve endpoint-probe timeouts from the same connection budget used by the
+ * provider. Hosted OpenAI-compatible routes can legitimately take longer than
+ * a local health endpoint, especially during cold starts.
+ */
+export function resolveLLMProbeTimeoutMs(
+  provider: ProbeableLLMProvider,
+  explicitTimeoutMs?: number,
+): number {
+  if (explicitTimeoutMs !== undefined) return explicitTimeoutMs;
+  if (isOpenAICompatibleProvider(provider)) {
+    return provider.connect_timeout_ms ?? DEFAULT_OPENAI_PROBE_TIMEOUT_MS;
+  }
+  return DEFAULT_LLM_PROBE_TIMEOUT_MS;
+}
 
 /** Providers backed by Ollama's native /api/chat protocol. */
 export function isOllamaProvider(provider: Pick<ProbeableLLMProvider, 'type'>): boolean {
@@ -97,8 +115,9 @@ export async function fetchOpenAIModels(baseUrl: string, apiKey: string, timeout
  */
 export async function probeLLMProviderAvailability(
   provider: ProbeableLLMProvider,
-  timeoutMs = DEFAULT_LLM_PROBE_TIMEOUT_MS,
+  timeoutMs?: number,
 ): Promise<LLMProbeResult> {
+  const effectiveTimeoutMs = resolveLLMProbeTimeoutMs(provider, timeoutMs);
   const started = Date.now();
   const done = (ok: boolean, detail: string): LLMProbeResult => ({
     ok,
@@ -108,15 +127,18 @@ export async function probeLLMProviderAvailability(
   try {
     if (isOllamaProvider(provider)) {
       const baseUrl = normalizeBaseUrl(provider.base_url, 'http://localhost:11434');
-      await getJson(new URL('/api/tags', baseUrl), timeoutMs);
+      await getJson(new URL('/api/tags', baseUrl), effectiveTimeoutMs);
       return done(true, `ollama endpoint reachable: ${baseUrl}`);
     }
     if (isOpenAICompatibleProvider(provider)) {
       const baseUrl = normalizeBaseUrl(provider.base_url, 'https://api.openai.com/v1');
       const url = `${baseUrl.replace(/\/$/, '')}/models`;
       const ctrl = new AbortController();
-      const timer = timeoutMs > 0
-        ? setTimeout(() => ctrl.abort(new Error(`availability probe timed out after ${timeoutMs}ms`)), timeoutMs)
+      const timer = effectiveTimeoutMs > 0
+        ? setTimeout(
+            () => ctrl.abort(new Error(`availability probe timed out after ${effectiveTimeoutMs}ms`)),
+            effectiveTimeoutMs,
+          )
         : null;
       try {
         const res = await fetch(url, {

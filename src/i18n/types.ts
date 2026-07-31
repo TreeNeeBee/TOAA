@@ -353,6 +353,7 @@ export interface Messages {
     cachedTestArtifactsIncomplete: (id: string, missing: string[]) => string;
     testRollbackNotice: (testId: string, testPhase: string, sourceId: string, sourcePhase: string) => string;
     debugResumeInfraRetry: (id: string, n: number) => string;
+    enhanceResumeRevalidationNotice: (id: string, ticketId: string, n: number) => string;
     spinDebugRetry: (id: string, attempt: number, budget: number, cap: number, reason: string) => string;
     retryException: (attempt: number, budget: number, msg: string) => string;
     fixSucceeded: (id: string, attempt: number) => string;
@@ -458,8 +459,13 @@ export interface Messages {
     executorFeedbackVerifyMissing: (paths: string) => string;
     executorFeedbackReadOnlyLoopWarning: (rounds: number, targets: string) => string;
     executorFeedbackReadOnlyRecoveryRequired: string;
+    executorFeedbackDiagnosticProbeAllowance: (
+      remainingRounds: number,
+      maxActionsPerRound: number,
+    ) => string;
     executorFeedbackRepairEvidenceMissing: string;
     executorFeedbackBugResolutionPlanMissing: string;
+    executorFeedbackPostMutationVerificationRequired: string;
   };
 
   // ───────── Skill prompts ─────────

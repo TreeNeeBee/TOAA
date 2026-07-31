@@ -6,6 +6,7 @@ import { Workspace } from '../src/workspace/workspace.js';
 import { isCompleteTurnJson, StepExecutor } from '../src/agents/executor.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 import type { Step } from '../src/core/plan.js';
+import { getLanguageProfile } from '../src/core/language.js';
 import type { Tool, ToolContext } from '../src/tools/types.js';
 import { readFileTool, writeFileTool } from '../src/tools/fs.js';
 import { replaceInFileTool } from '../src/tools/edit.js';
@@ -90,6 +91,35 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastUser).toContain('outputs=[src/x.py]');
     expect(llm.lastUser).toContain('writable=[src/]');
     expect(llm.lastUser).toContain('The target must already exist');
+  });
+
+  it('keeps design-stage paired tests separate from CODE implementation ownership', async () => {
+    const llm = new CapturingLLM();
+    const designStep: Step = {
+      ...baseStep,
+      id: 'S003',
+      phase: 'DETAILED_DESIGN',
+      role: 'Architect',
+      outputs: ['docs/03-detailed-design.md', 'tests/integration/pipeline.test.ts'],
+    };
+    await ws.writeFile('docs/03-detailed-design.md', '# design\n');
+    await ws.writeFile('tests/integration/pipeline.test.ts', 'test("contract", () => {});\n');
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
+
+    await exec.run({
+      step: designStep,
+      tools: [],
+      ctx: {
+        ...ctx,
+        allowedWrites: designStep.outputs,
+        stepId: designStep.id,
+      },
+    });
+
+    expect(llm.lastUser).toContain('## phase write boundary');
+    expect(llm.lastUser).toContain('product implementation belongs to CODE');
+    expect(llm.lastUser).toContain('may import planned product source paths before those source files exist');
+    expect(llm.lastUser).toContain('Do not create src/** stubs');
   });
 
   it('prioritizes exact missing outputs in the first model turn', async () => {
@@ -248,6 +278,208 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(false);
     expect(r.error).toContain('bugResolutionPlan');
+    await expect(fs.access(path.join(tmp, 'src/x.py'))).rejects.toThrow();
+    expect(r.toolCalls).toHaveLength(0);
+  });
+
+  it('accepts a corrected plan on the next round without executing the rejected repair', async () => {
+    class CorrectedPlanLLM implements LLMClient {
+      readonly name = 'corrected-plan';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        return this.calls === 1
+          ? JSON.stringify({
+              thoughts: 'try to repair before documenting the plan',
+              actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 2\n' } }],
+              done: false,
+            })
+          : JSON.stringify({
+              thoughts: 'document and apply the scoped repair',
+              bugResolutionPlan: 'The implementation is stale; update src/x.py and verify the declared output.',
+              actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 3\n' } }],
+              done: true,
+            });
+      }
+    }
+    const llm = new CorrectedPlanLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const r = await exec.run({
+      step: baseStep,
+      executionRole: 'Debugger',
+      tools: [writeFileTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-1',
+        reason: 'unit test failed',
+        failureLog: 'AssertionError: expected x = 3',
+        repairRequired: true,
+      },
+    });
+
+    expect(r.success).toBe(true);
+    expect(llm.calls).toBe(2);
+    expect(await fs.readFile(path.join(tmp, 'src/x.py'), 'utf8')).toBe('x = 3\n');
+    expect(r.toolCalls).toHaveLength(1);
+  });
+
+  it('reuses the first Bug Ticket plan for later repair actions in the same attempt', async () => {
+    class PlanThenRepairLLM implements LLMClient {
+      readonly name = 'plan-then-repair';
+      calls = 0;
+      async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'establish the plan and inspect the implicated source',
+            bugResolutionPlan: 'Inspect src/x.py, update the stale value, and verify the declared output.',
+            actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+            done: false,
+          });
+        }
+        const repairWithoutRepeatedPlan = JSON.stringify({
+          thoughts: 'apply the already documented plan',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 4\n' } }],
+          done: true,
+        });
+        expect(options?.validate).toBeTypeOf('function');
+        expect(() => options!.validate!(repairWithoutRepeatedPlan)).not.toThrow();
+        return repairWithoutRepeatedPlan;
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new PlanThenRepairLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const r = await exec.run({
+      step: { ...baseStep, tools: ['read_file', 'write_file'] },
+      executionRole: 'Debugger',
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-1',
+        reason: 'unit test failed: src/x.py is stale',
+        failureLog: 'AssertionError: expected x = 4',
+        repairRequired: true,
+      },
+    });
+
+    expect(r.success).toBe(true);
+    expect(r.bugResolutionPlan).toContain('Inspect src/x.py');
+    expect(await fs.readFile(path.join(tmp, 'src/x.py'), 'utf8')).toBe('x = 4\n');
+  });
+
+  it('automatically runs the static CODE gate after a Debugger mutation', async () => {
+    class RepairOnlyLLM implements LLMClient {
+      readonly name = 'repair-only';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'apply the scoped compiler repair',
+          bugResolutionPlan: 'Update src/x.ts, then run npx tsc --noEmit.',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.ts', content: 'export const x = 1;\n' } }],
+          done: false,
+        });
+      }
+    }
+    let compilerRuns = 0;
+    const runProgram: Tool = {
+      name: 'run_program',
+      description: 'controlled TypeScript compiler',
+      argsSchema: { args: 'string[]' },
+      async run(args) {
+        compilerRuns++;
+        expect(args).toEqual({ args: ['npx', 'tsc', '--noEmit'] });
+        return { ok: true, summary: 'npx tsc --noEmit exit=0' };
+      },
+    };
+    const step: Step = {
+      ...baseStep,
+      outputs: ['src/x.ts'],
+      tools: ['write_file', 'run_program'],
+    };
+    const exec = new StepExecutor({ llm: new RepairOnlyLLM(), maxRounds: 1 });
+    const r = await exec.run({
+      step,
+      executionRole: 'Debugger',
+      languageProfile: getLanguageProfile('typescript'),
+      tools: [writeFileTool, runProgram],
+      ctx: { ...ctx, language: 'typescript' },
+      debugContext: {
+        bugTicketId: 'BUG-TS',
+        reason: 'CODE validation failed',
+        failureLog: 'src/x.ts(1,1): compiler error',
+        repairRequired: true,
+      },
+    });
+
+    expect(r.success).toBe(true);
+    expect(compilerRuns).toBe(1);
+    expect(r.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_program']);
+  });
+
+  it('automatically reruns inherited rollback tests after a CODE Debugger mutation', async () => {
+    class RollbackRepairLLM implements LLMClient {
+      readonly name = 'rollback-repair';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'repair the implementation exposed by the inherited unit gate',
+          bugResolutionPlan: 'Update src/x.ts, run the TypeScript compiler, then rerun the inherited unit test.',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.ts', content: 'export const x = 2;\n' } }],
+          done: false,
+        });
+      }
+    }
+    const executed: string[] = [];
+    const runProgram: Tool = {
+      name: 'run_program',
+      description: 'controlled TypeScript compiler',
+      argsSchema: { args: 'string[]' },
+      async run() {
+        executed.push('tsc');
+        return { ok: true, summary: 'tsc passed' };
+      },
+    };
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled inherited unit gate',
+      argsSchema: { args: 'string[]?' },
+      async run(args, toolCtx) {
+        executed.push('tests');
+        expect(args).toEqual({});
+        expect(toolCtx.defaultTestArgs).toEqual(['tests/unit/x.test.ts']);
+        return { ok: true, summary: 'unit gate passed' };
+      },
+    };
+    const step: Step = {
+      ...baseStep,
+      outputs: ['src/x.ts'],
+      tools: ['write_file', 'run_program', 'run_tests'],
+    };
+    const exec = new StepExecutor({ llm: new RollbackRepairLLM(), maxRounds: 1 });
+    const r = await exec.run({
+      step,
+      executionRole: 'Debugger',
+      languageProfile: getLanguageProfile('typescript'),
+      tools: [writeFileTool, runProgram, runTests],
+      ctx: {
+        ...ctx,
+        language: 'typescript',
+        defaultTestArgs: ['tests/unit/x.test.ts'],
+      },
+      debugContext: {
+        bugTicketId: 'BUG-ROLLBACK',
+        reason: 'UNIT_TEST rollback failed',
+        failureLog: 'tests/unit/x.test.ts failed',
+        repairRequired: true,
+      },
+    });
+
+    expect(r.success).toBe(true);
+    expect(executed).toEqual(['tsc', 'tests']);
+    expect(r.toolCalls.map((call) => call.tool)).toEqual([
+      'write_file',
+      'run_program',
+      'run_tests',
+    ]);
   });
 
   it('returns the DEBUG Bug Ticket resolution plan when the Bug Ticket is fixed', async () => {
@@ -355,6 +587,50 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.calls).toBe(2);
   });
 
+  it('extends a final mutation for verification even after an earlier malformed turn', async () => {
+    class MalformedThenWriteThenVerifyLLM implements LLMClient {
+      readonly name = 'malformed-write-verify';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) return 'not-json';
+        if (this.calls === 2) {
+          return JSON.stringify({
+            thoughts: 'apply the repair after the malformed response',
+            actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 8\n' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'verify the latest repair',
+          actions: [{ tool: 'run_tests', args: {} }],
+          done: false,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new MalformedThenWriteThenVerifyLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const r = await exec.run({
+      step: baseStep,
+      tools: [writeFileTool, runTestsTool],
+      ctx: {
+        ...ctx,
+        sandbox: {
+          async runProgram() { throw new Error('not used'); },
+          async runTests() {
+            return { exitCode: 0, stdout: '1 passed\n', stderr: '', timedOut: false, durationMs: 1 };
+          },
+          async installDeps() { throw new Error('not used'); },
+        } as never,
+      },
+    });
+
+    expect(r.success).toBe(true);
+    expect(r.rounds).toBe(3);
+    expect(llm.calls).toBe(3);
+  });
+
   it('extends a repaired test after an earlier failed verification so it can be rerun', async () => {
     class FailRepairVerifyLLM implements LLMClient {
       readonly name = 'fail-repair-verify';
@@ -402,6 +678,192 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.success).toBe(true);
     expect(r.rounds).toBe(3);
     expect(llm.calls).toBe(3);
+  });
+
+  it('keeps failed verification commands unresolved when a different command succeeds', async () => {
+    class DifferentVerificationLLM implements LLMClient {
+      readonly name = 'different-verification';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'run the compiler gate',
+            actions: [{ tool: 'run_program', args: { command: 'npx tsc --noEmit', cwd: '.' } }],
+            done: false,
+          });
+        }
+        if (this.calls === 2) {
+          return JSON.stringify({
+            thoughts: 'inspect the current directory with a different command',
+            actions: [{ tool: 'run_program', args: { command: 'pwd', cwd: '.' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({ thoughts: 'claim completion', actions: [], done: true });
+      }
+    }
+    const runProgram: Tool = {
+      name: 'run_program',
+      description: 'controlled command runner',
+      argsSchema: {},
+      async run(args) {
+        const command = (args as { command?: string }).command;
+        return command === 'pwd'
+          ? { ok: true, summary: '/workspace' }
+          : { ok: false, error: 'tsc exit=2: TS2345 incompatible contract' };
+      },
+    };
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({ llm: new DifferentVerificationLLM(), maxRounds: 3 });
+    const r = await exec.run({
+      step: { ...baseStep, tools: ['run_program'] },
+      tools: [runProgram],
+      ctx,
+    });
+
+    expect(r.success).toBe(false);
+    expect(r.error).toContain('unresolved tool failures remain');
+    expect(r.error).toContain('TS2345 incompatible contract');
+  });
+
+  it('stops an identical failed verification repeated without a successful mutation', async () => {
+    class RepeatedVerificationLLM implements LLMClient {
+      readonly name = 'repeated-verification';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'rerun the same compiler command without changing code',
+          actions: [{ tool: 'run_program', args: { command: 'npx tsc --noEmit', cwd: '.' } }],
+          done: false,
+        });
+      }
+    }
+    const runProgram: Tool = {
+      name: 'run_program',
+      description: 'always failing compiler gate',
+      argsSchema: {},
+      async run() {
+        return { ok: false, error: 'tsc exit=2: TS2339 missing API' };
+      },
+    };
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({ llm: new RepeatedVerificationLLM(), maxRounds: 4 });
+    const r = await exec.run({
+      step: { ...baseStep, tools: ['run_program'] },
+      tools: [runProgram],
+      ctx,
+    });
+
+    expect(r.success).toBe(false);
+    expect(r.rounds).toBe(2);
+    expect(r.toolCalls).toHaveLength(2);
+    expect(r.error).toContain('verification command repeated without a successful mutation');
+    expect(r.error).toContain('next attempt must patch/write');
+  });
+
+  it('stops an identical failed dependency mutation repeated without progress', async () => {
+    class RepeatedDependencyLLM implements LLMClient {
+      readonly name = 'repeated-dependency';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'repeat the same misspelled package',
+          actions: [{ tool: 'add_dependency', args: { packages: ['cron-par'] } }],
+          done: false,
+        });
+      }
+    }
+    const addDependency: Tool = {
+      name: 'add_dependency',
+      description: 'controlled dependency mutation',
+      argsSchema: {},
+      async run() {
+        return { ok: false, error: 'npm 404 cron-par package not found; manifest restored' };
+      },
+    };
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({ llm: new RepeatedDependencyLLM(), maxRounds: 4 });
+    const result = await exec.run({
+      step: { ...baseStep, tools: ['add_dependency'] },
+      tools: [addDependency],
+      ctx,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls).toHaveLength(2);
+    expect(result.error).toContain('mutation action repeated without a successful mutation');
+    expect(result.error).toContain('different repair strategy');
+  });
+
+  it('does not count adding an already-present dependency as Debugger repair evidence', async () => {
+    class NoopDependencyLLM implements LLMClient {
+      readonly name = 'noop-dependency';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'claim repair by adding an existing dependency',
+          actions: [{ tool: 'add_dependency', args: { packages: ['cheerio'] } }],
+          done: true,
+        });
+      }
+    }
+    const addDependency: Tool = {
+      name: 'add_dependency',
+      description: 'no-op dependency mutation',
+      argsSchema: {},
+      async run() {
+        return {
+          ok: true,
+          summary: 'add_dependency package.json +0 (none new; sandbox rebuild skipped)',
+          data: { added: [], finalLines: ['cheerio'] },
+        };
+      },
+    };
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({ llm: new NoopDependencyLLM(), maxRounds: 1 });
+    const result = await exec.run({
+      step: { ...baseStep, tools: ['add_dependency'] },
+      executionRole: 'Debugger',
+      tools: [addDependency],
+      ctx,
+      debugContext: {
+        reason: 'compiler failure',
+        failureLog: 'error TS2339: missing contract',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('without repair evidence');
+  });
+
+  it('does not count an identical write_file rewrite as Debugger repair evidence', async () => {
+    class NoopWriteLLM implements LLMClient {
+      readonly name = 'noop-write';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'claim repair by rewriting identical bytes',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({ llm: new NoopWriteLLM(), maxRounds: 1 });
+    const result = await exec.run({
+      step: baseStep,
+      executionRole: 'Debugger',
+      tools: [writeFileTool],
+      ctx,
+      debugContext: {
+        reason: 'compiler failure',
+        failureLog: 'error TS2339: missing contract',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.toolCalls[0]?.summary).toContain('unchanged');
+    expect(result.error).toContain('without repair evidence');
   });
 
   it('omits executed write payloads from assistant history instead of inventing contentBytes args', async () => {
@@ -463,6 +925,56 @@ describe('StepExecutor system prompt assembly', () => {
     expect(written).toBe('x = 1\n');
   });
 
+  it('normalizes a provider-native tool_use object into an executor action', async () => {
+    class NativeToolUseLLM implements LLMClient {
+      readonly name = 'native-tool-use';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            type: 'tool_use',
+            id: 'toolu_test',
+            name: 'write_file',
+            input: { path: 'src/x.py', content: 'x = 11\n' },
+          });
+        }
+        return JSON.stringify({ thoughts: 'complete', actions: [], done: true });
+      }
+    }
+    const llm = new NativeToolUseLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const result = await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
+
+    expect(result.success).toBe(true);
+    expect(llm.calls).toBe(2);
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'write_file', ok: true }),
+    ]);
+    expect(await ws.readFile('src/x.py')).toBe('x = 11\n');
+  });
+
+  it('does not execute a mutation recovered from structurally incomplete JSON', async () => {
+    class TruncatedMutationLLM implements LLMClient {
+      readonly name = 'truncated-mutation';
+      async chat(): Promise<string> {
+        return '{"thoughts":"replace method","actions":[{"tool":"replace_in_file","args":' +
+          '{"path":"src/x.py","find":"stale","replace":"export';
+      }
+    }
+    await ws.writeFile('src/x.py', 'stale\n');
+    const exec = new StepExecutor({ llm: new TruncatedMutationLLM(), maxRounds: 1 });
+    const result = await exec.run({
+      step: { ...baseStep, tools: ['replace_in_file'] },
+      tools: [replaceInFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.toolCalls).toHaveLength(0);
+    expect(await ws.readFile('src/x.py')).toBe('stale\n');
+  });
+
   it('does not stop a provider stream on a repairable but incomplete file payload', () => {
     expect(isCompleteTurnJson(
       '{"thoughts":"write test","actions":[{"tool":"write_file","args":{"path":"tests/x.test.ts","content":"import',
@@ -497,7 +1009,7 @@ describe('StepExecutor system prompt assembly', () => {
       }
     }
     const llm = new DeclarativeWriterLLM();
-    const exec = new StepExecutor({ llm, maxRounds: 3 });
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
     const result = await exec.run({
       step: {
         ...baseStep,
@@ -513,6 +1025,159 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.success).toBe(true);
     expect(result.rounds).toBe(1);
     expect(llm.calls).toBe(1);
+  });
+
+  it('keeps a gated Step in the same conversation until quality evidence is supplied', async () => {
+    class QualityHandshakeLLM implements LLMClient {
+      readonly name = 'quality-handshake';
+      calls = 0;
+      sawQualityFeedback = false;
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'write the declared design artifact',
+            qualityAssessment: {
+              completion: 0,
+              upstreamAlignment: 0,
+              metrics: {},
+              tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+              evidence: [],
+              gaps: ['all declared outputs have not been created yet'],
+            },
+            actions: [{
+              tool: 'write_file',
+              args: { path: 'docs/03-detailed-design.md', content: '# Detailed Design\n' },
+            }],
+            done: false,
+          });
+        }
+        this.sawQualityFeedback = messages.at(-1)?.content.includes(
+          'Quality gate protocol is incomplete',
+        ) ?? false;
+        return JSON.stringify({
+          thoughts: 'submit evidence for the verified artifact without rewriting it',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['docs/03-detailed-design.md'],
+            gaps: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    const llm = new QualityHandshakeLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'DETAILED_DESIGN',
+        role: 'Architect',
+        tools: ['write_file'],
+        outputs: ['docs/03-detailed-design.md'],
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      tools: [writeFileTool],
+      ctx: { ...ctx, allowedWrites: ['docs/'] },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(2);
+    expect(llm.calls).toBe(2);
+    expect(llm.sawQualityFeedback).toBe(true);
+    expect(result.toolCalls).toHaveLength(1);
+  });
+
+  it('does not hide unresolved verification failures behind stale quality evidence', async () => {
+    class FailedVerificationAfterAssessmentLLM implements LLMClient {
+      readonly name = 'failed-verification-after-assessment';
+      calls = 0;
+
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'record the current artifact assessment before verification',
+            qualityAssessment: {
+              completion: 1,
+              upstreamAlignment: 1,
+              metrics: {},
+              tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+              evidence: ['src/x.py'],
+              gaps: [],
+            },
+            actions: [],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'run the compiler gate',
+          bugResolutionPlan: 'Use the current compiler result to identify the stale contract, patch it, and rerun the same gate.',
+          actions: [{ tool: 'run_program', args: { args: ['npx', 'tsc', '--noEmit'] } }],
+          done: false,
+        });
+      }
+    }
+    const failingProgramTool: Tool<Record<string, unknown>> = {
+      name: 'run_program',
+      description: 'run a program',
+      argsSchema: { args: 'string[]' },
+      async run() {
+        return {
+          ok: false,
+          error: 'npx tsc --noEmit exit=2: src/x.py(1,1): error TS2339: Property api is missing',
+        };
+      },
+    };
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({
+      llm: new FailedVerificationAfterAssessmentLLM(),
+      maxRounds: 2,
+    });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        tools: ['run_program'],
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      executionRole: 'Debugger',
+      tools: [failingProgramTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-VERIFY-FAILURE',
+        reason: 'CODE validation failed: tsc --noEmit exit=2',
+        failureLog: 'src/x.py(1,1): error TS2339: Property api is missing',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('npx tsc --noEmit exit=2');
+    expect(result.error).not.toContain('qualityAssessment.postToolEvidence');
   });
 
   it('keeps empty or whitespace-only declared artifacts in the missing-output set', async () => {
@@ -836,6 +1501,67 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.success).toBe(true);
     expect(r.toolCalls.find((c) => c.tool === 'read_file' && !c.ok)?.error).toContain('tool not allowed');
     await expect(fs.readFile(path.join(tmp, 'src/x.py'), 'utf8')).resolves.toBe('x = 1\n');
+  });
+
+  it('does not make unauthorized downstream verification tools permanent blockers in a development phase', async () => {
+    class DeferredVerificationLLM implements LLMClient {
+      readonly name = 'deferred-verification';
+      private calls = 0;
+
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'attempt verification before checking the current phase tool boundary',
+            actions: [
+              { tool: 'run_tests', args: {} },
+              { tool: 'run_program', args: { args: ['src/x.py'] } },
+            ],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'accept the authored artifact and defer execution to its paired test phase',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py exists and is non-empty'],
+            gaps: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const exec = new StepExecutor({ llm: new DeferredVerificationLLM(), maxRounds: 2 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tool: 'run_tests', ok: false }),
+      expect.objectContaining({ tool: 'run_program', ok: false }),
+    ]));
   });
 
   it('clears a missing output read_file failure when the same output is later written', async () => {
@@ -1183,7 +1909,7 @@ describe('StepExecutor system prompt assembly', () => {
     }
     await ws.writeFile('src/source.py', 'value = 1\n');
     const llm = new ReadTwiceThenWriteLLM();
-    const exec = new StepExecutor({ llm, maxRounds: 4 });
+    const exec = new StepExecutor({ llm, maxRounds: 3 });
     const r = await exec.run({ step: baseStep, tools: [readFileTool, writeFileTool], ctx });
     expect(r.success).toBe(true);
     expect(llm.sawWarning).toBe(true);
@@ -1197,8 +1923,9 @@ describe('StepExecutor system prompt assembly', () => {
       sawRecoveryWarning = false;
       async chat(messages: ChatMessage[]): Promise<string> {
         this.calls++;
-        if (this.calls === 2) {
-          this.sawRecoveryWarning = messages[messages.length - 1]?.content.includes('Read-only recovery mode') ?? false;
+        if (this.calls >= 2) {
+          this.sawRecoveryWarning = this.sawRecoveryWarning ||
+            (messages[messages.length - 1]?.content.includes('Read-only recovery mode') ?? false);
         }
         return JSON.stringify({
           thoughts: 'inspect again despite recovery warning',
@@ -1225,6 +1952,129 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.error).toContain('read-only recovery mode repeated probe actions');
     expect(llm.calls).toBe(2);
     expect(llm.sawRecoveryWarning).toBe(true);
+  });
+
+  it('allows recovery to inspect distinct concrete error targets before patching', async () => {
+    class MultiFileRecoveryLLM implements LLMClient {
+      readonly name = 'multi-file-recovery';
+      calls = 0;
+      async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          const response = JSON.stringify({
+            thoughts: 'inspect the three compiler-reported contract owners in one bounded round',
+            actions: [1, 2, 3].map((index) => ({
+              tool: 'read_file',
+              args: { path: `src/error-${index}.py` },
+            })),
+            done: false,
+          });
+          options?.validate?.(response);
+          return response;
+        }
+        return JSON.stringify({
+          thoughts: 'apply the cross-file contract repair',
+          bugResolutionPlan: 'Inspect each compiler-reported contract owner, then patch the shared implementation.',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 2\n' } }],
+          done: true,
+        });
+      }
+    }
+    for (let index = 1; index <= 3; index++) {
+      await ws.writeFile(`src/error-${index}.py`, `value = ${index}\n`);
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new MultiFileRecoveryLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const result = await exec.run({
+      step: baseStep,
+      executionRole: 'Debugger',
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-MULTI-FILE',
+        reason: 'CODE validation failed: tsc --noEmit exit=2',
+        failureLog:
+          'compiler errors reference src/error-1.py, src/error-2.py, and src/error-3.py',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.calls).toBe(2);
+    expect(result.toolCalls.filter((call) => call.tool === 'read_file')).toHaveLength(3);
+    expect(await ws.readFile('src/x.py')).toBe('x = 2\n');
+  });
+
+  it('adapts direct-repair diagnostic rounds to the number of compiler-reported files', async () => {
+    class SequentialMultiFileRecoveryLLM implements LLMClient {
+      readonly name = 'sequential-multi-file-recovery';
+      calls = 0;
+      sawRemainingAllowance = false;
+
+      async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the first compiler-reported contract group',
+            actions: [1, 2, 3].map((index) => ({
+              tool: 'read_file',
+              args: { path: `src/error-${index}.ts` },
+            })),
+            done: false,
+          });
+        }
+        if (this.calls === 2) {
+          this.sawRemainingAllowance = messages.at(-1)?.content.includes(
+            'diagnostic collection remains available for 1 round',
+          ) ?? false;
+          const response = JSON.stringify({
+            thoughts: 'inspect the remaining compiler-reported contract owners',
+            actions: [4, 5].map((index) => ({
+              tool: 'read_file',
+              args: { path: `src/error-${index}.ts` },
+            })),
+            done: false,
+          });
+          expect(options?.validate).toBeTypeOf('function');
+          expect(() => options!.validate!(response)).not.toThrow();
+          return response;
+        }
+        return JSON.stringify({
+          thoughts: 'apply the focused repair after collecting both contract groups',
+          bugResolutionPlan: 'Inspect each compiler-reported owner, patch the shared implementation, and verify the gate.',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 3\n' } }],
+          done: true,
+        });
+      }
+    }
+
+    for (let index = 1; index <= 5; index++) {
+      await ws.writeFile(`src/error-${index}.ts`, `export const value${index} = ${index};\n`);
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new SequentialMultiFileRecoveryLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 3 });
+    const result = await exec.run({
+      step: { ...baseStep, tools: ['read_file', 'write_file'] },
+      executionRole: 'Debugger',
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-SEQUENTIAL-MULTI-FILE',
+        reason: 'CODE validation failed: tsc --noEmit exit=2',
+        failureLog: [1, 2, 3, 4, 5]
+          .map((index) => `src/error-${index}.ts(1,1): error TS2339: missing contract ${index}`)
+          .join('\n'),
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.calls).toBe(3);
+    expect(llm.sawRemainingAllowance).toBe(true);
+    expect(result.toolCalls.filter((call) => call.tool === 'read_file')).toHaveLength(5);
+    expect(await ws.readFile('src/x.py')).toBe('x = 3\n');
   });
 
   it('bounds the first recovery inspection round before requiring a mutation', async () => {
@@ -1291,7 +2141,7 @@ describe('StepExecutor system prompt assembly', () => {
         }
         expect(options?.validate).toBeTypeOf('function');
         expect(() => options!.validate!('{')).toThrow(/empty or unparseable JSON/u);
-        expect(() => options!.validate!('{ "thoughts": "')).toThrow(/no valid tool actions/u);
+        expect(() => options!.validate!('{ "thoughts": "')).toThrow(/empty or unparseable JSON/u);
         expect(() =>
           options!.validate!(
             JSON.stringify({
@@ -1302,6 +2152,15 @@ describe('StepExecutor system prompt assembly', () => {
           ),
         ).not.toThrow();
         expect(() => options!.validate!(readOnly)).toThrow(/read-only\/probe actions/u);
+        expect(() =>
+          options!.validate!(
+            JSON.stringify({
+              thoughts: 'inspect a distinct compiler-reported file',
+              actions: [{ tool: 'read_file', args: { path: 'src/other.py' } }],
+              done: false,
+            }),
+          ),
+        ).not.toThrow();
         expect(() =>
           options!.validate!(
             JSON.stringify({
@@ -1339,10 +2198,105 @@ describe('StepExecutor system prompt assembly', () => {
     expect(await ws.readFile('src/source.py')).toBe('value = 2\n');
   });
 
+  it('requires a repair turn after a Debugger reproduces an actionable compiler failure', async () => {
+    class CompilerRepairLLM implements LLMClient {
+      readonly name = 'compiler-repair';
+      calls = 0;
+      async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          expect(options?.validate).toBeTypeOf('function');
+          return JSON.stringify({
+            thoughts: 'reproduce the current compiler failure once',
+            bugResolutionPlan: 'Reproduce TS2339 once, patch the reported public API, and rerun the compiler gate.',
+            actions: [{ tool: 'run_program', args: { command: 'npx tsc --noEmit' } }],
+            done: false,
+          });
+        }
+        expect(options?.validate).toBeTypeOf('function');
+        if (this.calls === 2) {
+          expect(() =>
+            options!.validate!(JSON.stringify({
+              thoughts: 'stall after seeing the compiler diagnostics',
+              actions: [],
+              done: false,
+            })),
+          ).toThrow(/no valid tool actions/u);
+          expect(() =>
+            options!.validate!(JSON.stringify({
+              thoughts: 'inspect the newly reported source once',
+              actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+              done: false,
+            })),
+          ).not.toThrow();
+          return JSON.stringify({
+            thoughts: 'inspect the newly reported source once',
+            actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+            done: false,
+          });
+        }
+        if (this.calls === 3) {
+          expect(() =>
+            options!.validate!(JSON.stringify({
+              thoughts: 'repeat the same inspection',
+              actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+              done: false,
+            })),
+          ).toThrow(/read-only\/probe actions/u);
+          return JSON.stringify({
+            thoughts: 'repair the compiler-reported contract',
+            bugResolutionPlan: 'Reproduce TS2339 once, patch the reported public API, and rerun the compiler gate.',
+            actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'export const api = 1;\n' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'verify the repaired compiler contract',
+          bugResolutionPlan: 'Reproduce TS2339 once, patch the reported public API, and rerun the compiler gate.',
+          actions: [{ tool: 'run_program', args: { command: 'npx tsc --noEmit' } }],
+          done: false,
+        });
+      }
+    }
+    let compilerRuns = 0;
+    const runProgram: Tool = {
+      name: 'run_program',
+      description: 'controlled TypeScript compiler',
+      argsSchema: {},
+      async run() {
+        compilerRuns++;
+        return compilerRuns === 1
+          ? { ok: false, error: 'tsc exit=2: src/x.py(1,1): error TS2339: Property api is missing' }
+          : { ok: true, summary: 'tsc passed' };
+      },
+    };
+    await ws.writeFile('src/x.py', 'export const stale = 1;\n');
+    const llm = new CompilerRepairLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 4 });
+    const result = await exec.run({
+      step: { ...baseStep, tools: ['run_program', 'read_file', 'write_file'] },
+      executionRole: 'Debugger',
+      tools: [runProgram, readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-COMPILER',
+        reason: 'CODE validation failed: npx tsc --noEmit exit=2',
+        failureLog: 'src/x.py(1,1): error TS2339: Property api is missing',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.calls).toBe(4);
+    expect(await ws.readFile('src/x.py')).toContain('api');
+  });
+
   it('returns provider validation rejections as low-quality debug attempt failures', async () => {
     class LowQualityRejectedLLM implements LLMClient {
       readonly name = 'low-quality-provider-chain';
+      calls = 0;
       async chat(): Promise<string> {
+        this.calls++;
         throw new Error(
           'all LLM providers failed for role Debugger: ' +
           'openrouter_deepseek_flash/openai:deepseek/deepseek-v4-flash: ' +
@@ -1366,7 +2320,107 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(false);
     expect(r.error).toContain('low-quality Debugger response');
-    expect(r.metrics.repeatedTurns).toBe(1);
+    expect(r.rounds).toBe(2);
+    expect(r.metrics.repeatedTurns).toBe(2);
+  });
+
+  it('retains tool feedback and recovers in the same attempt after one low-quality rejection', async () => {
+    class RetainedContextLLM implements LLMClient {
+      readonly name = 'retained-debug-context';
+      calls = 0;
+      sawPriorReadFeedback = false;
+      async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the compiler-reported source once',
+            actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+            done: false,
+          });
+        }
+        if (this.calls === 2) {
+          throw new Error(
+            'low-quality Debugger response: read-only/probe actions in read-only recovery mode; ' +
+            'produce a repair action, verification action, or concrete blocker instead',
+          );
+        }
+        this.sawPriorReadFeedback =
+          messages.some((message) =>
+            message.role === 'user' && message.content.includes('read src/x.py')
+          ) &&
+          messages.some((message) =>
+            message.role === 'user' && message.content.includes('Do not reread those files')
+          );
+        expect(options?.validate).toBeTypeOf('function');
+        return JSON.stringify({
+          thoughts: 'patch using the retained current source content',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'export const api = 2;\n' } }],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'export const stale = 1;\n');
+    const llm = new RetainedContextLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 3 });
+    const result = await exec.run({
+      step: { ...baseStep, tools: ['read_file', 'write_file'] },
+      executionRole: 'Debugger',
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        reason: 'CODE validation failed: npx tsc --noEmit exit=2',
+        failureLog: 'src/x.py(1,1): error TS2339: Property api is missing',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.calls).toBe(3);
+    expect(llm.sawPriorReadFeedback).toBe(true);
+    expect(await ws.readFile('src/x.py')).toContain('api');
+  });
+
+  it('requires a repair action on the first turn after a read-only response was rejected', async () => {
+    class StrictRecoveryLLM implements LLMClient {
+      readonly name = 'strict-read-recovery';
+      calls = 0;
+      async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        expect(options?.validate).toBeTypeOf('function');
+        expect(() =>
+          options!.validate!(JSON.stringify({
+            thoughts: 'repeat the already rejected inspection',
+            actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+            done: false,
+          })),
+        ).toThrow(/read-only\/probe actions/u);
+        return JSON.stringify({
+          thoughts: 'apply the repair immediately using preserved evidence',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 9\n' } }],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new StrictRecoveryLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
+    const result = await exec.run({
+      step: baseStep,
+      executionRole: 'Debugger',
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      debugContext: {
+        reason:
+          'low-quality Debugger response: read-only/probe actions in read-only recovery mode; ' +
+          'produce a repair action',
+        failureLog: 'src/x.py(1,1): error TS2339: Property api is missing',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.calls).toBe(1);
+    expect(await ws.readFile('src/x.py')).toBe('x = 9\n');
   });
 
   it('rejects repeated read-only Debugger turns when missing outputs need direct repair', async () => {
@@ -1730,7 +2784,7 @@ describe('StepExecutor system prompt assembly', () => {
       tools: [runTestsTool],
       ctx,
       contextSnippets: [
-        { path: 'src/huge.py', content: 'A'.repeat(5000) },
+        { path: 'src/huge.py', content: 'A'.repeat(12_000) },
       ],
       debugContext: {
         reason: 'unit failed',
@@ -1741,8 +2795,10 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(true);
     expect(llm.lastUser).toContain('src/huge.py');
+    expect(llm.lastUser).toContain('## debug repair packet');
     expect(llm.lastUser).toContain('[truncated');
-    expect(llm.lastUser).not.toContain('A'.repeat(1500));
+    expect(llm.lastUser).toContain('A'.repeat(3000));
+    expect(llm.lastUser).not.toContain('A'.repeat(7000));
     expect(llm.lastUser).not.toContain('B'.repeat(3000));
   });
 

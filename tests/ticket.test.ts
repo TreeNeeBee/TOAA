@@ -10,8 +10,10 @@ import {
 } from '../src/core/ticket.js';
 import type { Plan, Step } from '../src/core/plan.js';
 import { ChangeRequestLifecycle } from '../src/core/engine/change_request_lifecycle.js';
+import { EnhancementLifecycle } from '../src/core/engine/enhancement_lifecycle.js';
 import { TICKET_LIFECYCLE_OWNERS } from '../src/core/engine/lifecycle_registry.js';
 import { WorkTicketLifecycle } from '../src/core/engine/work_ticket_lifecycle.js';
+import { AuditLogger } from '../src/audit/audit.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
 function codeStep(): Step {
@@ -368,6 +370,27 @@ describe('ticket workflow', () => {
     await expect(new TicketStore(workspace).load()).rejects.toThrow();
   });
 
+  it('does not reuse a Ticket id preserved in the append-only event log after rollback', async () => {
+    const { root, workspace, store, step } = await setup();
+    const first = await createBug(store, step);
+    const indexPath = path.join(root, '.xcompiler/tickets/index.json');
+    const rolledBackIndex = (
+      JSON.parse(await fs.readFile(indexPath, 'utf8')) as Array<{ id: string }>
+    ).filter((ticket) => ticket.id !== first.id);
+    await fs.writeFile(
+      indexPath,
+      `${JSON.stringify(rolledBackIndex, null, 2)}\n`,
+      'utf8',
+    );
+
+    const resumed = new TicketStore(workspace);
+    await resumed.load();
+    const second = await createBug(resumed, step);
+
+    expect(first.id).toBe('BUG-P1-001');
+    expect(second.id).toBe('BUG-P1-002');
+  });
+
   it('routes only bug tickets through debug, verification, and final closure', async () => {
     const { store, step } = await setup();
     const bug = await createBug(store, step);
@@ -558,5 +581,163 @@ describe('ticket workflow', () => {
     };
     expect(summary.enhancementsByKind['functional-gap']).toBe(1);
     expect(summary.modelImpact['author-provider']?.['attributed-gap']).toBe(1);
+  });
+
+  it('closes every verified Enhance merged into a completed change request', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-ticket-cr-enhance-'));
+    const workspace = new Workspace(root);
+    const store = new TicketStore(workspace);
+    const workTickets = new WorkTicketLifecycle(store);
+    const currentPlan = vModelPlan();
+    const step = currentPlan.steps.find((candidate) => candidate.phase === 'DETAILED_DESIGN')!;
+    const laterVerification = currentPlan.steps.find((candidate) => candidate.phase === 'CODE')!;
+    step.dependsOn = [];
+    laterVerification.dependsOn = [step.id];
+    currentPlan.steps = [step, laterVerification];
+    await workTickets.registerExecutionGraph(currentPlan);
+    await workTickets.completeStep(step);
+    const work = store.featureForStep(step.id, 'P1')!;
+
+    const createEnhancement = (title: string, verificationStep = step) => store.createEnhance({
+      priority: 'high',
+      iterationId: 'P1',
+      title,
+      description: `${title} needs a verified design delta.`,
+      parentTicketId: work.rootTicketId,
+      rootTicketId: work.rootTicketId,
+      relatedTicketIds: [work.id],
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: `${step.id}:${title}`,
+        stepId: step.id,
+        phase: step.phase,
+        role: step.role,
+      },
+      acceptance: [`${title} is verified.`],
+      artifacts: step.outputs,
+      kind: 'functional-gap',
+      finding: `${title} is incomplete.`,
+      sourceQualityGateStepId: step.id,
+      targetStepId: step.id,
+      targetPhase: step.phase,
+      verificationStepId: verificationStep.id,
+      verificationPhase: verificationStep.phase,
+      affectedWorkTicketIds: [work.id],
+      changeRequestTicketIds: [],
+      disposition: 'change-request',
+    });
+    const sourceEnhancement = await createEnhancement('source quality gap');
+    const mergedEnhancement = await createEnhancement(
+      'later quality gap',
+      laterVerification,
+    );
+    const request = await store.createChangeRequest({
+      priority: 'high',
+      iterationId: 'P1',
+      title: 'Propagate verified design deltas',
+      description: 'Apply both accepted design deltas.',
+      objective: 'Apply both accepted design deltas.',
+      rootTicketId: work.rootTicketId,
+      relatedTicketIds: [sourceEnhancement.id, mergedEnhancement.id, work.id],
+      blockedByTicketIds: [],
+      source: {
+        kind: 'runtime',
+        externalId: `${sourceEnhancement.id}:${step.id}`,
+        stepId: step.id,
+        phase: step.phase,
+        role: step.role,
+      },
+      acceptance: ['All linked quality findings are verified.'],
+      artifacts: step.outputs,
+      sourceEnhanceTicketId: sourceEnhancement.id,
+      triggerTicketId: sourceEnhancement.id,
+      scope: { in: ['Both design deltas'], out: ['Unrelated behavior'] },
+      trigger: {
+        failedStepId: step.id,
+        failedPhase: step.phase,
+        failedAcceptance: step.acceptance,
+        reason: sourceEnhancement.finding,
+        failureSummary: sourceEnhancement.finding,
+      },
+      designSource: {
+        stepId: step.id,
+        phase: 'DETAILED_DESIGN',
+        baselineCommit: 'before-sha',
+        repairCommit: 'repair-sha',
+        changedArtifacts: step.outputs,
+      },
+      contractChange: {
+        summary: 'Apply both design deltas.',
+        before: ['Incomplete design'],
+        after: ['Verified design'],
+        interfaces: [],
+        dependencies: [],
+        constraints: ['Preserve unrelated behavior.'],
+      },
+      implementationPlan: 'Apply and verify the detailed-design delta.',
+      affectedSteps: [{
+        stepId: step.id,
+        phase: step.phase,
+        role: step.role,
+        title: step.title,
+        inputs: step.inputs,
+        outputs: step.outputs,
+        acceptance: step.acceptance,
+      }],
+      affectedArtifacts: step.outputs,
+      verification: {
+        targetStepId: step.id,
+        targetPhase: step.phase,
+        testArgs: [],
+        checks: [step.acceptance],
+        failurePolicy: 'Open a linked Bug Ticket.',
+        rollbackTargetStepId: step.id,
+        rollbackTargetPhase: step.phase,
+      },
+      execution: { completedStepIds: [] },
+    });
+    sourceEnhancement.changeRequestTicketIds = [request.id];
+    mergedEnhancement.changeRequestTicketIds = [request.id];
+    await store.persist(sourceEnhancement, 'change-request-linked');
+    await store.persist(mergedEnhancement, 'change-request-linked');
+
+    const audit = new AuditLogger({ root, command: 'test' });
+    const router = { recordTicketOutcome: () => undefined };
+    const enhancements = new EnhancementLifecycle(
+      store,
+      audit,
+      router as never,
+      workTickets,
+    );
+    const changes = new ChangeRequestLifecycle(
+      store,
+      null as never,
+      audit,
+      router as never,
+      enhancements,
+      null as never,
+      workTickets,
+    );
+    await changes.recordApplication(request, {
+      stepId: step.id,
+      phase: step.phase,
+      kind: 'design-change',
+      commit: 'verified-sha',
+      changedFiles: step.outputs,
+      summary: 'Applied both design deltas.',
+    });
+
+    await changes.maybeClose(currentPlan, request, step);
+    expect(request.status).toBe('in_progress');
+    expect(sourceEnhancement.status).toBe('open');
+    expect(mergedEnhancement.status).toBe('open');
+
+    await workTickets.completeStep(laterVerification);
+    await changes.maybeClose(currentPlan, request, laterVerification);
+
+    expect(request.status).toBe('closed');
+    expect(sourceEnhancement.status).toBe('closed');
+    expect(mergedEnhancement.status).toBe('closed');
   });
 });

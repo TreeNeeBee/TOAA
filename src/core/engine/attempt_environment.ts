@@ -35,7 +35,11 @@ import {
 } from '../plan.js';
 import type { ProjectMemory } from '../project_memory.js';
 import { pairedTestAssetPaths } from '../test_assets.js';
-import type { ChangeRequestTicket, TicketStore } from '../ticket.js';
+import type {
+  ChangeRequestTicket,
+  EnhanceTicket,
+  TicketStore,
+} from '../ticket.js';
 import type { LanguageProfile } from '../language.js';
 
 export interface AttemptEnvironmentDebug extends ContextDebugInput {
@@ -68,6 +72,7 @@ export async function buildAttemptEnvironment(input: {
   role: Step['role'];
   debug?: AttemptEnvironmentDebug;
   changeRequest?: ChangeRequestTicket;
+  enhancement?: EnhanceTicket;
   terminalOutput: boolean;
   maxRoundsPerStep?: number;
   maxDebugRoundsPerStep?: number;
@@ -76,7 +81,9 @@ export async function buildAttemptEnvironment(input: {
   requestPermission?: ToolPermissionRequester;
   onToolEvent?: ToolExecutionReporter;
 }): Promise<AttemptEnvironment> {
-  const effectiveToolRefs = ensureEssentialToolRefs(input.step);
+  const effectiveToolRefs = ensureAttemptToolRefs(input.step, {
+    incremental: !!input.changeRequest || !!input.enhancement,
+  });
   const { resolvedToolNames, hints } = input.skills.resolve(effectiveToolRefs);
   let extraNames: string[] = [];
   if (input.debug) {
@@ -85,6 +92,17 @@ export async function buildAttemptEnvironment(input: {
       extraNames = debuggerSkill.tools;
       hints.push(`[debugger] ${debuggerSkill.prompt}`);
     }
+  }
+  if (input.changeRequest || input.enhancement) {
+    hints.push(
+      input.debug
+        ? '[incremental-ticket] The current debug repair packet is the existing accepted baseline. ' +
+          'Use its complete snippets directly and prefer replace_in_file/apply_patch for focused changes; ' +
+          'read again only when a required snippet is absent or explicitly truncated.'
+        : '[incremental-ticket] Inspect the existing workspace baseline first. ' +
+          'Use read_file/code_search and prefer replace_in_file/apply_patch for focused changes; ' +
+          'do not rewrite already-accepted artifacts unless the Ticket requires it.',
+    );
   }
   const toolNames = dedup([...resolvedToolNames, ...extraNames]);
   const baseTools = input.registry.pick(toolNames);
@@ -177,6 +195,7 @@ export async function buildAttemptEnvironment(input: {
     step: input.step,
     debug: input.debug,
     changeRequest: input.changeRequest,
+    enhancement: input.enhancement,
     tickets: input.tickets,
     projectMemory: input.projectMemory,
     profile: input.profile,
@@ -191,6 +210,22 @@ export async function buildAttemptEnvironment(input: {
     skillHints: hints,
     toolNames,
   };
+}
+
+export function ensureAttemptToolRefs(
+  step: Step,
+  mode: { incremental: boolean },
+): string[] {
+  const base = ensureEssentialToolRefs(step);
+  if (!mode.incremental) return base;
+  return dedup([
+    ...base,
+    'read_file',
+    'list_dir',
+    'code_search',
+    'replace_in_file',
+    'apply_patch',
+  ]);
 }
 
 function testGateArgs(plan: Plan, step: Step): string[] {

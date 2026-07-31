@@ -33,12 +33,28 @@ export const addDependencyTool: Tool<
     const abs = resolved.abs;
     const added: string[] = [];
     let final: string[];
+    const rollbackPaths = ctx.language === 'typescript'
+      ? ['package.json', 'package-lock.json', 'npm-shrinkwrap.json']
+      : ['requirements.txt'];
+    const snapshots = await Promise.all(
+      rollbackPaths.map((rel) => snapshotWorkspaceFile(ctx.ws.abs(rel))),
+    );
 
     if (ctx.language === 'typescript') {
-      const pkg = await fs
-        .readFile(abs, 'utf8')
-        .then((text) => JSON.parse(text) as Record<string, unknown>)
-        .catch(() => ({} as Record<string, unknown>));
+      let pkg: Record<string, unknown>;
+      try {
+        const text = await fs.readFile(abs, 'utf8');
+        pkg = JSON.parse(text) as Record<string, unknown>;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          pkg = {};
+        } else {
+          return {
+            ok: false,
+            error: `add_dependency cannot update invalid package.json: ${(err as Error).message}`,
+          };
+        }
+      }
       const existingDeps =
         pkg.dependencies && typeof pkg.dependencies === 'object' && !Array.isArray(pkg.dependencies)
           ? { ...(pkg.dependencies as Record<string, string>) }
@@ -49,6 +65,9 @@ export const addDependencyTool: Tool<
         existingDeps[name] = existingDeps[name] || '*';
       }
       final = Object.keys(existingDeps).sort();
+      if (added.length === 0) {
+        return unchangedDependencyResult(manifestPath, final);
+      }
       pkg.dependencies = Object.fromEntries(final.map((name) => [name, existingDeps[name] ?? '*']));
       await fs.writeFile(abs, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
     } else {
@@ -69,14 +88,23 @@ export const addDependencyTool: Tool<
         set.add(p);
       }
       final = [...set].sort();
+      if (added.length === 0) {
+        return unchangedDependencyResult(manifestPath, final);
+      }
       await fs.writeFile(abs, final.join('\n') + '\n', 'utf8');
     }
     try {
       await ctx.sandbox.build(manifestPath);
     } catch (err) {
+      const rollbackErrors = await restoreWorkspaceFiles(snapshots);
+      const rollbackSummary = rollbackErrors.length === 0
+        ? `${manifestPath} and related lockfiles were restored`
+        : `rollback was incomplete: ${rollbackErrors.join('; ')}`;
       return {
         ok: false,
-        error: `${manifestPath} 已写入，但沙盒重建失败：${(err as Error).message}`,
+        error:
+          `sandbox rebuild failed after staging ${manifestPath}: ${(err as Error).message}; ` +
+          rollbackSummary,
       };
     }
     return {
@@ -86,3 +114,49 @@ export const addDependencyTool: Tool<
     };
   },
 };
+
+interface WorkspaceFileSnapshot {
+  abs: string;
+  existed: boolean;
+  content?: Buffer;
+}
+
+async function snapshotWorkspaceFile(abs: string): Promise<WorkspaceFileSnapshot> {
+  try {
+    return { abs, existed: true, content: await fs.readFile(abs) };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { abs, existed: false };
+    }
+    throw err;
+  }
+}
+
+async function restoreWorkspaceFiles(
+  snapshots: WorkspaceFileSnapshot[],
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (const snapshot of snapshots) {
+    try {
+      if (snapshot.existed) {
+        await fs.writeFile(snapshot.abs, snapshot.content!);
+      } else {
+        await fs.rm(snapshot.abs, { force: true });
+      }
+    } catch (err) {
+      errors.push(`${snapshot.abs}: ${(err as Error).message}`);
+    }
+  }
+  return errors;
+}
+
+function unchangedDependencyResult(
+  manifestPath: string,
+  finalLines: string[],
+) {
+  return {
+    ok: true as const,
+    data: { added: [], finalLines },
+    summary: `add_dependency ${manifestPath} +0 (none new; sandbox rebuild skipped)`,
+  };
+}

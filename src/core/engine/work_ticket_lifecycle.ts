@@ -151,6 +151,19 @@ export class WorkTicketLifecycle {
     this.projectStepState(step, feature);
   }
 
+  async deferStep(step: Step, reason: string): Promise<void> {
+    const feature = this.requireFeature(step);
+    feature.execution.state = 'queued';
+    feature.failureReason = reason;
+    feature.updatedAt = new Date().toISOString();
+    this.projectStepState(step, feature);
+    await this.store.persist(feature, 'stage-feature-deferred', {
+      stepId: step.id,
+      phase: step.phase,
+      reason,
+    });
+  }
+
   async completeStep(step: Step): Promise<void> {
     const feature = this.requireFeature(step);
     for (const child of this.descendantsOf(feature.id).reverse()) {

@@ -157,16 +157,21 @@ export function adjustDebugRetryWindow(
   };
 }
 
-export function latestActionableDebugAttempt<T extends { reason?: string }>(
+export function latestActionableDebugAttempt<
+  T extends { reason?: string; failureLogTail?: string },
+>(
   attempts: T[],
 ): T | undefined {
   const newest = [...attempts].reverse();
-  return newest.find((attempt) =>
-    !isReadOnlyProbeLoopFailure(attempt.reason) &&
-    !isNonDebuggableInfrastructureFailure(attempt.reason),
-  ) ??
-    newest.find((attempt) => !isNonDebuggableInfrastructureFailure(attempt.reason)) ??
-    attempts.at(-1);
+  return newest.find((attempt) => {
+    const log = cleanFailureLogForDebugContext(attempt.failureLogTail ?? '');
+    return hasConcreteActionableFailure(log) &&
+      !isNonDebuggableInfrastructureFailure(attempt.reason, log);
+  }) ??
+    newest.find((attempt) =>
+      !isReadOnlyProbeLoopFailure(attempt.reason) &&
+      !isNonDebuggableInfrastructureFailure(attempt.reason),
+    );
 }
 
 export function latestActionableSourceFailureLog<
@@ -202,5 +207,15 @@ export function composeDebugRetryFailureLog(
 export function cleanFailureLogForDebugContext(log: string): string {
   return stripNestedLatestDebuggerFailures(
     sanitizeDebugFailureLogForPrompt(log),
+  );
+}
+
+function hasConcreteActionableFailure(log: string): boolean {
+  return (
+    /\berror TS\d{4}\b/u.test(log) ||
+    /\b(?:tsc|compileall|pytest|vitest|npm test)\b[^\n]*(?:exit\s*=\s*[1-9]|failed|失败)/iu.test(log) ||
+    /\b(?:AssertionError|SyntaxError|TypeError|ReferenceError|ModuleNotFoundError|ImportError|FileNotFoundError|Traceback)\b/u.test(log) ||
+    /\bFAILED\s+(?:tests?|src)\//u.test(log) ||
+    /\b(?:run_tests|run_program)\b[^\n]*(?:FAIL|failed|失败|exit\s*=\s*[1-9])/iu.test(log)
   );
 }

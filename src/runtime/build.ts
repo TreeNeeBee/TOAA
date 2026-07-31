@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { loadConfigWithPath } from '../config/config.js';
 import { LLMRouter } from '../llm/router.js';
@@ -7,7 +8,15 @@ import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
 import { Workspace } from '../workspace/workspace.js';
 import { archiveIfExists } from '../workspace/doc_archive.js';
-import { Planner, buildPlan, type ClarificationCategory, type ClarifyOption, type ClarifyQuestion, type PlannerInput } from '../agents/planner.js';
+import {
+  Planner,
+  buildPlan,
+  type ClarificationCategory,
+  type ClarifyOption,
+  type ClarifyQuestion,
+  type DraftPhasePlan,
+  type PlannerInput,
+} from '../agents/planner.js';
 import { PlanSchema } from '../core/plan.js';
 import { DOC_NAMES } from '../core/docs.js';
 import { loadIncrementalBaseline, isIncrementalIntent } from '../core/incremental.js';
@@ -16,6 +25,7 @@ import { refreshProjectMemory } from '../core/project_memory.js';
 import { renderPlanMarkdown } from '../core/render.js';
 import { loadPhasePlan, savePhasePlan, savePlan } from '../core/storage.js';
 import {
+  buildPhasePlanCheckpoint,
   buildPhasePlanFromCurrentPlan,
   defaultPhasePlanPath,
   defaultPhasePlanStepPath,
@@ -471,6 +481,17 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await runtimeLog(io, 'success', M.compile.topicWritten(ws.abs(DOC_NAMES.topic)));
 
   // 4. Decompose — with topic.md as the V-model input
+  const phasePlanPath = opts.outputFile
+    ? path.resolve(opts.outputFile)
+    : defaultPhasePlanPath(ws.root);
+  const phasePlanSourceDigest = buildPhasePlanSourceDigest({
+    topic: finalTopicMd,
+    language,
+    intent,
+    baselineSummary: baseline.summary,
+    userAddenda,
+  });
+  let existingPhasePlan = await tryLoadPhasePlan(phasePlanPath);
   trace('ora.spin2.start');
   const spin2 = io.progress(M.compile.spinDecompose, { animate: false });
   trace('ora.spin2.started');
@@ -486,7 +507,57 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     };
     const decomposeContext = { input: plannerInput };
     await pluginHost.emit('compile.beforeDecompose', decomposeContext);
-    draft = await planner.decompose(decomposeContext.input);
+    const reusableCheckpoint =
+      !opts.force &&
+      existingPhasePlan?.sourceDigest === phasePlanSourceDigest &&
+      existingPhasePlan.language === language &&
+      existingPhasePlan.intent === intent;
+    let draftPhasePlan: DraftPhasePlan;
+    if (reusableCheckpoint && existingPhasePlan) {
+      draftPhasePlan = {
+        requirementDigest: existingPhasePlan.requirementDigest,
+        globalPrompt: existingPhasePlan.globalPrompt,
+        projectType: existingPhasePlan.projectType,
+        complexityAssessment: existingPhasePlan.complexityAssessment,
+        implementationPhases: existingPhasePlan.phases.map(({ planPath: _planPath, ...phase }) => phase),
+      };
+      await audit.event('note', `reusing PhasePlan checkpoint: ${phasePlanPath}`, {
+        messageId: 'compile.phase_plan_checkpoint_reused',
+        phasePlanPath,
+        sourceDigest: phasePlanSourceDigest,
+        currentPhaseId: existingPhasePlan.currentPhaseId,
+      });
+    } else {
+      draftPhasePlan = await planner.planPhasePlan(decomposeContext.input);
+      existingPhasePlan = buildPhasePlanCheckpoint({
+        language,
+        intent,
+        projectType: draftPhasePlan.projectType,
+        requirementDigest: draftPhasePlan.requirementDigest,
+        complexityAssessment: draftPhasePlan.complexityAssessment,
+        implementationPhases: draftPhasePlan.implementationPhases,
+        globalPrompt: draftPhasePlan.globalPrompt,
+        baselineSummary: baseline.summary,
+        userAddenda,
+        sourceDigest: phasePlanSourceDigest,
+        existing: existingPhasePlan,
+      });
+      await savePhasePlan(phasePlanPath, existingPhasePlan);
+      await audit.event('plan.persist', `PhasePlan checkpoint persisted: ${phasePlanPath}`, {
+        messageId: 'compile.phase_plan_checkpoint_persisted',
+        phasePlanPath,
+        sourceDigest: phasePlanSourceDigest,
+        currentPhaseId: existingPhasePlan.currentPhaseId,
+      });
+    }
+    const currentPhase = draftPhasePlan.implementationPhases.find((phase) => phase.status === 'current') ??
+      draftPhasePlan.implementationPhases[0];
+    if (!currentPhase) throw new Error('PhasePlan checkpoint has no current phase.');
+    draft = await planner.decomposePhase(
+      decomposeContext.input,
+      draftPhasePlan,
+      currentPhase.id,
+    );
   } catch (err) {
     spin2.fail(M.compile.decomposeFail);
     const msg = (err as Error).message ?? String(err);
@@ -555,12 +626,8 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   }
 
   // 7. Persist
-  const phasePlanPath = opts.outputFile
-    ? path.resolve(opts.outputFile)
-    : defaultPhasePlanPath(ws.root);
   const planPath = defaultPhasePlanStepPath(path.dirname(phasePlanPath), parsed.data.phaseId ?? 'P1');
   await savePlan(planPath, parsed.data);
-  const existingPhasePlan = await tryLoadPhasePlan(phasePlanPath);
   const phasePlan = buildPhasePlanFromCurrentPlan({
     plan: parsed.data,
     phasePlanPath,
@@ -608,6 +675,18 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     try { await scoreStore?.flush(); } catch { /* never block release */ }
     await lock.release();
   }
+}
+
+function buildPhasePlanSourceDigest(input: {
+  topic: string;
+  language: Language;
+  intent: PlanIntent;
+  baselineSummary: string;
+  userAddenda: string;
+}): string {
+  return createHash('sha256')
+    .update(JSON.stringify(input))
+    .digest('hex');
 }
 
 function isPlannerTransportFailure(message: string): boolean {

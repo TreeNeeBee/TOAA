@@ -143,6 +143,9 @@ Rules:
    - [Time stability] Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
 4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
+   These four development phases author their paired tests but do not run them unless the current Step explicitly authorises a verification tool. Their scheduled execution in UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST is not a current-phase gap and must not be listed in qualityAssessment.gaps.
+   Every paired test must import or execute the real product modules/public APIs declared by the Plan. Never duplicate product types, classes, algorithms, renderers, parsers, schedulers, or other business behavior inside a test to make it pass without product code.
+   Every DETAILED_DESIGN integration test must exercise at least two declared product source modules when the Plan declares two or more; an inline stand-in for either side is not integration evidence.
    UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
    Ratios use 0..1. Never invent measurements: record unavailable evidence as a gap so Runtime can create an Enhance Ticket.
    In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
@@ -227,6 +230,9 @@ Rules:
    - [Time stability] Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
 4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
+   These four development phases author their paired tests but do not run them unless the current Step explicitly authorises a verification tool. Their scheduled execution in UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST is not a current-phase gap and must not be listed in qualityAssessment.gaps.
+   Every paired test must import or execute the real product modules/public APIs declared by the Plan. Never duplicate product types, classes, algorithms, renderers, parsers, schedulers, or other business behavior inside a test to make it pass without product code.
+   Every DETAILED_DESIGN integration test must exercise at least two declared product source modules when the Plan declares two or more; an inline stand-in for either side is not integration evidence.
    UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
    Ratios use 0..1. Never invent measurements: record unavailable evidence as a gap so Runtime can create an Enhance Ticket.
    In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
@@ -329,7 +335,7 @@ const messages: Messages = {
     coderDebuggerSameModel: (model, coderProvider, debuggerProvider) =>
       `Model configuration advice: Coder (${coderProvider}) and Debugger (${debuggerProvider}) both use ${model}. Prefer different models so debugging provides an independent reasoning path.`,
     invalidBaseUrl: (raw, fallback) => `[xcompiler] invalid base_url (${raw}); configure a valid HTTP(S) URL (default: ${fallback})`,
-    providerValidationFailed: (role, model) => `[${role}] provider ${model} failed output validation; trying next`,
+    providerValidationFailed: (role, model) => `[${role}] provider ${model} failed output contract validation; returning to caller`,
     providerCallFailed: (role, model) => `[${role}] provider ${model} failed; trying next`,
     scoreReadFailed: (p, message) => `failed to read ${p}: ${message}`,
     scoreChanged: (provider, score, previous) => `score(${provider}) = ${score} (was ${previous})`,
@@ -658,6 +664,8 @@ const messages: Messages = {
     testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
       `  ↳ ${testId} ${testPhase} gate failed; V-model rollback → ${sourceId} ${sourcePhase} Debugger.`,
     debugResumeInfraRetry: (id, n) => `  ↻ ${id} previous session only recorded LLM provider/connectivity failures (${n} attempt(s)); clearing the stale debug cache entry and rerunning the step normally.`,
+    enhanceResumeRevalidationNotice: (id, ticketId, n) =>
+      `  ↻ ${id} resumes ${ticketId} after an inspection-only recovery loop (${n} attempt(s)); rerunning incremental quality validation with the existing artifacts.`,
     spinDebugRetry: (id, attempt, budget, cap, reason) => `🛠  ${id} DEBUG retry ${attempt}/${budget} (cap=${cap}) — ${reason}`,
     retryException: (a, b, msg) => `retry ${a}/${b} threw: ${msg}`,
     fixSucceeded: (id, a) => `${id} fix succeeded (retry=${a})`,
@@ -870,6 +878,7 @@ Return a full V-model StepPlan only for ${opts.phaseId}:
 - Do not output Steps for any other planned phase; P2/P3 detailed plans are generated only when they become the current phase.
 - If ${opts.phaseId} spans multiple concerns (domain logic, CLI/API, file I/O, external integration, orchestration, tests), declare architectureModules for this phase and map module-level work under HIGH_LEVEL_DESIGN/CODE/MODULE_TEST subTasks.
 - architectureModules.sourcePaths may only contain product source files under src/. Put product runtime non-code files in assetPaths. Do not register tests/fixtures, tests/utils, sample inputs, temporary outputs, directories, or docs as architecture modules.
+- architectureModules.testPaths must be module-contract tests authored by HIGH_LEVEL_DESIGN and executed by MODULE_TEST (normally tests/modules/*). CODE must author separate unit tests and must not repeat these testPaths.
 - dependencies contains only packages required by this phase; Python must include pytest; never output requirements.txt.
 - This phase must contain the canonical eight V-model macro Steps and synchronous paired test-design outputs.
 
@@ -897,10 +906,16 @@ Return strict JSON StepPlan for the current phase only.`,
       '. Next response must include a successful repair action (apply_patch / replace_in_file / write_file / add_dependency) or a concrete verification action (run_tests / run_program). Do not continue with only read_file, list_dir, code_search, or http_fetch.',
     executorFeedbackReadOnlyRecoveryRequired:
       'Read-only recovery mode is active because the previous attempt already failed from probing. The next response must use existing failure evidence to patch/write/change dependency or run verification; one more read-only-only response will fail this retry.',
+    executorFeedbackDiagnosticProbeAllowance: (remainingRounds, maxActionsPerRound) =>
+      `Bounded diagnostic collection remains available for ${remainingRounds} round(s), with at most ${maxActionsPerRound} novel read/probe actions per round. ` +
+      'Only inspect concrete paths or windows implicated by the current failure evidence; rereading a seen target is rejected. ' +
+      'Apply the focused repair immediately once enough evidence is available.',
     executorFeedbackRepairEvidenceMissing:
       'Invalid DEBUG completion: this retry has not produced repair evidence yet. Before done=true, perform at least one successful repair action or successful verification run; otherwise stop only with a concrete blocker in thoughts.',
     executorFeedbackBugResolutionPlanMissing:
-      'Invalid DEBUG Bug Ticket completion: bugResolutionPlan is required before the ticket can close. Return JSON with a concise handling plan plus the needed repair or verification actions.',
+      'Invalid DEBUG Bug Ticket action: bugResolutionPlan is required before the first repair or verification action. Return JSON with the root-cause hypothesis, repair target, and validation command together with the needed action.',
+    executorFeedbackPostMutationVerificationRequired:
+      'The latest successful mutation is not verified. Preserve the current files and use the next action to run the smallest relevant compiler/test gate; do not spend another round only reading or rewriting.',
   },
   skills: {
     patcher:
@@ -921,7 +936,7 @@ Return strict JSON StepPlan for the current phase only.`,
       'After repeated failures on a complex domain format, stop inventing from memory and ask for a user sample or network reference. Never edit the implementation or assertions to "fix" a parse error.',
     dep_resolver: 'On ModuleNotFoundError, use add_dependency to write the package back into requirements.txt and rebuild the sandbox.',
     debugger:
-      'Reproduce with run_tests/run_program, use analyze_error when useful, apply the smallest scoped patch or dependency change, then rerun the failing gate. After two failed replacements on one file, read its current content and switch edit strategy.',
+      'Reproduce with run_tests/run_program only when no concrete failure log exists. When the error and a complete debug repair packet are already present, apply the smallest scoped patch or dependency change directly, then rerun the failing gate. Read again only when a required file is absent, explicitly truncated, or two replacements on that file have failed.',
     refactorer:
       'Refactors must preserve behaviour: run regression tests → modify → run regression tests again. ' +
       'Every file tool requires a concrete workspace-relative args.path; read_file the same target before a local replacement to confirm its current bytes.',

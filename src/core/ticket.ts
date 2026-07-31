@@ -628,6 +628,7 @@ export function projectWorkStatusToStepStatus(
 
 export class TicketStore {
   private tickets: Ticket[] = [];
+  private readonly idHighWaterMarks = new Map<string, number>();
   private loaded = false;
 
   constructor(private readonly workspace: Workspace) {}
@@ -637,6 +638,19 @@ export class TicketStore {
     const raw = await this.workspace.readFile('.xcompiler/tickets/index.json').catch(() => '');
     if (raw.trim()) {
       this.tickets = z.array(TicketSchema).parse(JSON.parse(raw));
+    }
+    for (const ticket of this.tickets) this.observeTicketId(ticket.id);
+    const eventLog = await this.workspace
+      .readFile('.xcompiler/tickets/events.jsonl')
+      .catch(() => '');
+    for (const line of eventLog.split(/\r?\n/u)) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line) as { ticketId?: unknown };
+        if (typeof event.ticketId === 'string') this.observeTicketId(event.ticketId);
+      } catch {
+        // A partial final audit line must not make the current Ticket index unreadable.
+      }
     }
     this.loaded = true;
   }
@@ -711,6 +725,19 @@ export class TicketStore {
         ticket.type === 'enhance' &&
         ticket.iterationId === iterationId &&
         ticket.sourceQualityGateStepId === stepId &&
+        !['closed', 'cancelled', 'failed'].includes(ticket.status),
+    );
+  }
+
+  activeQualityEnhanceTargetingStep(
+    stepId: string,
+    iterationId: string,
+  ): EnhanceTicket | undefined {
+    return [...this.tickets].reverse().find(
+      (ticket): ticket is EnhanceTicket =>
+        ticket.type === 'enhance' &&
+        ticket.iterationId === iterationId &&
+        ticket.targetStepId === stepId &&
         !['closed', 'cancelled', 'failed'].includes(ticket.status),
     );
   }
@@ -1105,12 +1132,21 @@ export class TicketStore {
 
   private nextId(type: TicketType, iterationId: string): string {
     const prefix = `${TYPE_PREFIX[type]}-${iterationId}-`;
-    const max = this.tickets.reduce((current, ticket) => {
-      if (!ticket.id.startsWith(prefix)) return current;
-      const value = Number.parseInt(ticket.id.slice(prefix.length), 10);
-      return Number.isFinite(value) ? Math.max(current, value) : current;
-    }, 0);
-    return `${prefix}${String(max + 1).padStart(3, '0')}`;
+    const next = (this.idHighWaterMarks.get(prefix) ?? 0) + 1;
+    this.idHighWaterMarks.set(prefix, next);
+    return `${prefix}${String(next).padStart(3, '0')}`;
+  }
+
+  private observeTicketId(id: string): void {
+    const match = /^(.+-P\d{1,3}-)(\d+)$/u.exec(id);
+    if (!match) return;
+    const value = Number.parseInt(match[2]!, 10);
+    if (!Number.isFinite(value)) return;
+    const prefix = match[1]!;
+    this.idHighWaterMarks.set(
+      prefix,
+      Math.max(this.idHighWaterMarks.get(prefix) ?? 0, value),
+    );
   }
 }
 

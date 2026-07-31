@@ -607,6 +607,69 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     expect(plan.steps).toHaveLength(8);
   });
 
+  it('模块契约测试被 CODE 当作单元测试时会反馈并重试', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = {
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'one bounded CLI',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [
+        {
+          id: 'P1',
+          title: 'Core',
+          objective: 'Deliver the CLI.',
+          status: 'current' as const,
+          scope: ['CLI'],
+          deliverables: ['Runnable CLI'],
+          dependsOn: [],
+        },
+      ],
+    };
+    const moduleTestPath = 'tests/modules/cli-contract.test.ts';
+    const module = {
+      id: 'M001',
+      name: 'CLI',
+      responsibility: 'Own command parsing and dispatch.',
+      sourcePaths: ['src/main.ts'],
+      testPaths: [moduleTestPath],
+      dependencies: [],
+    };
+    const invalidSteps = vModelSteps('P1', 1, 'src/main.ts', moduleTestPath);
+    invalidSteps[3] = {
+      ...invalidSteps[3]!,
+      outputs: [...invalidSteps[3]!.outputs, moduleTestPath],
+    };
+    const repairedSteps = vModelSteps('P1', 1, 'src/main.ts', moduleTestPath);
+    const invalid = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [module],
+      steps: invalidSteps,
+    };
+    const repaired = { ...invalid, steps: repairedSteps };
+    const planner = new Planner(
+      fakeLLM([JSON.stringify(invalid), JSON.stringify(repaired)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      phasePlan,
+      'P1',
+    );
+
+    expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain(moduleTestPath);
+    expect(plan.architectureModules?.[0]?.testPaths).toEqual([moduleTestPath]);
+  });
+
   it('当前 phase 的架构规模门禁不被后续 planned phase 的 surface 误伤', async () => {
     const rawRequirement = '写一个 TypeScript CLI，每日抓取网上热点新闻并生成 Markdown 简报，后续支持定时调度。';
     const phasePlan = {

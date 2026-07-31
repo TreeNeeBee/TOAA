@@ -145,7 +145,7 @@ export function testRollbackTriageGuidance(brief: DebugBrief): string {
   return [
     '## V-model test rollback triage',
     'Classify the failure before editing: a bad assertion, mock shape, fixture, test-server lifecycle, or loopback port is a test-artifact defect; a valid assertion exposing wrong product behavior is an implementation/contract defect.',
-    'The paired source phase owns its test assets and may repair them during rollback. Right-side validation phases must never rewrite tests. Do not add product APIs solely to satisfy a test that calls a nonexistent helper.',
+    'The paired source phase owns its test assets and may repair them during rollback. Right-side validation phases must never rewrite tests. Do not add arbitrary product helpers solely for an isolated bad assertion. When accepted tests or consumers use multiple semantically compatible call forms, implement one coherent public contract with overloads, optional parameters, or adapters. If the forms are irreconcilable, report a contract defect and route it upstream instead of alternating implementations.',
     `Patch the actual defect, then run the inherited scoped test command before done=true.${failedTests}`,
   ].join('\n');
 }

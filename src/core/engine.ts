@@ -78,8 +78,13 @@ import {
   QualityAssessmentStore,
   emptyQualityAssessment,
   evaluateQualityGate,
+  reconcileDevelopmentQualityAssessment,
   type StageQualityAssessment,
 } from './quality_gate.js';
+import {
+  inspectPairedSourceTests,
+  mergePairedSourceTestQuality,
+} from './paired_test_contract.js';
 import {
   compactToolCallFailureDetail,
   hasFailedVerificationEvidence,
@@ -117,6 +122,7 @@ import { buildDebugPromptPayload } from './engine/debug_prompt.js';
 import { ChangeRequestLifecycle } from './engine/change_request_lifecycle.js';
 import { ChangeRequestOpening } from './engine/change_request_opening.js';
 import { BugLifecycle } from './engine/bug_lifecycle.js';
+import { CodePhaseValidator } from './engine/code_phase_validator.js';
 import { EnhancementLifecycle } from './engine/enhancement_lifecycle.js';
 import { presentStepFailure } from './engine/failure_presenter.js';
 import { RepairArtifactService } from './engine/repair_artifact.js';
@@ -215,6 +221,7 @@ export class PhaseEngine {
   private readonly changeRequests: ChangeRequestLifecycle;
   private readonly changeRequestOpening: ChangeRequestOpening;
   private readonly repairArtifacts: RepairArtifactService;
+  private readonly codePhases: CodePhaseValidator;
   private readonly testPhases: TestPhaseValidator;
   private readonly qualityAssessments: QualityAssessmentStore;
   private readonly initializedExecutionGraphs = new Set<string>();
@@ -268,6 +275,12 @@ export class PhaseEngine {
       opts.ws,
       opts.git,
       opts.planPath,
+    );
+    this.codePhases = new CodePhaseValidator(
+      opts.ws,
+      opts.sandbox,
+      opts.audit,
+      (request) => this.requestEnginePermission(request),
     );
     this.testPhases = new TestPhaseValidator(
       opts.ws,
@@ -601,7 +614,14 @@ export class PhaseEngine {
         };
       }
       if (this.workTickets.isStepComplete(step)) {
+        if (!(await this.revalidateCompletedSourceTestContract(plan, step))) {
+          await this.persistPlan(plan);
+          index -= 1;
+          continue;
+        }
         this.log(chalk.gray(t().engine.stepSkipDone(step.id, step.phase)));
+        await this.bugLifecycle.resolveBugsVerifiedByStep(step);
+        await this.enhancementLifecycle.resolveVerifiedByStep(step);
         if (this.shouldRunIterationGate(plan, step)) {
           const gate = await this.runIterationGateWithRepair(plan, step);
           executed += gate.executedSteps;
@@ -626,6 +646,37 @@ export class PhaseEngine {
       }
 
       const activeChangeRequest = this.tickets.activeChangeRequestForStep(step);
+      const activeQualityEnhancement = this.tickets.activeQualityEnhanceTargetingStep(
+        step.id,
+        step.iterationId ?? 'P1',
+      );
+      if (activeQualityEnhancement && !this.opts.onlyPhase) {
+        const verificationStep = activeQualityEnhancement.verificationStepId
+          ? order.find((candidate) =>
+              candidate.id === activeQualityEnhancement.verificationStepId &&
+              (candidate.iterationId ?? 'P1') === (step.iterationId ?? 'P1'))
+          : undefined;
+        const remediation = await this.rollbackQualityEnhancement(
+          plan,
+          order,
+          verificationStep ?? step,
+          activeQualityEnhancement,
+          activeChangeRequest,
+        );
+        executed += remediation.executedSteps;
+        await this.persistPlan(plan);
+        if (remediation.ok && remediation.restartIndex !== undefined) {
+          index = remediation.restartIndex;
+          continue;
+        }
+        return {
+          totalSteps: order.length,
+          executedSteps: executed,
+          failedStepId: remediation.failedStepId ?? step.id,
+          failureLog: remediation.failureLog ?? this.lastFailure?.failureLog,
+          failureReason: remediation.failureReason ?? this.lastFailure?.reason,
+        };
+      }
       await this.plugins.emit('step.before', { plan, step });
       let ok: boolean;
       try {
@@ -671,9 +722,6 @@ export class PhaseEngine {
           step.id,
           step.iterationId ?? 'P1',
         );
-        if (activeChangeRequest) {
-          await this.changeRequests.recordFailure(activeChangeRequest, failedBug, step);
-        }
         const failureRoute = classifyDebugFailure(
           this.isVModelTestPhase(step.phase) ? 'test' : 'development',
           this.lastFailure?.reason,
@@ -795,6 +843,57 @@ export class PhaseEngine {
 
   private testGateArgsForStep(plan: Plan, step: Step): string[] {
     return this.testPhases.testArgs(plan, step);
+  }
+
+  private async recoverRoutedBugDebugContext(
+    plan: Plan,
+    step: Step,
+  ): Promise<Omit<DebugAttemptContext, 'asDebugger'> | undefined> {
+    if (this.workTickets.executionState(step) !== 'running') return undefined;
+    const bug = this.bugLifecycle.openBugTargetingStep(
+      step.id,
+      step.iterationId ?? 'P1',
+    );
+    if (!bug) return undefined;
+
+    const verificationStep = bug.verificationStepId
+      ? plan.steps.find((candidate) =>
+          candidate.id === bug.verificationStepId &&
+          (candidate.iterationId ?? 'P1') === (step.iterationId ?? 'P1'))
+      : undefined;
+    const rawFailureLog = bug.rawFailureLogPath
+      ? await this.opts.ws.readFile(bug.rawFailureLogPath).catch(() => '')
+      : '';
+    const isTestRollback = !!verificationStep &&
+      this.isVModelTestPhase(verificationStep.phase);
+    return {
+      reason: bug.reason,
+      failureLog: rawFailureLog.trim() || bug.failureLog,
+      contextPaths: dedup([
+        ...step.inputs,
+        ...step.outputs,
+        ...(verificationStep?.inputs ?? []),
+        ...(verificationStep?.outputs ?? []),
+        ...(bug.debugBrief?.files ?? []),
+      ]),
+      extraAllowedWrites: isTestRollback
+        ? collectRollbackRepairOutputs(
+            topoSort(plan.steps),
+            step,
+            verificationStep,
+            this.profile.manifestFile,
+          )
+        : undefined,
+      contextMode: isTestRollback ? 'test-rollback' : undefined,
+      testScopeArgs: isTestRollback
+        ? this.testGateArgsForStep(plan, verificationStep)
+        : undefined,
+      bugTicketId: bug.id,
+      completedBeforeDebug:
+        isTestRollback ||
+        bug.source.stepId !== step.id ||
+        this.workTickets.isStepComplete(step),
+    };
   }
 
   private shouldRunIterationGate(plan: Plan, step: Step): boolean {
@@ -961,6 +1060,52 @@ export class PhaseEngine {
     ) ?? candidates.at(-1) ?? failedStep;
   }
 
+  private async revalidateCompletedSourceTestContract(
+    plan: Plan,
+    step: Step,
+  ): Promise<boolean> {
+    const inspection = await inspectPairedSourceTests(this.opts.ws, plan, step);
+    if (inspection.ok) return true;
+    if (inspection.testPaths.length === 0 && inspection.invalid.length === 0) return true;
+
+    const previous = this.qualityAssessments.latestForStep(step.id)?.assessment;
+    const assessment = mergePairedSourceTestQuality(
+      previous ?? {
+        ...emptyQualityAssessment(),
+        completion: 1,
+        upstreamAlignment: 1,
+      },
+      inspection,
+    );
+    const evaluation = evaluateQualityGate(step, assessment);
+    await this.qualityAssessments.record(
+      step,
+      this.workTickets.attemptCount(step),
+      assessment,
+      evaluation,
+    );
+    const enhancement = await this.enhancementLifecycle.recordQualityGap(
+      step,
+      step,
+      { assessment, evaluation, remediationTarget: 'same-step' },
+    );
+    await this.workTickets.resetStep(step, 'paired-test-contract-revalidation');
+    await this.opts.audit.event(
+      'quality.gate.enhance',
+      `${step.id} completed paired tests no longer satisfy the product-reference contract`,
+      {
+        messageId: 'engine.completed_paired_test_contract_failed',
+        stepId: step.id,
+        phase: step.phase,
+        enhanceTicketId: enhancement.id,
+        testPaths: inspection.testPaths,
+        invalid: inspection.invalid,
+        references: inspection.references,
+      },
+    );
+    return false;
+  }
+
   /**
    * Keep failed right-side reports and tool evidence available to the paired
    * source-phase Debugger. Test assets already belong to the source phase.
@@ -1054,6 +1199,7 @@ export class PhaseEngine {
       };
     }
 
+    await this.bugLifecycle.resolveBugsVerifiedByStep(target);
     if (isDesignChangeRequestPhase(target.phase) && affectedSteps.length > 0) {
       await this.changeRequestOpening.establishQuality({
         plan,
@@ -1320,13 +1466,67 @@ export class PhaseEngine {
     await this.ensureExecutionGraph(plan);
     await this.debugCache.load();
     const debugKey = stepExecutionKey(step);
-    const initialDebug = opts.initialDebug;
-    const inheritedExtraAllowedWrites = initialDebug?.extraAllowedWrites;
-    const inheritedContextMode = initialDebug?.contextMode;
-    const inheritedTestScopeArgs = initialDebug?.testScopeArgs;
-    const completedBeforeDebug =
+    if (this.debugCache.hasRunningAttempt(debugKey)) {
+      const reason = 'previous execution ended before the debug attempt reached a terminal status';
+      if (await this.debugCache.markInterrupted(debugKey, reason)) {
+        await this.opts.audit.event('note', `${step.id} recovered interrupted debug state`, {
+          messageId: 'engine.debug_cache_interrupted_recovered',
+          stepId: step.id,
+          phase: step.phase,
+          reason,
+        });
+      }
+    }
+    let initialDebug = opts.initialDebug;
+    if (!initialDebug && this.debugCache.attempts(debugKey).length === 0) {
+      initialDebug = await this.recoverRoutedBugDebugContext(plan, step);
+      if (initialDebug) {
+        await this.opts.audit.event(
+          'note',
+          `${step.id} recovered Debugger context from routed Bug Ticket`,
+          {
+            messageId: 'engine.routed_bug_resume_recovered',
+            stepId: step.id,
+            phase: step.phase,
+            bugTicketId: initialDebug.bugTicketId,
+            contextMode: initialDebug.contextMode,
+            testScopeArgs: initialDebug.testScopeArgs,
+          },
+        );
+      }
+    }
+    let inheritedContextPaths = initialDebug?.contextPaths;
+    let inheritedExtraAllowedWrites = initialDebug?.extraAllowedWrites;
+    let inheritedContextMode = initialDebug?.contextMode;
+    let inheritedTestScopeArgs = initialDebug?.testScopeArgs;
+    let completedBeforeDebug =
       initialDebug?.completedBeforeDebug ?? this.workTickets.isStepComplete(step);
-    const rootDebugFailureLog = initialDebug
+    if (initialDebug && this.debugCache.attempts(debugKey).length === 0) {
+      await this.debugCache.recordAttempt(debugKey, {
+        attempt: 0,
+        reason: initialDebug.reason,
+        failureLogTail: initialDebug.failureLog,
+        contextMode: initialDebug.contextMode,
+        testScopeArgs: initialDebug.testScopeArgs,
+        bugTicketId: initialDebug.bugTicketId,
+        completedBeforeDebug,
+        contextPaths: initialDebug.contextPaths,
+        extraAllowedWrites: initialDebug.extraAllowedWrites,
+      });
+      await this.opts.audit.event(
+        'note',
+        `${step.id} persisted resumable Debugger context before execution`,
+        {
+          messageId: 'engine.debug_resume_context_seeded',
+          stepId: step.id,
+          phase: step.phase,
+          contextMode: initialDebug.contextMode,
+          bugTicketId: initialDebug.bugTicketId,
+          testScopeArgs: initialDebug.testScopeArgs,
+        },
+      );
+    }
+    let rootDebugFailureLog = initialDebug
       ? cleanFailureLogForDebugContext(initialDebug.failureLog)
       : undefined;
     const includeRootDebugFailureLog = (failureLog: string, reason: string): string =>
@@ -1346,7 +1546,10 @@ export class PhaseEngine {
     // 归档属于一次尝试的工作区事务：快照必须先于归档。若该尝试回滚，
     // 下一次 Debugger 尝试会重新归档恢复后的旧产物；保留增量修复时则不重复归档。
     let archiveOutputsOnNextAttempt =
-      !opts.skipOutputArchive && !preserveCachedTestOutputs;
+      !opts.skipOutputArchive &&
+      !preserveCachedTestOutputs &&
+      !opts.changeRequest &&
+      !opts.enhancement;
     const runAttempt = async (debug?: DebugAttemptContext): Promise<AttemptOutcome> => {
       const archiveOutputs = archiveOutputsOnNextAttempt;
       const hadArchivableOutput = archiveOutputs && (
@@ -1407,12 +1610,21 @@ export class PhaseEngine {
       } else if (hadUnresolved) {
         const attempts = this.debugCache.attempts(debugKey);
         const last = attempts.slice(-1)[0]!;
-        const resume = latestActionableDebugAttempt(attempts) ?? last;
+        const actionableResume = latestActionableDebugAttempt(attempts);
+        const resume = actionableResume ?? last;
         const resumeFailureLog = cleanFailureLogForDebugContext(resume.failureLogTail);
         const cachedTestScopeArgs = inferCachedTestScopeArgs(resume);
         const cachedContextMode = resume.contextMode ?? (cachedTestScopeArgs.length > 0 ? 'test-rollback' : undefined);
-        if (isNonDebuggableInfrastructureFailure(resume.reason, resumeFailureLog)) {
-          // 上一次会话只留下 LLM provider 断连/限流等基础设施错误，没有任何可修复的代码线索。
+        inheritedContextPaths = resume.contextPaths ?? inheritedContextPaths;
+        inheritedExtraAllowedWrites = resume.extraAllowedWrites ?? inheritedExtraAllowedWrites;
+        inheritedContextMode = cachedContextMode ?? inheritedContextMode;
+        inheritedTestScopeArgs = cachedTestScopeArgs.length > 0
+          ? cachedTestScopeArgs
+          : inheritedTestScopeArgs;
+        completedBeforeDebug = resume.completedBeforeDebug ?? completedBeforeDebug;
+        activeBugTicketId ??= resume.bugTicketId;
+        if (!actionableResume || isNonDebuggableInfrastructureFailure(resume.reason, resumeFailureLog)) {
+          // 上一次会话只留下 provider 断连、限流或无根因的探测噪声，没有任何可修复的代码线索。
           // 不能拿陈旧的断连记录直接判死本次 run（否则只有手删 debug_cache.json 才能恢复）；
           // 清掉被污染的缓存条目，按正常流程重新执行该 Step。若 LLM 仍不可用，
           // 本次尝试会现场失败并走既有的基础设施失败退出路径，而不会持续累积。
@@ -1420,7 +1632,25 @@ export class PhaseEngine {
           await this.debugCache.markDone(debugKey);
           priorPrompt = '';
           initial = await runAttempt();
+        } else if (opts.enhancement && isReadOnlyProbeLoopFailure(resume.reason)) {
+          // The quality ticket asks this same phase to reassess existing outputs. A cached
+          // inspection-only loop is an executor recovery defect, not evidence that the
+          // project artifacts need a Debugger mutation. Re-enter incremental quality
+          // validation with the full input/output context and close the Bug only if the
+          // stage gate now passes.
+          this.log(chalk.yellow(t().engine.enhanceResumeRevalidationNotice(
+            step.id,
+            opts.enhancement.id,
+            attempts.length,
+          )));
+          await this.debugCache.markDone(debugKey);
+          priorPrompt = '';
+          initial = await runAttempt();
         } else {
+          // Preserve the actionable cached root cause across every outer Debugger retry.
+          // Otherwise a read-only/protocol failure from the first resumed attempt can
+          // replace the compiler/test evidence that the next retry actually needs.
+          rootDebugFailureLog ??= resumeFailureLog;
           if (this.isVModelTestPhase(step.phase)) {
             if (!shouldRollbackTestPhaseFailure(resume.reason, resumeFailureLog)) {
               this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
@@ -1429,6 +1659,7 @@ export class PhaseEngine {
                 failureLog: resumeFailureLog,
                 reason: resume.reason,
                 priorAttemptsPrompt: priorPrompt,
+                contextPaths: inheritedContextPaths,
                 extraAllowedWrites: inheritedExtraAllowedWrites,
                 contextMode: cachedContextMode,
                 testScopeArgs: cachedTestScopeArgs,
@@ -1452,6 +1683,7 @@ export class PhaseEngine {
                   asDebugger: true,
                   failureLog: validation.failureLog,
                   reason,
+                  contextPaths: inheritedContextPaths,
                   extraAllowedWrites: inheritedExtraAllowedWrites,
                   testScopeArgs: this.testGateArgsForStep(plan, step),
                   bugTicketId: activeBugTicketId,
@@ -1494,17 +1726,56 @@ export class PhaseEngine {
             }
           } else {
             this.log(chalk.yellow(t().engine.debugResumeNotice(step.id, attempts.length)));
-            initial = await runAttempt({
-              asDebugger: true,
-              failureLog: resumeFailureLog,
-              reason: resume.reason,
-              priorAttemptsPrompt: priorPrompt,
-              extraAllowedWrites: inheritedExtraAllowedWrites,
-              contextMode: cachedContextMode,
-              testScopeArgs: cachedTestScopeArgs,
-              bugTicketId: activeBugTicketId,
-              completedBeforeDebug,
-            });
+            const codeValidation = step.phase === 'CODE'
+              ? await this.codePhases.validateExisting(
+                  plan,
+                  step,
+                  this.profile,
+                  (candidate) => this.workTickets.isStepComplete(candidate),
+                )
+              : { status: 'skipped' as const };
+            if (codeValidation.status === 'denied') {
+              initial = {
+                ok: false,
+                failureLog: codeValidation.failureLog,
+                reason: codeValidation.reason,
+                bugKind: 'infrastructure',
+                evidence: {
+                  stage: 'cached-code-revalidation',
+                  permissionDenied: true,
+                },
+              };
+            } else {
+              const currentFailure =
+                codeValidation.status === 'failed' || codeValidation.status === 'passed'
+                  ? codeValidation
+                  : undefined;
+              if (codeValidation.status === 'failed') {
+                rootDebugFailureLog = cleanFailureLogForDebugContext(
+                  codeValidation.failureLog,
+                );
+              }
+              initial = await runAttempt({
+                asDebugger: true,
+                failureLog:
+                  codeValidation.status === 'passed'
+                    ? [
+                        codeValidation.failureLog,
+                        '## original cached failure (not reproduced by current CODE revalidation)',
+                        resumeFailureLog,
+                      ].join('\n')
+                    : currentFailure?.failureLog ?? resumeFailureLog,
+                reason: currentFailure?.reason ?? resume.reason,
+                priorAttemptsPrompt: priorPrompt,
+                contextPaths: inheritedContextPaths,
+                extraAllowedWrites: inheritedExtraAllowedWrites,
+                contextMode: cachedContextMode,
+                testScopeArgs: cachedTestScopeArgs,
+                bugTicketId: activeBugTicketId,
+                completedBeforeDebug:
+                  codeValidation.status === 'passed' || completedBeforeDebug,
+              });
+            }
           }
         }
       } else {
@@ -1571,7 +1842,7 @@ export class PhaseEngine {
       initial.reason,
       initial.failureLog,
     );
-    if (!activeBugTicketId) {
+    if (!activeBugTicketId && !nonDebuggableInfrastructureFailure) {
       const bug = await this.bugLifecycle.recordBug(plan, step, {
         kind: this.bugLifecycle.classifyBugKind(step, initial),
         reason: initial.reason ?? 'failed',
@@ -1601,6 +1872,10 @@ export class PhaseEngine {
         (s) => `[${s.code}] ${s.hint}`,
       ),
       contextMode: inheritedContextMode,
+      bugTicketId: activeBugTicketId,
+      completedBeforeDebug,
+      contextPaths: inheritedContextPaths,
+      extraAllowedWrites: inheritedExtraAllowedWrites,
       testScopeArgs: inheritedTestScopeArgs,
       metrics: initial.metrics
         ? {
@@ -1619,7 +1894,14 @@ export class PhaseEngine {
         failureLog: initial.failureLog,
       };
       await this.debugCache.markFailed(debugKey, reason);
-      await this.bugLifecycle.markBugFailed(activeBugTicketId, reason);
+      await this.workTickets.deferStep(step, reason);
+      await this.opts.audit.event('note', `${step.id} deferred after infrastructure failure`, {
+        messageId: 'engine.infrastructure_failure_deferred',
+        stepId: step.id,
+        phase: step.phase,
+        reason,
+        activeBugTicketId,
+      });
       if (this.terminalOutput) {
         presentStepFailure(this.log.bind(this), step, {
           attempts: 0,
@@ -1682,11 +1964,12 @@ export class PhaseEngine {
           failureLog: retryFailureLog,
           reason: lastReason,
           priorAttemptsPrompt: priorPrompt,
+          contextPaths: inheritedContextPaths,
           extraAllowedWrites: inheritedExtraAllowedWrites,
           contextMode: inheritedContextMode,
-          testScopeArgs: inheritedTestScopeArgs,
           bugTicketId: activeBugTicketId,
           completedBeforeDebug,
+          testScopeArgs: inheritedTestScopeArgs,
         });
       } catch (err) {
         const msg = (err as Error).message;
@@ -1743,6 +2026,10 @@ export class PhaseEngine {
             (s) => `[${s.code}] ${s.hint}`,
           ),
           contextMode: inheritedContextMode,
+          bugTicketId: activeBugTicketId,
+          completedBeforeDebug,
+          contextPaths: inheritedContextPaths,
+          extraAllowedWrites: inheritedExtraAllowedWrites,
           testScopeArgs: inheritedTestScopeArgs,
           metrics: r.metrics
             ? {
@@ -1837,6 +2124,10 @@ export class PhaseEngine {
           (s) => `[${s.code}] ${s.hint}`,
         ),
         contextMode: inheritedContextMode,
+        bugTicketId: activeBugTicketId,
+        completedBeforeDebug,
+        contextPaths: inheritedContextPaths,
+        extraAllowedWrites: inheritedExtraAllowedWrites,
         testScopeArgs: inheritedTestScopeArgs,
         metrics: m
           ? {
@@ -1999,6 +2290,7 @@ export class PhaseEngine {
         role,
         debug,
         changeRequest: attemptOpts.changeRequest,
+        enhancement: attemptOpts.enhancement,
         terminalOutput: this.terminalOutput,
         maxRoundsPerStep: this.opts.maxRoundsPerStep,
         maxDebugRoundsPerStep: this.opts.maxDebugRoundsPerStep,
@@ -2525,7 +2817,54 @@ export class PhaseEngine {
             };
           }
         }
-        const qualityAssessment = r.qualityAssessment ?? emptyQualityAssessment();
+        let qualityAssessment =
+          reconcileDevelopmentQualityAssessment(
+            step,
+            r.qualityAssessment,
+            verify.missing,
+          ) ?? emptyQualityAssessment();
+        if (
+          r.qualityAssessment &&
+          qualityAssessment !== r.qualityAssessment
+        ) {
+          await this.opts.audit.event(
+            'note',
+            `${step.id} quality assessment reconciled with verified outputs`,
+            {
+              messageId: 'engine.quality_assessment_reconciled',
+              stepId: step.id,
+              phase: step.phase,
+              verifiedOutputs: step.outputs.filter(
+                (output) => !verify.missing.includes(output),
+              ),
+              original: r.qualityAssessment,
+              reconciled: qualityAssessment,
+            },
+          );
+        }
+        const pairedTestInspection = await inspectPairedSourceTests(
+          this.opts.ws,
+          plan,
+          step,
+        );
+        if (!pairedTestInspection.ok) {
+          qualityAssessment = mergePairedSourceTestQuality(
+            qualityAssessment,
+            pairedTestInspection,
+          );
+          await this.opts.audit.event(
+            'note',
+            `${step.id} paired test product-reference contract failed`,
+            {
+              messageId: 'engine.paired_test_contract_failed',
+              stepId: step.id,
+              phase: step.phase,
+              testPaths: pairedTestInspection.testPaths,
+              invalid: pairedTestInspection.invalid,
+              references: pairedTestInspection.references,
+            },
+          );
+        }
         const qualityEvaluation = evaluateQualityGate(step, qualityAssessment);
         await this.qualityAssessments.record(
           step,

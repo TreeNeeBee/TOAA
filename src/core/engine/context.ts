@@ -15,6 +15,7 @@ import {
 } from '../project_memory.js';
 import type {
   ChangeRequestTicket,
+  EnhanceTicket,
   TicketStore,
 } from '../ticket.js';
 import { stepTransitivelyDependsOn } from '../workflow_state.js';
@@ -35,6 +36,7 @@ export async function buildContextSnippets(input: {
   step: Step;
   debug?: ContextDebugInput;
   changeRequest?: ChangeRequestTicket;
+  enhancement?: EnhanceTicket;
   tickets: TicketStore;
   projectMemory: ProjectMemory | null;
   profile: LanguageProfile;
@@ -57,6 +59,12 @@ export async function buildContextSnippets(input: {
       JSON.stringify(input.changeRequest, null, 2),
     );
   }
+  if (input.enhancement) {
+    out.set(
+      `.xcompiler/tickets/${input.enhancement.id}.json`,
+      JSON.stringify(input.enhancement, null, 2),
+    );
+  }
   if ((input.plan.architectureModules?.length ?? 0) > 0) {
     out.set(
       '.xcompiler/architecture-contract.json',
@@ -65,7 +73,11 @@ export async function buildContextSnippets(input: {
   }
 
   const interesting = input.debug?.contextPaths ??
-    (input.debug ? [...input.step.inputs, ...input.step.outputs] : input.step.inputs);
+    (
+      input.debug || input.changeRequest || input.enhancement
+        ? [...input.step.inputs, ...input.step.outputs]
+        : input.step.inputs
+    );
   for (const rel of interesting) {
     await pushWorkspaceSnippet(input.workspace, out, rel);
   }

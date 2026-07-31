@@ -60,11 +60,57 @@ describe('write_file tool', () => {
   it('writes within whitelist and rejects outside', async () => {
     const ok = await writeFileTool.run({ path: 'src/app.py', content: 'print(1)\n' }, ctx);
     expect(ok.ok).toBe(true);
+    expect(ok.data).toMatchObject({ previousBytes: 0, changed: true });
     expect(await ws.readFile('src/app.py')).toBe('print(1)\n');
 
     const bad = await writeFileTool.run({ path: 'docs/leak.md', content: 'x' }, ctx);
     expect(bad.ok).toBe(false);
     expect(bad.error).toMatch(/write denied/);
+  });
+
+  it('rejects suspicious truncation of an existing source file without changing it', async () => {
+    const original = `export class Service {\n${'  run(): void { return; }\n'.repeat(80)}}\n`;
+    await ws.writeFile('src/service.ts', original);
+
+    const result = await writeFileTool.run(
+      { path: 'src/service.ts', content: 'export' },
+      ctx,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/suspicious truncation/);
+    expect(result.error).toContain('existing');
+    expect(await ws.readFile('src/service.ts')).toBe(original);
+  });
+
+  it('allows small new files and ordinary complete rewrites', async () => {
+    const created = await writeFileTool.run({ path: 'src/new.ts', content: 'export' }, ctx);
+    expect(created.ok).toBe(true);
+    expect(created.data).toMatchObject({ previousBytes: 0, changed: true });
+
+    const original = 'a'.repeat(1000);
+    await ws.writeFile('src/normal.ts', original);
+    const rewritten = await writeFileTool.run(
+      { path: 'src/normal.ts', content: 'b'.repeat(800) },
+      ctx,
+    );
+    expect(rewritten.ok).toBe(true);
+    expect(rewritten.data).toMatchObject({ previousBytes: 1000, bytes: 800, changed: true });
+  });
+
+  it('reports identical rewrites as successful no-op operations', async () => {
+    const content = 'export const value = 1;\n';
+    await ws.writeFile('src/same.ts', content);
+
+    const result = await writeFileTool.run({ path: 'src/same.ts', content }, ctx);
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      previousBytes: Buffer.byteLength(content),
+      bytes: Buffer.byteLength(content),
+      changed: false,
+    });
+    expect(result.summary).toContain('unchanged');
   });
 
   it('uses explicit per-step chunk limits for write_file and append_file', async () => {
@@ -275,6 +321,20 @@ describe('apply_patch tool', () => {
     const r = await applyPatchTool.run({ patch }, ctx);
     expect(r.ok).toBe(true);
     expect(await ws.readFile('src/m.py')).toBe('a\nB\nc\n');
+  });
+
+  it('rejects a patch that suspiciously truncates an existing file', async () => {
+    const lines = Array.from({ length: 40 }, (_, index) => `line-${index + 1}`);
+    const original = `${lines.join('\n')}\n`;
+    await ws.writeFile('src/large.py', original);
+    const deleted = lines.map((line) => `-${line}`).join('\n');
+    const patch = `--- a/src/large.py\n+++ b/src/large.py\n@@ -1,40 +1,1 @@\n${deleted}\n+pass\n`;
+
+    const r = await applyPatchTool.run({ patch }, ctx);
+
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/suspicious truncation/);
+    expect(await ws.readFile('src/large.py')).toBe(original);
   });
 
   it('rejects patch targeting outside whitelist', async () => {

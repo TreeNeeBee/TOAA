@@ -355,6 +355,27 @@ describe('V-model architecture contract', () => {
     expect(markdown).toContain('M006 export');
   });
 
+  it('accepts cohesive modules without enforcing the heuristic module-count estimate', () => {
+    const plan = complexPlan();
+    const demand = analyzeArchitectureDemand(plan, plan.language);
+    plan.architectureModules = plan.architectureModules!
+      .filter((module) => ['M003', 'M004', 'M005', 'M006'].includes(module.id))
+      .map((module) => ({ ...module, dependencies: [] }));
+    plan.steps = plan.steps
+      .filter((item) => !['S004', 'S005'].includes(item.id))
+      .map((item) => ({
+        ...item,
+        outputs: item.id === 'S006'
+          ? [...item.outputs, 'docs/tests/unit-test-plan.md', 'tests/test_unit.py']
+          : item.outputs,
+        dependsOn: item.dependsOn.filter((dependency) => !['S004', 'S005'].includes(dependency)),
+      }));
+
+    expect(plan.architectureModules).toHaveLength(4);
+    expect(demand.minModules).toBeGreaterThan(plan.architectureModules.length);
+    expect(lintPlan(plan).filter((issue) => issue.level === 'error')).toEqual([]);
+  });
+
   it('rejects a shared CODE macro step when module subtasks are missing', () => {
     const plan = complexPlan();
     const entryStep = plan.steps.find((step) => step.outputs.includes('src/main.py'))!;

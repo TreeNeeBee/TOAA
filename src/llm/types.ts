@@ -27,9 +27,9 @@ export interface ChatOptions {
    */
   streamStopWhen?: (text: string) => boolean;
   /**
-   * 可选验证钩子：provider 返回后调用。抛异常会被 FallbackClient
-   * 视为该 provider 失败，并切换到下一个。适用于：JSON 退化、
-   * 空输出、model token loop 等“表面成功但语义不可用”场景。
+   * 可选输出契约验证钩子：provider 返回后调用。抛出的原始异常会立即
+   * 返回调用方，由拥有该契约的工作流携带精确反馈重试；不会以未变更的
+   * prompt 静默切换 provider。适用于 JSON 结构、计划契约和修复动作校验。
    */
   validate?: (text: string) => void;
   /**

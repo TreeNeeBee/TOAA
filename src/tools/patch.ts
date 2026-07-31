@@ -2,6 +2,7 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
+import { suspiciousTextTruncationError } from './content_guard.js';
 
 /**
  * 极简的 unified-diff patcher。仅支持：
@@ -39,6 +40,13 @@ export const applyPatchTool: Tool<{ patch: string }, { changedFiles: string[] }>
       }
       const next = applyHunks(original, fd.hunks);
       if (next.error) return { ok: false, error: `${resolved.rel}: ${next.error}` };
+      const truncationError = suspiciousTextTruncationError({
+        tool: 'apply_patch',
+        path: resolved.rel,
+        originalBytes: Buffer.byteLength(original),
+        replacementBytes: Buffer.byteLength(next.content),
+      });
+      if (truncationError) return { ok: false, error: truncationError };
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, next.content, 'utf8');
       changed.push(resolved.rel);
