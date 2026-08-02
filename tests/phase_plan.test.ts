@@ -69,6 +69,64 @@ describe('phase plan persistence', () => {
     ]);
   });
 
+  it('preserves completed Phase history when an incremental plan is appended', () => {
+    const existing = buildPhasePlanCheckpoint({
+      language: 'typescript',
+      intent: 'greenfield',
+      projectType: 'application',
+      requirementDigest: 'Deliver the core application.',
+      complexityAssessment: {
+        level: 'simple',
+        rationale: 'One completed Phase.',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [{
+        id: 'P1', title: 'Core', objective: 'Deliver core.', status: 'current', scope: ['core'],
+        deliverables: ['core'], dependsOn: [],
+        verificationGate: { summary: 'Core passes.', checks: ['npm test'], failurePolicy: 'Open a Bug.' },
+      }],
+      sourceDigest: 'b'.repeat(64),
+    });
+    existing.phases[0]!.status = 'complete';
+    const incremental = buildPlan({
+      requirementDigest: 'Add reporting.',
+      globalPrompt: 'Preserve core behavior.',
+      dependencies: [],
+      complexityAssessment: {
+        level: 'moderate',
+        rationale: 'A new reporting Phase is required.',
+        splitRecommended: true,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [{
+        id: 'P2', title: 'Reporting', objective: 'Add reporting.', status: 'current', scope: ['reports'],
+        deliverables: ['report command'], dependsOn: [],
+        verificationGate: { summary: 'Reports pass.', checks: ['npm test'], failurePolicy: 'Open a Bug.' },
+      }],
+      steps: vModelSteps('P2'),
+    }, { language: 'typescript', intent: 'feature' });
+    incremental.implementationPhases = incremental.implementationPhases.filter(
+      (phase) => phase.status === 'current',
+    );
+
+    const merged = buildPhasePlanFromCurrentPlan({
+      plan: incremental,
+      phasePlanPath: '/workspace/phasePlan.json',
+      currentPlanPath: '/workspace/plan.P2.json',
+      existing,
+    });
+
+    expect(merged.phases.map((phase) => [phase.id, phase.status])).toEqual([
+      ['P1', 'complete'],
+      ['P2', 'current'],
+    ]);
+    expect(merged.currentPhaseId).toBe('P2');
+    expect(merged.requirementDigest).toContain('Deliver the core application.');
+    expect(merged.requirementDigest).toContain('Add reporting.');
+    expect(merged.complexityAssessment.level).toBe('moderate');
+  });
+
   it('loads phasePlan.json as the current phase plan target', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-phase-plan-'));
     const plan = buildPlan(
@@ -268,9 +326,7 @@ function vModelSteps(iterationId = 'P1'): Step[] {
       outputs: stepOutputs(phase, index),
       dependsOn: index === 0 ? [] : [`S${String(index).padStart(3, '0')}`],
       acceptance: `${phase} output exists.`,
-      status: 'PENDING',
-      retries: 0,
-      maxRetries: 3,
+      maxAttempts: 3,
     };
   });
 }

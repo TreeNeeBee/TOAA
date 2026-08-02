@@ -22,7 +22,6 @@ import {
   parseIntent,
   parseLocale,
   parseNonNegativeInteger,
-  parsePhase,
   parseStepId,
 } from './arguments.js';
 
@@ -126,9 +125,6 @@ program
   .argument('<project>', t().cli.argProjectFile)
   .option('-c, --config <file>', t().cli.optConfig)
   .option('--dry-run', t().cli.optDryRun, false)
-  .option('--from <stepId>', t().cli.optFrom, parseStepId)
-  .option('--phase <phase>', t().cli.optPhase, parsePhase)
-  .option('--reset', t().cli.optReset, false)
   .option('--force', t().cli.optForce, false)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
   .action(async (projectArg, opts) => {
@@ -136,9 +132,6 @@ program
       projectFile: projectArg,
       configPath: opts.config,
       dryRun: !!opts.dryRun,
-      fromStepId: opts.from,
-      onlyPhase: opts.phase,
-      resetStatus: !!opts.reset,
       force: !!opts.force,
       debugWikiPath: opts.debugWikiPath,
       io: createCliRuntimeIO(),
@@ -209,9 +202,6 @@ program
   .option('-w, --workspace <dir>', t().cli.optWorkspace)
   .option('-c, --config <file>', t().cli.optConfig)
   .option('--dry-run', t().cli.optDryRun, false)
-  .option('--from <stepId>', t().cli.optFrom, parseStepId)
-  .option('--phase <phase>', t().cli.optPhase, parsePhase)
-  .option('--reset', t().cli.optReset, false)
   .option('--force', t().cli.optForce, false)
   .option('--project-file <file>', t().cli.optProjectFile)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
@@ -222,9 +212,6 @@ program
       workspace: opts.workspace,
       configPath: opts.config,
       dryRun: !!opts.dryRun,
-      fromStepId: opts.from,
-      onlyPhase: opts.phase,
-      resetStatus: !!opts.reset,
       force: !!opts.force,
       projectFilePath: opts.projectFile,
       debugWikiPath: opts.debugWikiPath,

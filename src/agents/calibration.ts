@@ -620,7 +620,7 @@ function inferPhase(rawPhase: unknown, role: string, outputs: string[]): string 
  *  - systemPrompt 长度不足 → 补齐到至少 20 字符
  *  - title / description 缺失 → 用阶段名兜底，避免空字符串
  *  - tools / inputs / outputs / dependsOn 缺失 → 默认空数组
- *  - maxRetries 非正整数 → 重置为 3
+ *  - maxAttempts 非正整数 -> 重置为 3
  */
 export function calibrateStepShape(steps: Step[]): Step[] {
   return steps.map((raw) => {
@@ -678,11 +678,9 @@ export function calibrateStepShape(steps: Step[]): Step[] {
       subTasks: calibrateSubTasks(s.subTasks),
       dependsOn: Array.isArray(s.dependsOn) ? (s.dependsOn as string[]) : [],
       acceptance,
-      status: (typeof s.status === 'string' ? s.status : 'PENDING') as Step['status'],
-      retries: typeof s.retries === 'number' && s.retries >= 0 ? s.retries : 0,
-      maxRetries:
-        typeof s.maxRetries === 'number' && Number.isInteger(s.maxRetries) && s.maxRetries > 0
-          ? s.maxRetries
+      maxAttempts:
+        typeof s.maxAttempts === 'number' && Number.isInteger(s.maxAttempts) && s.maxAttempts > 0
+          ? s.maxAttempts
           : 3,
     } as Step;
   });
@@ -987,9 +985,7 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
       acceptance: tsMode
         ? `既有 Vitest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`
         : `既有 pytest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`,
-      status: 'PENDING',
-      retries: 0,
-      maxRetries: 3,
+      maxAttempts: 3,
     });
   }
   const syntheticByIteration = new Map(syntheticSteps.map((step) => [iterationIdOf(step), step]));

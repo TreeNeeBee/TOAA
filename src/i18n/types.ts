@@ -22,6 +22,8 @@ export interface Messages {
     coderDebuggerSameModel: (model: string, coderProvider: string, debuggerProvider: string) => string;
     invalidBaseUrl: (raw: string, fallback: string) => string;
     providerValidationFailed: (role: string, model: string) => string;
+    providerValidationRetry: (role: string, model: string) => string;
+    providerValidationRepairPrompt: (error: string) => string;
     providerCallFailed: (role: string, model: string) => string;
     scoreReadFailed: (path: string, message: string) => string;
     scoreChanged: (provider: string, score: string, previous: string) => string;
@@ -139,9 +141,6 @@ export interface Messages {
     optYes: string;
     optForce: string;
     optDryRun: string;
-    optFrom: string;
-    optPhase: string;
-    optReset: string;
     optMaxDepth: string;
     optTail: string;
     optPlan: string;
@@ -296,9 +295,9 @@ export interface Messages {
     secOutputs: string;
     secRecentAudit: (n: number) => string;
     planHeader: (path: string, language: string) => string;
-    planStatusSummary: (total: number, done: number, pending: number, failed: number, running: number) => string;
+    planStatusSummary: (total: number, done: number, ready: number, blocked: number, running: number) => string;
     planReadFailed: (path: string, message: string) => string;
-    stepHeader: (id: string, phase: string, title: string, status: string, retries: number, maxRetries: number) => string;
+    stepHeader: (id: string, phase: string, title: string, state: string, attempts: number, maxAttempts: number) => string;
     stepRoleTools: (role: string, tools: string) => string;
     stepDependsOn: (ids: string) => string;
     outputStatus: (exists: boolean, path: string) => string;
@@ -307,7 +306,7 @@ export interface Messages {
 
   // ───────── execute (xcompiler run) ─────────
   execute: {
-    forceReset: string;
+    forceLockOverride: string;
     manifestRecalibrated: (path: string) => string;
     manifestSeeded: (path: string) => string;
     auditPlanLoaded: (path: string) => string;
@@ -319,7 +318,6 @@ export interface Messages {
     runReasonLabel: string;
     runFailureLogHeader: string;
     runAllDone: (executed: number, total: number) => string;
-    runPartialDone: (executed: number, total: number, remaining: string) => string;
     projectAuditSummary: (errors: number, warnings: number) => string;
     projectMemoryRefreshFailed: (message: string) => string;
     projectAuditCheck: (name: string, summary: string) => string;
@@ -339,65 +337,14 @@ export interface Messages {
 
   // ───────── engine ─────────
   engine: {
-    spinSandboxBuild: (profile: LanguageProfile) => string;
-    sandboxReady: (reason: string) => string;
-    stepSkipDone: (id: string, phase: string) => string;
-    spinSandboxRebuild: (id: string, profile: LanguageProfile) => string;
-    sandboxStatus: (reason: string) => string;
-    autoFixedSrcImports: (n: number, files: string) => string;
-    debugResumeNotice: (id: string, n: number) => string;
-    cachedTestRevalidationNotice: (id: string, n: number) => string;
     cachedTestGateStart: (id: string, testArgs: string[]) => string;
     cachedTestGatePassed: (id: string) => string;
     cachedTestGateFailed: (id: string, exitCode: number, timedOut: boolean) => string;
     cachedTestArtifactsIncomplete: (id: string, missing: string[]) => string;
-    testRollbackNotice: (testId: string, testPhase: string, sourceId: string, sourcePhase: string) => string;
-    debugResumeInfraRetry: (id: string, n: number) => string;
-    enhanceResumeRevalidationNotice: (id: string, ticketId: string, n: number) => string;
-    spinDebugRetry: (id: string, attempt: number, budget: number, cap: number, reason: string) => string;
-    retryException: (attempt: number, budget: number, msg: string) => string;
-    fixSucceeded: (id: string, attempt: number) => string;
-    retryHealthyButFailed: (attempt: number, before: number, budget: number, tag: string, reason: string) => string;
-    retryLowQuality: (attempt: number, before: number, budget: number, tag: string, reason: string) => string;
-    retryStillFailed: (attempt: number, budget: number, tag: string, reason: string) => string;
-    earlyAbortLowQuality: (id: string, n: number) => string;
-    stepFinalFailed: (id: string, phase: string, role: string) => string;
-    finalAttemptsLine: (attempts: number, budget: number, cap: number, earlyAbort: boolean) => string;
-    finalMetricsLine: (health: string, parseFail: number, repeat: number, toolFail: string, progress: string) => string;
-    reasonLabel: string;
-    failureLogHeader: string;
-    fixSuggestionsHeader: string;
-    auditHint: (id: string) => string;
-    spinStepRunning: (id: string, phase: string, title: string) => string;
-    noFailureLog: string;
-    suggestionLine: (index: number, code: string, hint: string) => string;
-    phaseStart: (id: string, phase: string, title: string) => string;
-    phaseFailed: (id: string, debug: boolean, reason: string) => string;
-    phaseDone: (id: string, rounds: number) => string;
-    phaseException: (id: string, message: string) => string;
-    archGateReason: (missing: number) => string;
-    archGateMissing: (tokens: string) => string;
-    archGateInstruction: (path: string) => string;
-    testGateReason: (exitCode: number, timedOut: boolean) => string;
-    deliveryGateReason: (command: string, exitCode: number, timedOut: boolean) => string;
     missingPythonEntrypoint: string;
     missingTypeScriptEntrypoint: string;
     invalidPythonEntrypointSource: (path: string) => string;
     entrypointHelpOutputMissing: (command: string) => string;
-    reasonLine: (reason: string) => string;
-    roundsLine: (rounds: number) => string;
-    commandLine: (command: string) => string;
-    stdoutTailHeader: string;
-    stderrTailHeader: string;
-    testStdoutTailHeader: string;
-    testStderrTailHeader: string;
-    outputsMissing: (paths: string) => string;
-    metricsLine: (health: string, parseFail: number, repeat: number, toolFail: string, progress: string) => string;
-    metricsUnavailable: string;
-    toolCallsHeader: string;
-    toolCallLine: (tool: string, ok: boolean, detail: string) => string;
-    projectMemoryRefreshFailed: (message: string) => string;
-    deliveryFixHints: (language: string) => string[];
   };
 
   // ───────── render (plan.md / topic.md headers) ─────────
@@ -495,6 +442,7 @@ export interface Messages {
     openaiKeyMissing: (provider: string) => string;
     openaiReachable: (provider: string, baseUrl: string) => string;
     openaiUnreachable: (provider: string, baseUrl: string, msg: string) => string;
+    openaiModelListUnavailable: (provider: string, status: number) => string;
     openaiModelListMissing: (provider: string, model: string) => string;
     providerScoreZero: (provider: string) => string;
     roleNoLiveProvider: (role: string) => string;
@@ -502,15 +450,15 @@ export interface Messages {
     sandboxKind: (kind: string) => string;
     sandboxNetworkPolicy: (policy: string, ports: number[]) => string;
     sandboxFullNoPorts: string;
-    sandboxNodeMissing: string;
+    sandboxNodeMissing: (detail: string) => string;
     sandboxNodeOk: (version: string) => string;
-    sandboxNpmMissing: string;
+    sandboxNpmMissing: (detail: string) => string;
     sandboxNpmOk: (version: string) => string;
-    sandboxNpxMissing: string;
+    sandboxNpxMissing: (detail: string) => string;
     sandboxNpxOk: (version: string) => string;
-    sandboxPythonMissing: string;
+    sandboxPythonMissing: (detail: string) => string;
     sandboxPythonOk: (version: string) => string;
-    sandboxVenvMissing: string;
+    sandboxVenvMissing: (detail: string) => string;
     sandboxVenvOk: string;
     sandboxDockerMissing: (bin: string) => string;
     sandboxDockerOk: (version: string) => string;

@@ -50,7 +50,7 @@ cp config.example.yaml config.yaml
 #   llm.providers.<name>.type: openai | ollama
 #   llm.roles.{Planner|Architect|Coder|Tester|Debugger}: provider 名数组
 #   agent.sandboxes.python.mode / agent.sandboxes.typescript.mode: subprocess | docker
-#   agent.max_rounds_per_step / max_debug_rounds_per_step / max_debug_retries
+#   agent.max_rounds_per_step / max_debug_rounds_per_step
 ```
 
 ### 1.3 构建并安装为全局命令
@@ -350,7 +350,7 @@ docker rmi xcompiler:latest
 | `EACCES: /var/run/docker.sock` | `xcompiler` 用户不在宿主 docker 组 | `DOCKER_GID=$(stat -c '%g' /var/run/docker.sock) docker compose ...` |
 | 长时 LLM 调用后 `audit.jsonl` 没事件 | （已修）旧版异步 appendFile 排队丢失 | 升级到当前版本：审计已改为 `appendFileSync` |
 | `Plan schema 校验失败` | LLM 返回 plan 字段类型异常 | 查看 `<workspace>/docs/.draft/plan.invalid.json` 定位字段，必要时调高 `agent.max_rounds_per_step` 或换更强模型作为 Planner |
-| 测试阶段一直被 DEBUG 重试到 max | 实现层 bug，DEBUG 也修不动 | 看 `<workspace>/.xcompiler/audit.jsonl` 里 `pytest stderr (tail)`；必要时手动改 SUT 后 `xcompiler run --from S<id>` 续跑 |
+| 测试阶段达到 Step attempt 上限 | Bug/CR 链未能通过配对验证 | 查看 Ticket 领域 Log 与 `<workspace>/.xcompiler/audit.jsonl` 的失败证据；修复配置或环境后重新执行 `xcompiler run`，Scheduler 会从精确的未完成 Ticket 恢复，不能跳过 Step |
 
 ---
 

@@ -480,9 +480,9 @@ function injectLanguageContractPrompts(steps: Step[], language: Language): Step[
     '\n\nTypeScript runtime/test contract（强制，覆盖本 Step 其它相反描述）：\n' +
     '- 测试框架必须使用 Vitest：测试文件从 `vitest` 导入 `describe/it/expect/vi`，禁止 Jest API、`jest.fn`、`jest.spyOn`、`jest.mock`。\n' +
     '- `package.json` 必须使用 `"test": "vitest run"`，`"build": "tsc --noEmit"`，并包含 `type: "module"`。\n' +
-    '- `tsconfig.json` 必须启用 `allowImportingTsExtensions: true`，确保显式 `.ts` 导入可通过 `tsc --noEmit`。\n' +
+    '- `tsconfig.json` 必须启用 `allowImportingTsExtensions: true`，并将产品 build/typecheck 的 include 限定为 `src/**/*.ts`、`src/**/*.tsx`；各阶段测试只由对应 Vitest 门禁执行，不得把未来阶段 tests 全量并入产品 build。\n' +
     '- greenfield 项目的 HIGH_LEVEL_DESIGN 必须输出 `package.json`、`tsconfig.json` 与模块测试；CODE 阶段输出产品源码、单元测试计划与可执行单元测试，不再补写基础工程配置。\n' +
-    '- `devDependencies` 使用 `typescript`、`tsx`、`vitest`、`@types/node`；禁止新增或要求 `jest`、`ts-jest`、`@types/jest`、`ts-node`、`nodemon`。\n' +
+    '- `devDependencies` 使用 `typescript`、`tsx`、`vitest`、`@vitest/coverage-v8`、`@types/node`，Vitest 与 coverage provider 使用兼容版本；禁止新增或要求 `jest`、`ts-jest`、`@types/jest`、`ts-node`、`nodemon`。\n' +
     '- 本地源码导入必须使用显式 `.ts` ESM specifier，代码需兼容 Node 原生 TypeScript type stripping。\n' +
     '- 时间相关测试必须冻结系统时钟或从当前时钟推导预期值；禁止一边调用 `new Date()` 一边硬编码年份。';
   return steps.map((step) => {
@@ -1153,10 +1153,10 @@ function isProjectShapeAmbiguous(text: string): boolean {
 }
 
 function isProjectShapeClarification(question: ClarifyQuestion): boolean {
-  const text = `${question.question}\n${question.why}`.toLowerCase();
+  const text = `${question.question}\n${question.why}\n${question.options.map((option) => option.answer).join('\n')}`.toLowerCase();
   return (
     /api[- ]?library|public api|reusable api|client library|sdk|package|library|runnable app|application|cli|service|mixed/u.test(text) ||
-    /api\s*(库|客户端|能力)|公共\s*api|可复用接口|库项目|软件包|开发包|可运行|应用|命令行|服务|混合/u.test(question.question)
+    /api\s*(库|客户端|能力)|公共\s*api|可复用接口|库项目|软件包|开发包|可运行|应用|命令行|服务|混合/u.test(text)
   );
 }
 

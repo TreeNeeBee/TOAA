@@ -5,7 +5,7 @@ import type { Workspace } from '../workspace/workspace.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
 import type { Language } from '../core/plan.js';
-import type { Sandbox, SandboxLimits, ExecResult, ExecExtra } from './types.js';
+import type { Sandbox, SandboxBuildOptions, SandboxLimits, ExecResult, ExecExtra } from './types.js';
 import { normalizeTypeScriptTestArgs } from './test_args.js';
 import { resolveTypeScriptProgramCommand } from './program_args.js';
 import { createInstallProgressWatch, execRaw, formatExecFailure, sanitizeVenvName } from './subprocess.js';
@@ -103,12 +103,15 @@ export class DockerSandbox implements Sandbox {
    * 1. 哈希依赖清单 → 命中缓存（venv/node_modules 存在 + sha 一致）则直接返回；
    * 2. 否则起一次性容器，在 bind-mount 的工程目录内安装依赖。
    */
-  async build(manifestFile?: string): Promise<{ rebuilt: boolean; reason: string }> {
+  async build(
+    manifestFile?: string,
+    options?: SandboxBuildOptions,
+  ): Promise<{ rebuilt: boolean; reason: string }> {
     await this.assertDocker();
     const sandboxAbs = this.opts.ws.abs(this.sandboxRel);
     await fs.mkdir(sandboxAbs, { recursive: true });
     if (this.language === 'typescript') {
-      return this.buildNode(manifestFile ?? 'package.json');
+      return this.buildNode(manifestFile ?? 'package.json', options);
     }
     return this.buildPython(manifestFile ?? 'requirements.txt');
   }
@@ -175,14 +178,17 @@ export class DockerSandbox implements Sandbox {
     return { rebuilt: true, reason: venvExists ? 'requirements changed' : 'venv created' };
   }
 
-  private async buildNode(manifestFile: string): Promise<{ rebuilt: boolean; reason: string }> {
+  private async buildNode(
+    manifestFile: string,
+    options?: SandboxBuildOptions,
+  ): Promise<{ rebuilt: boolean; reason: string }> {
     const pkgAbs = this.opts.ws.abs(manifestFile);
     const pkgContent = await fs.readFile(pkgAbs, 'utf8').catch(() => '');
     if (!pkgContent) {
       return { rebuilt: false, reason: 'no package.json yet' };
     }
     const lockContent = await fs.readFile(this.opts.ws.abs('package-lock.json'), 'utf8').catch(() => '');
-    const sig = crypto.createHash('sha256').update(this.image + '\n' + pkgContent + '\n' + lockContent).digest('hex');
+    const sig = dockerNodeDependencySignature(this.image, pkgContent, lockContent);
     const cacheAbs = this.opts.ws.abs(this.cacheRel);
     const cached = await fs.readFile(cacheAbs, 'utf8').catch(() => '');
     const modulesExist = await fs
@@ -200,7 +206,7 @@ export class DockerSandbox implements Sandbox {
       }
     }
 
-    const installCommand = lockContent.trim()
+    const installCommand = lockContent.trim() && !options?.refreshLockfile
       ? 'npm ci --ignore-scripts --no-audit --no-fund'
       : 'npm install --ignore-scripts --no-audit --no-fund';
     const progressWatch = createInstallProgressWatch(
@@ -228,7 +234,39 @@ export class DockerSandbox implements Sandbox {
     if (r.exitCode !== 0) {
       throw new Error(formatExecFailure(`docker sandbox build failed (image=${this.image}, cwd=${this.opts.ws.root})`, r));
     }
-    await fs.writeFile(cacheAbs, sig, 'utf8');
+    if (options?.refreshLockfile) {
+      const validationCommand = 'npm ci --dry-run --ignore-scripts --no-audit --no-fund';
+      await this.opts.audit?.event(
+        'sandbox.exec',
+        t().sandboxLog.command('docker', validationCommand),
+        { messageId: 'sandbox.command', cwd: this.opts.ws.root, image: this.image },
+      );
+      const validation = await execRaw(
+        this.dockerBin,
+        [
+          'run',
+          '--rm',
+          '-v',
+          `${this.opts.ws.root}:${this.workdir}`,
+          '-w',
+          this.workdir,
+          ...this.extraRunArgs,
+          this.image,
+          'bash',
+          '-lc',
+          validationCommand,
+        ],
+      );
+      if (validation.exitCode !== 0) {
+        throw new Error(formatExecFailure(
+          `docker npm lockfile validation failed after dependency update (image=${this.image}, cwd=${this.opts.ws.root})`,
+          validation,
+        ));
+      }
+    }
+    const finalLockContent = await fs.readFile(this.opts.ws.abs('package-lock.json'), 'utf8').catch(() => '');
+    const finalSignature = dockerNodeDependencySignature(this.image, pkgContent, finalLockContent);
+    await fs.writeFile(cacheAbs, finalSignature, 'utf8');
     await this.opts.audit?.event('sandbox.exec', t().sandboxLog.dockerNodeBuilt, {
       messageId: 'sandbox.docker_node_built', image: this.image,
     });
@@ -341,4 +379,8 @@ export class DockerSandbox implements Sandbox {
     }
     return `${this.workdir}/${p.replaceAll('\\', '/')}`;
   }
+}
+
+function dockerNodeDependencySignature(image: string, packageJson: string, lockfile: string): string {
+  return crypto.createHash('sha256').update(image + '\n' + packageJson + '\n' + lockfile).digest('hex');
 }

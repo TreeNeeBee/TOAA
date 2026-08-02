@@ -53,6 +53,24 @@ describe('Planner.clarify — multi-dimensional quality gate', () => {
     expect(questions[4]?.category).toBe('quality');
   });
 
+  it('recognizes project-shape clarification from prioritized option answers', async () => {
+    const questionsWithProjectShapeOptions = standardQuestions.map((question) => ({ ...question }));
+    questionsWithProjectShapeOptions[3] = {
+      id: 'Q4',
+      category: 'boundary',
+      question: '你希望这个程序最终以什么形态交付给使用者？',
+      why: '这会决定项目结构和交付边界。',
+      options: [
+        { label: 'A', answer: '作为可直接运行的 CLI 应用交付。' },
+        { label: 'B', answer: '作为可复用的 API library 软件包交付。' },
+        { label: 'C', answer: '采用应用与公共 API 并存的混合形态。' },
+      ],
+    };
+
+    const p = new Planner(fakeLLM(JSON.stringify(questionsWithProjectShapeOptions)));
+    await expect(p.clarify('Build a customer lookup capability.')).resolves.toHaveLength(7);
+  });
+
   it('rejects empty or underspecified question sets so fallback can regenerate them', async () => {
     await expect(new Planner(fakeLLM('[]')).clarify('x')).rejects.toThrow(/no questions/);
     await expect(

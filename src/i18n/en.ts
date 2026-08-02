@@ -88,7 +88,7 @@ Output JSON shape:
       "dependsOn": [],
       "acceptance": "string",
       "qualityGate": { "completionMin": 0.95, "upstreamAlignmentMin": 0.95, "metrics": {}, "tolerance": { "metricShortfall": 0.02, "maxFailedTests": 0, "maxSkippedTests": 0, "maxWarnings": 0 } },
-      "maxRetries": 3
+      "maxAttempts": 3
     }
   ]
 }`;
@@ -301,7 +301,7 @@ Strict output ownership:
 - REQUIREMENT_ANALYSIS owns functional tests; HIGH_LEVEL_DESIGN owns module tests and architectureModules.testPaths; DETAILED_DESIGN owns integration tests; CODE owns unit tests plus product source/runtime assets.
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST consume those tests as inputs and output validation reports/delivery docs only.
 - For greenfield TypeScript, exactly one HIGH_LEVEL_DESIGN Step must output package.json with scripts, dependencies, and devDependencies. CODE must not output package.json.
-- For TypeScript package.json, use Vitest only: "test": "vitest run", "build": "tsc --noEmit", devDependencies include typescript/tsx/vitest/@types/node. Do not mention or request Jest, ts-jest, @types/jest, ts-node, or nodemon.
+- For TypeScript package.json, use Vitest only: "test": "vitest run", "build": "tsc --noEmit", and include typescript/tsx/vitest/@vitest/coverage-v8/@types/node in devDependencies with compatible Vitest/provider versions. Scope tsconfig product build/typecheck to src/**/*.ts and src/**/*.tsx; each V-model test Step runs only its paired tests through Vitest. Do not mention or request Jest, ts-jest, @types/jest, ts-node, or nodemon.
 
 Return only the current phase's dependencies, architectureModules, and steps. Complex or multi-concern work must declare architectureModules for the current phase and map module-level work under HIGH_LEVEL_DESIGN/CODE/MODULE_TEST subTasks. Each Step's subTasks may nest at most two levels.
 
@@ -320,7 +320,7 @@ Return strict JSON only:
     { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
-    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
+    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxAttempts": 3 }
   ]
 }
 
@@ -335,7 +335,11 @@ const messages: Messages = {
     coderDebuggerSameModel: (model, coderProvider, debuggerProvider) =>
       `Model configuration advice: Coder (${coderProvider}) and Debugger (${debuggerProvider}) both use ${model}. Prefer different models so debugging provides an independent reasoning path.`,
     invalidBaseUrl: (raw, fallback) => `[xcompiler] invalid base_url (${raw}); configure a valid HTTP(S) URL (default: ${fallback})`,
-    providerValidationFailed: (role, model) => `[${role}] provider ${model} failed output contract validation; returning to caller`,
+    providerValidationFailed: (role, model) => `[${role}] provider ${model} failed output contract validation`,
+    providerValidationRetry: (role, model) => `[${role}] retrying provider ${model} with contract feedback before fallback`,
+    providerValidationRepairPrompt: (error) =>
+      `Your previous output failed the caller contract: ${error.slice(0, 1800)}\n` +
+      'Correct the complete response using the original system and user requirements. Return only the requested format without explanation or Markdown.',
     providerCallFailed: (role, model) => `[${role}] provider ${model} failed; trying next`,
     scoreReadFailed: (p, message) => `failed to read ${p}: ${message}`,
     scoreChanged: (provider, score, previous) => `score(${provider}) = ${score} (was ${previous})`,
@@ -434,7 +438,7 @@ const messages: Messages = {
   cli: {
     rootDescription: 'XCompiler — AI Software Factory CLI',
     compileDescription: 'Interactively compile a requirement into phasePlan.json and the current phase plan (with mandatory human gates)',
-    runDescription: 'Execute a confirmed phasePlan.json (supports phased runs: --phase / --from)',
+    runDescription: 'Execute the current canonical Phase from a confirmed phasePlan.json',
     loadDescription: 'Load a XXX.xc project file and continue its current plan',
     appendDescription: 'Append a new requirement to an existing XXX.xc project through clarification and V-model execution',
     lsDescription: 'Scan workspace and list every phasePlan.json status summary',
@@ -450,9 +454,6 @@ const messages: Messages = {
     optYes: 'skip human confirmation (only meaningful with -i / -t)',
     optForce: 'force regenerate: override workspace lock and ignore existing plan files',
     optDryRun: 'print topology only, do not execute',
-    optFrom: 'start from the given Step (earlier ones are skipped)',
-    optPhase: 'execute only the given V-model phase (REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN/CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST)',
-    optReset: 'reset all Step status to PENDING',
     optMaxDepth: 'maximum recursion depth',
     optTail: 'number of recent audit entries',
     optPlan: 'phasePlan.json path, default <workspace>/phasePlan.json',
@@ -597,17 +598,17 @@ const messages: Messages = {
     secOutputs: '— outputs —',
     secRecentAudit: (n) => `— recent audit (${n}) —`,
     planHeader: (p, language) => `${p} lang=${language}`,
-    planStatusSummary: (total, done, pending, failed, running) =>
-      `steps=${total} done=${done} pending=${pending} failed=${failed} running=${running}`,
+    planStatusSummary: (total, done, ready, blocked, running) =>
+      `steps=${total} done=${done} ready=${ready} blocked=${blocked} running=${running}`,
     planReadFailed: (p, message) => `${p} — ${message}`,
-    stepHeader: (id, phase, title, status, retries, maxRetries) => `${id} ${phase} ${title} ${status} retries=${retries}/${maxRetries}`,
+    stepHeader: (id, phase, title, state, attempts, maxAttempts) => `${id} ${phase} ${title} ${state} attempts=${attempts}/${maxAttempts}`,
     stepRoleTools: (role, tools) => `role=${role} tools=[${tools}]`,
     stepDependsOn: (ids) => `dependsOn: ${ids}`,
     outputStatus: (exists, p) => `${exists ? '✓' : '✗'} ${p}`,
     auditEntry: (ts, kind, message) => `${ts} ${kind} ${message}`,
   },
   execute: {
-    forceReset: '--force: resetting every Step to PENDING and overriding the workspace lock.',
+    forceLockOverride: '--force: overriding the workspace process lock; domain lifecycle state is unchanged.',
     manifestRecalibrated: (p) => `recalibrated ${p} (removed version pins / hallucinated names)`,
     manifestSeeded: (p) => `seeded ${p} from plan.dependencies`,
     auditPlanLoaded: (p) => `plan loaded: ${p}`,
@@ -619,8 +620,6 @@ const messages: Messages = {
     runReasonLabel: '  reason: ',
     runFailureLogHeader: '  --- failure log (tail, 40 lines) ---',
     runAllDone: (e, total) => `Plan fully completed (${e}/${total})`,
-    runPartialDone: (e, total, remaining) =>
-      `requested scope completed (${e}/${total}); plan remains incomplete: ${remaining}`,
     projectAuditSummary: (errors, warnings) => `project audit: ${errors} error(s), ${warnings} warning(s)`,
     projectMemoryRefreshFailed: (message) => `project memory refresh failed: ${message}`,
     projectAuditCheck: (name, summary) => `[audit:${name}] ${summary}`,
@@ -639,21 +638,6 @@ const messages: Messages = {
       `${name} failed (exit=${exitCode}${timedOut ? ', timeout' : ''})`,
   },
   engine: {
-    spinSandboxBuild: (profile) =>
-      profile.id === 'typescript'
-        ? `building sandbox (npm install, ${profile.manifestFile})…`
-        : `building sandbox (pip install -r ${profile.manifestFile})…`,
-    sandboxReady: (r) => `sandbox ready: ${r}`,
-    stepSkipDone: (id, phase) => `  ↪ ${id} ${phase} already done, skipping`,
-    spinSandboxRebuild: (id, profile) =>
-      profile.id === 'typescript'
-        ? `Step ${id} wrote ${profile.manifestFile} — rebuilding npm sandbox…`
-        : `Step ${id} wrote ${profile.manifestFile} — rebuilding pip sandbox…`,
-    sandboxStatus: (r) => `sandbox: ${r}`,
-    autoFixedSrcImports: (n, files) => `  ⚠ auto-fixed sys.path bootstrap in ${n} entry file(s): ${files}`,
-    debugResumeNotice: (id, n) => `  ↻ ${id} previous session ended FAILED (${n} attempts so far); first round of this run goes straight into Debugger mode.`,
-    cachedTestRevalidationNotice: (id, n) =>
-      `  ↻ ${id} has a cached FAILED result (${n} attempts so far); rerunning its current test gate before any V-model rollback.`,
     cachedTestGateStart: (id, testArgs) =>
       `  [Engine Gate] ${id} run_tests${testArgs.length > 0 ? `: ${testArgs.join(', ')}` : ': full test suite'}`,
     cachedTestGatePassed: (id) => `  [Engine Gate] ${id} current test gate passed`,
@@ -661,42 +645,6 @@ const messages: Messages = {
       `  [Engine Gate] ${id} current test gate failed (exit=${exitCode}${timedOut ? ', timeout' : ''})`,
     cachedTestArtifactsIncomplete: (id, missing) =>
       `  [Engine Gate] ${id} has incomplete phase artifacts; repairing this test phase: ${missing.join(', ')}`,
-    testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
-      `  ↳ ${testId} ${testPhase} gate failed; V-model rollback → ${sourceId} ${sourcePhase} Debugger.`,
-    debugResumeInfraRetry: (id, n) => `  ↻ ${id} previous session only recorded LLM provider/connectivity failures (${n} attempt(s)); clearing the stale debug cache entry and rerunning the step normally.`,
-    enhanceResumeRevalidationNotice: (id, ticketId, n) =>
-      `  ↻ ${id} resumes ${ticketId} after an inspection-only recovery loop (${n} attempt(s)); rerunning incremental quality validation with the existing artifacts.`,
-    spinDebugRetry: (id, attempt, budget, cap, reason) => `🛠  ${id} DEBUG retry ${attempt}/${budget} (cap=${cap}) — ${reason}`,
-    retryException: (a, b, msg) => `retry ${a}/${b} threw: ${msg}`,
-    fixSucceeded: (id, a) => `${id} fix succeeded (retry=${a})`,
-    retryHealthyButFailed: (a, before, b, tag, reason) =>
-      `retry ${a}/${before}→${b} still failing but healthy (expand window) · ${tag} · ${reason}`,
-    retryLowQuality: (a, before, b, tag, reason) =>
-      `retry ${a}/${before}→${b} low-quality output (shrink window) · ${tag} · ${reason}`,
-    retryStillFailed: (a, b, tag, reason) =>
-      `retry ${a}/${b} still failing · ${tag} · ${reason}`,
-    earlyAbortLowQuality: (id, n) => `  ⚡ ${id} ${n} consecutive low-quality rounds — early-aborting DEBUG retries`,
-    stepFinalFailed: (id, phase, role) => `✖ Step ${id} (${phase} / ${role}) finally failed`,
-    finalAttemptsLine: (a, b, c, ea) =>
-      `  attempts=${a}  final_budget=${b}  cap=${c}` + (ea ? '  (early-abort: low-quality)' : ''),
-    finalMetricsLine: (h, p, r, tf, pr) =>
-      `  health=${h}  parseFail=${p}  repeat=${r}  toolFail=${tf}  progress=${pr}`,
-    reasonLabel: 'reason: ',
-    failureLogHeader: '--- failure log (tail, max 80 lines) ---',
-    fixSuggestionsHeader: '--- fix suggestions (calibration) ---',
-    auditHint: (id) => `  audit: see .xcompiler/audit.jsonl and .xcompiler/llm-stream/${id}-*.txt for the raw stream`,
-    spinStepRunning: (id, phase, title) => `▶ ${id} ${phase} ${title}`,
-    noFailureLog: '(no log captured)',
-    suggestionLine: (index, code, hint) => `  ${index}. [${code}] ${hint}`,
-    phaseStart: (id, phase, title) => `${id} ${phase} ${title}`,
-    phaseFailed: (id, debug, reason) => `${id} ${debug ? 'DEBUG ' : ''}FAILED — ${reason}`,
-    phaseDone: (id, rounds) => `${id} DONE (rounds=${rounds})`,
-    phaseException: (id, message) => `${id} FAILED (exception) — ${message}`,
-    archGateReason: (missing) => `HIGH_LEVEL_DESIGN gate: architecture contract missing ${missing} token(s)`,
-    archGateMissing: (tokens) => `missing module ids/paths: ${tokens}`,
-    archGateInstruction: (p) => `Update ${p} so every architectureModules item is traceable before CODE starts.`,
-    testGateReason: (exitCode, timedOut) => `Test gate: tests exit=${exitCode}${timedOut ? ' (timeout)' : ''}`,
-    deliveryGateReason: (command, exitCode, timedOut) => `FUNCTIONAL_TEST gate: \`${command}\` exit=${exitCode}${timedOut ? ' (timeout)' : ''}`,
     missingPythonEntrypoint:
       'missing Python entrypoint: expected src/main.py, src/<package>/__main__.py, or an explicit CLI file such as src/cli.py',
     missingTypeScriptEntrypoint:
@@ -705,34 +653,6 @@ const messages: Messages = {
       `invalid Python entrypoint source in ${path}: expected a real CLI entry structure such as def main(...), argparse.ArgumentParser, or if __name__ == "__main__"; placeholder/import-only files are not runnable applications.`,
     entrypointHelpOutputMissing: (command) =>
       `entrypoint probe \`${command}\` exited 0 but produced no meaningful help/usage text; implement --help instead of relying on an empty script exit.`,
-    reasonLine: (reason) => `reason: ${reason}`,
-    roundsLine: (rounds) => `rounds: ${rounds}`,
-    commandLine: (command) => `command: ${command}`,
-    stdoutTailHeader: '--- stdout (tail) ---',
-    stderrTailHeader: '--- stderr (tail) ---',
-    testStdoutTailHeader: '--- test stdout (tail) ---',
-    testStderrTailHeader: '--- test stderr (tail) ---',
-    outputsMissing: (paths) => `outputs missing: ${paths}`,
-    metricsLine: (health, parseFail, repeat, toolFail, progress) =>
-      `metrics: health=${health} parseFail=${parseFail} repeat=${repeat} toolFail=${toolFail} progress=${progress}`,
-    metricsUnavailable: 'metrics: (n/a)',
-    toolCallsHeader: 'tool calls:',
-    toolCallLine: (tool, ok, detail) => `  - ${tool} ${ok ? 'OK' : 'FAIL'} ${detail}`,
-    projectMemoryRefreshFailed: (message) => `project memory refresh failed: ${message}`,
-    deliveryFixHints: (language) => language === 'typescript'
-      ? [
-          'Fix directions (priority order):',
-          '  1. For module resolution / ERR_MODULE_NOT_FOUND in TypeScript source, use relative ESM imports with explicit .ts specifiers.',
-          '  2. For --help / unknown option, main() must support --help and exit 0.',
-          '  3. For application exceptions, fix the implementation and keep the entrypoint thin.',
-        ]
-      : [
-          'Fix directions (priority order):',
-          '  1. For ModuleNotFoundError involving src, add the planner #19 sys.path bootstrap or remove the src. import prefix.',
-          '  2. main() must be a real CLI entrypoint: parse --help, call the project modules, print meaningful output, and use if __name__ == "__main__": main().',
-          '  3. For argparse errors, main() must support --help without other required arguments and exit 0.',
-          '  4. For business exceptions, fix the implementation and keep the entrypoint limited to parsing and dispatch.',
-        ],
   },
   render: {
     sectionGlobalPrompt: '## Global prompt (injected into every Step\'s system prompt)',
@@ -964,7 +884,9 @@ Return strict JSON StepPlan for the current phase only.`,
     ollamaModelOk: (provider, model) => `provider "${provider}": model "${model}" available`,
     openaiKeyMissing: (provider) => `provider "${provider}": api_key empty (set the provider env var such as OPENROUTER_API_KEY, or config.llm.providers.${provider}.api_key)`,
     openaiReachable: (provider, baseUrl) => `provider "${provider}": OpenAI endpoint reachable @ ${baseUrl}`,
-    openaiUnreachable: (provider, baseUrl, msg) => `provider "${provider}": OpenAI endpoint unreachable @ ${baseUrl} — ${msg}`,
+    openaiUnreachable: (provider, baseUrl, msg) => `provider "${provider}": OpenAI /models check failed @ ${baseUrl} — ${msg}`,
+    openaiModelListUnavailable: (provider, status) =>
+      `provider "${provider}": endpoint is reachable but does not expose /models (HTTP ${status}); model membership was not verified`,
     openaiModelListMissing: (provider, model) =>
       `provider "${provider}": model "${model}" not in /models response (it may still work if your account has access)`,
     providerScoreZero: (provider) => `provider "${provider}" disabled (score=0)`,
@@ -976,15 +898,16 @@ Return strict JSON StepPlan for the current phase only.`,
     sandboxFullNoPorts:
       'network=full but no expose_ports configured — host-side cannot reach container services. ' +
       'Add `agent.sandboxes.<language>.<local|docker>.limits.expose_ports: [<port>]` in config.yaml.',
-    sandboxNodeMissing: 'node not found on PATH (required by TypeScript subprocess sandbox)',
+    sandboxNodeMissing: (detail) => `node unavailable (required by TypeScript subprocess sandbox): ${detail}`,
     sandboxNodeOk: (version) => `node OK (${version})`,
-    sandboxNpmMissing: 'npm not found on PATH (required by TypeScript subprocess sandbox)',
+    sandboxNpmMissing: (detail) => `npm unavailable (required by TypeScript subprocess sandbox): ${detail}`,
     sandboxNpmOk: (version) => `npm OK (${version})`,
-    sandboxNpxMissing: 'npx not found on PATH (required by TypeScript subprocess sandbox)',
+    sandboxNpxMissing: (detail) => `npx unavailable (required by TypeScript subprocess sandbox): ${detail}`,
     sandboxNpxOk: (version) => `npx OK (${version})`,
-    sandboxPythonMissing: 'python3 not found on PATH (required by subprocess sandbox)',
+    sandboxPythonMissing: (detail) => `python3 unavailable (required by subprocess sandbox): ${detail}`,
     sandboxPythonOk: (version) => `python3 OK (${version})`,
-    sandboxVenvMissing: 'python3 venv module unavailable (install python3-venv / python3-virtualenv)',
+    sandboxVenvMissing: (detail) =>
+      `python3 venv module unavailable (install python3-venv / python3-virtualenv): ${detail}`,
     sandboxVenvOk: 'python3 venv module OK',
     sandboxDockerMissing: (bin) => `docker binary "${bin}" not found on PATH`,
     sandboxDockerOk: (version) => `docker OK (${version})`,

@@ -19,7 +19,7 @@ const baseStep = (over: Partial<Step>): Step =>
     outputs: ['docs/01-requirement-analysis.md'],
     dependsOn: [],
     acceptance: 'ok',
-    maxRetries: 3,
+    maxAttempts: 3,
     ...over,
   }) as Step;
 

@@ -2,7 +2,9 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { DEFAULT_PHASE_PLAN_FILE } from '../core/phase_plan.js';
 import { loadPlanTarget } from '../core/storage.js';
-import type { Plan, Step } from '../core/plan.js';
+import type { Step } from '../domain/steps/step.js';
+import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
+import { Workspace } from '../workspace/workspace.js';
 
 export interface LsOptions {
   workspace: string;
@@ -13,8 +15,8 @@ export interface LsOptions {
 export interface PlanSummary {
   total: number;
   done: number;
-  failed: number;
-  pending: number;
+  blocked: number;
+  ready: number;
   running: number;
 }
 
@@ -41,12 +43,15 @@ export async function runLsCommand(opts: LsOptions): Promise<LsResult> {
     try {
       const loaded = await loadPlanTarget(file);
       const plan = loaded.plan;
+      const repository = new DomainObjectRepository(new Workspace(path.dirname(file)));
+      await repository.load();
+      const project = await repository.findProject();
       const digest = plan.requirementDigest?.split('\n')[0]?.slice(0, 100);
       plans.push({
         path: file,
         relativePath,
         language: plan.language,
-        summary: summarizePlan(plan),
+        summary: project ? await summarizeProject(repository, project.id) : undefined,
         requirementDigestLine: digest || undefined,
       });
     } catch (err) {
@@ -94,8 +99,13 @@ export async function runShowCommand(opts: ShowOptions): Promise<ShowResult> {
   const requestedPlanPath = opts.planPath ? path.resolve(opts.planPath) : await defaultInspectPlanPath(root);
   const loaded = await loadPlanTarget(requestedPlanPath);
   const planPath = loaded.planPath;
-  const plan = loaded.plan;
-  const step = plan.steps.find((s) => s.id === opts.stepId);
+  const repository = new DomainObjectRepository(new Workspace(root));
+  await repository.load();
+  const domainSteps = (await repository.list({ objectType: 'step' }))
+    .filter((object): object is Step => object.objectType === 'step');
+  const step = domainSteps.find((candidate) =>
+    candidate.id === opts.stepId || candidate.name.toUpperCase() === opts.stepId.toUpperCase(),
+  );
   if (!step) {
     return {
       root,
@@ -112,7 +122,10 @@ export async function runShowCommand(opts: ShowOptions): Promise<ShowResult> {
     outputs.push({ path: out, exists: await fileExists(path.join(root, out)) });
   }
   const auditFile = path.join(root, '.xcompiler', 'audit.jsonl');
-  const auditEvents = await readAuditFor(auditFile, opts.stepId, opts.auditTail ?? 10);
+  const auditEvents = (await Promise.all([
+    readAuditFor(auditFile, step.id, opts.auditTail ?? 10),
+    readAuditFor(auditFile, step.name, opts.auditTail ?? 10),
+  ])).flat().sort((left, right) => left.ts.localeCompare(right.ts)).slice(-(opts.auditTail ?? 10));
   return {
     root,
     planPath: loaded.phasePlanPath ?? planPath,
@@ -124,15 +137,20 @@ export async function runShowCommand(opts: ShowOptions): Promise<ShowResult> {
   };
 }
 
-export function summarizePlan(plan: Plan): PlanSummary {
-  const acc: PlanSummary = { total: plan.steps.length, done: 0, failed: 0, pending: 0, running: 0 };
-  for (const s of plan.steps) {
-    if (s.status === 'DONE') acc.done++;
-    else if (s.status === 'FAILED') acc.failed++;
-    else if (s.status === 'RUNNING') acc.running++;
-    else acc.pending++;
+export async function summarizeProject(
+  repository: DomainObjectRepository,
+  projectId: import('../domain/identity/object_id.js').ObjectId,
+): Promise<PlanSummary> {
+  const steps = (await repository.list({ objectType: 'step', projectId }))
+    .filter((object): object is Step => object.objectType === 'step');
+  const summary: PlanSummary = { total: steps.length, done: 0, blocked: 0, ready: 0, running: 0 };
+  for (const step of steps) {
+    if (step.state === 'closed' || step.state === 'delivered') summary.done += 1;
+    else if (step.state === 'pending') summary.blocked += 1;
+    else if (step.state === 'in_progress') summary.running += 1;
+    else summary.ready += 1;
   }
-  return acc;
+  return summary;
 }
 
 export async function findPlans(root: string, maxDepth: number): Promise<string[]> {

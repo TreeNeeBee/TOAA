@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 export class Workspace {
@@ -16,6 +17,19 @@ export class Workspace {
     const full = this.abs(rel);
     await fs.mkdir(path.dirname(full), { recursive: true });
     await fs.writeFile(full, content, 'utf8');
+  }
+
+  async writeFileAtomic(rel: string, content: string): Promise<void> {
+    const full = this.abs(rel);
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    const temporary = `${full}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, content, 'utf8');
+      await fs.rename(temporary, full);
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async appendFile(rel: string, content: string): Promise<void> {

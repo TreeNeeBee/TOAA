@@ -38,6 +38,43 @@ function buildRunSummary(
   return s;
 }
 
+function extractVitestEvidence(stdout: string): string[] {
+  const lines = stdout
+    .replaceAll('\r', '')
+    .split('\n');
+  const evidence: string[] = [];
+  const tests = lines.find((line) => /^\s*Tests\s+/u.test(line));
+  if (tests) evidence.push(tests.trim().replaceAll(/\s+/gu, ' '));
+  const coverage = lines.find((line) => /^\s*All files\s*\|/u.test(line));
+  if (coverage) {
+    const columns = coverage.split('|').map((value) => value.trim());
+    if (columns.length >= 5) {
+      evidence.push(
+        `coverage statements=${columns[1]}% branches=${columns[2]}% functions=${columns[3]}% lines=${columns[4]}%`,
+      );
+    }
+  }
+  const lowCoverageFiles: string[] = [];
+  let directory = '';
+  for (const line of lines) {
+    const columns = line.split('|').map((value) => value.trim());
+    if (columns.length < 5 || !/^\d+(?:\.\d+)?$/u.test(columns[4] ?? '')) continue;
+    const label = columns[0] ?? '';
+    if (!label.includes('.')) {
+      if (label.startsWith('src')) directory = label;
+      continue;
+    }
+    const lineCoverage = Number(columns[4]);
+    if (lineCoverage >= 80) continue;
+    const file = directory && !label.startsWith('src/') ? `${directory}/${label}` : label;
+    lowCoverageFiles.push(`${file}=${lineCoverage}%`);
+  }
+  if (lowCoverageFiles.length > 0) {
+    evidence.push(`low-coverage files: ${lowCoverageFiles.slice(0, 8).join(', ')}`);
+  }
+  return evidence;
+}
+
 export const runProgramTool: Tool<
   { args: string[]; cwd?: string; timeoutMs?: number },
   { exitCode: number; stdout: string; stderr: string; timedOut: boolean }
@@ -71,6 +108,7 @@ export const runTestsTool: Tool<
   name: 'run_tests',
   description:
     '在沙盒内运行测试套件（Python: pytest；TypeScript: npm test / Vitest），可指定额外参数。' +
+    'TypeScript UNIT_TEST 门禁会自动启用覆盖率采集，无需重复传 --coverage。' +
     '失败时 summary 自动附带 stderr/stdout 末尾若干行，调用方可直接据此修复。',
   argsSchema: { args: 'string[]?', cwd: 'string?', timeoutMs: 'number?' },
   async run(args, ctx) {
@@ -82,11 +120,15 @@ export const runTestsTool: Tool<
       : requestedArgs;
     const hasExplicitTestSelector =
       ctx.language === 'typescript' && requestedEffectiveArgs.some((arg) => !arg.startsWith('-'));
+    const defaultTestArgs = ctx.defaultTestArgs ?? [];
+    const scopedDefaultArgs = requestedEffectiveArgs.some(isCoverageArgument)
+      ? defaultTestArgs.filter((arg) => !isCoverageArgument(arg))
+      : defaultTestArgs;
     const runArgs =
       ctx.language === 'typescript' && ctx.defaultTestArgs?.length && !hasExplicitTestSelector
-        ? [...ctx.defaultTestArgs, ...requestedEffectiveArgs]
-        : requestedEffectiveArgs.length === 0 && ctx.defaultTestArgs?.length
-          ? ctx.defaultTestArgs
+        ? [...scopedDefaultArgs, ...requestedEffectiveArgs]
+      : requestedEffectiveArgs.length === 0 && ctx.defaultTestArgs?.length
+          ? scopedDefaultArgs
           : requestedEffectiveArgs;
     const r = await ctx.sandbox.runTests(runArgs, { cwd: cwd.abs, timeoutMs: args.timeoutMs });
     const networkFailure = detectNetworkApiFailureInExec(r);
@@ -97,6 +139,7 @@ export const runTestsTool: Tool<
       r.timedOut ? '(timeout)' : '',
       runArgs.length > 0 ? `args=${runArgs.join(' ')}` : '',
     ].filter(Boolean).join(' ');
+    const successEvidence = ctx.language === 'typescript' ? extractVitestEvidence(r.stdout) : [];
     return {
       ok: passed,
       data: {
@@ -107,11 +150,15 @@ export const runTestsTool: Tool<
         passed,
       },
       summary: passed
-        ? base
+        ? [base, ...successEvidence].join('\n')
         : buildRunSummary(networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base, r),
     };
   },
 };
+
+function isCoverageArgument(arg: string): boolean {
+  return arg === '--coverage' || arg.startsWith('--coverage.');
+}
 
 async function resolveSandboxCwd(
   ctx: ToolContext,

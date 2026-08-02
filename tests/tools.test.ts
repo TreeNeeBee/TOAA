@@ -113,6 +113,25 @@ describe('write_file tool', () => {
     expect(result.summary).toContain('unchanged');
   });
 
+  it('requires patch tools for existing files in incremental Ticket modes', async () => {
+    await ws.writeFile('src/existing.ts', 'export const value = 1;\n');
+    ctx.preserveExistingFiles = true;
+
+    const denied = await writeFileTool.run(
+      { path: 'src/existing.ts', content: 'export const value = 2;\n' },
+      ctx,
+    );
+    const created = await writeFileTool.run(
+      { path: 'src/new-increment.ts', content: 'export const value = 2;\n' },
+      ctx,
+    );
+
+    expect(denied).toMatchObject({ ok: false });
+    expect(denied.error).toContain('incremental write denied');
+    expect(await ws.readFile('src/existing.ts')).toContain('value = 1');
+    expect(created).toMatchObject({ ok: true });
+  });
+
   it('uses explicit per-step chunk limits for write_file and append_file', async () => {
     ctx.writeChunkBytes = 16;
     const tooLarge = await writeFileTool.run({ path: 'src/big.py', content: 'x'.repeat(17) }, ctx);
@@ -619,6 +638,67 @@ describe('runTestsTool / runPythonTool summary', () => {
     expect(r.ok).toBe(true);
     expect(seenArgs).toEqual(['tests/unit/parser.test.ts', '--reporter=verbose']);
     expect(r.summary).toBe('npm test exit=0 args=tests/unit/parser.test.ts --reporter=verbose');
+  });
+
+  it('returns compact Vitest coverage evidence on a successful test run', async () => {
+    const { runTestsTool } = await import('../src/tools/sandbox.js');
+    const fakeCtx: ToolContext = {
+      ws,
+      sandbox: {
+        async runTests() {
+          return {
+            exitCode: 0,
+            stdout: [
+              ' Test Files  2 passed (2)',
+              '      Tests  5 passed (5)',
+              'File | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s',
+              'All files | 35.12 | 86.66 | 77.77 | 35.12 |',
+              ' src | 0 | 0 | 0 | 0 |',
+              '  cli.ts | 0 | 0 | 0 | 0 | 1-75',
+              ' src/adapters | 0 | 0 | 0 | 0 |',
+              '  rss-adapter.ts | 0 | 0 | 0 | 0 | 1-58',
+            ].join('\n'),
+            stderr: '',
+            timedOut: false,
+            durationMs: 1,
+          };
+        },
+        async runProgram() { throw new Error('not used'); },
+        async installDeps() { throw new Error('not used'); },
+      } as never,
+      allowedWrites: [],
+      stepId: 'S005',
+      language: 'typescript',
+      defaultTestArgs: ['tests/unit/parser.test.ts', '--coverage'],
+    };
+    const r = await runTestsTool.run({}, fakeCtx);
+    expect(r.ok).toBe(true);
+    expect(r.summary).toContain('Tests 5 passed (5)');
+    expect(r.summary).toContain('coverage statements=35.12% branches=86.66% functions=77.77% lines=35.12%');
+    expect(r.summary).toContain('low-coverage files: src/cli.ts=0%, src/adapters/rss-adapter.ts=0%');
+  });
+
+  it('does not duplicate the unit gate coverage flag when the model also requests it', async () => {
+    const { runTestsTool } = await import('../src/tools/sandbox.js');
+    let seenArgs: string[] = [];
+    const fakeCtx: ToolContext = {
+      ws,
+      sandbox: {
+        async runTests(args = []) {
+          seenArgs = args;
+          return { exitCode: 0, stdout: '', stderr: '', timedOut: false, durationMs: 1 };
+        },
+        async runProgram() { throw new Error('not used'); },
+        async installDeps() { throw new Error('not used'); },
+      } as never,
+      allowedWrites: [],
+      stepId: 'S005',
+      language: 'typescript',
+      defaultTestArgs: ['tests/unit/parser.test.ts', '--coverage'],
+    };
+    const r = await runTestsTool.run({ args: ['--coverage'] }, fakeCtx);
+    expect(r.ok).toBe(true);
+    expect(seenArgs).toEqual(['tests/unit/parser.test.ts', '--coverage']);
   });
 
   it('resolves run_tests cwd inside the project and rejects external cwd', async () => {

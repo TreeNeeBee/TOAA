@@ -32,8 +32,6 @@ async function writeCfg(overrides: Record<string, unknown>): Promise<string> {
       role_fallbacks: {},
     },
     agent: {
-      max_steps: 1,
-      max_debug_retries: 1,
       sandboxes: {
         python: { mode: 'subprocess' },
         typescript: { mode: 'subprocess' },
@@ -164,11 +162,33 @@ describe('doctor', () => {
     expect(llm.items.some((i) => i.level === 'fail' && /no live provider/i.test(i.message))).toBe(true);
   });
 
+  it('does not report an unreachable OpenAI provider as live for any role', async () => {
+    const cfgPath = await writeCfg({
+      llm: {
+        providers: {
+          unreachable: {
+            type: 'openai',
+            api_key: '',
+            base_url: 'http://127.0.0.1:1/v1',
+            model: 'missing',
+            connect_timeout_ms: 100,
+          },
+        },
+        roles: allRoles('unreachable'),
+        fallbacks: [],
+        role_fallbacks: {},
+      },
+    });
+    const r = await runDoctor({ configPath: cfgPath, probeTimeoutMs: 100 });
+    const llm = r.sections.find((s) => s.title === '[LLM]')!;
+    expect(llm.items.some((i) => i.level === 'fail' && /models check failed/i.test(i.message))).toBe(true);
+    expect(llm.items.filter((i) => i.level === 'fail' && /no live provider/i.test(i.message))).toHaveLength(5);
+    expect(llm.items.some((i) => i.level === 'ok' && /role .* ->/i.test(i.message))).toBe(false);
+  });
+
   it('checks node/npm/npx prerequisites for TypeScript subprocess sandbox', async () => {
     const cfgPath = await writeCfg({
       agent: {
-        max_steps: 1,
-        max_debug_retries: 1,
         sandboxes: {
           python: { mode: 'subprocess' },
           typescript: { mode: 'subprocess' },

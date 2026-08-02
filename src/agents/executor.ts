@@ -16,9 +16,9 @@ import {
 } from '../core/quality_gate.js';
 import type {
   ChangeRequestTicket,
-  EnhanceTicket,
-  WorkTicket,
-} from '../core/ticket.js';
+  EnhancementTicket,
+  Ticket,
+} from '../domain/tickets/ticket.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
 import type {
   Tool,
@@ -68,6 +68,8 @@ export interface ExecutorOptions {
 
 export interface ExecutorRunInput {
   step: Step;
+  /** Human-readable domain Step name used only for prompts and UI, for example P1-S004. */
+  stepName?: string;
   /** Runtime execution role. Debug retries keep the same source step but execute as Debugger. */
   executionRole?: Step['role'];
   /** 仅暴露给 LLM 的工具子集（已按 step.tools 过滤）。 */
@@ -76,11 +78,11 @@ export interface ExecutorRunInput {
   /** 注入到 user prompt 的额外上下文（如已有 inputs 内容）。 */
   contextSnippets?: Array<{ path: string; content: string }>;
   /** Canonical task handoff for this execution boundary. */
-  ticket?: WorkTicket;
+  ticket?: Ticket;
   /** Active engineering CR. The Step must apply only this delta to the existing baseline. */
   changeRequest?: ChangeRequestTicket;
   /** Active quality-gap remediation. The Step appends only the missing or under-target work. */
-  enhancement?: EnhanceTicket;
+  enhancement?: EnhancementTicket;
   /** 来自 Skill 的提示词，拼接到 system prompt 后。 */
   skillHints?: string[];
   /** debug 模式下传入上一轮失败记录（错误文本 / 失败测试 / 上下文）。 */
@@ -91,6 +93,11 @@ export interface ExecutorRunInput {
     debugBrief?: string;
     suggestions?: string;
     repairRequired?: boolean;
+    verificationScope?: {
+      stepId: string;
+      phase: Step['phase'];
+      testArgs: string[];
+    };
   };
   /** Plan 级别的全局 system prompt（xcompiler build 沉淀）。 */
   globalPrompt?: string;
@@ -246,6 +253,7 @@ export class StepExecutor {
     const failedVerificationAttempts = new Map<string, number>();
     const failedMutationAttempts = new Map<string, number>();
     let mutationGeneration = 0;
+    let verifiedMutationGeneration = 0;
     let actualRounds = 0;
     let consecutiveReadOnlyRounds = 0;
     let consecutiveNoProgressRounds = 0;
@@ -268,9 +276,10 @@ export class StepExecutor {
     const advisoryFailureRules = this.opts.advisoryFailureRules ?? [];
     const providers = new Set<string>();
 
+    const stepLabel = inp.stepName?.trim() || inp.step.id;
     for (let round = 1; round <= roundLimit; round++) {
       const rep = makeStreamReporter(
-        `${inp.step.id} ${role} round ${round}`,
+        `${stepLabel} ${role} round ${round}`,
         this.opts.llm.name,
         { enabled: this.opts.streamOutput === true },
       );
@@ -669,12 +678,13 @@ export class StepExecutor {
           continue;
         }
         const callId = randomUUID();
-        const permission = buildPermissionRequest(a.tool, a.args, inp.step.id, inp.ctx.language);
+        const permission = buildPermissionRequest(a.tool, a.args, inp.step.id, inp.ctx.language, stepLabel);
         if (permission) permission.id = callId;
         await inp.ctx.onToolEvent?.({
           callId,
           status: 'started',
           stepId: inp.step.id,
+          stepName: stepLabel,
           tool: a.tool,
           target: actionTargetPaths(a.tool, a.args).join(', ') || undefined,
           args: a.args,
@@ -702,6 +712,7 @@ export class StepExecutor {
               callId,
               status: 'completed',
               stepId: inp.step.id,
+              stepName: stepLabel,
               tool: a.tool,
               target: permission.target,
               ok: false,
@@ -714,7 +725,7 @@ export class StepExecutor {
           messageId: 'audit.tool_called', stepId: inp.step.id, tool: a.tool, args: a.args,
         });
         const toolReporter = makeStreamReporter(
-          t().stream.toolExecution(inp.step.id, a.tool),
+          t().stream.toolExecution(stepLabel, a.tool),
           t().stream.toolRunner,
           { enabled: this.opts.streamOutput === true },
         );
@@ -744,6 +755,7 @@ export class StepExecutor {
           const verificationKey = `${mutationGeneration}:${verificationActionKey(a)}`;
           if (r.ok) {
             failedVerificationAttempts.delete(verificationKey);
+            verifiedMutationGeneration = mutationGeneration;
           } else {
             const count = (failedVerificationAttempts.get(verificationKey) ?? 0) + 1;
             failedVerificationAttempts.set(verificationKey, count);
@@ -770,6 +782,7 @@ export class StepExecutor {
           callId,
           status: 'completed',
           stepId: inp.step.id,
+          stepName: stepLabel,
           tool: a.tool,
           target: actionTargetPaths(a.tool, a.args).join(', ') || undefined,
           ok: r.ok,
@@ -886,6 +899,7 @@ export class StepExecutor {
         inp.step,
         qualityAssessment,
         qualityAssessmentRound > lastToolActionRound,
+        unresolvedToolFailures.size > 0,
       );
       const supersededContractFailures =
         repairEvidence &&
@@ -896,11 +910,21 @@ export class StepExecutor {
         (V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(inp.step.phase) &&
         qualityAssessmentMissing.length === 0 &&
         hasOnlyUnauthorizedVerificationFailures(unresolvedToolFailures);
+      const reportedQualityGateFailure =
+        turn.done === true &&
+        actions.length === 0 &&
+        verify.ok &&
+        (V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) &&
+        qualityAssessment !== undefined &&
+        qualityAssessment.gaps.length > 0 &&
+        unresolvedToolFailures.size > 0 &&
+        qualityAssessmentMissing.length === 0;
       const unresolvedFailuresOk =
         unresolvedToolFailures.size === 0 ||
         (outputCompletionRecovery && hasOnlyUntargetedToolContractFailures(unresolvedToolFailures)) ||
         supersededContractFailures ||
-        nonBlockingPhaseVerificationFailures;
+        nonBlockingPhaseVerificationFailures ||
+        reportedQualityGateFailure;
       const completionSignal =
         turn.done ||
         verifiedCompletion ||
@@ -1087,34 +1111,54 @@ export class StepExecutor {
         completionSignal &&
         verify.ok &&
         qualityAssessmentMissing.length > 0;
-      const postMutationVerificationRequired = hasUnverifiedSuccessfulMutation(calls);
+      const postMutationVerificationRequired = mutationGeneration > verifiedMutationGeneration;
+      const successfulVerificationThisRound = turnResults.some(
+        (result) => result.ok && COMPLETION_VERIFICATION_TOOLS.has(result.tool),
+      );
+      const productiveExtensionAtLimit =
+        mutationSucceededThisRound ||
+        (
+          repeatedTurns === 0 &&
+          needsQualityHandshake &&
+          successfulVerificationThisRound
+        );
+      const productiveHandshakeAtLimit =
+        needsQualityHandshake &&
+        productiveExtensionAtLimit &&
+        !mutationSucceededThisRound;
       if (
         round >= roundLimit &&
-        roundLimit < hardRoundLimit &&
         (
-          postMutationVerificationRequired ||
-          needsQualityHandshake ||
-          novelDiagnosticProbeRound ||
-          shouldExtendProductiveRun({
-            parseFailures,
-            repeatedTurns,
-            calls,
-            initialMissing,
-            currentMissing: verify.missing.length,
-            consecutiveReadOnlyRounds,
-            unresolvedFailures: unresolvedToolFailures.size,
-          })
+          productiveExtensionAtLimit ||
+          (
+            roundLimit < hardRoundLimit &&
+            (
+              novelDiagnosticProbeRound ||
+              shouldExtendProductiveRun({
+                parseFailures,
+                repeatedTurns,
+                calls,
+                initialMissing,
+                currentMissing: verify.missing.length,
+                consecutiveReadOnlyRounds,
+                unresolvedFailures: unresolvedToolFailures.size,
+                pendingMutation: postMutationVerificationRequired,
+              })
+            )
+          )
         )
       ) {
-        const nextLimit = Math.min(hardRoundLimit, roundLimit + 2);
-        await inp.ctx.audit?.event('note', postMutationVerificationRequired
+        const nextLimit = productiveExtensionAtLimit
+          ? roundLimit + 2
+          : Math.min(hardRoundLimit, roundLimit + 2);
+        await inp.ctx.audit?.event('note', mutationSucceededThisRound
           ? `successful mutation needs verification; extending round budget ${roundLimit}→${nextLimit}`
-          : needsQualityHandshake
+          : productiveHandshakeAtLimit
             ? `verified outputs need quality evidence; extending round budget ${roundLimit}→${nextLimit}`
             : `productive step progress detected; extending round budget ${roundLimit}→${nextLimit}`, {
-          messageId: postMutationVerificationRequired
+          messageId: mutationSucceededThisRound
             ? 'audit.executor_post_mutation_verification_extension'
-            : needsQualityHandshake
+            : productiveHandshakeAtLimit
               ? 'audit.executor_quality_handshake_extension'
               : 'audit.executor_productive_round_extension',
           stepId: inp.step.id,
@@ -1236,7 +1280,7 @@ export class StepExecutor {
         completionSignaled && finalQualityAssessmentMissing.length > 0
           ? `qualityAssessment is incomplete; missing: ${finalQualityAssessmentMissing.join(', ')}`
           :
-        hasUnverifiedSuccessfulMutation(calls)
+        mutationGeneration > verifiedMutationGeneration
           ? 'max rounds exceeded before completion; the latest successful repair has not been followed by a successful verification.'
           : 'max rounds exceeded before completion',
       metrics,
@@ -1501,9 +1545,11 @@ async function automaticCodeDebugVerificationActions(input: {
   if (!input.actions.some((action) => isOutputMutationTool(action.tool))) return [];
   const automatic: LLMAction[] = [];
   const requestedTools = new Set(input.actions.map((action) => action.tool));
+  const hasInheritedTestGate = (input.ctx.defaultTestArgs?.length ?? 0) > 0;
   const hasStaticPrerequisites =
     input.language === 'typescript' || await input.ctx.ws.exists('src');
   if (
+    !hasInheritedTestGate &&
     hasStaticPrerequisites &&
     input.toolMap.has('run_program') &&
     !requestedTools.has('run_program')
@@ -1536,7 +1582,8 @@ function didPerformSuccessfulMutation(action: LLMAction, result: ToolResult): bo
   }
   if (action.tool !== 'add_dependency') return true;
   if (!isPlainRecord(result.data)) return false;
-  return Array.isArray(result.data.added) && result.data.added.length > 0;
+  return (Array.isArray(result.data.added) && result.data.added.length > 0) ||
+    (Array.isArray(result.data.updated) && result.data.updated.length > 0);
 }
 
 function shouldTrackRepeatedMutationFailure(result: ToolResult): boolean {
@@ -1566,32 +1613,19 @@ function shouldExtendProductiveRun(p: {
   currentMissing: number;
   consecutiveReadOnlyRounds: number;
   unresolvedFailures: number;
+  pendingMutation: boolean;
 }): boolean {
   if (p.parseFailures > 0 || p.repeatedTurns > 0 || p.consecutiveReadOnlyRounds >= 2) return false;
   const totalCalls = p.calls.length;
   const failedCalls = p.calls.filter((call) => !call.ok).length;
   const toolFailRatio = totalCalls > 0 ? failedCalls / totalCalls : 0;
-  const pendingMutation = hasUnverifiedSuccessfulMutation(p.calls);
   // A successful repair after a failed verification needs one more round to
   // prove the fix. The next successful verification clears the unresolved test failure.
-  if (pendingMutation && toolFailRatio <= 0.5) return true;
+  if (p.pendingMutation && toolFailRatio <= 0.5) return true;
   if (p.consecutiveReadOnlyRounds > 0) return false;
   if (toolFailRatio > 0.25 || p.unresolvedFailures > 0) return false;
   if (p.initialMissing > 0 && p.currentMissing < p.initialMissing) return true;
-  return pendingMutation;
-}
-
-function hasUnverifiedSuccessfulMutation(calls: ExecutorRunResult['toolCalls']): boolean {
-  let mutationPendingVerification = false;
-  for (const call of calls) {
-    if (!call.ok) continue;
-    if (COMPLETION_VERIFICATION_TOOLS.has(call.tool)) {
-      mutationPendingVerification = false;
-      continue;
-    }
-    if (isRepairEvidenceTool(call.tool)) mutationPendingVerification = true;
-  }
-  return mutationPendingVerification;
+  return p.pendingMutation;
 }
 
 function compactTurnForHistory(turn: LLMTurn, toolMap?: Map<string, Tool>): string {
@@ -1695,8 +1729,10 @@ function matchesAdvisoryFailureRule(
 }
 
 function isIgnorableReadOnlyToolFailure(action: LLMAction, result: ToolResult): boolean {
-  if (!result.error?.includes('tool not allowed for this step')) return false;
-  return action.tool === 'read_file' || action.tool === 'list_dir' || action.tool === 'code_search';
+  const readOnly = action.tool === 'read_file' || action.tool === 'list_dir' || action.tool === 'code_search';
+  if (!readOnly) return false;
+  return result.error?.includes('tool not allowed for this step') === true ||
+    /\bENOENT\b|no such file or directory/iu.test(result.error ?? '');
 }
 
 function actionResolutionKeys(action: LLMAction): string[] {
@@ -1781,92 +1817,94 @@ function buildPermissionRequest(
   args: unknown,
   stepId: string,
   language: ToolContext['language'],
+  stepName?: string,
 ): ToolPermissionRequest | undefined {
   const argRecord = isPlainRecord(args) ? args : {};
   const target = actionTargetPaths(tool, args).join(', ');
   const runtime = language === 'typescript' ? 'npm' : 'python';
+  const stepLabel = stepName?.trim() || stepId;
   if (tool === 'write_file' || tool === 'append_file' || tool === 'replace_in_file' || tool === 'apply_patch') {
     return {
       operationType: 'file_write',
       target: target || '(workspace file)',
-      reason: `Step ${stepId} requested ${tool} to update project files.`,
+      reason: `Step ${stepLabel} requested ${tool} to update project files.`,
       risk: 'This operation modifies files in the current workspace.',
       scope: 'current workspace',
       skippable: true,
       denyBehavior: 'The tool call is skipped and the agent must continue with an alternative or fail the step.',
       stepId,
       tool,
-      metadata: { args: redactLargeArgs(args) },
+      metadata: { stepName: stepLabel, args: redactLargeArgs(args) },
     };
   }
   if (tool === 'add_dependency') {
     return {
       operationType: 'config_change',
       target: language === 'typescript' ? 'package.json' : 'requirements.txt',
-      reason: `Step ${stepId} requested dependency manifest changes.`,
+      reason: `Step ${stepLabel} requested dependency manifest changes.`,
       risk: 'This can alter project dependencies and may trigger sandbox rebuilds.',
       scope: 'current workspace dependency manifest',
       skippable: true,
       denyBehavior: 'The dependency change is skipped; later build or test steps may fail and report the missing dependency.',
       stepId,
       tool,
-      metadata: { args },
+      metadata: { stepName: stepLabel, args },
     };
   }
   if (tool === 'install_deps') {
     return {
       operationType: 'install_dependency',
       target: Array.isArray(argRecord.packages) ? argRecord.packages.join(', ') : '(packages)',
-      reason: `Step ${stepId} requested dependency installation.`,
+      reason: `Step ${stepLabel} requested dependency installation.`,
       risk: 'This may execute package manager scripts and download code from registries.',
       scope: 'current workspace sandbox',
       skippable: true,
       denyBehavior: 'Dependency installation is skipped and the task continues with the missing dependency reported.',
       stepId,
       tool,
-      metadata: { args },
+      metadata: { stepName: stepLabel, args },
     };
   }
   if (tool === 'run_tests') {
     return {
       operationType: 'test_command',
       target: runtime === 'npm' ? 'npm test' : 'pytest',
-      reason: `Step ${stepId} requested test execution to validate changes.`,
+      reason: `Step ${stepLabel} requested test execution to validate changes.`,
       risk: 'Project test scripts may execute arbitrary local project code.',
       scope: 'current workspace sandbox',
       skippable: true,
       denyBehavior: 'Tests are skipped and the final result must mark verification as incomplete.',
       stepId,
       tool,
-      metadata: { args },
+      metadata: { stepName: stepLabel, args },
     };
   }
   if (tool === 'run_program') {
     return {
       operationType: 'shell_command',
       target: `${runtime} ${Array.isArray(argRecord.args) ? argRecord.args.join(' ') : ''}`.trim(),
-      reason: `Step ${stepId} requested program execution.`,
+      reason: `Step ${stepLabel} requested program execution.`,
       risk: 'This executes project code in the configured sandbox.',
       scope: 'current workspace sandbox',
       skippable: true,
       denyBehavior: 'The command is skipped and the agent must use another validation strategy or fail the step.',
       stepId,
       tool,
-      metadata: { args },
+      metadata: { stepName: stepLabel, args },
     };
   }
   if (tool === 'http_fetch') {
     return {
       operationType: 'network_access',
       target: typeof argRecord.url === 'string' ? argRecord.url : '(url)',
-      reason: `Step ${stepId} requested network access.`,
+      reason: `Step ${stepLabel} requested network access.`,
       risk: 'This contacts an external HTTP endpoint from the host process.',
       scope: 'network',
       skippable: true,
       denyBehavior: 'The network call is skipped; the agent must use local context or report the missing data.',
       stepId,
       tool,
-      metadata: { args: redactLargeArgs(args) },
+      metadata: { stepName: stepLabel, args: redactLargeArgs(args) },
     };
   }
   return undefined;
@@ -2201,7 +2239,7 @@ function renderUserPrompt(
       `### ${s.path}\n\`\`\`\n${truncate(
         s.content,
         s.path === '.xcompiler/architecture-contract.json' ||
-          s.path.startsWith('.xcompiler/tickets/')
+          s.path.startsWith('.xcompiler/objects/ticket/')
           ? architectureLimit
           : compactContext && isDebugRepairSnippet(s.path)
             ? debugRepairSnippetLimit
@@ -2228,6 +2266,19 @@ function renderUserPrompt(
         inp.debugContext.suggestions ? `\n${inp.debugContext.suggestions}\n` : '',
       ].join('\n')
     : '';
+  const verificationScope = inp.debugContext?.verificationScope
+    ? [
+        '## inherited paired verification gate',
+        `verification step: ${inp.debugContext.verificationScope.stepId}`,
+        `verification phase: ${inp.debugContext.verificationScope.phase}`,
+        'exact executable tests:',
+        ...inp.debugContext.verificationScope.testArgs.map((testPath) => `- ${testPath}`),
+        'This Bug was routed back from the paired verification Step. Repair only the root cause exposed by these tests.',
+        'Use run_tests without replacing the inherited selectors. Do not run broad compiler or all-project test commands that include tests owned by later V-model Steps.',
+        'A defect outside this exact gate belongs to its own owning Step and Ticket; do not absorb it into the current Bug.',
+        '',
+      ].join('\n')
+    : '';
   const missingOutputPriority = initialMissingOutputs.length > 0
     ? [
         '## highest-priority required-output gate',
@@ -2243,11 +2294,10 @@ function renderUserPrompt(
         '## active change-request ticket',
         `id: ${inp.changeRequest.id}`,
         `revision: ${inp.changeRequest.revision}`,
-        `status: ${inp.changeRequest.status}`,
-        `source enhancement: ${inp.changeRequest.sourceEnhanceTicketId}`,
-        `origin bug: ${inp.changeRequest.originBugTicketId}`,
-        `objective: ${inp.changeRequest.objective}`,
-        `contract delta: ${inp.changeRequest.contractChange.summary}`,
+        `state: ${inp.changeRequest.state}`,
+        `source ticket: ${inp.changeRequest.sourceTicketId}`,
+        `objective: ${inp.changeRequest.description}`,
+        `contract delta: ${inp.changeRequest.contractDelta.summary}`,
         'This CR carries an accepted upstream contract change. It is not an enhancement finding.',
         'This is incremental CR execution against the existing project baseline.',
         'Apply only the affected contract and artifacts for this Step. Preserve unrelated files and accepted behavior.',
@@ -2259,12 +2309,13 @@ function renderUserPrompt(
     ? [
         '## active enhancement ticket',
         `id: ${inp.enhancement.id}`,
-        `kind: ${inp.enhancement.kind}`,
+        `kind: ${inp.enhancement.enhancementKind}`,
         `finding: ${inp.enhancement.finding}`,
-        `quality gaps: ${(inp.enhancement.qualityFailures ?? []).join(' | ') || 'see finding'}`,
-        `verification: ${inp.enhancement.verificationStepId ?? inp.step.id} ${inp.enhancement.verificationPhase ?? inp.step.phase}`,
+        `verification step: ${inp.enhancement.verificationStepId}`,
         'Append or patch only the missing, incomplete, or below-threshold content.',
         'Preserve accepted baseline behavior and artifacts. Do not regenerate the whole phase or project.',
+        'For coverage gaps, use measured coverage evidence to add focused tests around uncovered production behavior. ' +
+          'Do not rewrite accepted production code merely to inflate a metric.',
         '',
       ].join('\n')
     : '';
@@ -2273,7 +2324,7 @@ function renderUserPrompt(
         '## active work ticket',
         `id: ${inp.ticket.id}`,
         `type: ${inp.ticket.type}`,
-        `status: ${inp.ticket.status}`,
+        `state: ${inp.ticket.state}`,
         `parent: ${inp.ticket.parentTicketId ?? 'none'}`,
         `acceptance: ${inp.ticket.acceptance.join(' | ') || inp.step.acceptance}`,
         'Complete only this ticket and its declared sub-tasks/artifacts.',
@@ -2318,6 +2369,7 @@ function renderUserPrompt(
       ? `## inputs (already produced):\n${inp.step.inputs.map((i) => `- ${i}`).join('\n')}\n`
       : '',
     debugRepairPacket,
+    verificationScope,
     ctxBlock ? `## context\nTreat these existing files as the current project truth. Extend or refactor them in place; do not replace the project with a tiny parallel implementation.\n\n${ctxBlock}\n` : '',
     dbg,
     t().prompts.executorUserPromptOutro,
@@ -2491,7 +2543,7 @@ function renderFeedback(
     if (turn.unresolvedFailures.some((failure) => /invalid add_dependency args/i.test(failure))) {
       lines.push(
         'Tool contract violation: add_dependency requires args.packages as a non-empty string array, ' +
-        'for example {"packages":["cheerio"]}.',
+        'for example {"packages":["cheerio@1.0.0"]}; set dev=true for test/build tooling.',
       );
     }
     if (turn.declaredDone) {
@@ -2508,6 +2560,7 @@ function missingQualityAssessmentFields(
   step: Step,
   assessment: StageQualityAssessment | undefined,
   freshAfterTools = true,
+  allowMetricGaps = false,
 ): string[] {
   // Legacy/programmatic Step objects without an explicit gate retain the
   // lightweight Executor contract. Plans produced by Planner always persist
@@ -2527,7 +2580,10 @@ function missingQualityAssessmentFields(
     }
   }
   for (const metric of Object.keys(resolveQualityGate(step).metrics)) {
-    if (typeof assessment.metrics[metric] !== 'number') {
+    if (
+      typeof assessment.metrics[metric] !== 'number' &&
+      !(allowMetricGaps && assessment.gaps.some((gap) => qualityGapNamesMetric(gap, metric)))
+    ) {
       missing.push(`qualityAssessment.metrics.${metric}`);
     }
   }
@@ -2535,6 +2591,12 @@ function missingQualityAssessmentFields(
     missing.push('qualityAssessment.evidence');
   }
   return missing;
+}
+
+function qualityGapNamesMetric(gap: string, metric: string): boolean {
+  const normalizedGap = gap.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
+  const normalizedMetric = metric.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
+  return normalizedMetric.length > 0 && normalizedGap.includes(normalizedMetric);
 }
 
 function renderToolResultDetail(

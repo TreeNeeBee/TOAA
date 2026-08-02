@@ -30,8 +30,6 @@ function mkCfg(partial: Partial<XCompilerConfig['llm']>): XCompilerConfig {
     },
     agent: {
       language: 'python',
-      max_steps: 1,
-      max_debug_retries: 1,
       sandbox: 'subprocess',
       sandbox_limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'off' },
       sandbox_docker: {
@@ -261,7 +259,7 @@ describe('LLMRouter fallback chain', () => {
     expect(secondaryCalls).toBe(1);
   });
 
-  it('falls back when a provider response fails the caller output contract', async () => {
+  it('retries the same provider with contract feedback before falling back', async () => {
     const cfg = mkCfg({ fallbacks: ['openai'] });
     const scores = new ScoreStore('/tmp/x/config.yaml');
     const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
@@ -290,9 +288,48 @@ describe('LLMRouter fallback chain', () => {
       },
     });
     expect(output).toBe('repair patch');
-    expect(firstCalls).toBe(1);
+    expect(firstCalls).toBe(2);
     expect(secondCalls).toBe(1);
     expect(scores.get('ollama_code')).toBeLessThan(ScoreStore.DEFAULT);
+  });
+
+  it('keeps the current provider when its contract-feedback retry succeeds', async () => {
+    const cfg = mkCfg({ fallbacks: ['openai'] });
+    const scores = new ScoreStore('/tmp/x/config.yaml');
+    const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clientsMap: Map<string, LLMClient> = (router as any).clients;
+    let primaryCalls = 0;
+    let secondaryCalls = 0;
+    let correctionSeen = false;
+    clientsMap.set('ollama_code', {
+      name: 'fake-primary',
+      chat: async (messages) => {
+        primaryCalls++;
+        correctionSeen ||= messages.some(
+          (message) => message.role === 'user' && message.content.includes('low-quality read-only response'),
+        );
+        return primaryCalls === 1 ? 'read-only probe' : 'repair patch';
+      },
+    });
+    clientsMap.set('openai', {
+      name: 'fake-secondary',
+      chat: async () => {
+        secondaryCalls++;
+        return 'secondary patch';
+      },
+    });
+
+    const output = await router.for('Coder').chat([{ role: 'user', content: 'hi' }], {
+      validate: (text) => {
+        if (text.includes('read-only')) throw new Error('low-quality read-only response');
+      },
+    });
+    expect(output).toBe('repair patch');
+    expect(primaryCalls).toBe(2);
+    expect(secondaryCalls).toBe(0);
+    expect(correctionSeen).toBe(true);
+    expect(scores.get('ollama_code')).toBeGreaterThanOrEqual(ScoreStore.DEFAULT);
   });
 
   it('can disable success score boosts for workflow-level LLM calls', async () => {

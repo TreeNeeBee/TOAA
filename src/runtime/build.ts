@@ -31,6 +31,15 @@ import {
   defaultPhasePlanStepPath,
 } from '../core/phase_plan.js';
 import { updateProjectFile } from '../core/project_file.js';
+import {
+  compileProjectExtension,
+  compileProjectGraph,
+  rebaseDraftPlanPhases,
+  type CompiledProjectExtension,
+  type CompiledProjectGraph,
+} from '../domain/planning/compiler.js';
+import { DomainAuditTrail } from '../domain/observability/audit_trail.js';
+import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
 import { AuditLogger } from '../audit/audit.js';
 import { acquireLock, LockError } from '../core/lock.js';
 import { setLocale, t } from '../i18n/index.js';
@@ -492,6 +501,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     userAddenda,
   });
   let existingPhasePlan = await tryLoadPhasePlan(phasePlanPath);
+  const phasePlanBaseline = existingPhasePlan;
   trace('ora.spin2.start');
   const spin2 = io.progress(M.compile.spinDecompose, { animate: false });
   trace('ora.spin2.started');
@@ -601,7 +611,37 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     throw new CompileExitError(3, M.compile.lintFail(issues.length));
   }
 
-  const planMd = renderPlanMarkdown(parsed.data);
+  const repository = new DomainObjectRepository(ws);
+  await repository.load();
+  const previousProject = await repository.findProject();
+  let persistedPlan = parsed.data;
+  if (isIncrementalIntent(intent)) {
+    if (!previousProject) {
+      throw new CompileExitError(
+        8,
+        'Incremental build requires a canonical Project in this workspace; run a greenfield build first.',
+      );
+    }
+    if (previousProject.state !== 'closed') {
+      throw new CompileExitError(
+        8,
+        `Incremental build requires the current Project to be closed; ${previousProject.name} is ${previousProject.state}.`,
+      );
+    }
+    const previousPhases = await Promise.all(previousProject.phaseIds.map((id) => repository.read(id)));
+    persistedPlan = PlanSchema.parse(rebaseDraftPlanPhases(
+      parsed.data,
+      previousPhases
+        .filter((object) => object.objectType === 'phase')
+        .map((phase) => phase.name),
+    ));
+    const rebasedIssues = lintPlan(persistedPlan).filter((issue) => issue.level === 'error');
+    if (rebasedIssues.length > 0) {
+      throw new CompileExitError(3, `Incremental Phase rebasing failed: ${rebasedIssues.map((issue) => issue.message).join('; ')}`);
+    }
+  }
+
+  const planMd = renderPlanMarkdown(persistedPlan);
   await ws.writeFile(`${draftDir}/plan.md`, planMd);
 
   // 6. 确认门 2
@@ -626,13 +666,15 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   }
 
   // 7. Persist
-  const planPath = defaultPhasePlanStepPath(path.dirname(phasePlanPath), parsed.data.phaseId ?? 'P1');
-  await savePlan(planPath, parsed.data);
+  const planPath = defaultPhasePlanStepPath(path.dirname(phasePlanPath), persistedPlan.phaseId ?? 'P1');
+  await savePlan(planPath, persistedPlan);
   const phasePlan = buildPhasePlanFromCurrentPlan({
-    plan: parsed.data,
+    plan: persistedPlan,
     phasePlanPath,
     currentPlanPath: planPath,
-    existing: existingPhasePlan,
+    existing: isIncrementalIntent(intent) && phasePlanBaseline
+      ? { ...phasePlanBaseline, sourceDigest: existingPhasePlan?.sourceDigest }
+      : existingPhasePlan,
   });
   await savePhasePlan(phasePlanPath, phasePlan);
   // 归档上一版本（如有），再写入新版本。topic.md 已在第 3.5 步落盘，这里只处理 plan.
@@ -640,24 +682,87 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await ws.writeFile(DOC_NAMES.plan, planMd);
   await refreshProjectMemory(ws, {
     planPath,
-    language: parsed.data.language,
-    intent: parsed.data.intent,
+    language: persistedPlan.language,
+    intent: persistedPlan.intent,
   });
   await ws.remove(draftDir);
   await audit.event('plan.persist', M.compile.auditPlanPersisted(planPath), {
     messageId: 'compile.plan_persisted',
     planPath,
     phasePlanPath,
-    steps: parsed.data.steps.length,
+    steps: persistedPlan.steps.length,
+  });
+  let graph: CompiledProjectGraph | CompiledProjectExtension;
+  if (previousProject && isIncrementalIntent(intent)) {
+    const projectPlanObject = await repository.read(previousProject.projectPlanId);
+    if (projectPlanObject.objectType !== 'plan' || projectPlanObject.planKind !== 'project') {
+      throw new Error(`Project ${previousProject.name} does not reference a canonical ProjectPlan`);
+    }
+    const predecessorPhaseId = previousProject.phaseIds.at(-1)!;
+    const predecessorPhaseObject = await repository.read(predecessorPhaseId);
+    if (predecessorPhaseObject.objectType !== 'phase') {
+      throw new Error(`Project ${previousProject.name} terminal object is not a Phase`);
+    }
+    const predecessorEpicObject = await repository.read(predecessorPhaseObject.epicTicketId);
+    if (predecessorEpicObject.objectType !== 'ticket' || predecessorEpicObject.type !== 'epic') {
+      throw new Error(`Phase ${predecessorPhaseObject.name} does not reference an Epic Ticket`);
+    }
+    graph = compileProjectExtension({
+      draft: persistedPlan,
+      topic: finalTopicMd,
+      topicSourceRef: DOC_NAMES.topic,
+      projectName: previousProject.name,
+      project: previousProject,
+      projectPlan: projectPlanObject,
+      predecessorPhase: predecessorPhaseObject,
+      predecessorEpic: predecessorEpicObject,
+    });
+    await repository.persistProjectExtension(graph);
+  } else {
+    graph = compileProjectGraph({
+      draft: persistedPlan,
+      topic: finalTopicMd,
+      topicSourceRef: DOC_NAMES.topic,
+      projectName: path.basename(ws.root) || 'project',
+    });
+    await repository.persistCompiledGraph(graph);
+    if (previousProject) await repository.retireProject(previousProject.id);
+  }
+  await new DomainAuditTrail(repository).recordEvent({
+    projectId: graph.project.id,
+    subject: { id: graph.projectPlan.activePhaseId, objectType: 'phase' },
+    kind: 'workflow.project_planned',
+    actor: 'xcompiler-runtime',
+    correlationId: graph.projectPlan.id,
+    payload: {
+      projectPlanId: graph.projectPlan.id,
+      phaseIds: graph.phases.map((phase) => phase.id),
+      activePhaseId: graph.projectPlan.activePhaseId,
+    },
+  });
+  await audit.event('plan.persist', `canonical domain graph persisted for ${graph.project.name}`, {
+    messageId: 'compile.domain_graph_persisted',
+    projectId: graph.project.id,
+    projectPlanId: graph.projectPlan.id,
+    phaseIds: graph.phases.map((phase) => phase.id),
+    activePhaseId: graph.projectPlan.activePhaseId,
+  });
+  await io.emit({
+    type: 'workflow',
+    event: 'project_planned',
+    projectId: graph.project.id,
+    phaseId: graph.projectPlan.activePhaseId,
+    correlationId: graph.projectPlan.id,
+    message: `${graph.phases.length} Phase(s) planned; ${graph.phases[0]?.name ?? 'P1'} materialized.`,
   });
   const projectFile = await updateProjectFile({
     workspace: ws.root,
     planPath: phasePlanPath,
     configPath: cfgPath,
     projectFilePath: opts.projectFilePath,
+    projectId: graph.project.id,
     command: opts.projectCommand ?? 'build',
     intent,
-    plan: parsed.data,
     requirementFile: opts.inputFile,
     topicFile: opts.topicFile,
     recordHistory: true,
@@ -667,9 +772,9 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await runtimeLog(io, 'success', M.compile.phasePlanWritten(phasePlanPath));
   await runtimeLog(io, 'success', M.compile.projectFileWritten(projectFile));
   await runtimeLog(io, 'info', M.compile.nextCommand(`xcompiler run ${path.relative(process.cwd(), phasePlanPath)}`));
-  await pluginHost.emit('compile.finish', { plan: parsed.data, planPath: phasePlanPath, phasePlanPath, currentPlanPath: planPath });
-  await audit.end({ status: 'ok', planPath, phasePlanPath, steps: parsed.data.steps.length });
-  await runtimeResult(io, 'build', 'ok', { planPath: phasePlanPath, currentPlanPath: planPath, steps: parsed.data.steps.length });
+  await pluginHost.emit('compile.finish', { plan: persistedPlan, planPath: phasePlanPath, phasePlanPath, currentPlanPath: planPath });
+  await audit.end({ status: 'ok', planPath, phasePlanPath, steps: persistedPlan.steps.length });
+  await runtimeResult(io, 'build', 'ok', { planPath: phasePlanPath, currentPlanPath: planPath, steps: persistedPlan.steps.length });
   return { planPath: phasePlanPath };
   } finally {
     try { await scoreStore?.flush(); } catch { /* never block release */ }

@@ -27,8 +27,6 @@ function baseConfig(extra: Record<string, unknown> = {}): Record<string, unknown
       role_fallbacks: {},
     },
     agent: {
-      max_steps: 1,
-      max_debug_retries: 1,
       sandboxes: {
         python: { mode: 'subprocess' },
         typescript: { mode: 'subprocess' },
@@ -128,8 +126,6 @@ llm:
   fallbacks: []
   role_fallbacks: {}
 agent:
-  max_steps: 1
-  max_debug_retries: 1
   sandboxes: {}
 `);
       const { config } = await loadConfigWithPath(cfgPath);
@@ -252,8 +248,6 @@ llm:
   fallbacks: []
   role_fallbacks: {}
 agent:
-  max_steps: 1
-  max_debug_retries: 1
   sandboxes:
     python:
       mode: subprocess

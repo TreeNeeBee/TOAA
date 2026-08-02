@@ -1,12 +1,19 @@
 import { spawn } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Workspace } from '../workspace/workspace.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
 import type { Language } from '../core/plan.js';
-import type { Sandbox, SandboxLimits, ExecResult, ExecExtra, ExecProgressWatch } from './types.js';
+import type {
+  Sandbox,
+  SandboxBuildOptions,
+  SandboxLimits,
+  ExecResult,
+  ExecExtra,
+  ExecProgressWatch,
+} from './types.js';
 import { normalizeTypeScriptTestArgs } from './test_args.js';
 import { resolveTypeScriptProgramCommand } from './program_args.js';
 
@@ -105,7 +112,10 @@ export class SubprocessSandbox implements Sandbox {
    * 构建/复用沙盒。manifestFile 为依赖清单在 workspace 内的相对路径；不存在则跳过安装。
    * Python → requirements.txt (venv + pip)；TypeScript → package.json (npm install)。
    */
-  async build(manifestFile?: string): Promise<{ rebuilt: boolean; reason: string }> {
+  async build(
+    manifestFile?: string,
+    options?: SandboxBuildOptions,
+  ): Promise<{ rebuilt: boolean; reason: string }> {
     await fs.mkdir(this.sandboxAbs, { recursive: true });
     if (this.opts.inheritEnv !== true) {
       await Promise.all([
@@ -116,7 +126,7 @@ export class SubprocessSandbox implements Sandbox {
       ]);
     }
     if (this.language === 'typescript') {
-      return this.buildNode(manifestFile ?? 'package.json');
+      return this.buildNode(manifestFile ?? 'package.json', options);
     }
     return this.buildPython(manifestFile ?? 'requirements.txt');
   }
@@ -191,7 +201,10 @@ export class SubprocessSandbox implements Sandbox {
     return { rebuilt: true, reason: venvExists ? 'requirements changed' : 'venv created' };
   }
 
-  private async buildNode(manifestFile: string): Promise<{ rebuilt: boolean; reason: string }> {
+  private async buildNode(
+    manifestFile: string,
+    options?: SandboxBuildOptions,
+  ): Promise<{ rebuilt: boolean; reason: string }> {
     const pkgAbs = this.opts.ws.abs(manifestFile);
     const pkgContent = await fs.readFile(pkgAbs, 'utf8').catch(() => '');
     if (!pkgContent) {
@@ -200,7 +213,7 @@ export class SubprocessSandbox implements Sandbox {
     }
     const lockAbs = this.opts.ws.abs('package-lock.json');
     const lockContent = await fs.readFile(lockAbs, 'utf8').catch(() => '');
-    const sig = crypto.createHash('sha256').update(pkgContent + '\n' + lockContent).digest('hex');
+    const sig = nodeDependencySignature(pkgContent, lockContent);
     const cached = await fs.readFile(this.cacheFile, 'utf8').catch(() => '');
     const modulesExist = await fs
       .stat(this.opts.ws.abs('node_modules'))
@@ -209,7 +222,7 @@ export class SubprocessSandbox implements Sandbox {
     if (modulesExist && cached === sig) {
       return { rebuilt: false, reason: 'cache hit' };
     }
-    const installArgs = lockContent.trim()
+    const installArgs = lockContent.trim() && !options?.refreshLockfile
       ? ['ci', '--ignore-scripts', '--no-audit', '--no-fund']
       : ['install', '--ignore-scripts', '--no-audit', '--no-fund'];
     const progressWatch = createInstallProgressWatch(
@@ -231,7 +244,27 @@ export class SubprocessSandbox implements Sandbox {
     if (r.exitCode !== 0) {
       throw new Error(formatExecFailure(`npm dependency install failed (cwd=${this.opts.ws.root})`, r));
     }
-    await fs.writeFile(this.cacheFile, sig, 'utf8');
+    if (options?.refreshLockfile) {
+      const validationArgs = ['ci', '--dry-run', '--ignore-scripts', '--no-audit', '--no-fund'];
+      await this.opts.audit?.event(
+        'sandbox.exec',
+        t().sandboxLog.command('subprocess', `npm ${validationArgs.join(' ')}`),
+        { messageId: 'sandbox.command', cwd: this.opts.ws.root },
+      );
+      const validation = await execRaw('npm', validationArgs, {
+        cwd: this.opts.ws.root,
+        env: this.baseEnvironment(),
+      });
+      if (validation.exitCode !== 0) {
+        throw new Error(formatExecFailure(
+          `npm lockfile validation failed after dependency update (cwd=${this.opts.ws.root})`,
+          validation,
+        ));
+      }
+    }
+    const finalLockContent = await fs.readFile(lockAbs, 'utf8').catch(() => '');
+    const finalSignature = nodeDependencySignature(pkgContent, finalLockContent);
+    await fs.writeFile(this.cacheFile, finalSignature, 'utf8');
     await this.opts.audit?.event('sandbox.exec', t().sandboxLog.subprocessNodeBuilt, {
       messageId: 'sandbox.subprocess_node_built',
     });
@@ -326,6 +359,10 @@ export class SubprocessSandbox implements Sandbox {
   }
 }
 
+function nodeDependencySignature(packageJson: string, lockfile: string): string {
+  return crypto.createHash('sha256').update(packageJson + '\n' + lockfile).digest('hex');
+}
+
 /** 把任意 workspace 目录名规整为 venv 安全名（保留 [A-Za-z0-9._-]，回退到 'venv'）。 */
 export function sanitizeVenvName(name: string): string {
   const cleaned = name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
@@ -370,8 +407,9 @@ export async function execRaw(
   opts: ExecRawOptions = {},
 ): Promise<ExecResult> {
   const start = Date.now();
+  const executable = await resolveExecutableOnPath(cmd, opts.env ?? process.env);
   return new Promise((resolve) => {
-    const child = spawn(cmd, argv, {
+    const child = spawn(executable, argv, {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -448,6 +486,39 @@ export async function execRaw(
       });
     });
   });
+}
+
+/** Resolve bare host commands before spawning them, including from native pkg executables. */
+export async function resolveExecutableOnPath(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  if (path.isAbsolute(command) || command.includes('/') || command.includes('\\')) {
+    return command;
+  }
+  const pathValue = env.PATH ?? env.Path ?? env.path ?? process.env.PATH ?? '';
+  if (!pathValue) return command;
+  const extensions = process.platform === 'win32'
+    ? executableExtensions(command, env.PATHEXT ?? process.env.PATHEXT)
+    : [''];
+  for (const dir of pathValue.split(path.delimiter).filter(Boolean)) {
+    for (const extension of extensions) {
+      const candidate = path.join(dir, `${command}${extension}`);
+      try {
+        await fs.access(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch {
+        // Continue through PATH in declaration order.
+      }
+    }
+  }
+  return command;
+}
+
+function executableExtensions(command: string, rawPathExt?: string): string[] {
+  if (path.extname(command)) return [''];
+  const values = (rawPathExt ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean);
+  return ['', ...values, ...values.map((value) => value.toLowerCase())];
 }
 
 async function directoryTreeSize(paths: string[]): Promise<number> {

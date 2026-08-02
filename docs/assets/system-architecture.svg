@@ -86,11 +86,11 @@
   <text class="label" x="284" y="583" text-anchor="middle">Phase Planner</text>
   <text class="small" x="284" y="600" text-anchor="middle">complexity, priorities, gates</text>
   <rect class="box workflow" x="560" y="564" width="240" height="46"/>
-  <text class="label" x="680" y="583" text-anchor="middle">V-Model Engine</text>
-  <text class="small" x="680" y="600" text-anchor="middle">stage order, rollback, resume</text>
+  <text class="label" x="680" y="583" text-anchor="middle">Domain Scheduler</text>
+  <text class="small" x="680" y="600" text-anchor="middle">UUID dependencies, rollback, resume</text>
   <rect class="box workflow" x="956" y="564" width="240" height="46"/>
-  <text class="label" x="1076" y="583" text-anchor="middle">Ticket Workflow</text>
-  <text class="small" x="1076" y="600" text-anchor="middle">stage-aware debug routing</text>
+  <text class="label" x="1076" y="583" text-anchor="middle">Ticket Lifecycle</text>
+  <text class="small" x="1076" y="600" text-anchor="middle">Bug, Enhancement, CR routing</text>
 
   <path class="line" d="M442 432 C426 474 360 520 284 564"/>
   <path class="line" d="M672 432 L680 564"/>
@@ -108,8 +108,8 @@
   <text class="label" x="767" y="754" text-anchor="middle">PluginHost</text>
   <text class="small" x="767" y="772" text-anchor="middle">hooks, tools, skills</text>
   <rect class="box execution" x="920" y="734" width="324" height="48"/>
-  <text class="label" x="1082" y="754" text-anchor="middle">Project Memory</text>
-  <text class="small" x="1082" y="772" text-anchor="middle">.xc progress and .xcompiler state</text>
+  <text class="label" x="1082" y="754" text-anchor="middle">Domain Repository</text>
+  <text class="small" x="1082" y="772" text-anchor="middle">objects, checkpoints, reports</text>
 
   <path class="line" d="M284 610 C276 646 258 690 234 734"/>
   <path class="line" d="M680 610 C648 654 580 700 513 734"/>
@@ -123,9 +123,9 @@
   <rect class="box infra" x="418" y="874" width="190" height="30"/>
   <text class="label" x="513" y="894" text-anchor="middle">Sandbox</text>
   <rect class="box store" x="674" y="874" width="214" height="30"/>
-  <text class="label" x="781" y="894" text-anchor="middle">Workspace Files</text>
+  <text class="label" x="781" y="894" text-anchor="middle">Object Registry</text>
   <rect class="box store" x="964" y="874" width="236" height="30"/>
-  <text class="label" x="1082" y="894" text-anchor="middle">Audit Logs</text>
+  <text class="label" x="1082" y="894" text-anchor="middle">Audit + Reports</text>
 
   <path class="line" d="M234 782 C234 812 236 842 237 874"/>
   <path class="line" d="M513 782 L513 874"/>

@@ -82,8 +82,8 @@ describe('project quality audit', () => {
     const plan = {
       ...tsPlan(),
       steps: [
-        { id: 'S001', phase: 'REQUIREMENT_ANALYSIS', title: 'a', description: 'a', systemPrompt: 'x'.repeat(30), role: 'Planner', tools: [], inputs: [], outputs: ['docs/01-requirement-analysis.md'], dependsOn: [], acceptance: 'ok', status: 'DONE', retries: 0, maxRetries: 3 },
-        { id: 'S002', phase: 'FUNCTIONAL_TEST', title: 'b', description: 'b', systemPrompt: 'x'.repeat(30), role: 'Tester', tools: [], inputs: [], outputs: ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'], dependsOn: ['S001'], acceptance: 'ok', status: 'PENDING', retries: 0, maxRetries: 3 },
+        { id: 'S001', phase: 'REQUIREMENT_ANALYSIS', title: 'a', description: 'a', systemPrompt: 'x'.repeat(30), role: 'Planner', tools: [], inputs: [], outputs: ['docs/01-requirement-analysis.md'], dependsOn: [], acceptance: 'ok', maxAttempts: 3 },
+        { id: 'S002', phase: 'FUNCTIONAL_TEST', title: 'b', description: 'b', systemPrompt: 'x'.repeat(30), role: 'Tester', tools: [], inputs: [], outputs: ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'], dependsOn: ['S001'], acceptance: 'ok', maxAttempts: 3 },
       ],
     } as Plan;
     expect(shouldRunProjectAudit({ onlyPhase: 'CODE' }, false)).toBe(false);

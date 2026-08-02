@@ -26,7 +26,7 @@ const step = (overrides: Partial<Step> = {}): Step =>
     outputs: ['src/reporting/service.ts'],
     dependsOn: [],
     acceptance: 'reporting service supports invoice export',
-    maxRetries: 3,
+    maxAttempts: 3,
     ...overrides,
   }) as Step;
 

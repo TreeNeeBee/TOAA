@@ -58,15 +58,16 @@ export function mapRuntimeEventToAcpUpdates(
         update: {
           sessionUpdate: 'tool_call',
           toolCallId,
-          title: event.target ? `${event.tool}: ${event.target}` : event.tool,
+          title: `${event.stepName ? `${event.stepName} · ` : ''}${event.target ? `${event.tool}: ${event.target}` : event.tool}`,
           kind: event.tool === 'run_tests' ? 'execute' : 'other',
           status: 'pending',
           rawInput: {
             stepId: event.stepId,
+            stepName: event.stepName,
             tool: event.tool,
             target: event.target,
           },
-          _meta: meta(eventType, { stepId: event.stepId, tool: event.tool }),
+          _meta: meta(eventType, { stepId: event.stepId, stepName: event.stepName, tool: event.tool }),
         },
       }];
     }
@@ -88,7 +89,7 @@ export function mapRuntimeEventToAcpUpdates(
             text: event.summary ?? event.error ?? `${event.tool} completed`,
           },
         }],
-        _meta: meta(eventType, { stepId: event.stepId, tool: event.tool }),
+        _meta: meta(eventType, { stepId: event.stepId, stepName: event.stepName, tool: event.tool }),
       },
     }];
   }
@@ -109,6 +110,7 @@ export function mapRuntimeEventToAcpUpdates(
         }],
         _meta: meta(eventType, {
           stepId: event.stepId,
+          stepName: event.stepName,
           tool: event.tool,
           path: event.path,
         }),
@@ -131,6 +133,7 @@ export function mapRuntimeEventToAcpUpdates(
         rawOutput: { patch: event.patch },
         _meta: meta(eventType, {
           stepId: event.stepId,
+          stepName: event.stepName,
           tool: event.tool,
           patch: event.patch,
         }),
@@ -143,6 +146,22 @@ export function mapRuntimeEventToAcpUpdates(
     return [{
       eventType,
       update: agentText(eventType, meta(eventType, { request: event.request })),
+    }];
+  }
+
+  if (event.type === 'workflow') {
+    return [{
+      eventType: event.event,
+      update: agentText(event.message ?? event.event, meta(event.event, {
+        projectId: event.projectId,
+        phaseId: event.phaseId,
+        stepId: event.stepId,
+        stepName: event.stepName,
+        ticketId: event.ticketId,
+        ticketType: event.ticketType,
+        correlationId: event.correlationId,
+        causationId: event.causationId,
+      })),
     }];
   }
 

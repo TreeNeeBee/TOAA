@@ -16,8 +16,10 @@ workspace/logs/
 coverage/
 .tools/
 
-# 审计、会话与开发追溯记录仅保存在本地，可能包含提示词、路径和运行环境信息。
-docs/audit/
+# 本地会话记录可能包含提示词、路径和运行环境信息；仅提交白名单中的重大变更审计。
+docs/audit/*
+!docs/audit/README.md
+!docs/audit/2026-08-01-runtime-domain-refactor.md
 docs/dev_audit_log.md
 
 # release/ 目录由 .github/workflows/release.yml 在 tag 推送时通过 GitHub Releases 发布，

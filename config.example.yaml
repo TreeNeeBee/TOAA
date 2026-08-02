@@ -72,12 +72,9 @@ llm:
   role_fallbacks: {}
 
 agent:
-  max_steps: 50
-  max_debug_retries: 3
-  # Debugger 滑动窗口的硬上限：LLM 持续健康输出时窗口可扩到该值；
-  # 出现解析失败/重复 actions/无进展时窗口快速收缩，连续 2 次低质量直接放弃。
-  # 默认 = max(max_debug_retries * 4, 10)
-  # max_debug_retries_cap: 12
+  # 每个 Step 的事务尝试上限由 Planner 的 maxAttempts 与项目复杂度动态确定：
+  # simple 至少 3 次、moderate 至少 5 次、complex 至少 8 次；多 Phase 项目会适度增加。
+  # 下列 round 配置控制单次尝试内部的 LLM 工具循环，不控制领域 Step 生命周期。
   # EditGuard 单 Step 累计行数预算。auto 会按 phase/tools/outputs/prompt 上下文自适应；
   # 如需固定硬上限，可设为数字，例如 400。
   # max_edit_lines_per_step: auto

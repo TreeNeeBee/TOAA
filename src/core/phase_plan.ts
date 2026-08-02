@@ -116,7 +116,7 @@ export function buildPhasePlanFromCurrentPlan(args: {
   const base = path.dirname(path.resolve(args.phasePlanPath));
   const currentPhaseId = args.plan.phaseId ?? 'P1';
   const existingById = new Map((args.existing?.phases ?? []).map((phase) => [phase.id, phase]));
-  const phases = (args.plan.implementationPhases ?? []).map((phase) => {
+  const materialized = (args.plan.implementationPhases ?? []).map((phase) => {
     const existing = existingById.get(phase.id);
     const planPath =
       phase.id === currentPhaseId
@@ -127,14 +127,28 @@ export function buildPhasePlanFromCurrentPlan(args: {
       planPath,
     };
   });
+  const materializedIds = new Set(materialized.map((phase) => phase.id));
+  const preserved = args.plan.intent === 'greenfield'
+    ? []
+    : (args.existing?.phases ?? []).filter((phase) => !materializedIds.has(phase.id));
+  const phases = [...preserved, ...materialized];
+  const requirementDigest = preserved.length > 0 &&
+    args.existing?.requirementDigest !== args.plan.requirementDigest
+    ? `${args.existing?.requirementDigest}\n\n${args.plan.requirementDigest}`
+    : args.plan.requirementDigest;
   return {
     kind: PHASE_PLAN_KIND,
     version: PHASE_PLAN_VERSION,
     language: args.plan.language,
     intent: args.plan.intent,
-    projectType: args.plan.projectType,
-    requirementDigest: args.plan.requirementDigest,
-    complexityAssessment: args.plan.complexityAssessment,
+    projectType: args.existing && args.existing.projectType !== args.plan.projectType
+      ? 'mixed'
+      : args.plan.projectType,
+    requirementDigest,
+    complexityAssessment: greaterComplexity(
+      args.existing?.complexityAssessment,
+      args.plan.complexityAssessment,
+    ),
     currentPhaseId,
     globalPrompt: args.plan.globalPrompt ?? '',
     baselineSummary: args.plan.baselineSummary ?? '',
@@ -204,4 +218,13 @@ function relativeFrom(base: string, target: string): string {
   const rel = path.relative(base, target).replace(/\\/g, '/');
   if (!rel) return '.';
   return rel.startsWith('..') ? target : rel;
+}
+
+function greaterComplexity(
+  previous: PhasePlan['complexityAssessment'] | undefined,
+  current: PhasePlan['complexityAssessment'],
+): PhasePlan['complexityAssessment'] {
+  if (!previous) return current;
+  const rank = { simple: 0, moderate: 1, complex: 2 } as const;
+  return rank[current.level] > rank[previous.level] ? current : previous;
 }

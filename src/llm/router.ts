@@ -189,8 +189,8 @@ export class LLMRouter {
 
 /**
  * 顺序尝试 provider，第一个成功即返回。
- * Provider/transport 故障可以切换候选；调用方契约校验失败必须原样返回调用方，
- * 由拥有该契约的 Planner/Executor 携带精确反馈重试。
+ * Provider/transport 故障可以切换候选；调用方契约校验失败先把精确错误
+ * 反馈给当前 provider 纠错一次，仍失败才按质量故障切换候选。
  */
 class FallbackClient implements LLMClient {
   readonly name: string;
@@ -250,6 +250,7 @@ class FallbackClient implements LLMClient {
         }
       }
       let attemptOptions = options;
+      let providerMessages = messages;
       for (let providerAttempt = 1; providerAttempt <= FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS; providerAttempt++) {
         let out: string;
         try {
@@ -288,7 +289,7 @@ class FallbackClient implements LLMClient {
               : operationWindow.responseTokenBudget,
         };
         try {
-          out = await c.client.chat(messages, providerOptions);
+          out = await c.client.chat(providerMessages, providerOptions);
         } catch (err) {
           lastErr = err;
           const retryDelayMs = retryDelayForLLMError(err);
@@ -365,6 +366,7 @@ class FallbackClient implements LLMClient {
           try {
             options.validate(out);
           } catch (vErr) {
+            const validationError = errorMessage(vErr);
             await this.audit?.event(
               'llm.error',
               t().llm.providerValidationFailed(this.role, c.client.name),
@@ -374,15 +376,32 @@ class FallbackClient implements LLMClient {
                 attempt: i + 1,
                 providerAttempt,
                 remaining: this.chain.length - i - 1,
-                error: (vErr as Error).message,
+                error: validationError,
                 output_preview: out.slice(0, 400),
               },
             );
+            if (providerAttempt < FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS) {
+              providerMessages = [
+                ...messages,
+                { role: 'assistant', content: validationOutputForRetry(out, operationWindow.feedbackCharBudget) },
+                { role: 'user', content: t().llm.providerValidationRepairPrompt(validationError) },
+              ];
+              await this.audit?.event(
+                'note',
+                t().llm.providerValidationRetry(this.role, c.client.name),
+                {
+                  messageId: 'llm.provider_validation_retry',
+                  provider: c.name,
+                  attempt: i + 1,
+                  providerAttempt,
+                  remaining: this.chain.length - i - 1,
+                  error: validationError,
+                },
+              );
+              lastErr = vErr;
+              continue;
+            }
             this.scores?.decay(c.name, `validate failed in role ${this.role}`);
-            // A structurally valid response can still be unusable for the current
-            // workflow (for example a Debugger that repeats read-only probes).
-            // Treat that as a provider-quality failure for this call and let the
-            // next configured model attempt the same well-defined turn.
             lastErr = vErr;
             failures.push(formatProviderFailure(c.name, c.client.name, vErr));
             break;
@@ -414,6 +433,11 @@ function formatProviderFailure(provider: string, model: string, err: unknown): s
 
 function truncateFailure(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}... [truncated ${text.length - max} chars]`;
+}
+
+function validationOutputForRetry(text: string, feedbackBudget: number): string {
+  const max = Math.max(1_000, Math.min(16_000, feedbackBudget));
+  return truncateFailure(text, max);
 }
 
 function withoutStreamingOptions(options?: ChatOptions): ChatOptions | undefined {

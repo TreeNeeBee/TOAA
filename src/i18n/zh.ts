@@ -88,7 +88,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
       "dependsOn": [],
       "acceptance": "string",
       "qualityGate": { "completionMin": 0.95, "upstreamAlignmentMin": 0.95, "metrics": {}, "tolerance": { "metricShortfall": 0.02, "maxFailedTests": 0, "maxSkippedTests": 0, "maxWarnings": 0 } },
-      "maxRetries": 3
+      "maxAttempts": 3
     }
   ]
 }`;
@@ -297,7 +297,7 @@ REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TES
 - REQUIREMENT_ANALYSIS 拥有功能测试；HIGH_LEVEL_DESIGN 拥有模块测试和 architectureModules.testPaths；DETAILED_DESIGN 拥有集成测试；CODE 拥有单元测试及产品源码/运行时资产。
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 只把这些测试作为 inputs，并仅输出验证报告/交付文档。
 - TypeScript greenfield 必须且只能有一个 HIGH_LEVEL_DESIGN Step 输出 package.json，包含 scripts、dependencies、devDependencies。CODE 不得输出 package.json。
-- TypeScript package.json 只能使用 Vitest："test": "vitest run"，"build": "tsc --noEmit"，devDependencies 包含 typescript/tsx/vitest/@types/node。禁止提及或要求 Jest、ts-jest、@types/jest、ts-node、nodemon。
+- TypeScript package.json 只能使用 Vitest："test": "vitest run"，"build": "tsc --noEmit"，devDependencies 包含 typescript/tsx/vitest/@vitest/coverage-v8/@types/node，并保证 Vitest 与 coverage provider 版本兼容。tsconfig 的产品 build/typecheck 只包含 src/**/*.ts 与 src/**/*.tsx；各 V 模型测试阶段通过 Vitest 独立运行自己的配对测试。禁止提及或要求 Jest、ts-jest、@types/jest、ts-node、nodemon。
 
 输出必须只包含当前 phase 的 dependencies、architectureModules 和 steps。复杂/多关注点任务必须用 architectureModules 表达当前 phase 的模块边界，并在 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 的 subTasks 中映射模块级工作。每个 Step 的 subTasks 最多嵌套 2 层。
 
@@ -316,7 +316,7 @@ architectureModules 只能描述当前 phase 的产品/业务源码模块：
     { "id": "M001", "name": "模块名", "responsibility": "单一明确职责", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
-    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxRetries": 3 }
+    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxAttempts": 3 }
   ]
 }
 
@@ -332,7 +332,11 @@ const messages: Messages = {
     coderDebuggerSameModel: (model, coderProvider, debuggerProvider) =>
       `模型配置建议：Coder（${coderProvider}）和 Debugger（${debuggerProvider}）当前都使用 ${model}。建议配置不同模型，让调试阶段获得独立的推理路径。`,
     invalidBaseUrl: (raw, fallback) => `[xcompiler] base_url 无效（${raw}）；请配置有效的 HTTP(S) URL（默认值：${fallback}）`,
-    providerValidationFailed: (role, model) => `[${role}] provider ${model} 输出契约校验失败，返回调用方纠错`,
+    providerValidationFailed: (role, model) => `[${role}] provider ${model} 输出契约校验失败`,
+    providerValidationRetry: (role, model) => `[${role}] provider ${model} 在切换前携带契约错误原模型纠错重试`,
+    providerValidationRepairPrompt: (error) =>
+      `上一次输出未通过调用方契约校验：${error.slice(0, 1800)}\n` +
+      '请根据原始 system 和 user 要求修正并重新返回完整结果。只返回要求的格式，不要解释或输出 Markdown。',
     providerCallFailed: (role, model) => `[${role}] provider ${model} 调用失败，切换到下一个`,
     scoreReadFailed: (p, message) => `读取 ${p} 失败：${message}`,
     scoreChanged: (provider, score, previous) => `评分（${provider}）=${score}（原值 ${previous}）`,
@@ -431,7 +435,7 @@ const messages: Messages = {
   cli: {
     rootDescription: 'XCompiler — AI Software Factory CLI',
     compileDescription: '交互式编译需求为 phasePlan.json 与当前阶段计划（含强制人工确认）',
-    runDescription: '执行已确认的 phasePlan.json（支持分阶段运行：--phase / --from）',
+    runDescription: '从已确认的 phasePlan.json 执行当前领域 Phase',
     loadDescription: '加载 XXX.xc 工程文件并继续当前 plan',
     appendDescription: '在已有 XXX.xc 工程基础上追加新需求，并重新走澄清与 V 模型执行',
     lsDescription: '扫描 workspace 列出所有 phasePlan.json 状态摘要',
@@ -447,9 +451,6 @@ const messages: Messages = {
     optYes: '跳过人工确认（仅在 -i / -t 提供时有意义）',
     optForce: '强制重新生成：覆写 workspace 锁、忽略旧计划文件',
     optDryRun: '仅打印拓扑顺序，不执行',
-    optFrom: '从指定 Step 开始（之前的跳过）',
-    optPhase: '仅执行指定 V 模型 phase（REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN/CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST）',
-    optReset: '重置所有 Step 状态为 PENDING',
     optMaxDepth: '递归最大深度',
     optTail: '最近审计条数',
     optPlan: 'phasePlan.json 路径，默认 <workspace>/phasePlan.json',
@@ -594,17 +595,17 @@ const messages: Messages = {
     secOutputs: '— outputs —',
     secRecentAudit: (n) => `— recent audit (${n}) —`,
     planHeader: (p, language) => `${p} 语言=${language}`,
-    planStatusSummary: (total, done, pending, failed, running) =>
-      `步骤=${total} 完成=${done} 待执行=${pending} 失败=${failed} 运行中=${running}`,
+    planStatusSummary: (total, done, ready, blocked, running) =>
+      `步骤=${total} 完成=${done} 就绪=${ready} 阻塞=${blocked} 运行中=${running}`,
     planReadFailed: (p, message) => `${p} — ${message}`,
-    stepHeader: (id, phase, title, status, retries, maxRetries) => `${id} ${phase} ${title} ${status} 重试=${retries}/${maxRetries}`,
+    stepHeader: (id, phase, title, state, attempts, maxAttempts) => `${id} ${phase} ${title} ${state} 尝试=${attempts}/${maxAttempts}`,
     stepRoleTools: (role, tools) => `角色=${role} 工具=[${tools}]`,
     stepDependsOn: (ids) => `依赖：${ids}`,
     outputStatus: (exists, p) => `${exists ? '✓' : '✗'} ${p}`,
     auditEntry: (ts, kind, message) => `${ts} ${kind} ${message}`,
   },
   execute: {
-    forceReset: '--force：重置所有 Step 为 PENDING，并覆盖工作区锁。',
+    forceLockOverride: '--force：仅覆盖工作区进程锁，不修改领域生命周期状态。',
     manifestRecalibrated: (p) => `已重新校准 ${p}（移除版本锁和幻觉包名）`,
     manifestSeeded: (p) => `已根据 plan.dependencies 生成 ${p}`,
     auditPlanLoaded: (p) => `已加载 plan：${p}`,
@@ -616,8 +617,6 @@ const messages: Messages = {
     runReasonLabel: '  原因: ',
     runFailureLogHeader: '  --- 详细失败日志（tail 40 行） ---',
     runAllDone: (e, total) => `Plan 全部完成（${e}/${total}）`,
-    runPartialDone: (e, total, remaining) =>
-      `指定范围执行完成（${e}/${total}）；Plan 尚未完成，未执行阶段：${remaining}`,
     projectAuditSummary: (errors, warnings) => `项目审计：${errors} 个错误，${warnings} 个警告`,
     projectMemoryRefreshFailed: (message) => `项目记忆刷新失败：${message}`,
     projectAuditCheck: (name, summary) => `[审计:${name}] ${summary}`,
@@ -636,21 +635,6 @@ const messages: Messages = {
       `${name} 失败（exit=${exitCode}${timedOut ? '，超时' : ''}）`,
   },
   engine: {
-    spinSandboxBuild: (profile) =>
-      profile.id === 'typescript'
-        ? `构建沙盒（npm install，${profile.manifestFile}）…`
-        : `构建沙盒（pip install -r ${profile.manifestFile}）…`,
-    sandboxReady: (r) => `沙盒就绪：${r}`,
-    stepSkipDone: (id, phase) => `  ↪ ${id} ${phase} 已完成，跳过`,
-    spinSandboxRebuild: (id, profile) =>
-      profile.id === 'typescript'
-        ? `Step ${id} 写入 ${profile.manifestFile}，重建 npm 沙盒…`
-        : `Step ${id} 写入 ${profile.manifestFile}，重建 pip 沙盒…`,
-    sandboxStatus: (r) => `沙盒：${r}`,
-    autoFixedSrcImports: (n, files) => `  ⚠ auto-fixed sys.path bootstrap in ${n} 个入口文件：${files}`,
-    debugResumeNotice: (id, n) => `  ↻ ${id} 检测到上次会话以 FAILED 结束（已累积 ${n} 次尝试），本次首轮直接进入 Debugger 模式。`,
-    cachedTestRevalidationNotice: (id, n) =>
-      `  ↻ ${id} 检测到历史 FAILED 结果（已累积 ${n} 次尝试），先重新执行当前测试门禁，再决定是否按 V 模型回退。`,
     cachedTestGateStart: (id, testArgs) =>
       `  [Engine Gate] ${id} 执行 run_tests${testArgs.length > 0 ? `：${testArgs.join(', ')}` : '：完整测试集'}`,
     cachedTestGatePassed: (id) => `  [Engine Gate] ${id} 当前测试门禁通过`,
@@ -658,41 +642,6 @@ const messages: Messages = {
       `  [Engine Gate] ${id} 当前测试门禁失败（exit=${exitCode}${timedOut ? '，超时' : ''}）`,
     cachedTestArtifactsIncomplete: (id, missing) =>
       `  [Engine Gate] ${id} 阶段产物不完整，留在当前测试阶段修复：${missing.join(', ')}`,
-    testRollbackNotice: (testId, testPhase, sourceId, sourcePhase) =>
-      `  ↳ ${testId} ${testPhase} 门禁失败；按 V 模型回退 → ${sourceId} ${sourcePhase} Debugger。`,
-    debugResumeInfraRetry: (id, n) => `  ↻ ${id} 上次会话仅留下 LLM 断连/限流等基础设施错误（${n} 次），已清理陈旧 debug 缓存，本次按正常流程重新执行该 Step。`,
-    enhanceResumeRevalidationNotice: (id, ticketId, n) =>
-      `  ↻ ${id} 从 ${ticketId} 的只读核验循环恢复（${n} 次），本次基于既有产物重新执行增量质量校验。`,
-    spinDebugRetry: (id, attempt, budget, cap, reason) => `🛠  ${id} DEBUG retry ${attempt}/${budget} (cap=${cap}) — ${reason}`,
-    retryException: (a, b, msg) => `retry ${a}/${b} 抛出异常：${msg}`,
-    fixSucceeded: (id, a) => `${id} 修复成功 (retry=${a})`,
-    retryHealthyButFailed: (a, before, b, tag, reason) =>
-      `retry ${a}/${before}→${b} 仍失败但健康（扩窗） · ${tag} · ${reason}`,
-    retryLowQuality: (a, before, b, tag, reason) =>
-      `retry ${a}/${before}→${b} 低质量输出（缩窗） · ${tag} · ${reason}`,
-    retryStillFailed: (a, b, tag, reason) => `retry ${a}/${b} 仍失败 · ${tag} · ${reason}`,
-    earlyAbortLowQuality: (id, n) => `  ⚡ ${id} 检测到连续 ${n} 次低质量 LLM 输出（解析失败/重复 actions/无进展），快速终止 DEBUG 重试`,
-    stepFinalFailed: (id, phase, role) => `✖ Step ${id} (${phase} / ${role}) 最终失败`,
-    finalAttemptsLine: (a, b, c, ea) =>
-      `  attempts=${a}  final_budget=${b}  cap=${c}` + (ea ? '  (early-abort: low-quality)' : ''),
-    finalMetricsLine: (h, p, r, tf, pr) =>
-      `  health=${h}  parseFail=${p}  repeat=${r}  toolFail=${tf}  progress=${pr}`,
-    reasonLabel: 'reason: ',
-    failureLogHeader: '--- failure log (tail, max 80 lines) ---',
-    fixSuggestionsHeader: '--- 修复建议（calibration） ---',
-    auditHint: (id) => `  审计: 查看 .xcompiler/audit.jsonl 与 .xcompiler/llm-stream/${id}-*.txt 获取完整原始流`,
-    spinStepRunning: (id, phase, title) => `▶ ${id} ${phase} ${title}`,
-    noFailureLog: '（未捕获日志）',
-    suggestionLine: (index, code, hint) => `  ${index}. [${code}] ${hint}`,
-    phaseStart: (id, phase, title) => `${id} ${phase} ${title}`,
-    phaseFailed: (id, debug, reason) => `${id} ${debug ? 'DEBUG ' : ''}失败 — ${reason}`,
-    phaseDone: (id, rounds) => `${id} 完成（轮次=${rounds}）`,
-    phaseException: (id, message) => `${id} 异常失败 — ${message}`,
-    archGateReason: (missing) => `HIGH_LEVEL_DESIGN 门禁：架构契约缺少 ${missing} 个标记`,
-    archGateMissing: (tokens) => `缺失模块 ID/路径：${tokens}`,
-    archGateInstruction: (p) => `请更新 ${p}，确保每个 architectureModules 项在进入 CODE 前均可追踪。`,
-    testGateReason: (exitCode, timedOut) => `测试门禁：测试退出码=${exitCode}${timedOut ? '（超时）' : ''}`,
-    deliveryGateReason: (command, exitCode, timedOut) => `FUNCTIONAL_TEST 门禁：\`${command}\` 退出码=${exitCode}${timedOut ? '（超时）' : ''}`,
     missingPythonEntrypoint: '缺少 Python 入口：需要 src/main.py、src/<package>/__main__.py，或 src/cli.py 等显式 CLI 文件',
     missingTypeScriptEntrypoint:
       '缺少 TypeScript 入口：需要 package.json start/bin 或 src/main.ts、src/index.ts、src/main.tsx 之一',
@@ -700,34 +649,6 @@ const messages: Messages = {
       `Python 入口源码无效：${path} 必须是真实 CLI 入口，至少包含 def main(...)、argparse.ArgumentParser 或 if __name__ == "__main__" 这类入口结构；仅 import/comment 的占位文件不能算可运行应用。`,
     entrypointHelpOutputMissing: (command) =>
       `入口探测 \`${command}\` 虽然退出码为 0，但没有输出有意义的 help/usage 文本；必须实现 --help，不能靠空脚本自然退出过关。`,
-    reasonLine: (reason) => `原因：${reason}`,
-    roundsLine: (rounds) => `轮次：${rounds}`,
-    commandLine: (command) => `命令：${command}`,
-    stdoutTailHeader: '--- 标准输出（尾部）---',
-    stderrTailHeader: '--- 标准错误（尾部）---',
-    testStdoutTailHeader: '--- 测试标准输出（尾部）---',
-    testStderrTailHeader: '--- 测试标准错误（尾部）---',
-    outputsMissing: (paths) => `缺失输出：${paths}`,
-    metricsLine: (health, parseFail, repeat, toolFail, progress) =>
-      `指标：健康度=${health} 解析失败=${parseFail} 重复=${repeat} 工具失败=${toolFail} 进度=${progress}`,
-    metricsUnavailable: '指标：无',
-    toolCallsHeader: '工具调用：',
-    toolCallLine: (tool, ok, detail) => `  - ${tool} ${ok ? '成功' : '失败'} ${detail}`,
-    projectMemoryRefreshFailed: (message) => `项目记忆刷新失败：${message}`,
-    deliveryFixHints: (language) => language === 'typescript'
-      ? [
-          '修复方向（按优先级）：',
-          '  1. 若 TypeScript 源码出现模块解析或 ERR_MODULE_NOT_FOUND，使用带显式 .ts 后缀的相对 ESM import。',
-          '  2. 若为 --help 或未知选项，main() 必须支持 --help 并以 0 退出。',
-          '  3. 若为应用异常，修复实现并保持入口轻量。',
-        ]
-      : [
-          '修复方向（按优先级）：',
-          '  1. 若为 src 相关 ModuleNotFoundError，加入 planner #19 的 sys.path 自举或移除 import 的 src. 前缀。',
-          '  2. main() 必须是真实 CLI 入口：解析 --help、调用项目模块、打印有意义输出，并用 if __name__ == "__main__": main() 启动。',
-          '  3. 若为 argparse 错误，main() 必须无需其他必填参数即可支持 --help 并以 0 退出。',
-          '  4. 若为业务异常，修复实现；入口只负责参数解析与调用。',
-        ],
   },
   render: {
     sectionGlobalPrompt: '## Global prompt (注入每个 Step 的 system prompt)',
@@ -957,7 +878,9 @@ ${opts.phasePlan}
     ollamaModelOk: (provider, model) => `provider "${provider}"：模型 "${model}" 可用`,
     openaiKeyMissing: (provider) => `provider "${provider}"：api_key 为空（请设置该 provider 对应的环境变量，例如 OPENROUTER_API_KEY，或 config.llm.providers.${provider}.api_key）`,
     openaiReachable: (provider, baseUrl) => `provider "${provider}"：OpenAI 端点可达 @ ${baseUrl}`,
-    openaiUnreachable: (provider, baseUrl, msg) => `provider "${provider}"：OpenAI 端点不可达 @ ${baseUrl} —— ${msg}`,
+    openaiUnreachable: (provider, baseUrl, msg) => `provider "${provider}"：OpenAI /models 检查失败 @ ${baseUrl} —— ${msg}`,
+    openaiModelListUnavailable: (provider, status) =>
+      `provider "${provider}"：端点可达但未提供 /models（HTTP ${status}），未校验模型清单成员关系`,
     openaiModelListMissing: (provider, model) =>
       `provider "${provider}"：/models 响应中未列出 "${model}"（若你的账号有访问权限仍可正常调用）`,
     providerScoreZero: (provider) => `provider "${provider}" 已禁用（score=0）`,
@@ -969,15 +892,15 @@ ${opts.phasePlan}
     sandboxFullNoPorts:
       'network=full 但未配置 expose_ports—宿主侧无法访问容器内服务。' +
       '请在 config.yaml 中设置 `agent.sandboxes.<language>.<local|docker>.limits.expose_ports: [<port>]`。',
-    sandboxNodeMissing: 'PATH 上找不到 node（TypeScript subprocess 沙盒必需）',
+    sandboxNodeMissing: (detail) => `node 不可用（TypeScript subprocess 沙盒必需）：${detail}`,
     sandboxNodeOk: (version) => `node OK（${version}）`,
-    sandboxNpmMissing: 'PATH 上找不到 npm（TypeScript subprocess 沙盒必需）',
+    sandboxNpmMissing: (detail) => `npm 不可用（TypeScript subprocess 沙盒必需）：${detail}`,
     sandboxNpmOk: (version) => `npm OK（${version}）`,
-    sandboxNpxMissing: 'PATH 上找不到 npx（TypeScript subprocess 沙盒必需）',
+    sandboxNpxMissing: (detail) => `npx 不可用（TypeScript subprocess 沙盒必需）：${detail}`,
     sandboxNpxOk: (version) => `npx OK（${version}）`,
-    sandboxPythonMissing: 'PATH 上找不到 python3（subprocess 沙盒必需）',
+    sandboxPythonMissing: (detail) => `python3 不可用（subprocess 沙盒必需）：${detail}`,
     sandboxPythonOk: (version) => `python3 OK（${version}）`,
-    sandboxVenvMissing: 'python3 venv 模块不可用（请安装 python3-venv / python3-virtualenv）',
+    sandboxVenvMissing: (detail) => `python3 venv 模块不可用（请安装 python3-venv / python3-virtualenv）：${detail}`,
     sandboxVenvOk: 'python3 venv 模块 OK',
     sandboxDockerMissing: (bin) => `PATH 上找不到 docker 二进制 "${bin}"`,
     sandboxDockerOk: (version) => `docker OK（${version}）`,

@@ -19,9 +19,7 @@ function mkStep(over: Partial<Step> & Pick<Step, 'id' | 'phase'>): Step {
     outputs: over.outputs ?? [],
     dependsOn: over.dependsOn ?? [],
     acceptance: over.acceptance ?? '完成。',
-    status: 'PENDING',
-    retries: 0,
-    maxRetries: 3,
+    maxAttempts: 3,
   };
 }
 

@@ -1,4 +1,3 @@
-import type { Workspace } from '../workspace/workspace.js';
 import {
   V_MODEL_DEVELOPMENT_PHASES,
   V_MODEL_SOURCE_TO_TEST_PHASE,
@@ -8,7 +7,6 @@ import {
   type Step,
 } from './plan.js';
 
-export const QUALITY_ASSESSMENTS_PATH = '.xcompiler/quality/assessments.json';
 
 export interface StageQualityAssessment {
   completion?: number;
@@ -29,18 +27,6 @@ export interface QualityGateEvaluation {
   bugFailures: string[];
 }
 
-export interface QualityAssessmentRecord {
-  version: 1;
-  stepId: string;
-  iterationId: string;
-  phase: Phase;
-  role: Step['role'];
-  attempt: number;
-  policy: StageQualityGate;
-  assessment: StageQualityAssessment;
-  evaluation: QualityGateEvaluation;
-  recordedAt: string;
-}
 
 export function defaultQualityGateForPhase(phase: Phase): StageQualityGate {
   const sourceBase = {
@@ -157,9 +143,11 @@ export function reconcileDevelopmentQualityAssessment(
   const deferredVerificationGaps = assessment.gaps.filter((gap) =>
     isDeferredPairedTestExecutionGap(step, gap),
   );
+  const downstreamMetricGaps = assessment.gaps.filter(isDownstreamVerificationMetricGap);
   const reconciledGaps = new Set([
     ...staleOutputGaps,
     ...deferredVerificationGaps,
+    ...downstreamMetricGaps,
   ]);
   const gaps = assessment.gaps.filter((gap) => !reconciledGaps.has(gap));
   const evidence = dedup([...assessment.evidence, ...verifiedOutputs]);
@@ -182,6 +170,22 @@ export function reconcileDevelopmentQualityAssessment(
     evidence,
     gaps,
   };
+}
+
+function isDownstreamVerificationMetricGap(gap: string): boolean {
+  const normalized = gap.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
+  return [
+    'lineCoverage',
+    'branchCoverage',
+    'testCasePassRate',
+    'interfaceCoverage',
+    'integrationScenarioCoverage',
+    'moduleCoverage',
+    'contractCoverage',
+    'functionalCoverage',
+    'requirementCoverage',
+    'endToEndPassRate',
+  ].some((metric) => normalized.includes(metric.toLowerCase()));
 }
 
 export function evaluateQualityGate(
@@ -295,61 +299,6 @@ function isVerifiedMissingOutputGap(
 
 function dedup(values: readonly string[]): string[] {
   return [...new Set(values)];
-}
-
-export class QualityAssessmentStore {
-  private records: QualityAssessmentRecord[] = [];
-  private loaded = false;
-
-  constructor(private readonly workspace: Workspace) {}
-
-  async load(): Promise<void> {
-    if (this.loaded) return;
-    const raw = await this.workspace.readFile(QUALITY_ASSESSMENTS_PATH).catch(() => '');
-    if (raw.trim()) {
-      const parsed = JSON.parse(raw) as unknown;
-      if (!Array.isArray(parsed)) {
-        throw new Error(`${QUALITY_ASSESSMENTS_PATH} must contain an array`);
-      }
-      this.records = parsed as QualityAssessmentRecord[];
-    }
-    this.loaded = true;
-  }
-
-  all(): readonly QualityAssessmentRecord[] {
-    return this.records;
-  }
-
-  latestForStep(stepId: string): QualityAssessmentRecord | undefined {
-    return [...this.records].reverse().find((record) => record.stepId === stepId);
-  }
-
-  async record(
-    step: Step,
-    attempt: number,
-    assessment: StageQualityAssessment,
-    evaluation: QualityGateEvaluation,
-  ): Promise<QualityAssessmentRecord> {
-    await this.load();
-    const record: QualityAssessmentRecord = {
-      version: 1,
-      stepId: step.id,
-      iterationId: step.iterationId ?? 'P1',
-      phase: step.phase,
-      role: step.role,
-      attempt,
-      policy: resolveQualityGate(step),
-      assessment,
-      evaluation,
-      recordedAt: new Date().toISOString(),
-    };
-    this.records.push(record);
-    await this.workspace.writeFile(
-      QUALITY_ASSESSMENTS_PATH,
-      `${JSON.stringify(this.records, null, 2)}\n`,
-    );
-    return record;
-  }
 }
 
 function testGate(metrics: Record<string, number>): StageQualityGate {

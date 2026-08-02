@@ -49,6 +49,11 @@ export interface ExecExtra {
   progressWatch?: ExecProgressWatch;
 }
 
+export interface SandboxBuildOptions {
+  /** Regenerate the TypeScript lockfile after a controlled manifest change. */
+  refreshLockfile?: boolean;
+}
+
 /** 沙盒统一接口。任意 phase / tool 都通过此接口与运行时交互。 */
 export interface Sandbox {
   /** 实现标识，便于审计与日志区分。 */
@@ -61,7 +66,10 @@ export interface Sandbox {
    * manifestFile 为依赖清单在 workspace 内的相对路径；不存在则跳过安装。
    * 返回是否真正重建。
    */
-  build(manifestFile?: string): Promise<{ rebuilt: boolean; reason: string }>;
+  build(
+    manifestFile?: string,
+    options?: SandboxBuildOptions,
+  ): Promise<{ rebuilt: boolean; reason: string }>;
 
   /** 执行任意命令；cmd 视实现可能是宿主路径或容器内路径。 */
   exec(cmd: string, argv: string[], extra?: ExecExtra): Promise<ExecResult>;

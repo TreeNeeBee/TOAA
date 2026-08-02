@@ -140,6 +140,7 @@ async function checkLlm(
     requiresApiKey: boolean;
     probeTimeoutMs: number;
   }> = [];
+  const openaiLive = new Map<string, boolean>();
   for (const [name, p] of providers) {
     if (isOllamaProvider(p)) {
       const url = normalizeBaseUrl(p.base_url, 'http://localhost:11434');
@@ -193,24 +194,38 @@ async function checkLlm(
   // 2b) openai: api_key + connection (+ model membership warn)
   for (const p of openaiList) {
     if (p.requiresApiKey && !p.apiKey) {
+      openaiLive.set(p.name, false);
       sec.items.push({
         level: referencedProviders.has(p.name) ? 'fail' : 'warn',
         message: M.openaiKeyMissing(p.name),
       });
       continue;
     }
-    if (skipNetwork) continue;
+    if (skipNetwork) {
+      openaiLive.set(p.name, true);
+      continue;
+    }
     try {
       const models = await fetchOpenAIModels(p.baseUrl, p.apiKey, p.probeTimeoutMs);
+      openaiLive.set(p.name, true);
       sec.items.push({ level: 'ok', message: M.openaiReachable(p.name, p.baseUrl) });
       if (models.length > 0 && !models.includes(p.model)) {
         sec.items.push({ level: 'warn', message: M.openaiModelListMissing(p.name, p.model) });
       }
     } catch (err) {
-      sec.items.push({
-        level: 'fail',
-        message: M.openaiUnreachable(p.name, p.baseUrl, (err as Error).message),
-      });
+      const detail = (err as Error).message;
+      const status = httpStatusFromError(detail);
+      if (status !== undefined && [404, 405, 501].includes(status)) {
+        openaiLive.set(p.name, true);
+        sec.items.push({ level: 'ok', message: M.openaiReachable(p.name, p.baseUrl) });
+        sec.items.push({ level: 'warn', message: M.openaiModelListUnavailable(p.name, status) });
+      } else {
+        openaiLive.set(p.name, false);
+        sec.items.push({
+          level: 'fail',
+          message: M.openaiUnreachable(p.name, p.baseUrl, detail),
+        });
+      }
     }
   }
 
@@ -240,7 +255,8 @@ async function checkLlm(
       }
       if (isOpenAICompatibleProvider(prov)) {
         const baseUrl = normalizeBaseUrl(prov.base_url, 'https://api.openai.com/v1');
-        return !openAIEndpointRequiresApiKey(baseUrl) || (prov.api_key ?? '').length > 0;
+        const hasRequiredKey = !openAIEndpointRequiresApiKey(baseUrl) || (prov.api_key ?? '').length > 0;
+        return hasRequiredKey && openaiLive.get(n) === true;
       }
       return false;
     });
@@ -252,6 +268,11 @@ async function checkLlm(
   }
 
   return sec;
+}
+
+function httpStatusFromError(message: string): number | undefined {
+  const match = /^HTTP (\d{3})\b/u.exec(message);
+  return match ? Number(match[1]) : undefined;
 }
 
 function candidatesForRole(cfg: XCompilerConfig, role: string): string[] {
@@ -296,19 +317,19 @@ async function checkSubprocessLanguage(sec: CheckSection, language: Language): P
   if (language === 'typescript') {
     const node = await execRaw('node', ['--version'], { timeoutMs: 5_000 });
     if (node.exitCode !== 0) {
-      sec.items.push({ level: 'fail', message: M.sandboxNodeMissing });
+      sec.items.push({ level: 'fail', message: M.sandboxNodeMissing(execResultDetail(node)) });
       return;
     }
     sec.items.push({ level: 'ok', message: M.sandboxNodeOk((node.stdout || node.stderr).trim()) });
     const npm = await execRaw('npm', ['--version'], { timeoutMs: 5_000 });
     if (npm.exitCode !== 0) {
-      sec.items.push({ level: 'fail', message: M.sandboxNpmMissing });
+      sec.items.push({ level: 'fail', message: M.sandboxNpmMissing(execResultDetail(npm)) });
       return;
     }
     sec.items.push({ level: 'ok', message: M.sandboxNpmOk((npm.stdout || npm.stderr).trim()) });
     const npx = await execRaw('npx', ['--version'], { timeoutMs: 5_000 });
     if (npx.exitCode !== 0) {
-      sec.items.push({ level: 'fail', message: M.sandboxNpxMissing });
+      sec.items.push({ level: 'fail', message: M.sandboxNpxMissing(execResultDetail(npx)) });
       return;
     }
     sec.items.push({ level: 'ok', message: M.sandboxNpxOk((npx.stdout || npx.stderr).trim()) });
@@ -316,16 +337,21 @@ async function checkSubprocessLanguage(sec: CheckSection, language: Language): P
   }
   const v = await execRaw('python3', ['--version'], { timeoutMs: 5_000 });
   if (v.exitCode !== 0) {
-    sec.items.push({ level: 'fail', message: M.sandboxPythonMissing });
+    sec.items.push({ level: 'fail', message: M.sandboxPythonMissing(execResultDetail(v)) });
     return;
   }
   sec.items.push({ level: 'ok', message: M.sandboxPythonOk((v.stdout || v.stderr).trim()) });
   const venv = await execRaw('python3', ['-m', 'venv', '--help'], { timeoutMs: 5_000 });
   if (venv.exitCode !== 0) {
-    sec.items.push({ level: 'fail', message: M.sandboxVenvMissing });
+    sec.items.push({ level: 'fail', message: M.sandboxVenvMissing(execResultDetail(venv)) });
   } else {
     sec.items.push({ level: 'ok', message: M.sandboxVenvOk });
   }
+}
+
+function execResultDetail(result: Awaited<ReturnType<typeof execRaw>>): string {
+  const detail = (result.stderr || result.stdout).trim().replace(/\s+/gu, ' ').slice(0, 240);
+  return detail || `exit=${result.exitCode}${result.timedOut ? ', timeout' : ''}`;
 }
 
 async function checkDockerSandbox(sec: CheckSection, bin: string, skipNetwork: boolean): Promise<void> {

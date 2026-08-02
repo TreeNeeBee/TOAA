@@ -111,6 +111,7 @@ const typescriptProfile: LanguageProfile = {
       ),
       devDependencies: {
         vitest: '*',
+        '@vitest/coverage-v8': '*',
         typescript: '*',
         tsx: '*',
         '@types/node': '*',

@@ -37,6 +37,7 @@ export interface RuntimeToolCallEvent {
   callId: string;
   status: ToolExecutionEvent['status'];
   stepId: string;
+  stepName?: string;
   tool: string;
   target?: string;
   ok?: boolean;
@@ -48,6 +49,7 @@ export interface RuntimeFileChangedEvent {
   type: 'file_changed';
   callId: string;
   stepId: string;
+  stepName?: string;
   tool: string;
   path: string;
 }
@@ -56,6 +58,7 @@ export interface RuntimePatchProposedEvent {
   type: 'patch_proposed';
   callId: string;
   stepId: string;
+  stepName?: string;
   tool: string;
   patch: string;
 }
@@ -66,6 +69,28 @@ export interface RuntimePermissionEvent {
   request: ToolPermissionRequest;
 }
 
+export interface RuntimeWorkflowEvent {
+  type: 'workflow';
+  event:
+    | 'project_planned'
+    | 'phase_started'
+    | 'step_started'
+    | 'ticket_started'
+    | 'ticket_routed'
+    | 'step_delivered'
+    | 'phase_delivered'
+    | 'project_delivered';
+  projectId: string;
+  phaseId?: string;
+  stepId?: string;
+  stepName?: string;
+  ticketId?: string;
+  ticketType?: string;
+  correlationId: string;
+  causationId?: string;
+  message?: string;
+}
+
 export type RuntimeEvent =
   | RuntimeLogEvent
   | RuntimeProgressEvent
@@ -73,7 +98,8 @@ export type RuntimeEvent =
   | RuntimeToolCallEvent
   | RuntimeFileChangedEvent
   | RuntimePatchProposedEvent
-  | RuntimePermissionEvent;
+  | RuntimePermissionEvent
+  | RuntimeWorkflowEvent;
 
 export interface RuntimeProgress {
   succeed(message: string): void | Promise<void>;

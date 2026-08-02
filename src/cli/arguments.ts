@@ -1,5 +1,5 @@
 import { Help, InvalidArgumentError, type Command } from 'commander';
-import { PHASES, PLAN_INTENTS, type Phase, type PlanIntent } from '../core/plan.js';
+import { PLAN_INTENTS, type PlanIntent } from '../core/plan.js';
 import { normaliseLocale, t, type Locale } from '../i18n/index.js';
 
 const LOCALE_ALIASES = new Set([
@@ -53,17 +53,9 @@ export function parseIntent(value: string): PlanIntent {
   return normalized as PlanIntent;
 }
 
-export function parsePhase(value: string): Phase {
-  const normalized = value.trim().toUpperCase();
-  if (!PHASES.includes(normalized as Phase)) {
-    throw new InvalidArgumentError(t().cli.invalidPhase(value, PHASES.join(', ')));
-  }
-  return normalized as Phase;
-}
-
 export function parseStepId(value: string): string {
   const normalized = value.trim().toUpperCase();
-  if (!/^S\d{3,}$/u.test(normalized)) {
+  if (!/^(?:P\d{1,3}-)?S\d{3,}$/u.test(normalized)) {
     throw new InvalidArgumentError(t().cli.invalidStepId(value));
   }
   return normalized;

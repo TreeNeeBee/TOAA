@@ -209,10 +209,6 @@ const LlmSchema = z.object({
 });
 
 const AgentSchema = z.object({
-    max_steps: z.number().int().positive().default(50),
-    max_debug_retries: z.number().int().positive().default(3),
-    /** Debugger 滑动窗口的硬上限（默认 = max(max_debug_retries*4, 10)）。 */
-    max_debug_retries_cap: z.number().int().positive().optional(),
     max_rounds_per_step: z.number().int().positive().default(6),
     max_debug_rounds_per_step: z.number().int().positive().optional(),
     max_edit_lines_per_step: z.union([z.literal('auto'), z.number().int().positive()]).default('auto'),

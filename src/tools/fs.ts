@@ -188,6 +188,21 @@ export const writeFileTool: Tool<{ path: string; content: string }, WriteFileDat
 
       const next = Buffer.from(args.content, 'utf8');
       const previousBytes = previous?.byteLength ?? 0;
+      if (previous?.equals(next)) {
+        return {
+          ok: true,
+          data: { bytes: size, previousBytes, changed: false },
+          summary: `unchanged ${resolved.rel} (${size}B; content identical)`,
+        };
+      }
+      if (previous && ctx.preserveExistingFiles) {
+        return {
+          ok: false,
+          error:
+            `incremental write denied: ${resolved.rel} is an accepted existing file. ` +
+            'Use replace_in_file or apply_patch for the smallest required delta; write_file may still create a missing file.',
+        };
+      }
       const truncationError = previous
         ? suspiciousTextTruncationError({
             tool: 'write_file',
@@ -200,14 +215,6 @@ export const writeFileTool: Tool<{ path: string; content: string }, WriteFileDat
         return {
           ok: false,
           error: truncationError,
-        };
-      }
-
-      if (previous?.equals(next)) {
-        return {
-          ok: true,
-          data: { bytes: size, previousBytes, changed: false },
-          summary: `unchanged ${resolved.rel} (${size}B; content identical)`,
         };
       }
 

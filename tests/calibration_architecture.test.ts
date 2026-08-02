@@ -20,9 +20,7 @@ function step(overrides: Partial<Step> & Pick<Step, 'id' | 'phase'>): Step {
     outputs: overrides.outputs ?? [],
     dependsOn: overrides.dependsOn ?? [],
     acceptance: overrides.acceptance ?? 'Declared outputs exist.',
-    status: 'PENDING',
-    retries: 0,
-    maxRetries: 3,
+    maxAttempts: 3,
   };
 }
 

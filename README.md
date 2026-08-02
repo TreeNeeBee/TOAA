@@ -46,25 +46,24 @@ XCompiler combines a phase iteration model with the V-model. The planner first c
 
 V-model behavior:
 
-- `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, and `CODE` each generate the paired test plan and executable test cases: functional, module/contract, integration, and unit respectively.
+- Each implementation Phase owns exactly eight canonical Steps: `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, `CODING`, `UNIT_TEST`, `INTEGRATION_TEST`, `SYSTEM_TEST`, and `ACCEPTANCE_TEST`.
+- Planner JSON is an immutable execution specification. Runtime compiles it into globally identified Project, Phase, Step, Ticket, KPI, Changelist, Checkpoint, Report, Log, and AuditEvent objects; only those objects own lifecycle state.
+- `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, and `CODING` each generate the paired acceptance, system, integration, and unit test plans and executable cases.
 - `HIGH_LEVEL_DESIGN` defines system-level interfaces, external APIs, third-party libraries, and dependencies.
 - `DETAILED_DESIGN` defines internal module structure and implementation details.
-- `UNIT_TEST`, `INTEGRATION_TEST`, `MODULE_TEST`, and `FUNCTIONAL_TEST` are validation-only: they inspect the existing paired tests, run the scoped gate, and write reports without modifying `src/` or `tests/`.
-- Every S1-S4 delivery gate records stage completion and alignment with its upstream requirement/design contract. Missing or under-aligned work opens an `enhance` Ticket and reruns the owning stage in incremental mode.
+- `UNIT_TEST`, `INTEGRATION_TEST`, `SYSTEM_TEST`, and `ACCEPTANCE_TEST` are validation-only: they inspect paired tests, run scoped gates, and write reports without rewriting source or accepted tests.
+- Every S1-S4 delivery gate records stage completion and alignment with its upstream requirement/design contract. Missing or under-aligned work opens an `enhancement` Ticket and reruns the owning stage in incremental mode.
 - S5 enforces line, branch, and test-case pass coverage; S6 enforces interface and integration-scenario coverage; S7 enforces module and contract coverage; S8 enforces functional, requirement, and end-to-end coverage. Each plan can override thresholds and bounded `tolerance`.
-- A metric shortfall, skipped-test excess, warning excess, or missing quality evidence opens an `enhance`; an actual failed test, command error, or semantic `validationDefect` opens a `bug`.
-- Runtime compiles every executable iteration into one `epic`, eight `kind: v-model-stage` Features, and one final `kind: delivery` Feature. A Step's first and second `subTasks` levels become Task and Sub-task Tickets.
-- Stage Features carry explicit `dependsOnTicketIds`; V-model source/verification pairs use `verificationTicketId` and `pairedSourceTicketId`. Array order is never treated as a dependency.
-- A later iteration Epic explicitly depends on its prerequisite Epics, and its first stage Feature inherits that gate. Reordering Plan arrays cannot bypass an unfinished iteration.
-- Stage identity is the composite `(iterationId, stepId)`, so P1/S001 and P2/S001 have separate Features, blockers, retries, and Debug histories.
-- The delivery Feature starts only after all eight stage Features are both `closed` and execution-`passed`, prerequisite Epics have passed, and no active Bug, Enhance, or Change Request remains. Closing it closes the Epic; it never cascades fake completion into unfinished children.
-- A concrete failure creates a `bug` for Debugger execution. Quality findings are independent `enhance` Tickets with kind `defect`, `functional-gap`, or `test-incomplete`; they are not disguised as Bugs.
-- Only an accepted upstream design/contract delta creates a `change-request`. Its trigger is the Enhance finding; `originBugTicketId` is present only when a Bug initiated that finding. Downstream stages apply only the delta and record change/verification commits.
-- A downstream failure creates another linked Bug and increments the same change-request revision. A child change-request is created only when the correction materially expands contract or scope.
-- Bug closure order is fixed: repair -> verification -> debug-wiki persistence -> `closed`. A design Bug remains blocked by its change-request until every affected gate passes.
+- A metric shortfall, incomplete artifact, or alignment gap opens an `enhancement`; an execution or test failure opens a `bug`. These are distinct Ticket types with distinct reporting and scoring effects.
+- Each Phase compiles to one `epic`, eight Step `story` Tickets, optional `task` Tickets with at most two nested task levels, and one delivery `story`. Dependencies are UUID references, never array positions or display names.
+- Globally unique UUIDv7 `id` values own identity. Human labels such as `P1-S004` are stored in `name`; they are never foreign keys.
+- A Bug routes to the paired source Step for Debug. Its root-cause fix produces a `change-request` carrying the contract delta, affected Step IDs, implementation plan, changelists, commits, and verification gates.
+- Downstream CR work is incremental. A CR failure creates a linked Bug, blocks the parent CR, executes the paired-source repair and child CR verification, then resumes only the parent's remaining applications.
+- Bug closure order is fixed: source repair -> all affected CR gates -> verified solution -> debug-wiki persistence. Retrieved fixes that fail are marked for review rather than accumulated as trusted context.
+- A Phase closes only when all eight Steps, Step stories, corrective Tickets, KPI assessments, and the delivery story are closed. The Project closes only after every dependency-ready Phase closes.
 - Completed-phase debug must provide a real patch/rewrite or successful verification evidence.
 - Network/API failures are treated as real gates: if the project API fails, the run must repair or switch API instead of hiding the failure.
-- Every quality assessment is persisted in `.xcompiler/quality/assessments.json`. Successful delivery writes `docs/project-development-report.md` with iteration status, S1-S8 thresholds and measurements, tolerance observations, Ticket totals, audit results, and the final delivery verdict.
+- Quality assessments, changelists, checkpoints, reports, logs, and audit events are first-class registered objects. Delivery writes `docs/project-development-report.md` and links its Report object back to the owning Phase or Project.
 
 ---
 
@@ -78,15 +77,14 @@ Layer responsibilities:
 
 - **Adapters**: argument/protocol parsing, config loading, user interaction, output rendering, exit codes.
 - **Runtime**: Runtime API, Build Service, Run Service, Event Stream, and Permission Broker; the only business entry point.
-- **Workflow and planning**: phase iteration, V-model definition, Ticket-graph compilation/routing, rollback, iteration gates, delivery, resume.
-- **State policy**: the Ticket graph is the runtime source of truth for `epic`, `feature`, `task`, `sub-task`, `bug`, `enhance`, and `change-request`. Plan Step status/retry fields are progress projections only. No adapter or agent mutates persisted workflow state directly.
+- **Workflow and planning**: Planner drafts, Project/Phase/Step compilation, dependency scheduling, failure routing, quality gates, delivery, and exact-state resume.
+- **State policy**: canonical domain objects are the only runtime source of truth. Ticket types are `epic`, `story`, `task`, `bug`, `enhancement`, and `change-request`; Planner files contain no execution state.
 - **Agents / Skills**: role-specific prompts plus allowed tools for each stage.
 - **Tools**: guarded file edits, program/test execution, API fetches, dependency edits, git snapshots.
 - **LLM Router**: role chains, provider scores, cluster fallbacks, OpenAI-compatible/Ollama clients, audit.
-- **Workspace**: `phasePlan.json`, `plan.P<N>.json`, `<name>.xc`, `.xcompiler/audit.jsonl`, `.xcompiler/tickets/`, `.xcompiler/quality/assessments.json`, debug cache, project memory, and `docs/project-development-report.md`.
+- **Workspace**: `phasePlan.json` and `plan.P<N>.json` planning artifacts, `<name>.xc` manifest, `.xcompiler/registry/` identity index/events, `.xcompiler/objects/<type>/<uuid>.json` canonical objects, human audit logs, debug wiki, project memory, and delivery reports.
 
-Ticket state is persisted in `.xcompiler/tickets/index.json`, per-ticket JSON/Markdown snapshots, and the append-only `.xcompiler/tickets/events.jsonl`. Work Tickets separate governance status from execution state (`queued`, `running`, `passed`, `failed`). Bug evidence and repair patches live under the Bug Ticket directory, so every handoff keeps its trigger, root Epic, dependencies, V-model pairing, blockers, affected artifacts, acceptance gates, and final resolution.
-`.xcompiler/tickets/summary.json` separates enhancement kinds, CR revisions, status counts, and per-provider model impact. A quality gap penalizes the attributed author provider; a validated finding rewards its validator; verified Debug and CR work rewards the providers that produced the accepted repair. Creating a CR by itself never changes a model score.
+The append-only object-registry event stream is the recovery source; its snapshot index is rebuildable. Each registry entry maps `id` to `objectType`, object path, parent, revision, content hash, and lifecycle state. Adapters and agents cannot mutate these files directly; Runtime use cases call the repository, scheduler, and lifecycle commands.
 
 ---
 
@@ -163,8 +161,6 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 | `xcompiler build -i <file>` | Build a phase plan from a requirement file |
 | `xcompiler build -t <topic.md>` | Reuse a clarified topic and skip Gate 1 |
 | `xcompiler run <phasePlan.json>` | Execute the active phase plan |
-| `xcompiler run --from <stepId>` | Resume from a specific step |
-| `xcompiler run --phase <phase>` | Run only one phase/stage |
 | `xcompiler run --debug-wiki-path <dir>` | Reuse and update a shared layered debug wiki path |
 | `xcompiler load <name.xc>` | Load project config/progress and continue |
 | `xcompiler append <name.xc> -i <file>` | Add a new requirement to an existing project |
@@ -182,7 +178,7 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **LLM routing**: role-specific provider chains, XCompiler-maintained dynamic scores, user overrides from `llm_scores_user.yaml`, and `tags: [cluster]` fallback score bands for aggregated routes such as `openrouter/free`.
 - **Languages**: Python and TypeScript project generation, testing, execution, and entry checks.
 - **Sandbox**: `subprocess` by default with an isolated environment (`inherit_env: false`); optional `docker` mode for enforceable network/resource isolation. `network: off` is rejected in subprocess mode because a host child process cannot enforce it.
-- **Audit**: every run writes `.xcompiler/audit.jsonl`, LLM stream traces, `docs/process_log.md`, debug cache, debug wiki feedback, and project memory.
+- **Audit**: every run writes human-readable process logs plus first-class domain AuditEvent/Log objects with correlation and causation IDs.
 - **Debug wiki**: Bug Ticket repairs retrieve LLM-wiki style prior fixes by compact `DebugBrief`. The wiki is a layered Markdown knowledge base: bundled `wiki/system` policy pages, bundled `wiki/agent` calibration pages, and local `wiki/external` resolved-Bug knowledge. Runtime regenerates `index.md` for review, `index.json` for retrieval, and `log.md` for append-only operations. By default it is copied to the XCompiler path (`$XC_PATH/.xcompiler/debug-wiki` when `XC_PATH` is set, otherwise the package/repo root); use `--debug-wiki-path <dir>` to share a different root. A Bug closes only after its `bugResolutionPlan` and evidence are persisted; failed reused fixes are marked `needs_review`.
 - **Security gates**: project file access is guarded, write tools are scoped to declared outputs, and sensitive actions can be surfaced as permission events in adapter scenarios.
 
@@ -203,7 +199,7 @@ LLM routing is configured under `config.yaml -> llm.*`.
 | `agent.sandboxes.<language>.local.inherit_env` | `false` | Opt in to host environment inheritance; keep false when the host contains API keys or other secrets |
 | `max_rounds_per_step` | `6` | LLM dialogue limit within a normal step |
 | `max_debug_rounds_per_step` | `max(8, 2 * max_rounds_per_step)` | Debugger round cap |
-| `max_debug_retries` | `3` | Debug retry attempts |
+| Planner `Step.maxAttempts` | complexity-adaptive | Transactional Step attempts; minimum grows from simple to moderate/complex and with Phase count |
 | `--debug-wiki-path <dir>` | XCompiler path `.xcompiler/debug-wiki` | Shared layered debug wiki root |
 | `max_edit_lines_per_step` | `auto` | Adaptive EditGuard cumulative write-line budget |
 | `max_write_chunk_bytes` | `auto` | Per-call write budget derived from the active Provider context window and current prompt; a number remains a hard override |
@@ -235,7 +231,7 @@ npm test
 npm run build
 ```
 
-Recent local release gate: 60 test files / 616 tests passed.
+The release gate always runs the complete current suite; no fixed historical test count is used as an acceptance claim.
 
 ---
 

@@ -164,9 +164,7 @@ describe('OllamaClient streaming', () => {
         outputs,
         dependsOn: index === 0 ? [] : [`S${String(index).padStart(3, '0')}`],
         acceptance: 'a',
-        status: 'PENDING',
-        retries: 0,
-        maxRetries: 3,
+        maxAttempts: 3,
       }));
       res.write(JSON.stringify({ message: { role: 'assistant', content: `"steps":${JSON.stringify(steps)}}` } }) + '\n');
       open = res; // no done=true, no end

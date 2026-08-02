@@ -220,6 +220,64 @@ describe('add_dependency', () => {
     await expect(fs.stat(path.join(tmp, 'npm-shrinkwrap.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('parses scoped npm version selectors and refreshes the lockfile as a dev dependency', async () => {
+    await ws.writeFile('package.json', JSON.stringify({
+      name: 'fixture',
+      dependencies: { yaml: '^2.0.0' },
+      devDependencies: { vitest: '^1.2.0' },
+    }, null, 2));
+    ctx.language = 'typescript';
+    let buildArgs: unknown[] = [];
+    ctx.sandbox = {
+      build: async (...args: unknown[]) => {
+        buildArgs = args;
+        return { rebuilt: true, reason: 'lockfile refreshed' };
+      },
+    } as never;
+
+    const r = await addDependencyTool.run(
+      { packages: ['@vitest/coverage-v8@1.6.1'], dev: true },
+      ctx,
+    );
+
+    expect(r.ok).toBe(true);
+    expect(r.data).toMatchObject({ added: ['@vitest/coverage-v8'], updated: [] });
+    expect(buildArgs).toEqual(['package.json', { refreshLockfile: true }]);
+    const pkg = JSON.parse(await ws.readFile('package.json')) as {
+      dependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
+    };
+    expect(pkg.dependencies).toEqual({ yaml: '^2.0.0' });
+    expect(pkg.devDependencies['@vitest/coverage-v8']).toBe('1.6.1');
+    expect(pkg.devDependencies['@vitest/coverage-v8@1.6.1']).toBeUndefined();
+  });
+
+  it('updates an existing npm dependency version without duplicating the package name', async () => {
+    await ws.writeFile('package.json', JSON.stringify({
+      name: 'fixture',
+      devDependencies: {
+        '@vitest/coverage-v8': '1.5.0',
+        vitest: '1.6.1',
+      },
+    }, null, 2));
+    ctx.language = 'typescript';
+
+    const r = await addDependencyTool.run(
+      { packages: ['@vitest/coverage-v8@1.6.1'], dev: true },
+      ctx,
+    );
+
+    expect(r.ok).toBe(true);
+    expect(r.data).toMatchObject({ added: [], updated: ['@vitest/coverage-v8'] });
+    const pkg = JSON.parse(await ws.readFile('package.json')) as {
+      devDependencies: Record<string, string>;
+    };
+    expect(pkg.devDependencies).toEqual({
+      '@vitest/coverage-v8': '1.6.1',
+      vitest: '1.6.1',
+    });
+  });
+
   it('skips sandbox rebuild when every requested dependency already exists', async () => {
     await ws.writeFile('requirements.txt', 'pytest\n');
     let buildCalls = 0;

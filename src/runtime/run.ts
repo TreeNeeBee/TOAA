@@ -10,7 +10,10 @@ import { reportRoleModelAdvice } from '../llm/role_advice.js';
 import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
 import { createSandbox } from '../sandbox/factory.js';
-import { PhaseEngine } from '../core/engine.js';
+import {
+  DomainExecutionEngine,
+  type DomainEngineResult,
+} from '../application/execution/domain_engine.js';
 import { acquireLock, LockError } from '../core/lock.js';
 import {
   Planner,
@@ -19,7 +22,7 @@ import {
 } from '../agents/planner.js';
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
-import { runProjectAudit, shouldRunProjectAudit } from '../core/project_audit.js';
+import { runProjectAudit } from '../core/project_audit.js';
 import {
   generateProjectDevelopmentReport,
 } from '../core/project_report.js';
@@ -28,15 +31,19 @@ import { updateProjectFile } from '../core/project_file.js';
 import { DOC_NAMES } from '../core/docs.js';
 import { renderPlanMarkdown } from '../core/render.js';
 import { advancePhasePlan, phasePlanFileName, type PhasePlan } from '../core/phase_plan.js';
-import { DebugCache } from '../core/debug_cache.js';
 import type { Language, Plan, PlanIntent } from '../core/plan.js';
 import { setLocale, t } from '../i18n/index.js';
 import { PluginHost } from '../plugins/host.js';
 import type { XCompilerPlugin } from '../plugins/types.js';
 import { hasXcEnv } from '../config/env.js';
-import type { EngineResult } from '../core/engine.js';
 import type { ProjectAuditResult } from '../core/project_audit.js';
 import type { ToolExecutionEvent, ToolPermissionRequest } from '../tools/types.js';
+import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
+import { compilePhaseMaterialization } from '../domain/planning/compiler.js';
+import { ProjectPlanSchema } from '../domain/planning/plan.js';
+import { reviseObjectEnvelope } from '../domain/objects/object_envelope.js';
+import type { ObjectId } from '../domain/identity/object_id.js';
+import { DomainAuditTrail } from '../domain/observability/audit_trail.js';
 import {
   runtimeLog,
   runtimeResult,
@@ -49,9 +56,6 @@ export interface ExecuteOptions {
   workspace: string;
   configPath?: string;
   dryRun?: boolean;
-  fromStepId?: string;
-  onlyPhase?: string;
-  resetStatus?: boolean;
   force?: boolean;
   /** Optional XXX.xc project file to keep in sync with execution progress. */
   projectFilePath?: string;
@@ -72,7 +76,7 @@ export interface ExecuteOptions {
 
 export interface ExecuteResult {
   status: 'ok' | 'failed' | 'error' | 'dry-run';
-  engine?: EngineResult;
+  engine?: DomainEngineResult;
   audit?: ProjectAuditResult;
   message?: string;
   exitCode?: number;
@@ -111,8 +115,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     workspace: ws.root,
     plan: opts.planPath,
     dryRun: !!opts.dryRun,
-    fromStepId: opts.fromStepId ?? '',
-    onlyPhase: opts.onlyPhase ?? '',
   });
   const pluginHost = new PluginHost({
     plugins: opts.plugins,
@@ -121,23 +123,42 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   });
   await pluginHost.initialize();
 
-  const target = await loadPlanTarget(opts.planPath);
-  const planAbs = target.planPath;
-  const publicPlanPath = target.phasePlanPath ?? target.planPath;
-  const plan = target.plan;
-  const projectCommand = opts.projectCommand ?? 'run';
-  // --force resets the current iteration Ticket graph and clears debug history.
-  if (opts.force) {
-    await runtimeLog(io, 'warning', t().execute.forceReset);
-    opts.resetStatus = true;
+  let target = await loadPlanTarget(opts.planPath);
+  let planAbs = target.planPath;
+  let publicPlanPath = target.phasePlanPath ?? target.planPath;
+  let plan = target.plan;
+  const domainRepository = new DomainObjectRepository(ws);
+  await domainRepository.load();
+  const domainAudit = new DomainAuditTrail(domainRepository);
+  let domainProject = await domainRepository.findProject();
+  if (!domainProject) {
+    throw new Error('Canonical Project is missing; run xcompiler build before xcompiler run.');
   }
-
-  if (opts.resetStatus) {
-    const debugCache = new DebugCache(ws.abs('.xcompiler/debug_cache.json'));
-    await debugCache.clearAll();
-    await audit.event('plan.persist', 'cleared debug cache because run reset was requested', {
-      messageId: 'execute.debug_cache_reset',
+  let phaseObjects = await Promise.all(domainProject.phaseIds.map((id) => domainRepository.read(id)));
+  let domainPhase = phaseObjects.find((object) =>
+    object.objectType === 'phase' && object.name === plan.phaseId,
+  );
+  if (!domainPhase || domainPhase.objectType !== 'phase') {
+    throw new Error(`Canonical Phase ${plan.phaseId} is missing from Project ${domainProject.name}`);
+  }
+  if (domainPhase.stepIds.length === 0) {
+    await materializeNextDomainPhase({
+      repository: domainRepository,
+      projectId: domainProject.id,
+      phaseId: domainPhase.id,
+      plan,
     });
+    const materialized = await domainRepository.read(domainPhase.id);
+    if (materialized.objectType !== 'phase') throw new Error(`Object ${domainPhase.id} is not a Phase`);
+    domainPhase = materialized;
+  }
+  const recoverUnadvancedPhase = domainPhase.state === 'closed' &&
+    domainProject.currentPhaseId !== undefined &&
+    domainProject.currentPhaseId !== domainPhase.id;
+  const projectCommand = opts.projectCommand ?? 'run';
+  // --force only overrides a stale process lock; lifecycle state remains authoritative.
+  if (opts.force) {
+    await runtimeLog(io, 'warning', t().execute.forceLockOverride);
   }
   let projectFilePath = await updateProjectFile({
     workspace: ws.root,
@@ -146,7 +167,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     projectFilePath: opts.projectFilePath,
     command: projectCommand,
     intent: plan.intent,
-    plan,
     recordHistory: opts.recordProjectHistory ?? true,
   });
 
@@ -222,43 +242,95 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
   const router = new LLMRouter(cfg, audit, scoreStore, unavailableProviders, pluginHost);
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
+  if (recoverUnadvancedPhase) {
+    if (!target.phasePlan || !target.phasePlanPath || !domainProject.currentPhaseId) {
+      throw new Error(
+        `Project ${domainProject.name} advanced beyond ${domainPhase.name}, but the PhasePlan recovery context is missing.`,
+      );
+    }
+    const recovery = await completeAndPrepareNextPhase({
+      phasePlan: target.phasePlan,
+      phasePlanPath: target.phasePlanPath,
+      ws,
+      router,
+      audit,
+      io,
+      currentPlanPath: planAbs,
+      currentPlan: plan,
+      iterationDelivered: true,
+    });
+    if (!recovery.nextPlan) {
+      throw new Error(`Project ${domainProject.name} points to a next Phase but PhasePlan has no next plan`);
+    }
+    await materializeNextDomainPhase({
+      repository: domainRepository,
+      projectId: domainProject.id,
+      phaseId: domainProject.currentPhaseId,
+      plan: recovery.nextPlan,
+    });
+    target = await loadPlanTarget(target.phasePlanPath);
+    planAbs = target.planPath;
+    publicPlanPath = target.phasePlanPath ?? target.planPath;
+    plan = target.plan;
+    domainProject = await domainRepository.findProject();
+    if (!domainProject) throw new Error('Canonical Project disappeared during Phase recovery');
+    phaseObjects = await Promise.all(domainProject.phaseIds.map((id) => domainRepository.read(id)));
+    const recoveredPhase = phaseObjects.find((object) =>
+      object.objectType === 'phase' && object.name === plan.phaseId,
+    );
+    if (!recoveredPhase || recoveredPhase.objectType !== 'phase' || recoveredPhase.stepIds.length === 0) {
+      throw new Error(`Canonical Phase ${plan.phaseId} recovery did not materialize its Step graph`);
+    }
+    domainPhase = recoveredPhase;
+    await audit.event('plan.persist', `recovered and materialized ${domainPhase.name}`, {
+      messageId: 'execute.phase_recovered',
+      projectId: domainProject.id,
+      phaseId: domainPhase.id,
+      planPath: planAbs,
+    });
+    await runtimeLog(io, 'success', `recovered ${domainPhase.name} from the canonical Project state`);
+    projectFilePath = await updateProjectFile({
+      workspace: ws.root,
+      planPath: publicPlanPath,
+      configPath: cfgPath,
+      projectFilePath,
+      command: projectCommand,
+      intent: plan.intent,
+    });
+  }
   const git = new GitService(ws);
   const sandbox = createSandbox(cfg, ws, audit, plan.language);
-
-  const engine = new PhaseEngine({
-    ws,
+  const requestPermission = io.requestPermission
+    ? async (request: ToolPermissionRequest) => {
+        await io.emit({ type: 'permission', status: 'requested', request });
+        const decision = await io.requestPermission!(request);
+        await io.emit({ type: 'permission', status: decision.approved ? 'approved' : 'denied', request });
+        return decision;
+      }
+    : undefined;
+  let finalProjectAudit: ProjectAuditResult | undefined;
+  const engine = new DomainExecutionEngine({
+    workspace: ws,
     git,
     sandbox,
     router,
     audit,
+    repository: domainRepository,
     plugins: pluginHost,
-    planPath: planAbs,
-    fromStepId: opts.fromStepId,
-    onlyPhase: opts.onlyPhase,
     maxRoundsPerStep: cfg.agent.max_rounds_per_step,
     maxDebugRoundsPerStep: cfg.agent.max_debug_rounds_per_step,
-    maxDebugRetries: cfg.agent.max_debug_retries,
-    maxDebugRetriesCap: cfg.agent.max_debug_retries_cap,
     maxEditLinesPerStep: cfg.agent.max_edit_lines_per_step,
     maxWriteChunkBytes: cfg.agent.max_write_chunk_bytes,
     terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
     debugWikiPath: opts.debugWikiPath ? path.resolve(opts.debugWikiPath) : undefined,
-    debugWikiStrict: !!opts.debugWikiPath,
-    resetExecutionState: !!opts.resetStatus,
-    requestPermission: io.requestPermission
-      ? async (request: ToolPermissionRequest) => {
-          await io.emit({ type: 'permission', status: 'requested', request });
-          const decision = await io.requestPermission!(request);
-          await io.emit({ type: 'permission', status: decision.approved ? 'approved' : 'denied', request });
-          return decision;
-        }
-      : undefined,
+    requestPermission,
     onToolEvent: async (event: ToolExecutionEvent) => {
       await io.emit({
         type: 'tool_call',
         callId: event.callId,
         status: event.status,
         stepId: event.stepId,
+        stepName: event.stepName,
         tool: event.tool,
         target: event.target,
         ok: event.ok,
@@ -270,6 +342,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           type: 'patch_proposed',
           callId: event.callId,
           stepId: event.stepId,
+          stepName: event.stepName,
           tool: event.tool,
           patch: event.patch,
         });
@@ -280,27 +353,74 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
             type: 'file_changed',
             callId: event.callId,
             stepId: event.stepId,
+            stepName: event.stepName,
             tool: event.tool,
             path: changed,
           });
         }
       }
     },
-    onPlanProgress: async (progressPlan) => {
+    onTransition: async (event) => {
+      await io.emit({ type: 'workflow', ...event });
+      await domainAudit.recordEvent({
+        projectId: event.projectId,
+        subject: event.ticketId
+          ? { id: event.ticketId, objectType: 'ticket' }
+          : event.stepId
+            ? { id: event.stepId, objectType: 'step' }
+            : { id: event.phaseId, objectType: 'phase' },
+        kind: `workflow.${event.event}`,
+        actor: 'xcompiler-runtime',
+        correlationId: event.correlationId,
+        causationId: event.causationId,
+        payload: {
+          phaseId: event.phaseId,
+          stepId: event.stepId,
+          stepName: event.stepName,
+          ticketId: event.ticketId,
+          ticketType: event.ticketType,
+          message: event.message,
+        },
+      });
       projectFilePath = await updateProjectFile({
         workspace: ws.root,
         planPath: publicPlanPath,
         configPath: cfgPath,
         projectFilePath,
         command: projectCommand,
-        intent: progressPlan.intent,
-        plan: progressPlan,
+        intent: plan.intent,
       });
     },
-  });
+    finalGate: async () => {
+      if (requestPermission) {
+        const decision = await requestPermission({
+          operationType: 'test_command',
+          target: 'project audit gate',
+          reason: 'Run the phase delivery audit before closing its Epic.',
+          risk: 'The audit may execute tests or the project entrypoint in the configured sandbox.',
+          scope: 'current workspace sandbox',
+          skippable: false,
+          denyBehavior: 'Keep the phase open and return a failed run.',
+        });
+        if (!decision.approved) return { ok: false, reason: 'project audit permission denied' };
+      }
+      finalProjectAudit = await runProjectAudit({ ws, sandbox, plan, profile });
+      await emitProjectAudit(io, finalProjectAudit);
+      return {
+        ok: finalProjectAudit.ok,
+        reason: finalProjectAudit.ok
+          ? undefined
+          : `project audit failed (${finalProjectAudit.errors} error(s))`,
+        failureLog: finalProjectAudit.checks
+          .filter((check) => check.severity === 'error' && !check.ok)
+          .map((check) => `${check.name}: ${check.summary}${check.detail ? `\n${check.detail}` : ''}`)
+          .join('\n'),
+      };
+    },
+  }, plan);
 
   try {
-    let r = await engine.run(plan);
+    const r = await engine.run(domainPhase.id);
     await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
     if (r.failedStepId) {
       await runtimeLog(io, 'error', t().execute.runInterrupted(r.failedStepId, r.executedSteps, r.totalSteps));
@@ -322,166 +442,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       await runtimeResult(io, 'run', 'failed', { failedStepId: r.failedStepId, exitCode: 4 });
       return { status: 'failed', engine: r, message: r.failureReason, exitCode: 4 };
     }
-    const incompleteSteps = engine.incompleteSteps(plan);
-    if (!opts.onlyPhase && incompleteSteps.length > 0) {
-      const failedStepId = incompleteSteps[0]!.id;
-      const reason =
-        'runtime refused to complete an incomplete plan: ' +
-        incompleteSteps.map((step) => `${step.id}=${step.status}`).join(', ');
-      r = {
-        ...r,
-        failedStepId,
-        failureReason: reason,
-        failureLog: reason,
-      };
-      await runtimeLog(io, 'error', t().execute.runInterrupted(failedStepId, r.executedSteps, r.totalSteps));
-      await runtimeLog(io, 'error', `${t().execute.runReasonLabel}${reason}`);
-      await audit.event('note', reason, {
-        messageId: 'execute.incomplete_plan_blocked',
-        steps: incompleteSteps.map(({ id, phase, status }) => ({ id, phase, status })),
-      });
-      await audit.end({
-        status: 'failed',
-        executedSteps: r.executedSteps,
-        totalSteps: r.totalSteps,
-        failedStepId,
-        failureReason: reason,
-      });
-      await updateProjectFile({
-        workspace: ws.root,
-        planPath: publicPlanPath,
-        configPath: cfgPath,
-        projectFilePath,
-        command: projectCommand,
-        intent: plan.intent,
-        plan,
-      });
-      await runtimeResult(io, 'run', 'failed', {
-        failedStepId,
-        incompleteSteps: incompleteSteps.map((step) => step.id),
-        exitCode: 4,
-      });
-      return { status: 'failed', engine: r, message: reason, exitCode: 4 };
-    }
-    let auditWarnings = 0;
-    let finalProjectAudit: ProjectAuditResult | undefined;
-    if (shouldRunProjectAudit(
-      { onlyPhase: opts.onlyPhase },
-      engine.incompleteSteps(plan).length === 0,
-    )) {
-      if (io.requestPermission) {
-        const request: ToolPermissionRequest = {
-          operationType: 'test_command',
-          target: 'project audit gate',
-          reason: 'Run the final project audit before returning the task result.',
-          risk: 'The project audit may execute tests or entrypoint commands in the configured sandbox.',
-          scope: 'current workspace sandbox',
-          skippable: true,
-          denyBehavior: 'Skip the project audit and fail the run as unverified.',
-        };
-        await io.emit({ type: 'permission', status: 'requested', request });
-        const decision = await io.requestPermission(request);
-        await io.emit({ type: 'permission', status: decision.approved ? 'approved' : 'denied', request });
-        if (!decision.approved) {
-          const message = `project audit permission denied${decision.reason ? `: ${decision.reason}` : ''}`;
-          await runtimeLog(io, 'error', message);
-          await runtimeResult(io, 'run', 'failed', { projectAuditSkipped: true, exitCode: 4 });
-          return { status: 'failed', message, exitCode: 4 };
-        }
-      }
-      let auditResult = await runProjectAudit({ ws, sandbox, plan, profile });
-      await emitProjectAudit(io, auditResult);
-      await audit.event('note', t().execute.projectAuditSummary(auditResult.errors, auditResult.warnings), {
-        messageId: 'execute.project_audit_summary',
-        checks: auditResult.checks,
-      });
-      if (!auditResult.ok) {
-        await runtimeLog(io, 'warning', 'project audit failed; entering Debugger repair before final verdict');
-        await audit.event('note', 'project audit failed; entering Debugger repair', {
-          messageId: 'execute.project_audit_repair_start',
-          checks: auditResult.checks,
-        });
-        let repair = await engine.repairProjectAuditFailure(plan, auditResult);
-        await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
-        if (!repair.failedStepId && repair.restartIndex !== undefined) {
-          const rerun = await engine.run(plan);
-          repair = {
-            ...rerun,
-            executedSteps: repair.executedSteps + rerun.executedSteps,
-          };
-          await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
-        }
-        if (repair.failedStepId) {
-          await runtimeLog(
-            io,
-            'error',
-            t().execute.runInterrupted(repair.failedStepId, r.executedSteps + repair.executedSteps, r.totalSteps),
-          );
-          if (repair.failureReason) {
-            await runtimeLog(io, 'error', `${t().execute.runReasonLabel}${repair.failureReason}`);
-          }
-          if (repair.failureLog) {
-            const tail = repair.failureLog.split('\n').slice(-40).join('\n');
-            await runtimeLog(io, 'dim', t().execute.runFailureLogHeader);
-            await runtimeLog(io, 'raw', tail);
-          }
-          await audit.end({
-            status: 'failed',
-            executedSteps: r.executedSteps + repair.executedSteps,
-            totalSteps: r.totalSteps,
-            failedStepId: repair.failedStepId,
-            failureReason: repair.failureReason,
-            qualityAuditErrors: auditResult.errors,
-            qualityAuditWarnings: auditResult.warnings,
-          });
-          await updateProjectFile({
-            workspace: ws.root,
-            planPath: publicPlanPath,
-            configPath: cfgPath,
-            projectFilePath,
-            command: projectCommand,
-            intent: plan.intent,
-            plan,
-          });
-          await runtimeResult(io, 'run', 'failed', { failedStepId: repair.failedStepId, exitCode: 4 });
-          return { status: 'failed', engine: repair, audit: auditResult, message: repair.failureReason, exitCode: 4 };
-        }
-        r = {
-          totalSteps: r.totalSteps,
-          executedSteps: r.executedSteps + repair.executedSteps,
-        };
-        auditResult = await runProjectAudit({ ws, sandbox, plan, profile });
-        await emitProjectAudit(io, auditResult);
-        await audit.event('note', t().execute.projectAuditSummary(auditResult.errors, auditResult.warnings), {
-          messageId: 'execute.project_audit_summary',
-          checks: auditResult.checks,
-          afterRepair: true,
-        });
-      }
-      if (!auditResult.ok) {
-        await audit.end({
-          status: 'failed',
-          executedSteps: r.executedSteps,
-          totalSteps: r.totalSteps,
-          qualityAuditErrors: auditResult.errors,
-          qualityAuditWarnings: auditResult.warnings,
-        });
-        await updateProjectFile({
-          workspace: ws.root,
-          planPath: publicPlanPath,
-          configPath: cfgPath,
-          projectFilePath,
-          command: projectCommand,
-          intent: plan.intent,
-          plan,
-        });
-        await runtimeResult(io, 'run', 'failed', { qualityAuditErrors: auditResult.errors, exitCode: 4 });
-        return { status: 'failed', engine: r, audit: auditResult, exitCode: 4 };
-      }
-      auditWarnings = auditResult.warnings;
-      finalProjectAudit = auditResult;
-    }
-    const iterationDelivered = !opts.onlyPhase && engine.isIterationDelivered(plan.phaseId);
+    const iterationDelivered = true;
     const phaseAdvance = target.phasePlan && target.phasePlanPath && iterationDelivered
       ? await completeAndPrepareNextPhase({
           phasePlan: target.phasePlan,
@@ -495,6 +456,14 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           iterationDelivered,
         })
       : undefined;
+    if (phaseAdvance?.nextPlan && r.nextPhaseId) {
+      await materializeNextDomainPhase({
+        repository: domainRepository,
+        projectId: domainProject.id,
+        phaseId: r.nextPhaseId,
+        plan: phaseAdvance.nextPlan,
+      });
+    }
     const projectPlan = phaseAdvance?.nextPlan ?? plan;
     const reportPath = iterationDelivered
       ? await generateProjectDevelopmentReport({
@@ -503,6 +472,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           phasePlan: phaseAdvance?.phasePlan ?? target.phasePlan,
           projectAudit: finalProjectAudit,
           finalDelivery: !phaseAdvance?.nextPlan,
+          repository: domainRepository,
         })
       : undefined;
     if (reportPath) {
@@ -520,20 +490,12 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         `iteration ${phaseAdvance.completedPhaseId} passed; prepared ${phaseAdvance.nextPlan.phaseId}`,
       );
     }
-    if (iterationDelivered) {
-      await runtimeLog(io, 'success', t().execute.runAllDone(r.executedSteps, r.totalSteps));
-    } else {
-      await runtimeLog(io, 'warning', t().execute.runPartialDone(
-        r.executedSteps,
-        r.totalSteps,
-        incompleteSteps.map((step) => step.id).join(', '),
-      ));
-    }
+    await runtimeLog(io, 'success', t().execute.runAllDone(r.executedSteps, r.totalSteps));
     await audit.end({
-      status: auditWarnings > 0 ? 'warn' : 'ok',
+      status: (finalProjectAudit?.warnings ?? 0) > 0 ? 'warn' : 'ok',
       executedSteps: r.executedSteps,
       totalSteps: r.totalSteps,
-      qualityAuditWarnings: auditWarnings,
+      qualityAuditWarnings: finalProjectAudit?.warnings ?? 0,
     });
     await updateProjectFile({
       workspace: ws.root,
@@ -542,7 +504,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       projectFilePath,
       command: projectCommand,
       intent: projectPlan.intent,
-      plan: projectPlan,
     });
     await runtimeResult(io, 'run', 'ok', {
       executedSteps: r.executedSteps,
@@ -568,7 +529,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       projectFilePath,
       command: projectCommand,
       intent: plan.intent,
-      plan,
     });
     await runtimeResult(io, 'run', 'error', { message: msg, exitCode: 5 });
     return { status: 'error', message: msg, exitCode: 5 };
@@ -578,6 +538,44 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   } finally {
     await lock.release();
   }
+}
+
+async function materializeNextDomainPhase(input: {
+  repository: DomainObjectRepository;
+  projectId: ObjectId;
+  phaseId: ObjectId;
+  plan: Plan;
+}): Promise<void> {
+  const projectObject = await input.repository.read(input.projectId);
+  const phaseObject = await input.repository.read(input.phaseId);
+  if (projectObject.objectType !== 'project') throw new Error(`Object ${input.projectId} is not a Project`);
+  if (phaseObject.objectType !== 'phase') throw new Error(`Object ${input.phaseId} is not a Phase`);
+  const phasePlanObject = await input.repository.read(phaseObject.planId);
+  const epicObject = await input.repository.read(phaseObject.epicTicketId);
+  if (phasePlanObject.objectType !== 'plan' || phasePlanObject.planKind !== 'phase') {
+    throw new Error(`Phase ${phaseObject.name} does not reference a PhasePlan`);
+  }
+  if (epicObject.objectType !== 'ticket' || epicObject.type !== 'epic') {
+    throw new Error(`Phase ${phaseObject.name} does not reference an Epic Ticket`);
+  }
+  const materialization = compilePhaseMaterialization({
+    draft: input.plan,
+    project: projectObject,
+    phase: phaseObject,
+    phasePlan: phasePlanObject,
+    epic: epicObject,
+  });
+  await input.repository.persistPhaseMaterialization(materialization);
+  const projectPlanObject = await input.repository.read(projectObject.projectPlanId);
+  if (projectPlanObject.objectType !== 'plan' || projectPlanObject.planKind !== 'project') {
+    throw new Error(`Project ${projectObject.name} does not reference a ProjectPlan`);
+  }
+  const projectPlan = ProjectPlanSchema.parse({
+    ...projectPlanObject,
+    ...reviseObjectEnvelope(projectPlanObject),
+    activePhaseId: phaseObject.id,
+  });
+  await input.repository.update(projectPlan, 'materialized');
 }
 
 async function completeAndPrepareNextPhase(args: {

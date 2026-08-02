@@ -2,7 +2,12 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { SubprocessSandbox, execRaw, formatExecFailure } from '../src/sandbox/subprocess.js';
+import {
+  SubprocessSandbox,
+  execRaw,
+  formatExecFailure,
+  resolveExecutableOnPath,
+} from '../src/sandbox/subprocess.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
 async function tempDir(name: string): Promise<string> {
@@ -10,6 +15,18 @@ async function tempDir(name: string): Promise<string> {
 }
 
 describe('execRaw install progress watch', () => {
+  it('resolves bare commands to absolute host paths before spawning', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await tempDir('host-command');
+    const executable = path.join(dir, 'xc-host-probe');
+    await fs.writeFile(executable, '#!/bin/sh\nprintf "host-ok"\n', 'utf8');
+    await fs.chmod(executable, 0o755);
+
+    expect(await resolveExecutableOnPath('xc-host-probe', { PATH: dir })).toBe(executable);
+    const result = await execRaw('xc-host-probe', [], { env: { PATH: dir } });
+    expect(result).toMatchObject({ exitCode: 0, stdout: 'host-ok' });
+  });
+
   it('fails only after the watched install path stops growing', async () => {
     const dir = await tempDir('install-idle');
     const result = await execRaw(process.execPath, ['-e', 'setTimeout(() => {}, 500)'], {
@@ -97,5 +114,34 @@ describe('SubprocessSandbox environment isolation', () => {
       if (previous === undefined) delete process.env[secretName];
       else process.env[secretName] = previous;
     }
+  });
+});
+
+describe('SubprocessSandbox TypeScript dependency cache', () => {
+  it('stores the post-install lockfile signature after a controlled refresh', async () => {
+    const dir = await tempDir('node-lock-refresh');
+    const ws = new Workspace(dir);
+    await ws.writeFile('fixture-dep/package.json', JSON.stringify({
+      name: 'fixture-dep',
+      version: '1.0.0',
+    }, null, 2) + '\n');
+    await ws.writeFile('package.json', JSON.stringify({
+      name: 'lock-refresh-fixture',
+      version: '1.0.0',
+      private: true,
+      dependencies: { 'fixture-dep': 'file:./fixture-dep' },
+    }, null, 2) + '\n');
+    const sandbox = new SubprocessSandbox({
+      ws,
+      language: 'typescript',
+      limits: { cpu: 1, memory_mb: 128, wall_seconds: 10, network: 'download-only' },
+    });
+
+    const refreshed = await sandbox.build('package.json', { refreshLockfile: true });
+    const cached = await sandbox.build('package.json');
+
+    expect(refreshed.rebuilt).toBe(true);
+    expect(await ws.exists('package-lock.json')).toBe(true);
+    expect(cached).toEqual({ rebuilt: false, reason: 'cache hit' });
   });
 });

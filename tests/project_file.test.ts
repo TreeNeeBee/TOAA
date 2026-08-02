@@ -4,176 +4,183 @@ import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import type { Plan } from '../src/core/plan.js';
 import {
+  XCOMPILER_PROJECT_MANIFEST_KIND,
   buildProjectProgress,
   defaultProjectFilePath,
   findProjectFile,
   loadXCompilerProject,
   updateProjectFile,
-  XCOMPILER_PROJECT_KIND,
 } from '../src/core/project_file.js';
+import { compileProjectGraph } from '../src/domain/planning/compiler.js';
+import { StepSchema } from '../src/domain/steps/step.js';
+import { reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
+import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
+import { Workspace } from '../src/workspace/workspace.js';
 
 describe('XCompiler project file', () => {
-  it('creates a workspace-local XXX.xc file with resumable paths and progress', async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
-    const plan = samplePlan([
-      ['S001', 'DONE'],
-      ['S002', 'RUNNING'],
-      ['S003', 'PENDING'],
-    ]);
+  it('creates a workspace-local manifest that points to the canonical Project', async () => {
+    const { workspace, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
-      planPath: path.join(workspace, 'plan.json'),
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
       configPath: path.join(workspace, 'config.yaml'),
       command: 'build',
       intent: 'feature',
-      plan,
       requirementFile: path.join(workspace, 'feature.md'),
       recordHistory: true,
     });
 
     expect(projectFile).toBe(defaultProjectFilePath(workspace));
-    expect(projectFile.endsWith('.xc')).toBe(true);
     const loaded = await loadXCompilerProject(projectFile);
-    expect(loaded.data.kind).toBe(XCOMPILER_PROJECT_KIND);
+    expect(loaded.data.kind).toBe(XCOMPILER_PROJECT_MANIFEST_KIND);
+    expect(loaded.data.projectId).toBe(graph.project.id);
+    expect(loaded.project.id).toBe(graph.project.id);
     expect(loaded.workspace).toBe(path.resolve(workspace));
-    expect(loaded.planPath).toBe(path.join(workspace, 'plan.json'));
+    expect(loaded.planPath).toBe(path.join(workspace, 'phasePlan.json'));
     expect(loaded.configPath).toBe(path.join(workspace, 'config.yaml'));
-    expect(loaded.data.progress?.status).toBe('running');
-    expect(loaded.data.progress?.currentStepId).toBe('S002');
-    expect(loaded.data.progress?.done).toBe(1);
-    expect(loaded.data.history).toHaveLength(1);
+    expect(loaded.data.progress?.status).toBe('planned');
+    expect(loaded.data.progress?.steps[0]?.name).toBe('P1-S001');
     expect(loaded.data.history[0]?.command).toBe('build');
   });
 
   it('does not auto-discover legacy .toaa project files', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
-    await fs.writeFile(path.join(workspace, 'legacy.toaa'), JSON.stringify({
-      kind: XCOMPILER_PROJECT_KIND,
-      version: '1',
-      name: 'legacy',
-      workspace: '.',
-      planPath: 'plan.json',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      history: [],
-    }));
-
+    await fs.writeFile(path.join(workspace, 'legacy.toaa'), '{}');
     expect(await findProjectFile(workspace)).toBeUndefined();
-    await expect(loadXCompilerProject(path.join(workspace, 'legacy.toaa'))).rejects.toThrow(/\.xc/);
+    await expect(loadXCompilerProject(path.join(workspace, 'legacy.toaa'))).rejects.toThrow(/\.xc/u);
   });
 
-  it('rejects legacy toaa.project payloads', async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
-    const legacy = path.join(workspace, 'legacy.xc');
-    await fs.writeFile(legacy, JSON.stringify({
-      kind: 'toaa.project',
-      version: '1',
-      name: 'legacy',
-      workspace: '.',
-      planPath: 'plan.json',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      history: [],
+  it.each(['toaa.project', 'xcompiler.project'])(
+    'rejects obsolete %s project payloads',
+    async (kind) => {
+      const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
+      const legacy = path.join(workspace, 'legacy.xc');
+      await fs.writeFile(legacy, JSON.stringify({ kind, version: '1', workspace, planPath: 'plan.json' }));
+      await expect(loadXCompilerProject(legacy)).rejects.toThrow();
+      await expect(updateProjectFile({ workspace, projectFilePath: legacy, planPath: 'plan.json' }))
+        .rejects.toThrow();
+    },
+  );
+
+  it('derives progress only from domain Step state', async () => {
+    const { graph } = await canonicalWorkspace();
+    const states = ['closed', 'pending', 'created'] as const;
+    const steps = graph.steps.slice(0, 3).map((step, index) => StepSchema.parse({
+      ...step,
+      ...reviseObjectEnvelope(step),
+      state: states[index],
+      pendingReason: states[index] === 'pending' ? 'defect' : undefined,
     }));
-
-    await expect(loadXCompilerProject(legacy)).rejects.toThrow();
-  });
-
-  it('marks a failed plan as failed and records the failed step id', () => {
-    const progress = buildProjectProgress(samplePlan([
-      ['S001', 'DONE'],
-      ['S002', 'FAILED'],
-      ['S003', 'PENDING'],
-    ]));
-
+    const progress = buildProjectProgress(graph.project, steps);
     expect(progress.status).toBe('failed');
-    expect(progress.failedStepId).toBe('S002');
+    expect(progress.failedStepId).toBe(steps[1]!.id);
     expect(progress.percent).toBe(33);
   });
 
-  it('stores the workspace as an absolute path in the .xc file', async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
+  it('stores the workspace as an absolute path', async () => {
+    const { workspace, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
-      planPath: path.join(workspace, 'plan.json'),
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
       command: 'build',
-      plan: samplePlan([['S001', 'DONE']]),
     });
     const raw = JSON.parse(await fs.readFile(projectFile, 'utf8')) as { workspace: string };
-    expect(path.isAbsolute(raw.workspace)).toBe(true);
     expect(raw.workspace).toBe(path.resolve(workspace));
   });
 
-  it('rejects a stale workspace path that no longer exists', async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
-    const projectFile = path.join(workspace, 'stale.xc');
-    await fs.writeFile(projectFile, JSON.stringify(projectFilePayload(path.join(workspace, 'moved-away'))));
-
-    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/does not exist/);
+  it('rejects a manifest pointing to an unknown Project', async () => {
+    const { workspace, graph } = await canonicalWorkspace();
+    const projectFile = await updateProjectFile({
+      workspace,
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
+    });
+    const data = JSON.parse(await fs.readFile(projectFile, 'utf8')) as Record<string, unknown>;
+    data.projectId = '018f22ce-7e2a-7d51-8d89-abcdef123456';
+    await fs.writeFile(projectFile, JSON.stringify(data));
+    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/entry not found/u);
   });
 
-  it('rejects a workspace that does not contain the project file (write-leak guard)', async () => {
-    const wsA = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-a-'));
-    const wsB = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-b-'));
-    const projectFile = path.join(wsA, 'leak.xc');
-    await fs.writeFile(projectFile, JSON.stringify(projectFilePayload(wsB)));
-
-    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/not inside its declared workspace/);
+  it('rejects a stale workspace path before loading domain state', async () => {
+    const { workspace, graph } = await canonicalWorkspace();
+    const projectFile = await updateProjectFile({
+      workspace,
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
+    });
+    const data = JSON.parse(await fs.readFile(projectFile, 'utf8')) as Record<string, unknown>;
+    data.workspace = path.join(workspace, 'moved-away');
+    await fs.writeFile(projectFile, JSON.stringify(data));
+    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/does not exist/u);
   });
 
-  it('rejects a workspace without write permission (permission mismatch guard)', async () => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
-    const projectFile = path.join(workspace, 'readonly.xc');
-    await fs.writeFile(projectFile, JSON.stringify(projectFilePayload(workspace)));
+  it('rejects a workspace that does not contain the manifest', async () => {
+    const { workspace, graph } = await canonicalWorkspace();
+    const projectFile = await updateProjectFile({
+      workspace,
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
+    });
+    const other = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-other-'));
+    const data = JSON.parse(await fs.readFile(projectFile, 'utf8')) as Record<string, unknown>;
+    data.workspace = other;
+    await fs.writeFile(projectFile, JSON.stringify(data));
+    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/outside its declared workspace/u);
+  });
+
+  it('rejects a workspace without write permission', async () => {
+    const { workspace, graph } = await canonicalWorkspace();
+    const projectFile = await updateProjectFile({
+      workspace,
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
+    });
     await fs.chmod(workspace, 0o555);
     try {
-      await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/not writable/);
+      await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/not writable/u);
     } finally {
       await fs.chmod(workspace, 0o755);
     }
   });
 });
 
-function projectFilePayload(workspace: string): Record<string, unknown> {
-  return {
-    kind: XCOMPILER_PROJECT_KIND,
-    version: '1',
-    name: 'sample',
-    workspace,
-    planPath: 'plan.json',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    history: [],
-  };
+async function canonicalWorkspace() {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
+  const repository = new DomainObjectRepository(new Workspace(workspace));
+  await repository.load();
+  const graph = compileProjectGraph({
+    draft: samplePlan(),
+    topic: 'Build a Python application.',
+    projectName: 'sample',
+  });
+  await repository.persistCompiledGraph(graph);
+  return { workspace, repository, graph };
 }
 
-function samplePlan(statuses: Array<[string, Plan['steps'][number]['status']]>): Plan {
+function samplePlan(): Plan {
+  const phases = [
+    ['REQUIREMENT_ANALYSIS', 'Planner'], ['HIGH_LEVEL_DESIGN', 'Architect'],
+    ['DETAILED_DESIGN', 'Architect'], ['CODE', 'Coder'], ['UNIT_TEST', 'Tester'],
+    ['INTEGRATION_TEST', 'Tester'], ['MODULE_TEST', 'Tester'], ['FUNCTIONAL_TEST', 'Tester'],
+  ] as const;
   return {
-    version: '1',
-    language: 'python',
-    intent: 'feature',
-    projectType: 'application',
+    version: '1', language: 'python', intent: 'feature', phaseId: 'P1', projectType: 'application',
     requirementDigest: 'sample',
-    globalPrompt: '',
-    baselineSummary: '',
-    dependencies: ['pytest'],
-    userAddenda: '',
-    createdAt: '2026-06-30T00:00:00.000Z',
-    steps: statuses.map(([id, status], index) => ({
-      id,
-      phase: index === 0 ? 'REQUIREMENT_ANALYSIS' : index === 1 ? 'CODE' : 'UNIT_TEST',
-      title: `Step ${id}`,
-      description: `Description for ${id}`,
-      systemPrompt: `Prompt for ${id}`,
-      role: index === 0 ? 'Planner' : index === 1 ? 'Coder' : 'Tester',
-      tools: [],
-      inputs: [],
-      outputs: [`docs/${id}.md`],
-      dependsOn: index === 0 ? [] : [statuses[index - 1]![0]],
-      acceptance: `Acceptance for ${id}`,
-      status,
-      retries: status === 'FAILED' ? 2 : 0,
-      maxRetries: 3,
+    complexityAssessment: { level: 'simple', rationale: 'one phase', splitRecommended: false, userForcedPhaseSplit: false },
+    implementationPhases: [{
+      id: 'P1', title: 'Core', objective: 'Deliver core.', status: 'current', scope: ['core'],
+      deliverables: ['src/main.py'], dependsOn: [],
+      verificationGate: { summary: 'Pass all gates.', checks: ['acceptance'], failurePolicy: 'Open Bug.' },
+    }],
+    globalPrompt: '', baselineSummary: '', dependencies: [], userAddenda: '', createdAt: new Date().toISOString(),
+    steps: phases.map(([phase, role], index) => ({
+      id: `S${String(index + 1).padStart(3, '0')}`, iterationId: 'P1', phase,
+      title: phase, description: `Execute ${phase}.`, systemPrompt: `Execute ${phase}.`, role,
+      tools: [], inputs: [], outputs: [`docs/${index + 1}.md`], subTasks: [],
+      dependsOn: index ? [`S${String(index).padStart(3, '0')}`] : [], acceptance: `${phase} passes.`,
+      maxAttempts: 3,
     })),
   };
 }

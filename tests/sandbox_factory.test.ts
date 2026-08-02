@@ -9,9 +9,7 @@ const baseCfg = (sandbox: 'subprocess' | 'docker'): XCompilerConfig =>
   ({
     llm: { providers: {}, roles: {}, fallbacks: [] },
     agent: {
-      max_steps: 10,
       max_rounds_per_step: 6,
-      max_debug_retries: 3,
       max_edit_lines_per_step: 400,
       sandboxes: {
         python: {

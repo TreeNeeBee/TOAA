@@ -1,62 +1,75 @@
 import type { Workspace } from '../workspace/workspace.js';
-import type { PhasePlan } from './phase_plan.js';
-import type { Plan, Step } from './plan.js';
+import type { PhasePlan as LegacyPhasePlan } from './phase_plan.js';
+import type { Plan } from './plan.js';
 import type { ProjectAuditResult } from './project_audit.js';
-import {
-  QualityAssessmentStore,
-  resolveQualityGate,
-  type QualityAssessmentRecord,
-} from './quality_gate.js';
-import { TicketStore, type Ticket } from './ticket.js';
+import type { Phase } from '../domain/phases/phase.js';
+import type { QualityAssessment } from '../domain/quality/quality.js';
+import type { Step } from '../domain/steps/step.js';
+import type { Ticket } from '../domain/tickets/ticket.js';
+import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
+import { createObjectEnvelope, reviseObjectEnvelope } from '../domain/objects/object_envelope.js';
+import { ReportSchema } from '../domain/observability/records.js';
+import { ProjectSchema } from '../domain/projects/project.js';
+import { PhaseSchema } from '../domain/phases/phase.js';
 
 export const PROJECT_DEVELOPMENT_REPORT_PATH = 'docs/project-development-report.md';
 
 export async function generateProjectDevelopmentReport(input: {
   workspace: Workspace;
   plan: Plan;
-  phasePlan?: PhasePlan;
+  phasePlan?: LegacyPhasePlan;
   projectAudit?: ProjectAuditResult;
   finalDelivery: boolean;
+  repository?: DomainObjectRepository;
 }): Promise<string> {
-  const quality = new QualityAssessmentStore(input.workspace);
-  const tickets = new TicketStore(input.workspace);
-  await quality.load();
-  await tickets.load();
-
-  const latest = latestQualityRecords(quality.all());
-  const unresolved = tickets.all().filter((ticket) =>
-    !['resolved', 'closed', 'cancelled'].includes(ticket.status)
+  const repository = input.repository ?? new DomainObjectRepository(input.workspace);
+  if (!input.repository) await repository.load();
+  const project = await repository.findProject();
+  if (!project) throw new Error('Cannot generate project report without a canonical Project');
+  const objects = await repository.list({ projectId: project.id });
+  const phases = objects.filter((object): object is Phase => object.objectType === 'phase');
+  const steps = objects.filter((object): object is Step => object.objectType === 'step');
+  const tickets = objects.filter((object): object is Ticket => object.objectType === 'ticket');
+  const assessments = objects.filter(
+    (object): object is QualityAssessment => object.objectType === 'quality-assessment',
   );
-  const summary = tickets.summary();
-  const steps = input.plan.steps;
-  const stageFeatures = steps
-    .map((step) => tickets.featureForStep(step.id, step.iterationId ?? 'P1'))
-    .filter((ticket) => ticket !== undefined);
-  const epic = tickets.epicForIteration(input.plan.phaseId);
-  const delivery = tickets.deliveryForIteration(input.plan.phaseId);
-  const qualityRows = collectQualityRows(steps, latest);
-  const passedQualityGates = qualityRows.filter((row) => row.record?.evaluation.passed).length;
-  const allStepsDone =
-    stageFeatures.length === steps.length &&
-    stageFeatures.every(
-      (ticket) => ticket.status === 'closed' && ticket.execution.state === 'passed',
-    );
+  const currentPhase = phases.find((phase) => phase.name === input.plan.phaseId);
+  const currentSteps = currentPhase
+    ? steps.filter((step) => step.phaseId === currentPhase.id)
+    : [];
+  const currentTickets = currentPhase
+    ? tickets.filter((ticket) => ticket.phaseId === currentPhase.id)
+    : [];
+  const unresolved = tickets.filter((ticket) => ticket.state !== 'closed' && ticket.state !== 'cancelled');
+  const qualityRows = currentSteps.map((step) => ({
+    step,
+    assessment: step.qualityAssessmentId
+      ? assessments.find((assessment) => assessment.id === step.qualityAssessmentId)
+      : undefined,
+  }));
+  const allStepsClosed = currentSteps.length === 8 && currentSteps.every((step) => step.state === 'closed');
+  const allQualityPassed = qualityRows.length === 8 && qualityRows.every((row) => row.assessment?.passed);
+  const epic = currentPhase
+    ? currentTickets.find((ticket) => ticket.id === currentPhase.epicTicketId)
+    : undefined;
+  const delivery = currentTickets.find(
+    (ticket) => ticket.type === 'story' && ticket.workKind === 'delivery',
+  );
   const auditPassed = input.projectAudit?.ok ?? false;
-  const allQualityGatesPassed =
-    qualityRows.length > 0 &&
-    qualityRows.every((row) => row.record?.evaluation.passed);
   const deliveryPassed =
-    allStepsDone &&
-    epic?.status === 'closed' &&
-    epic.execution.state === 'passed' &&
-    delivery?.status === 'closed' &&
-    delivery.execution.state === 'passed' &&
-    allQualityGatesPassed &&
+    allStepsClosed &&
+    allQualityPassed &&
+    epic?.state === 'closed' &&
+    delivery?.state === 'closed' &&
     auditPassed &&
-    unresolved.length === 0;
+    unresolved.filter((ticket) =>
+      ticket.phaseId === currentPhase?.id &&
+      (ticket.type === 'bug' || ticket.type === 'enhancement' || ticket.type === 'change-request')
+    ).length === 0;
   const verdict = deliveryPassed
     ? input.finalDelivery ? 'DELIVERED' : 'ITERATION PASSED'
     : 'NOT READY';
+  const counts = countTickets(tickets);
 
   const lines = [
     '# Project Development Report',
@@ -67,36 +80,38 @@ export async function generateProjectDevelopmentReport(input: {
     '',
     '## Project',
     '',
+    `- Project ID: ${project.id}`,
     `- Requirement: ${input.plan.requirementDigest}`,
-    `- Language: ${input.plan.language}`,
-    `- Project type: ${input.plan.projectType}`,
+    `- Language: ${project.language}`,
+    `- Project type: ${project.projectType}`,
     `- Complexity: ${input.plan.complexityAssessment.level}`,
     `- Current iteration: ${input.plan.phaseId}`,
-    `- Current iteration V-model Features complete: ${stageFeatures.filter((ticket) =>
-      ticket.status === 'closed' && ticket.execution.state === 'passed'
-    ).length}/${steps.length}`,
-    `- Project stage quality gates passed: ${passedQualityGates}/${qualityRows.length}`,
+    `- V-model Steps closed: ${currentSteps.filter((step) => step.state === 'closed').length}/${currentSteps.length}`,
+    `- Quality gates passed: ${qualityRows.filter((row) => row.assessment?.passed).length}/${qualityRows.length}`,
     '',
     '## Iterations',
     '',
-    ...renderIterations(input.plan, input.phasePlan),
+    '| Iteration | State | Objective | Verification gate |',
+    '| --- | --- | --- | --- |',
+    ...phases.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })).map((phase) =>
+      `| ${phase.name} | ${phase.state} | ${escapeTable(phase.objective)} | ${escapeTable(phase.verificationGate.join('; '))} |`
+    ),
     '',
     '## Stage Quality',
     '',
-    '| Step | Stage | Status | Completion / Alignment | Engineering metrics | Tolerance observations |',
+    '| Step | Stage | State | Score | KPI observations | Gaps |',
     '| --- | --- | --- | --- | --- | --- |',
-    ...qualityRows.map(({ step, record }) => renderQualityRow(step, record)),
+    ...qualityRows.map(({ step, assessment }) => renderQualityRow(step, assessment)),
     '',
     '## Ticket Summary',
     '',
-    `- Total: ${summary.total}`,
-    `- Epics: ${summary.byType.epic}`,
-    `- Features: ${summary.byType.feature}`,
-    `- Tasks: ${summary.byType.task}`,
-    `- Sub-tasks: ${summary.byType['sub-task']}`,
-    `- Bugs: ${summary.byType.bug}`,
-    `- Enhancements: ${summary.byType.enhance} (functional gaps ${summary.enhancementsByKind['functional-gap']}, test incomplete ${summary.enhancementsByKind['test-incomplete']}, defects ${summary.enhancementsByKind.defect})`,
-    `- Change requests: ${summary.changeRequests.total} (${summary.changeRequests.totalRevisions} revision(s), ${summary.changeRequests.open} open)`,
+    `- Total: ${tickets.length}`,
+    `- Epics: ${counts.epic}`,
+    `- Stories: ${counts.story}`,
+    `- Tasks: ${counts.task}`,
+    `- Bugs: ${counts.bug}`,
+    `- Enhancements: ${counts.enhancement}`,
+    `- Change requests: ${counts['change-request']}`,
     `- Unresolved: ${unresolved.length}`,
     '',
     ...renderUnresolvedTickets(unresolved),
@@ -111,99 +126,64 @@ export async function generateProjectDevelopmentReport(input: {
     '## Delivery Decision',
     '',
     deliveryPassed
-      ? '- All stage gates, Ticket verification, and the project audit passed.'
-      : '- Delivery is blocked until every V-model Feature passes, every quality gate passes, all blocking Tickets close, and the project audit is clear.',
+      ? '- All Step, Ticket, quality, and project audit gates passed.'
+      : '- Delivery remains blocked by an incomplete Step, open corrective Ticket, failed quality assessment, or project audit.',
     '',
   ];
-  await input.workspace.writeFile(PROJECT_DEVELOPMENT_REPORT_PATH, `${lines.join('\n')}\n`);
-  return PROJECT_DEVELOPMENT_REPORT_PATH;
+  const reportPath = input.finalDelivery || !currentPhase
+    ? PROJECT_DEVELOPMENT_REPORT_PATH
+    : `docs/project-development-report.${currentPhase.name}.md`;
+  await input.workspace.writeFile(reportPath, `${lines.join('\n')}\n`);
+  const subject = input.finalDelivery || !currentPhase
+    ? { id: project.id, objectType: 'project' as const }
+    : { id: currentPhase.id, objectType: 'phase' as const };
+  const report = ReportSchema.parse({
+    ...createObjectEnvelope({
+      name: `${currentPhase?.name ?? project.name}-development-report`,
+      objectType: 'report',
+      projectId: project.id,
+    }),
+    subject,
+    reportType: input.finalDelivery ? 'delivery' : 'phase',
+    path: reportPath,
+    title: 'Project Development Report',
+    summary: `${verdict}: ${currentSteps.filter((step) => step.state === 'closed').length}/${currentSteps.length} Steps closed.`,
+    verdict: deliveryPassed ? 'passed' : 'failed',
+    relatedObjectIds: [
+      ...currentSteps.map((step) => step.id),
+      ...currentTickets.map((ticket) => ticket.id),
+      ...qualityRows.flatMap((row) => row.assessment ? [row.assessment.id] : []),
+    ],
+    generatedAt: new Date().toISOString(),
+  });
+  await repository.insert(report, report.verdict);
+  if (subject.objectType === 'project') {
+    const updated = ProjectSchema.parse({
+      ...project,
+      ...reviseObjectEnvelope(project),
+      reportIds: [...project.reportIds, report.id],
+    });
+    await repository.update(updated, updated.state);
+  } else if (currentPhase) {
+    const updated = PhaseSchema.parse({
+      ...currentPhase,
+      ...reviseObjectEnvelope(currentPhase),
+      reportIds: [...currentPhase.reportIds, report.id],
+    });
+    await repository.update(updated, updated.state);
+  }
+  return reportPath;
 }
 
-function latestQualityRecords(
-  records: readonly QualityAssessmentRecord[],
-): Map<string, QualityAssessmentRecord> {
-  const latest = new Map<string, QualityAssessmentRecord>();
-  for (const record of records) {
-    latest.set(qualityKey(record.iterationId, record.stepId), record);
+function renderQualityRow(step: Step, assessment?: QualityAssessment): string {
+  if (!assessment) {
+    return `| ${step.name} | ${step.type} | ${step.state} | NOT ASSESSED | - | - |`;
   }
-  return latest;
-}
-
-function qualityKey(iterationId: string | undefined, stepId: string): string {
-  return `${iterationId ?? 'P1'}:${stepId}`;
-}
-
-function collectQualityRows(
-  currentSteps: readonly Step[],
-  records: ReadonlyMap<string, QualityAssessmentRecord>,
-): Array<{ step?: Step; record?: QualityAssessmentRecord }> {
-  const rows = new Map<string, { step?: Step; record?: QualityAssessmentRecord }>();
-  for (const record of records.values()) {
-    rows.set(qualityKey(record.iterationId, record.stepId), { record });
-  }
-  for (const step of currentSteps) {
-    const key = qualityKey(step.iterationId, step.id);
-    rows.set(key, { step, record: records.get(key) });
-  }
-  return [...rows.entries()]
-    .sort(([left], [right]) =>
-      left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })
-    )
-    .map(([, row]) => row);
-}
-
-function renderQualityRow(step: Step | undefined, record: QualityAssessmentRecord | undefined): string {
-  const stepId = step?.id ?? record?.stepId ?? '-';
-  const iterationId = step?.iterationId ?? record?.iterationId ?? 'P1';
-  const phase = step?.phase ?? record?.phase;
-  if (!phase) {
-    return `| ${iterationId}/${stepId} | UNKNOWN | NOT ASSESSED | - | - | - |`;
-  }
-  const policy = record?.policy ?? (step ? resolveQualityGate(step) : undefined);
-  if (!policy) {
-    return `| ${iterationId}/${stepId} | ${phase} | NOT ASSESSED | - | - | - |`;
-  }
-  if (!record) {
-    return `| ${iterationId}/${stepId} | ${phase} | NOT ASSESSED | - | - | - |`;
-  }
-  const assessment = record.assessment;
-  const source = [
-    policy.completionMin === undefined
-      ? ''
-      : `completion ${formatRatio(assessment.completion)}/${formatRatio(policy.completionMin)}`,
-    policy.upstreamAlignmentMin === undefined
-      ? ''
-      : `alignment ${formatRatio(assessment.upstreamAlignment)}/${formatRatio(policy.upstreamAlignmentMin)}`,
-  ].filter(Boolean).join('; ') || '-';
-  const metrics = Object.entries(policy.metrics).map(([name, threshold]) =>
-    `${name} ${formatRatio(assessment.metrics[name])}/${formatRatio(threshold)}`
+  const observations = assessment.observations.map((item) =>
+    `${item.kpiId.slice(0, 8)}=${formatRatio(item.value)} (${item.passed ? 'pass' : 'fail'})`
   ).join('; ') || '-';
-  const tolerance = [
-    `failed=${assessment.tolerance.failedTests}/${policy.tolerance.maxFailedTests}`,
-    `skipped=${assessment.tolerance.skippedTests}/${policy.tolerance.maxSkippedTests}`,
-    `warnings=${assessment.tolerance.warnings}/${policy.tolerance.maxWarnings}`,
-    `metric shortfall=${formatRatio(policy.tolerance.metricShortfall)}`,
-  ].join('; ');
-  return [
-    `| ${iterationId}/${stepId}`,
-    phase,
-    record.evaluation.passed ? 'PASS' : 'FAIL',
-    escapeTable(source),
-    escapeTable(metrics),
-    `${escapeTable(tolerance)} |`,
-  ].join(' | ');
-}
-
-function renderIterations(plan: Plan, phasePlan?: PhasePlan): string[] {
-  const phases = phasePlan?.phases ?? plan.implementationPhases;
-  return [
-    '| Iteration | Status | Objective | Verification gate |',
-    '| --- | --- | --- | --- |',
-    ...phases.map((phase) =>
-      `| ${phase.id} | ${phase.status} | ${escapeTable(phase.objective)} | ` +
-      `${escapeTable(phase.verificationGate?.summary ?? 'not specified')} |`
-    ),
-  ];
+  return `| ${step.name} | ${step.type} | ${step.state} | ${formatRatio(assessment.score)} | ` +
+    `${escapeTable(observations)} | ${escapeTable(assessment.gaps.join('; ') || '-')} |`;
 }
 
 function renderUnresolvedTickets(tickets: readonly Ticket[]): string[] {
@@ -212,14 +192,21 @@ function renderUnresolvedTickets(tickets: readonly Ticket[]): string[] {
     '### Unresolved Tickets',
     '',
     ...tickets.map((ticket) =>
-      `- ${ticket.id} [${ticket.type}/${ticket.status}]: ${ticket.title}`
+      `- ${ticket.name} (${ticket.id}) [${ticket.type}/${ticket.state}]: ${ticket.description}`
     ),
     '',
   ];
 }
 
-function formatRatio(value: number | undefined): string {
-  return value === undefined ? 'missing' : `${(value * 100).toFixed(1)}%`;
+function countTickets(tickets: readonly Ticket[]): Record<Ticket['type'], number> {
+  return tickets.reduce<Record<Ticket['type'], number>>((counts, ticket) => {
+    counts[ticket.type] += 1;
+    return counts;
+  }, { epic: 0, story: 0, task: 0, bug: 0, enhancement: 0, 'change-request': 0 });
+}
+
+function formatRatio(value: number): string {
+  return `${(value * 100).toFixed(1)}%`;
 }
 
 function escapeTable(value: string): string {

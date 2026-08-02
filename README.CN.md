@@ -46,12 +46,16 @@ XCompiler 把 Phase 迭代模型和 V 模型结合起来。Planner 先生成总�
 
 V 模型行为：
 
-- `REQUIREMENT_ANALYSIS`、`HIGH_LEVEL_DESIGN`、`DETAILED_DESIGN`、`CODE` 会同步生成对应下游测试期望。
+- 每个 Phase 固定包含八个领域 Step：需求分析、概要设计、详细设计、编码、单元测试、集成测试、系统测试、验收测试。
+- Planner JSON 是不可变的执行规格，不再保存运行状态。Runtime 将其编译为使用 UUIDv7 全局标识的 Project、Phase、Step、Ticket、KPI、Changelist、Checkpoint、Report、Log 和 AuditEvent 对象。
+- 需求分析、概要设计、详细设计、编码会同步生成对应的验收、系统、集成、单元测试计划和可执行用例。
 - `HIGH_LEVEL_DESIGN` 定义系统级接口、外部 API、第三方库选型和依赖确认。
 - `DETAILED_DESIGN` 定义模块内部结构和具体实现方案。
-- 测试失败先记录为 issue，再路由回匹配的上游阶段交给 Debugger 修复。
-- 回退到 `HIGH_LEVEL_DESIGN` 或 `DETAILED_DESIGN` 的修复会创建工程 CR。Issue 保持 `change_pending`，下游阶段只实施 CR 增量，并记录变更/验证提交。
-- 下游失败使同一 CR 进入 `rework`；只有契约或范围实质扩大时才创建子 CR。全部受影响门禁通过后，CR 和 Issue 才关闭。
+- Ticket 类型固定为 `epic`、`story`、`task`、`bug`、`enhancement`、`change-request`。展示名如 `P1-S004` 只用于阅读，所有关系都使用全局 ID。
+- 测试或执行失败创建 Bug，并路由到配对的上游 Step；完成度、对齐度或覆盖指标不足创建 Enhancement。
+- 上游修复先形成 CR，携带契约差异、影响 Step/产物、实施方案、changelist、commit 和验证门禁；下游只实施增量变化。
+- CR 下游失败会创建关联 Bug 并阻塞父 CR；配对源 Step 修复和子 CR 验证通过后，只恢复父 CR 尚未完成的应用步骤。
+- Bug 只有在所有受影响 CR 门禁通过、方案被验证并写入 Debug Wiki 后才关闭。失败的历史方案会标记为待复核。
 - 已完成阶段的 Debug 必须提供真实 patch/rewrite 或成功验证证据。
 - 网络/API 调用失败是正式门禁：项目 API 失败时必须修复或切换可用 API，不能跳过或掩盖。
 
@@ -67,12 +71,14 @@ V 模型行为：
 
 - **Adapters**：参数/协议解析、配置加载、用户交互、输出渲染、Exit Code。
 - **Runtime**：Runtime API、Build Service、Run Service、Event Stream、Permission Broker，是唯一业务入口。
-- **Workflow and planning**：Phase 迭代、V 模型调度、回退/Debug 路由、迭代门禁、断点恢复。
-- **State policy**：Step、Phase、Issue、CR 使用各自的迁移表并共享统一迁移守卫；Adapter 和 Agent 不得直接修改持久化流程状态。
+- **Workflow and planning**：Planner 草案、领域图编译、Phase 迭代、V 模型依赖调度、失败路由、质量门禁、交付和精确恢复。
+- **State policy**：领域对象是唯一运行真相；Planner 文件不含执行状态，Adapter 和 Agent 不得直接修改持久化生命周期。
 - **Agents / Skills**：每个阶段的角色化 prompt 与工具白名单。
 - **Tools**：文件编辑、程序/测试执行、API fetch、依赖修改、git 快照，全部受门禁约束。
 - **LLM Router**：角色链、动态评分、cluster fallback、OpenAI-compatible/Ollama 客户端、审计。
-- **Workspace**：`phasePlan.json`、`plan.P<N>.json`、`<name>.xc`、`.xcompiler/audit.jsonl`、`.xcompiler/issues/`、`.xcompiler/change-requests/`、Debug cache、Project memory。
+- **Workspace**：Planner 计划文件、`<name>.xc` 清单、`.xcompiler/registry/` 注册表、`.xcompiler/objects/<type>/<uuid>.json` 领域对象、人类审计日志、Debug Wiki、Project memory 和交付报告。
+
+注册表追加事件是恢复依据，快照索引可重建。每个条目记录对象 ID、类型、路径、父对象、revision、内容哈希和生命周期状态。
 
 ---
 
@@ -148,8 +154,6 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 | `xcompiler build -i <file>` | 从需求文件生成阶段计划 |
 | `xcompiler build -t <topic.md>` | 复用已澄清 topic，跳过 Gate 1 |
 | `xcompiler run <phasePlan.json>` | 执行当前阶段计划 |
-| `xcompiler run --from <stepId>` | 从指定 Step 断点恢复 |
-| `xcompiler run --phase <phase>` | 只执行某个阶段/状态 |
 | `xcompiler run --debug-wiki-path <dir>` | 复用并更新共享分层 Debug wiki 路径 |
 | `xcompiler load <name.xc>` | 读取工程配置/进度并继续 |
 | `xcompiler append <name.xc> -i <file>` | 在已有工程上追加新需求 |
@@ -167,8 +171,8 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **LLM 路由**：角色专用 provider 链、XCompiler 自动维护的动态评分、`llm_scores_user.yaml` 用户覆盖，以及 `tags: [cluster]` 聚合路由兜底评分带。
 - **语言**：支持 Python 与 TypeScript 的工程生成、测试、运行和入口检查。
 - **Sandbox**：默认 `subprocess` 且隔离宿主环境变量（`inherit_env: false`）；可切换 `docker` 获得可执行的网络/资源隔离。subprocess 无法兑现 `network: off`，因此该组合会明确报错。
-- **Audit**：每次运行写入 `.xcompiler/audit.jsonl`、LLM stream trace、`docs/process_log.md`、Debug cache、Debug wiki 反馈和 Project memory。
-- **Debug wiki**：Debugger 处理 issue 时会基于压缩后的 `DebugBrief` 检索 LLM-wiki 风格的历史修复经验。wiki 是分层 Markdown 知识库：随包发布的 `wiki/system` 策略页、随包发布的 `wiki/agent` calibration 页、本地 `wiki/external` 真实 issue 解决方案页。Runtime 会重新生成 `index.md` 供人工审阅、`index.json` 供检索使用，并追加 `log.md` 记录操作流水。默认复制到 XCompiler 路径（设置 `XC_PATH` 时为 `$XC_PATH/.xcompiler/debug-wiki`，否则为包/仓库根目录），也可用 `--debug-wiki-path <dir>` 指定共享根目录。issue 正确修复后会把 LLM 输出的 `issueResolutionPlan` 写入 `external`；复用方案失败会通过 feedback overlay 标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
+- **Audit**：每次运行写入人类可读日志，并持久化带 correlation/causation ID 的领域 AuditEvent 和 Log 对象。
+- **Debug wiki**：Debugger 处理 Bug Ticket 时会基于压缩后的 `DebugBrief` 检索 LLM-wiki 风格的历史修复经验。wiki 是分层 Markdown 知识库：随包发布的 `wiki/system` 策略页、随包发布的 `wiki/agent` calibration 页、本地 `wiki/external` 真实 Bug 解决方案页。Runtime 会重新生成 `index.md` 供人工审阅、`index.json` 供检索使用，并追加 `log.md` 记录操作流水。默认复制到 XCompiler 路径（设置 `XC_PATH` 时为 `$XC_PATH/.xcompiler/debug-wiki`，否则为包/仓库根目录），也可用 `--debug-wiki-path <dir>` 指定共享根目录。Bug 的全部 CR 验证通过后才把 `bugResolutionPlan` 写入 `external`；复用方案失败会通过 feedback overlay 标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
 - **安全门禁**：项目文件访问受控，写工具限制在 Step 声明 outputs 内，敏感操作可通过 Adapter 暴露为权限事件。
 
 ---
@@ -188,7 +192,7 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 | `agent.sandboxes.<language>.local.inherit_env` | `false` | 是否显式继承宿主环境；宿主含 API key 等机密时应保持关闭 |
 | `max_rounds_per_step` | `6` | 普通 Step 的 LLM 对话轮数上限 |
 | `max_debug_rounds_per_step` | `max(8, 2 * max_rounds_per_step)` | Debugger 对话轮数上限 |
-| `max_debug_retries` | `3` | Debug 重试次数 |
+| Planner `Step.maxAttempts` | 按复杂度自适应 | Step 事务尝试上限；随 simple/moderate/complex 和 Phase 数量增长 |
 | `--debug-wiki-path <dir>` | XCompiler 路径下的 `.xcompiler/debug-wiki` | 共享分层 Debug wiki 根目录路径 |
 | `max_edit_lines_per_step` | `auto` | EditGuard 单 Step 累计写入行数预算 |
 | `max_write_chunk_bytes` | `auto` | 单次写入 chunk 字节预算 |
@@ -220,7 +224,7 @@ npm test
 npm run build
 ```
 
-最近本地 release gate：60 个测试文件 / 616 个测试通过。
+Release gate 始终执行当前完整测试集，不使用固定的历史测试数量作为验收声明。
 
 ---
 

@@ -42,6 +42,8 @@ export interface ToolExecutionEvent {
   callId: string;
   status: 'started' | 'completed';
   stepId: string;
+  /** Human-readable Step name for UI; stepId remains the canonical identity. */
+  stepName?: string;
   tool: string;
   target?: string;
   args?: Record<string, unknown>;
@@ -77,6 +79,8 @@ export interface ToolContext {
   readChunkBytes?: number;
   /** run_tests 未提供有效过滤参数时使用的当前阶段默认测试范围。 */
   defaultTestArgs?: string[];
+  /** Incremental Tickets may create files but must patch, rather than overwrite, accepted files. */
+  preserveExistingFiles?: boolean;
   /** Optional protocol/UI permission hook for sensitive tool operations. */
   requestPermission?: ToolPermissionRequester;
   /** Optional protocol/UI event hook for tool calls and file changes. */

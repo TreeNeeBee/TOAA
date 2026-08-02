@@ -255,9 +255,7 @@ function contractPlan(
     outputs: [testPath],
     dependsOn: [],
     acceptance: 'The paired test exercises the product implementation.',
-    status: 'PENDING',
-    retries: 0,
-    maxRetries: 3,
+    maxAttempts: 3,
   };
   return {
     version: '1',

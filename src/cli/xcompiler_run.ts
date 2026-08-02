@@ -3,7 +3,7 @@ import { runRunCommand } from '../runtime/commands.js';
 import type { ExecuteResult } from '../runtime/run.js';
 import { setLocale, t } from '../i18n/index.js';
 import { XCOMPILER_VERSION } from '../version.js';
-import { configureLocalizedHelp, localeFromArgv, parseLocale, parsePhase, parseStepId } from './arguments.js';
+import { configureLocalizedHelp, localeFromArgv, parseLocale } from './arguments.js';
 import { xcEnv } from '../config/env.js';
 import { createCliRuntimeIO } from './runtime_adapter.js';
 
@@ -22,9 +22,6 @@ program
   .option('-w, --workspace <dir>', t().cli.optWorkspace)
   .option('-c, --config <file>', t().cli.optConfig)
   .option('--dry-run', t().cli.optDryRun, false)
-  .option('--from <stepId>', t().cli.optFrom, parseStepId)
-  .option('--phase <phase>', t().cli.optPhase, parsePhase)
-  .option('--reset', t().cli.optReset, false)
   .option('--force', t().cli.optForce, false)
   .option('--project-file <file>', t().cli.optProjectFile)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
@@ -35,9 +32,6 @@ program
       workspace: opts.workspace,
       configPath: opts.config,
       dryRun: !!opts.dryRun,
-      fromStepId: opts.from,
-      onlyPhase: opts.phase,
-      resetStatus: !!opts.reset,
       force: !!opts.force,
       projectFilePath: opts.projectFile,
       debugWikiPath: opts.debugWikiPath,

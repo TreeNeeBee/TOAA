@@ -22,7 +22,7 @@ describe('calibrateStepShape', () => {
     expect(s!.systemPrompt.length).toBeGreaterThanOrEqual(20);
     expect(s!.tools).toEqual(['skill:tester']);
     expect(s!.dependsOn).toEqual([]);
-    expect(s!.maxRetries).toBe(3);
+    expect(s!.maxAttempts).toBe(3);
   });
 
   it('adds phase-aware default tools when a writable step forgot to declare any', () => {

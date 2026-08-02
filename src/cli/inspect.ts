@@ -29,7 +29,7 @@ export async function runLs(opts: LsOptions): Promise<void> {
       t().inspect.planHeader(chalk.cyan(plan.relativePath || plan.path), plan.language ?? ''),
     );
     console.log('  ' + t().inspect.planStatusSummary(
-      summary.total, summary.done, summary.pending, summary.failed, summary.running,
+      summary.total, summary.done, summary.ready, summary.blocked, summary.running,
     ));
     if (plan.requirementDigestLine) {
       console.log(`   ${chalk.gray(t().inspect.digestLabel)} ${plan.requirementDigestLine}`);
@@ -48,22 +48,16 @@ export async function runShow(opts: ShowOptions): Promise<void> {
   }
 
   console.log(t().inspect.stepHeader(
-    chalk.cyan(step.id), chalk.yellow(step.phase), chalk.bold(step.title), statusBadge(step.status), step.retries, step.maxRetries,
+    chalk.cyan(`${step.name} (${step.id})`), chalk.yellow(step.type), chalk.bold(step.title), statusBadge(step.state), step.attempts, step.maxAttempts,
   ));
   console.log(t().inspect.stepRoleTools(step.role, step.tools.join(', ')));
-  if (step.dependsOn.length > 0) console.log(t().inspect.stepDependsOn(step.dependsOn.join(', ')));
+  if (step.dependencyStepIds.length > 0) console.log(t().inspect.stepDependsOn(step.dependencyStepIds.join(', ')));
   console.log('');
   console.log(chalk.gray(t().inspect.secDescription));
   console.log(step.description);
   console.log('');
   console.log(chalk.gray(t().inspect.secAcceptance));
-  console.log(step.acceptance);
-  console.log('');
-  if ((step.subTasks?.length ?? 0) > 0) {
-    console.log(chalk.gray(t().inspect.secSubtasks));
-    for (const line of renderSubTasks(step.subTasks ?? [], 0)) console.log(line);
-    console.log('');
-  }
+  console.log(step.acceptance.join('\n'));
   console.log(chalk.gray(t().inspect.secSystemPrompt));
   console.log(step.systemPrompt);
   console.log('');
@@ -80,30 +74,16 @@ export async function runShow(opts: ShowOptions): Promise<void> {
   }
 }
 
-function statusBadge(status: InspectStep['status']): string {
+function statusBadge(status: InspectStep['state']): string {
   switch (status) {
-    case 'DONE':
-      return chalk.green('[DONE]');
-    case 'FAILED':
-      return chalk.red('[FAILED]');
-    case 'RUNNING':
-      return chalk.yellow('[RUNNING]');
+    case 'closed':
+    case 'delivered':
+      return chalk.green(`[${status.toUpperCase()}]`);
+    case 'pending':
+      return chalk.red('[PENDING]');
+    case 'in_progress':
+      return chalk.yellow('[IN PROGRESS]');
     default:
-      return chalk.gray('[PENDING]');
+      return chalk.gray(`[${status.toUpperCase()}]`);
   }
-}
-
-function renderSubTasks(tasks: NonNullable<InspectStep['subTasks']>, depth: number): string[] {
-  const lines: string[] = [];
-  const indent = '  '.repeat(depth);
-  for (const task of tasks) {
-    const outputs = task.outputs && task.outputs.length > 0 ? ` [${task.outputs.join(', ')}]` : '';
-    lines.push(`${indent}- ${task.id}: ${task.title}${outputs}`);
-    lines.push(`${indent}  ${task.description}`);
-    if (task.acceptance) lines.push(`${indent}  acceptance: ${task.acceptance}`);
-    if (task.subTasks && task.subTasks.length > 0) {
-      lines.push(...renderSubTasks(task.subTasks, depth + 1));
-    }
-  }
-  return lines;
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -7,7 +7,7 @@ import { isCompleteTurnJson, StepExecutor } from '../src/agents/executor.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 import type { Step } from '../src/core/plan.js';
 import { getLanguageProfile } from '../src/core/language.js';
-import type { Tool, ToolContext } from '../src/tools/types.js';
+import type { Tool, ToolContext, ToolExecutionEvent } from '../src/tools/types.js';
 import { readFileTool, writeFileTool } from '../src/tools/fs.js';
 import { replaceInFileTool } from '../src/tools/edit.js';
 import { runTestsTool } from '../src/tools/sandbox.js';
@@ -53,12 +53,38 @@ const baseStep: Step = {
   outputs: ['src/x.py'],
   dependsOn: [],
   acceptance: 'src/x.py exists',
-  status: 'PENDING',
-  retries: 0,
-  maxRetries: 3,
+  maxAttempts: 3,
 };
 
 describe('StepExecutor system prompt assembly', () => {
+  it('renders the readable Step name while retaining the canonical UUID in tool events', async () => {
+    const canonicalId = '019fbc80-af28-728a-949c-1ac2396a57d0';
+    const writes = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const events: ToolExecutionEvent[] = [];
+    const exec = new StepExecutor({ llm: new CapturingLLM(), maxRounds: 1, streamOutput: true });
+
+    const result = await exec.run({
+      step: { ...baseStep, id: canonicalId },
+      stepName: 'P1-S004',
+      tools: [writeFileTool],
+      ctx: {
+        ...ctx,
+        stepId: canonicalId,
+        onToolEvent: (event) => { events.push(event); },
+      },
+    });
+    const output = writes.mock.calls.map((args) => String(args[0])).join('');
+    writes.mockRestore();
+
+    expect(result.success).toBe(true);
+    expect(output).toContain('$ P1-S004 Coder round 1');
+    expect(output).toMatch(/\$ P1-S004 (?:工具|tool) write_file/u);
+    expect(output).not.toContain(canonicalId);
+    expect(events).toHaveLength(2);
+    expect(events.every((event) => event.stepId === canonicalId)).toBe(true);
+    expect(events.every((event) => event.stepName === 'P1-S004')).toBe(true);
+  });
+
   it('injects globalPrompt + step.systemPrompt into system message', async () => {
     const llm = new CapturingLLM();
     const exec = new StepExecutor({ llm, maxRounds: 2 });
@@ -419,10 +445,12 @@ describe('StepExecutor system prompt assembly', () => {
   it('automatically reruns inherited rollback tests after a CODE Debugger mutation', async () => {
     class RollbackRepairLLM implements LLMClient {
       readonly name = 'rollback-repair';
-      async chat(): Promise<string> {
+      lastUser = '';
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.lastUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
         return JSON.stringify({
           thoughts: 'repair the implementation exposed by the inherited unit gate',
-          bugResolutionPlan: 'Update src/x.ts, run the TypeScript compiler, then rerun the inherited unit test.',
+          bugResolutionPlan: 'Update src/x.ts, then rerun the inherited unit test.',
           actions: [{ tool: 'write_file', args: { path: 'src/x.ts', content: 'export const x = 2;\n' } }],
           done: false,
         });
@@ -454,7 +482,8 @@ describe('StepExecutor system prompt assembly', () => {
       outputs: ['src/x.ts'],
       tools: ['write_file', 'run_program', 'run_tests'],
     };
-    const exec = new StepExecutor({ llm: new RollbackRepairLLM(), maxRounds: 1 });
+    const llm = new RollbackRepairLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
     const r = await exec.run({
       step,
       executionRole: 'Debugger',
@@ -470,16 +499,20 @@ describe('StepExecutor system prompt assembly', () => {
         reason: 'UNIT_TEST rollback failed',
         failureLog: 'tests/unit/x.test.ts failed',
         repairRequired: true,
+        verificationScope: {
+          stepId: 'S005',
+          phase: 'UNIT_TEST',
+          testArgs: ['tests/unit/x.test.ts'],
+        },
       },
     });
 
     expect(r.success).toBe(true);
-    expect(executed).toEqual(['tsc', 'tests']);
-    expect(r.toolCalls.map((call) => call.tool)).toEqual([
-      'write_file',
-      'run_program',
-      'run_tests',
-    ]);
+    expect(executed).toEqual(['tests']);
+    expect(r.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_tests']);
+    expect(llm.lastUser).toContain('## inherited paired verification gate');
+    expect(llm.lastUser).toContain('tests/unit/x.test.ts');
+    expect(llm.lastUser).toContain('Do not run broad compiler or all-project test commands');
   });
 
   it('returns the DEBUG Bug Ticket resolution plan when the Bug Ticket is fixed', async () => {
@@ -1100,6 +1133,148 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.calls).toBe(2);
     expect(llm.sawQualityFeedback).toBe(true);
     expect(result.toolCalls).toHaveLength(1);
+  });
+
+  it('hands a measured test-quality gap to the outer Ticket gate without looping on the failed probe', async () => {
+    class CoverageGapLLM implements LLMClient {
+      readonly name = 'coverage-gap';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'attempt the required coverage probe',
+            actions: [{ tool: 'run_tests', args: { args: ['--coverage'] } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'report the missing provider as a measured quality gap for Enhancement routing',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: { testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['reports/unit-test-report.md'],
+            gaps: [
+              'lineCoverage is unavailable because @vitest/coverage-v8 is missing',
+              'branchCoverage is unavailable because @vitest/coverage-v8 is missing',
+            ],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('reports/unit-test-report.md', '# Unit report\n');
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'coverage probe',
+      argsSchema: { args: 'string[]?' },
+      async run() {
+        return {
+          ok: false,
+          error: "MISSING DEPENDENCY Cannot find dependency '@vitest/coverage-v8'",
+        };
+      },
+    };
+    const llm = new CoverageGapLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'UNIT_TEST',
+        role: 'Tester',
+        tools: ['run_tests'],
+        outputs: ['reports/unit-test-report.md'],
+        qualityGate: {
+          metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 2,
+          },
+        },
+      },
+      executionRole: 'Tester',
+      tools: [runTests],
+      ctx: { ...ctx, allowedWrites: ['reports/unit-test-report.md'] },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'run_tests', ok: false }),
+    ]);
+    expect(result.qualityAssessment?.gaps).toHaveLength(2);
+  });
+
+  it('rejects a stale metric gap when the current attempt has no failed measurement probe', async () => {
+    class StaleCoverageGapLLM implements LLMClient {
+      readonly name = 'stale-coverage-gap';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'run only the plain test gate',
+            actions: [{ tool: 'run_tests', args: {} }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'reuse an old missing-provider finding without measuring coverage',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: { testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['plain tests passed'],
+            gaps: [
+              'lineCoverage is unavailable because the provider is missing',
+              'branchCoverage is unavailable because the provider is missing',
+            ],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'test gate',
+      argsSchema: { args: 'string[]?' },
+      async run() {
+        return { ok: true, summary: '2 tests passed' };
+      },
+    };
+    const llm = new StaleCoverageGapLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step: {
+        ...baseStep,
+        phase: 'UNIT_TEST',
+        role: 'Tester',
+        tools: ['run_tests'],
+        outputs: [],
+        qualityGate: {
+          metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 2,
+          },
+        },
+      },
+      executionRole: 'Tester',
+      tools: [runTests],
+      ctx,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/lineCoverage|quality assessment/u);
+    expect(llm.calls).toBe(2);
   });
 
   it('does not hide unresolved verification failures behind stale quality evidence', async () => {

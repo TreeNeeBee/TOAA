@@ -69,14 +69,6 @@ export type ComplexityLevel = (typeof COMPLEXITY_LEVELS)[number];
 export const IMPLEMENTATION_PHASE_STATUSES = ['current', 'planned', 'complete', 'deferred'] as const;
 export type ImplementationPhaseStatus = (typeof IMPLEMENTATION_PHASE_STATUSES)[number];
 
-export const STEP_STATUSES = [
-  'PENDING',
-  'RUNNING',
-  'DONE',
-  'FAILED',
-] as const;
-export type StepStatus = (typeof STEP_STATUSES)[number];
-
 export const ROLES = [
   'Planner',
   'Architect',
@@ -228,9 +220,8 @@ export const StepSchema = z
     acceptance: z.string().min(1),
     /** Engineering delivery thresholds evaluated before the Step can become DONE. */
     qualityGate: StageQualityGateSchema.optional(),
-    status: z.enum(STEP_STATUSES).default('PENDING'),
-    retries: z.number().int().nonnegative().default(0),
-    maxRetries: z.number().int().positive().default(3),
+    /** Attempt policy copied into the canonical Step; this draft never owns execution state. */
+    maxAttempts: z.number().int().positive().default(3),
   })
   .strict();
 
