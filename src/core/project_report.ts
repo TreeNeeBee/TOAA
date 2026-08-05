@@ -11,6 +11,7 @@ import { createObjectEnvelope, reviseObjectEnvelope } from '../domain/objects/ob
 import { ReportSchema } from '../domain/observability/records.js';
 import { ProjectSchema } from '../domain/projects/project.js';
 import { PhaseSchema } from '../domain/phases/phase.js';
+import { TicketFlowMetricsService } from '../application/project_management/ticket_flow_metrics.js';
 
 export const PROJECT_DEVELOPMENT_REPORT_PATH = 'docs/project-development-report.md';
 
@@ -33,6 +34,18 @@ export async function generateProjectDevelopmentReport(input: {
   const assessments = objects.filter(
     (object): object is QualityAssessment => object.objectType === 'quality-assessment',
   );
+  const management = objects.find(
+    (object) => object.objectType === 'project-management-plan' && object.id === project.managementPlanId,
+  );
+  if (!management || management.objectType !== 'project-management-plan') {
+    throw new Error(`Project ${project.name} has no Project Management Plan`);
+  }
+  const actors = objects.filter((object) => object.objectType === 'actor-registration');
+  const assignments = objects.filter((object) => object.objectType === 'ticket-assignment');
+  const risks = objects.filter((object) => object.objectType === 'risk-record');
+  const decisions = objects.filter((object) => object.objectType === 'decision-record');
+  const interactions = objects.filter((object) => object.objectType === 'interaction-request');
+  const flow = await new TicketFlowMetricsService(repository).calculate(project.id);
   const currentPhase = phases.find((phase) => phase.name === input.plan.phaseId);
   const currentSteps = currentPhase
     ? steps.filter((step) => step.phaseId === currentPhase.id)
@@ -88,6 +101,7 @@ export async function generateProjectDevelopmentReport(input: {
     `- Current iteration: ${input.plan.phaseId}`,
     `- V-model Steps closed: ${currentSteps.filter((step) => step.state === 'closed').length}/${currentSteps.length}`,
     `- Quality gates passed: ${qualityRows.filter((row) => row.assessment?.passed).length}/${qualityRows.length}`,
+    `- PM plan status: ${management.status}`,
     '',
     '## Iterations',
     '',
@@ -115,6 +129,19 @@ export async function generateProjectDevelopmentReport(input: {
     `- Unresolved: ${unresolved.length}`,
     '',
     ...renderUnresolvedTickets(unresolved),
+    '## Project Governance',
+    '',
+    `- Registered actors: ${actors.length}`,
+    `- Ticket assignments: ${assignments.length}`,
+    `- Decisions: ${decisions.length}`,
+    `- Open risks: ${risks.filter((risk) => risk.objectType === 'risk-record' && risk.status !== 'closed').length}`,
+    `- Pending interactions: ${interactions.filter((request) => request.objectType === 'interaction-request' && request.status === 'pending').length}`,
+    `- Routed Tickets: ${flow.routedTicketCount}/${flow.ticketCount}`,
+    `- Average routing latency: ${formatDuration(flow.averageRoutingLatencyMs)}`,
+    `- Average resolution cycle: ${formatDuration(flow.averageResolutionCycleMs)}`,
+    `- Handoffs / reopens / escalations: ${flow.totalHandoffs} / ${flow.totalReopens} / ${flow.totalEscalations}`,
+    `- Stalled Tickets: ${flow.stalledTicketIds.length}`,
+    '',
     '## Project Audit',
     '',
     ...(input.projectAudit
@@ -156,21 +183,20 @@ export async function generateProjectDevelopmentReport(input: {
     ],
     generatedAt: new Date().toISOString(),
   });
-  await repository.insert(report, report.verdict);
   if (subject.objectType === 'project') {
     const updated = ProjectSchema.parse({
       ...project,
       ...reviseObjectEnvelope(project),
       reportIds: [...project.reportIds, report.id],
     });
-    await repository.update(updated, updated.state);
+    await repository.commit([report, updated]);
   } else if (currentPhase) {
     const updated = PhaseSchema.parse({
       ...currentPhase,
       ...reviseObjectEnvelope(currentPhase),
       reportIds: [...currentPhase.reportIds, report.id],
     });
-    await repository.update(updated, updated.state);
+    await repository.commit([report, updated]);
   }
   return reportPath;
 }
@@ -207,6 +233,13 @@ function countTickets(tickets: readonly Ticket[]): Record<Ticket['type'], number
 
 function formatRatio(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
+}
+
+function formatDuration(value: number | undefined): string {
+  if (value === undefined) return 'N/A';
+  if (value < 1_000) return `${value}ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(1)}s`;
+  return `${(value / 60_000).toFixed(1)}m`;
 }
 
 function escapeTable(value: string): string {

@@ -5,7 +5,7 @@ export type DebugFailureCategory = 'test_failure' | 'syntax_error' | 'import_err
   'network_api_failure' | 'missing_output' | 'tool_loop' | 'permission_denied' | 'llm_provider' | 'exception' | 'unknown';
 
 export interface DebugBrief {
-  version: 1;
+  version: 2;
   category: DebugFailureCategory;
   summary: string;
   primaryError: string;
@@ -46,7 +46,7 @@ export function buildDebugBrief(input: DebugBriefInput): DebugBrief {
   const statusCodes = dedup([...(rootSignals.statusCodes ?? []), ...(latestSignals?.statusCodes ?? [])]).slice(0, 6);
   const evidence = selectEvidenceLines(raw, category, primaryError, failedTests, files, toolFailures);
   return {
-    version: 1,
+    version: 2,
     category,
     summary: buildSummary({ category, reason, primaryError, failedTests, files, phase: input.phase, targetPhase: input.targetPhase }),
     primaryError,

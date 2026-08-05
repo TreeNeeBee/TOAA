@@ -11,7 +11,7 @@ import {
 import { assertStateTransition, type StateTransitions } from '../util/state_machine.js';
 
 export const PHASE_PLAN_KIND = 'xcompiler.phasePlan';
-export const PHASE_PLAN_VERSION = '1';
+export const PHASE_PLAN_VERSION = '2';
 export const DEFAULT_PHASE_PLAN_FILE = 'phasePlan.json';
 
 export const PhasePlanPhaseSchema = ImplementationPhaseSchema.extend({

@@ -1,4 +1,18 @@
+import { isLLMRequestError } from '../../llm/errors.js';
+import { RecordReplayError } from '../record_replay/types.js';
+
 export type AttemptFailureKind = 'execution' | 'infrastructure';
+
+export interface AttemptFailure {
+  kind: AttemptFailureKind;
+  category: 'llm-provider' | 'tool' | 'test' | 'quality' | 'contract' | 'internal';
+  code: string;
+  message: string;
+  retryable: boolean;
+  switchProvider: boolean;
+  statusCode?: number;
+  details?: Record<string, unknown>;
+}
 
 /**
  * Infrastructure failures happen outside the generated project and must never
@@ -6,16 +20,40 @@ export type AttemptFailureKind = 'execution' | 'infrastructure';
  * network/API failure produced by the project itself still becomes a Bug.
  */
 export function classifyAttemptFailure(reason: unknown): AttemptFailureKind {
-  const message = reason instanceof Error ? reason.message : String(reason ?? '');
-  if (
-    /all LLM providers failed for role/iu.test(message) ||
-    /OpenAI-compatible provider request failed/iu.test(message) ||
-    /LLM provider not configured for role/iu.test(message) ||
-    /No usable LLM provider in chain for role/iu.test(message) ||
-    /OpenAI stream (?:idle|wall-clock)/iu.test(message) ||
-    /(?:Ollama|LLM provider)[^\n]*(?:request timed out|stream idle|stream wall-clock|fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND)/iu.test(message)
-  ) {
-    return 'infrastructure';
+  return classifyFailure(reason).kind;
+}
+
+export function classifyFailure(reason: unknown): AttemptFailure {
+  if (isLLMRequestError(reason)) {
+    return {
+      kind: 'infrastructure',
+      category: 'llm-provider',
+      code: reason.failure.code,
+      message: reason.message,
+      retryable: reason.failure.retryable,
+      switchProvider: reason.failure.switchProvider,
+      statusCode: reason.failure.statusCode,
+      details: reason.failure.details,
+    };
   }
-  return 'execution';
+  if (reason instanceof RecordReplayError) {
+    return {
+      kind: 'execution',
+      category: reason.code === 'replay_miss' ? 'test' : 'contract',
+      code: reason.code,
+      message: reason.message,
+      retryable: false,
+      switchProvider: false,
+      details: reason.details,
+    };
+  }
+  const message = reason instanceof Error ? reason.message : String(reason ?? '');
+  return {
+    kind: 'execution',
+    category: 'internal',
+    code: 'unclassified_execution_failure',
+    message,
+    retryable: true,
+    switchProvider: false,
+  };
 }

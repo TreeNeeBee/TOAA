@@ -1,13 +1,13 @@
-import { createObjectEnvelope } from '../objects/object_envelope.js';
-import type { Step } from '../steps/step.js';
-import type { DomainObjectRepository } from '../../infrastructure/repository/domain_object_repository.js';
+import { createObjectEnvelope } from '../../domain/objects/object_envelope.js';
+import type { Step } from '../../domain/steps/step.js';
+import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import {
   KpiObservationSchema,
   QualityAssessmentSchema,
   calculateQuality,
   evaluateKpi,
   type QualityAssessment,
-} from './quality.js';
+} from '../../domain/quality/quality.js';
 
 export interface QualityMetricInput {
   metric: string;
@@ -16,7 +16,7 @@ export interface QualityMetricInput {
 }
 
 export class QualityAssessmentService {
-  constructor(private readonly repository: DomainObjectRepository) {}
+  constructor(private readonly repository: DomainObjectRepositoryPort) {}
 
   async assessStep(input: {
     step: Step;

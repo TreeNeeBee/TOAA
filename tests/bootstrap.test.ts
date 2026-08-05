@@ -9,7 +9,7 @@ import {
   qualifyBootstrapCandidate,
   renderBootstrapReport,
   type BootstrapResult,
-} from '../src/cli/bootstrap.js';
+} from '../src/runtime/bootstrap.js';
 
 const cleanup: string[] = [];
 

@@ -22,11 +22,12 @@ XCompiler Runtime
              |
              v
 Application execution
-  DomainExecutionEngine | DomainAttemptRunner | execution projection
+  ProjectOrchestrator(PM) | WorkScheduler | CorrectiveWorkflow
+  DomainAttemptRunner | Quality | Record/Replay | Projection
              |
              v
 Domain
-  Project | Phase | Step | Ticket | Scheduler | Quality | Evidence
+  Project | Phase | Step | Ticket | Assignment | Decision | Risk | Evidence
              |
              v
 Infrastructure
@@ -70,6 +71,11 @@ interface ObjectEnvelope {
 | Checkpoint | 不可变的对象快照引用和事件序号 |
 | Deliverable / Report | 交付路径、验收条件和阶段/项目报告 |
 | Log / AuditEvent | Ticket 日志及带 correlation/causation 的领域审计 |
+| ActorRegistration / Assignment | 角色能力注册、Ticket 所有权和容量 |
+| ProjectManagementPlan | PM 范围基线、状态、风险、决策和交互索引 |
+| Decision / Risk / InteractionRequest | PM 决策、风险控制和用户授权证据 |
+| TicketTraceEvent | 只追加、哈希链保护的 Ticket 流转调用链 |
+| DomainEvent | 与对象修改同一 UnitOfWork 提交的 outbox 事件 |
 
 关系只保存 ID 或 `{ id, objectType }`。父 ID 是权威关系；子列表和反向依赖是可校验投影。
 
@@ -82,7 +88,7 @@ interface ObjectEnvelope {
 - Planner Step 使用 `S001` 等局部标签，包含 prompt、工具、输入、输出和最多两层子任务。
 - Planner 文件不包含运行状态、重试状态或恢复游标。
 
-Build 通过 Planning Compiler 一次性创建当前领域图：
+Build 通过 Planning Compiler 一次性创建当前领域图，并由 PM 立即注册全部 Ticket、记录活动 Phase 选择、导入澄清记录并刷新项目状态投影：
 
 ```text
 Project
@@ -102,20 +108,20 @@ Project
 每个 Phase 固定八个 Step：
 
 ```text
-REQUIREMENT_ANALYSIS ---------------------- ACCEPTANCE_TEST
-       HIGH_LEVEL_DESIGN --------------- SYSTEM_TEST
+REQUIREMENT_ANALYSIS ---------------------- FUNCTIONAL_TEST
+       HIGH_LEVEL_DESIGN --------------- MODULE_TEST
               DETAILED_DESIGN ------- INTEGRATION_TEST
-                         CODING --- UNIT_TEST
+                         CODE --- UNIT_TEST
 ```
 
 配对关系：
 
 | 产出阶段 | 验证阶段 | 同步生成内容 |
 | --- | --- | --- |
-| REQUIREMENT_ANALYSIS | ACCEPTANCE_TEST | 验收/功能测试计划和用例 |
-| HIGH_LEVEL_DESIGN | SYSTEM_TEST | 系统、模块和接口契约测试 |
+| REQUIREMENT_ANALYSIS | FUNCTIONAL_TEST | 验收/功能测试计划和用例 |
+| HIGH_LEVEL_DESIGN | MODULE_TEST | 系统、模块和接口契约测试 |
 | DETAILED_DESIGN | INTEGRATION_TEST | 集成场景和测试 |
-| CODING | UNIT_TEST | 单元测试计划和用例 |
+| CODE | UNIT_TEST | 单元测试计划和用例 |
 
 S1-S4 负责产出并验证完成度及上游对齐度。S5-S8 不重新设计或重写产品，只检查测试资产完整性、运行既有测试并提交结构化指标。
 
@@ -162,7 +168,7 @@ Phase 在八个 Step 和所有纠正 Ticket 关闭后执行 Delivery Story，随
 
 ## 8. 调度规则
 
-`DomainScheduler` 是唯一调度和生命周期推进者：
+Application 层的 PM Orchestrator 是唯一项目推进者；它通过 `WorkScheduler` 选择工作，通过领域状态策略验证每次跳转：
 
 1. 优先恢复唯一的 `in_progress` Step/Ticket。
 2. 否则按 Step 依赖选择首个就绪项。
@@ -172,6 +178,8 @@ Phase 在八个 Step 和所有纠正 Ticket 关闭后执行 Delivery Story，随
 6. 没有可运行项时，只有所有 Step、Story、纠正 Ticket 和最终审计通过才允许关闭 Phase。
 
 数组顺序不构成依赖，显示名不构成身份，Planner 状态不参与裁决。
+
+PM 只创建有项目上下文的 Epic 和 Story。Task、Bug、Enhancement、CR 由掌握技术上下文的发现角色创建，先提交 PM 注册，再由 PM 按能力、状态、容量和稳定排序路由。所有权由已接受 Assignment 表示；每次提交、注册、路由、接受、转交和关闭都追加不可变 TicketTraceEvent。
 
 ## 9. 错误、Enhancement 与 CR
 
@@ -234,27 +242,37 @@ plan.P<N>.json                         current Planner execution spec
 .xcompiler/registry/events.jsonl       append-only registry events
 .xcompiler/registry/index.json         rebuildable registry snapshot
 .xcompiler/objects/<type>/<uuid>.json  canonical domain objects
+.xcompiler/project-status.json         rebuildable PM status projection
+.xcompiler/record-replay/              redacted external-interaction fixtures
 .xcompiler/audit.jsonl                 detailed operational audit
 docs/process_log.md                    human-readable process log
 docs/project-development-report.md     delivery projection
 ```
 
-`.xc` 只保存 workspace、配置、当前计划引用和 canonical `projectId`，不复制 Project 状态。恢复时先加载注册表，再通过 Project 的 `currentPhaseId` 和 Scheduler 恢复精确 Ticket/Step；不存在 `--from`、`--phase` 或 `--reset` 跳过门禁的入口。
+`.xc` 只保存 workspace、配置、当前计划引用和 canonical `projectId`，不复制 Project 状态。恢复时先加载注册表，再通过 Project 的 `currentPhaseId` 和 PM WorkScheduler 恢复精确 Ticket/Step；不存在 `--from`、`--phase` 或 `--reset` 跳过门禁的入口。
 
 注册表每次更新校验对象类型、父关系、Project 归属、revision 和内容哈希。事件流可重放并重建 index；对象损坏、孤儿引用或跨 Project 父关系必须明确报错。
 
-## 13. Runtime 事件与权限
+## 13. Record/Replay
 
-Runtime 通过事件暴露 `project_planned`、`phase_started`、`ticket_started`、`step_started`、`ticket_routed`、`step_delivered`、`phase_delivered` 和 `project_delivered`。每个事件携带稳定的 Project/Phase/Step/Ticket ID、correlation ID 和 causation ID，并同步持久化 DomainAuditEvent。
+HTTP、LLM 和 subprocess 外部交互通过统一端口记录；测试逻辑不内嵌特定 API 的 fixture 规则。`record`/`refresh` 只能由显式 fixture 准备命令触发，验证阶段强制 `replay`，缺失、歧义、哈希链损坏、未脱敏或过期 fixture 都明确失败。`refresh` 追加 supersession 关系，不覆盖历史证据。
+
+## 14. Runtime 事件与权限
+
+Runtime 通过事件暴露 `project_planned`、`phase_started`、`ticket_started`、`step_started`、`ticket_routed`、`step_delivered`、`phase_delivered` 和 `project_delivered`。每个事件都有 `eventId`、`eventVersion`、`occurredAt`，并携带稳定的 Project/Phase/Step/Ticket ID、correlation ID 和 causation ID，同步写入事务 outbox 与领域审计。
 
 Run 中 shell、文件修改、删除、依赖安装、配置修改、Git、网络、测试、构建和工作区外访问都必须通过权限接口。拒绝不能静默：Runtime 要么采用明确替代路径，要么返回失败并写入最终报告。
 
-## 14. 不变量
+ACP 取消把同一 AbortSignal 传入 Build、Run、Planner、Executor 和 OpenAI-compatible 网络请求。权限等待立即取消；无法中断的本地操作以 best-effort 完成后停止，不会静默报告成功。
+
+## 15. 不变量
 
 - Runtime 是唯一业务入口。
 - 一个 workspace 只能有一个未 tombstone 的 Project。
 - 全部持久化引用使用 UUIDv7 ID；`name` 不作为键。
 - 一个 Phase 只有一个 Epic、八个配对 Step 和一个 Delivery Story。
+- 所有 Ticket 先由 PM 注册；Epic/Story 只能由 PM 创建，其他 Ticket 不能由 PM 代写技术上下文。
+- Ticket Trace 只能追加且必须通过哈希链校验，Assignment 是唯一所有权来源。
 - 每个 Step 最多有一个进行中的执行 Ticket。
 - 任何通过的 Step 必须引用同 Step 的 passing QualityAssessment。
 - CR 每个受影响 Step 必须有唯一 verified application 才能关闭。

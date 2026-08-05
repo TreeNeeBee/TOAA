@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Workspace } from '../src/workspace/workspace.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
+import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
 import { DomainAuditTrail } from '../src/domain/observability/audit_trail.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { generateProjectDevelopmentReport } from '../src/core/project_report.js';
@@ -80,7 +81,7 @@ describe('domain plan compiler', () => {
       topic: 'Build a TypeScript news application.',
       projectName: 'news',
     });
-    const coding = graph.steps.find((step) => step.type === 'CODING')!;
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
     const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
     const codingStory = graph.tickets.find((ticket) => ticket.type === 'story' && ticket.stepId === coding.id)!;
     const unitStory = graph.tickets.find((ticket) => ticket.type === 'story' && ticket.stepId === unit.id)!;
@@ -101,7 +102,7 @@ describe('domain plan compiler', () => {
     });
     const repository = new DomainObjectRepository(workspace);
     await repository.load();
-    await repository.persistCompiledGraph(graph);
+    await new ProjectGraphPersistenceService(repository).persistGraph(graph);
 
     const expectedCount = 1 + 1 + graph.phasePlans.length + graph.phases.length +
       graph.steps.length + graph.tickets.length + graph.kpis.length + graph.deliverables.length;
@@ -163,7 +164,7 @@ describe('domain plan compiler', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-domain-extension-'));
     const repository = new DomainObjectRepository(new Workspace(root));
     await repository.load();
-    await repository.persistCompiledGraph(original);
+    await new ProjectGraphPersistenceService(repository).persistGraph(original);
     const predecessorPhase = PhaseSchema.parse({
       ...original.phases[0]!,
       ...reviseObjectEnvelope(original.phases[0]!),
@@ -211,7 +212,7 @@ describe('domain plan compiler', () => {
       ...original.project.phaseIds,
       ...extension.phases.map((phase) => phase.id),
     ]);
-    await repository.persistProjectExtension(extension);
+    await new ProjectGraphPersistenceService(repository).persistExtension(extension);
     expect((await repository.findProject())?.id).toBe(original.project.id);
     expect(await repository.registry.verifyIntegrity({ verifyContent: true })).toEqual([]);
   });

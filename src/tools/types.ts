@@ -2,6 +2,7 @@ import type { Workspace } from '../workspace/workspace.js';
 import type { Sandbox } from '../sandbox/types.js';
 import type { AuditLogger } from '../audit/audit.js';
 import type { Language } from '../core/plan.js';
+import type { RecordReplayController } from '../application/record_replay/controller.js';
 
 export type ToolPermissionOperation =
   | 'shell_command'
@@ -85,6 +86,8 @@ export interface ToolContext {
   requestPermission?: ToolPermissionRequester;
   /** Optional protocol/UI event hook for tool calls and file changes. */
   onToolEvent?: ToolExecutionReporter;
+  /** Generic external-interaction record/replay boundary. */
+  recordReplay?: RecordReplayController;
 }
 
 /** 单次工具调用的结果统一结构。 */

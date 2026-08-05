@@ -21,7 +21,6 @@ function mkCfg(overrides: Partial<XCompilerConfig['llm']> = {}): XCompilerConfig
     agent: {
       max_rounds_per_step: 6,
       max_edit_lines_per_step: 100,
-      max_write_chunk_bytes: 'auto',
       sandboxes: {
         python: {
           mode: 'subprocess',

@@ -9,7 +9,7 @@ import type { Phase } from './plan.js';
 
 export const DEFAULT_DEBUG_WIKI_REL_PATH = '.xcompiler/debug-wiki';
 export const BUNDLED_DEBUG_WIKI_REL_PATH = 'debug-wiki';
-export const DEBUG_WIKI_VERSION = 1;
+export const DEBUG_WIKI_VERSION = 2;
 
 export type DebugWikiLayer = 'system' | 'agent' | 'external';
 export type DebugWikiEntryStatus = 'active' | 'needs_review' | 'superseded';
@@ -81,7 +81,7 @@ export interface DebugWikiResolutionInput {
 }
 
 interface DebugWikiIndex {
-  version: 1;
+  version: 2;
   updatedAt: string;
   root: string;
   layers: Record<DebugWikiLayer, { entries: number; writable: boolean }>;

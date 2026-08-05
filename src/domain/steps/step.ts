@@ -6,10 +6,10 @@ import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 
 export const V_MODEL_STEP_PAIRS = [
-  ['REQUIREMENT_ANALYSIS', 'ACCEPTANCE_TEST'],
-  ['HIGH_LEVEL_DESIGN', 'SYSTEM_TEST'],
+  ['REQUIREMENT_ANALYSIS', 'FUNCTIONAL_TEST'],
+  ['HIGH_LEVEL_DESIGN', 'MODULE_TEST'],
   ['DETAILED_DESIGN', 'INTEGRATION_TEST'],
-  ['CODING', 'UNIT_TEST'],
+  ['CODE', 'UNIT_TEST'],
 ] as const;
 
 export type DevelopmentStepType = (typeof V_MODEL_STEP_PAIRS)[number][0];

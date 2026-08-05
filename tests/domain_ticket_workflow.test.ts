@@ -4,8 +4,10 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { compileProjectGraph } from '../src/domain/planning/compiler.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
-import { TicketWorkflow } from '../src/domain/tickets/workflow.js';
-import { QualityAssessmentService } from '../src/domain/quality/assessment_service.js';
+import { TicketWorkflow } from '../src/application/project_management/ticket_workflow.js';
+import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
+import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
+import { QualityAssessmentService } from '../src/application/execution/quality_assessment_service.js';
 import type { Step } from '../src/domain/steps/step.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../src/workspace/workspace.js';
@@ -13,13 +15,14 @@ import type { Plan } from '../src/core/plan.js';
 
 describe('TicketWorkflow', () => {
   it('keeps a Bug open until its linked Change Request is implemented and verified', async () => {
-    const { graph, repository, workflow } = await setup();
+    const { graph, repository, workflow, registration } = await setup();
     const integration = graph.steps.find((step) => step.type === 'INTEGRATION_TEST')!;
     const detailed = graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
     const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
-    const coding = graph.steps.find((step) => step.type === 'CODING')!;
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
 
     const bug = await workflow.openBug({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
       failedStep: integration,
       targetStep: detailed,
       verificationStep: integration,
@@ -27,9 +30,14 @@ describe('TicketWorkflow', () => {
       severity: 'high',
       message: 'The service and adapter contracts disagree.',
       summary: 'Integration contract mismatch.',
+      category: 'test',
+      code: 'integration_contract_mismatch',
+      retryable: true,
+      switchProvider: false,
       rawEvidenceRef: '.xcompiler/failures/integration.log',
       correlationId: createObjectId(),
     });
+    await registration.routeAndAssign(bug.id);
     await workflow.setSolution(bug.id, {
       status: 'applied',
       approach: 'Correct the detailed contract and propagate its delta.',
@@ -40,6 +48,7 @@ describe('TicketWorkflow', () => {
     });
     const request = await workflow.openChangeRequest({
       sourceTicketId: bug.id,
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
       triggerStepId: integration.id,
       sourceStepId: detailed.id,
       affectedStepIds: [detailed.id, coding.id, unit.id, integration.id],
@@ -56,6 +65,7 @@ describe('TicketWorkflow', () => {
       ],
       verificationGate: ['All affected Step gates pass.'],
     });
+    await registration.routeAndAssign(request.id);
     await workflow.setSolution(request.id, {
       status: 'verified',
       approach: 'Apply the contract delta through each affected Step.',
@@ -87,10 +97,11 @@ describe('TicketWorkflow', () => {
   });
 
   it('refuses to close a CR when any affected Step lacks change and verification evidence', async () => {
-    const { graph, repository, workflow } = await setup();
+    const { graph, repository, workflow, registration } = await setup();
     const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
-    const coding = graph.steps.find((step) => step.type === 'CODING')!;
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
     const enhancement = await workflow.openEnhancement({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
       sourceStep: unit,
       targetStep: coding,
       verificationStep: unit,
@@ -98,6 +109,7 @@ describe('TicketWorkflow', () => {
       finding: 'Boundary branches are not covered.',
       correlationId: createObjectId(),
     });
+    await registration.routeAndAssign(enhancement.id);
     await workflow.setSolution(enhancement.id, {
       status: 'applied',
       approach: 'Add the missing boundary implementation and tests.',
@@ -107,6 +119,7 @@ describe('TicketWorkflow', () => {
       updatedAt: new Date().toISOString(),
     });
     const request = await workflow.openChangeRequest({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
       sourceTicketId: enhancement.id,
       triggerStepId: unit.id,
       sourceStepId: coding.id,
@@ -120,6 +133,7 @@ describe('TicketWorkflow', () => {
       implementationPlan: ['Update code and unit tests.'],
       verificationGate: ['Coverage KPI passes.'],
     });
+    await registration.routeAndAssign(request.id);
     await workflow.setSolution(request.id, {
       status: 'verified',
       approach: 'Apply the boundary delta.',
@@ -149,8 +163,10 @@ async function setup() {
     topic: 'Build a TypeScript service.',
     projectName: 'service',
   });
-  await repository.persistCompiledGraph(graph);
-  return { graph, repository, workflow: new TicketWorkflow(repository) };
+  await new ProjectGraphPersistenceService(repository).persistGraph(graph);
+  const registration = new TicketRegistrationService(repository);
+  await registration.registerProjectTickets(graph.project.id);
+  return { graph, repository, registration, workflow: new TicketWorkflow(repository) };
 }
 
 async function passingAssessment(repository: DomainObjectRepository, step: Step) {

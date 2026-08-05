@@ -1,18 +1,17 @@
 import chalk from 'chalk';
 import {
-  runLsCommand,
-  runShowCommand,
+  XCompilerRuntime,
   type InspectStep,
   type LsOptions,
   type ShowOptions,
-} from '../runtime/inspect.js';
+} from '../runtime.js';
 import { t } from '../i18n/index.js';
 
 export type { LsOptions, ShowOptions };
 
 /** `xcompiler ls` CLI adapter. */
 export async function runLs(opts: LsOptions): Promise<void> {
-  const result = await runLsCommand(opts);
+  const result = await new XCompilerRuntime().ls(opts);
   if (result.plans.length === 0) {
     console.log(chalk.yellow(t().inspect.noPlanFound));
     return;
@@ -39,7 +38,7 @@ export async function runLs(opts: LsOptions): Promise<void> {
 
 /** `xcompiler show <stepId>` CLI adapter. */
 export async function runShow(opts: ShowOptions): Promise<void> {
-  const result = await runShowCommand(opts);
+  const result = await new XCompilerRuntime().show(opts);
   const step = result.step;
   if (!step) {
     console.error(chalk.red(t().inspect.stepNotFound(opts.stepId)));

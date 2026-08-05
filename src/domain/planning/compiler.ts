@@ -31,12 +31,28 @@ import {
   type ProjectPlan,
 } from './plan.js';
 import { assertDomainGraph, type DomainGraph } from '../workflow/domain_graph.js';
+import { DOMAIN_ROLES, type DomainRole } from '../workflow/role.js';
+import {
+  capabilitiesForRole,
+  defaultAgentForRole,
+  roleForStepType,
+  supportedTicketTypesForRole,
+} from '../workflow/role_profile.js';
+import {
+  ActorRegistrationSchema,
+  ProjectManagementPlanSchema,
+  reviseManagementPlan,
+  type ActorRegistration,
+  type ProjectManagementPlan,
+} from '../project_management/index.js';
 
 export interface CompiledProjectGraph extends DomainGraph {
   projectPlan: ProjectPlan;
   phasePlans: PhasePlan[];
   kpis: Kpi[];
   deliverables: Deliverable[];
+  actors: ActorRegistration[];
+  managementPlan: ProjectManagementPlan;
 }
 
 export interface CompileProjectGraphInput {
@@ -65,6 +81,7 @@ export interface CompiledProjectExtension {
   tickets: Ticket[];
   kpis: Kpi[];
   deliverables: Deliverable[];
+  managementPlan: ProjectManagementPlan;
 }
 
 export function rebaseDraftPlanPhases(draft: DraftPlan, existingPhaseNames: readonly string[]): DraftPlan {
@@ -97,6 +114,8 @@ export function compileProjectExtension(input: CompileProjectGraphInput & {
   projectPlan: ProjectPlan;
   predecessorPhase: Phase;
   predecessorEpic: WorkTicket;
+  actors: ActorRegistration[];
+  managementPlan: ProjectManagementPlan;
 }): CompiledProjectExtension {
   if (input.project.language !== input.draft.language) {
     throw new Error(
@@ -110,6 +129,7 @@ export function compileProjectExtension(input: CompileProjectGraphInput & {
     throw new Error('Incremental Phase requires a closed predecessor Phase and Epic');
   }
   const generated = compileProjectGraph(input);
+  const actorByRole = new Map(input.actors.map((actor) => [actor.role, actor]));
   const firstPhaseId = generated.projectPlan.activePhaseId;
   const phases = generated.phases.map((phase) => PhaseSchema.parse({
     ...phase,
@@ -128,6 +148,9 @@ export function compileProjectExtension(input: CompileProjectGraphInput & {
   const tickets = generated.tickets.map((ticket) => TicketSchema.parse({
     ...ticket,
     projectId: input.project.id,
+    creatorActorId: ticket.type === 'epic' || ticket.type === 'story'
+      ? input.project.pmActorId
+      : requireActor(actorByRole, ticket.role).id,
     dependencyTicketIds: ticket.type === 'epic' && ticket.phaseId === firstPhaseId
       ? [...new Set([...ticket.dependencyTicketIds, input.predecessorEpic.id])]
       : ticket.dependencyTicketIds,
@@ -172,7 +195,13 @@ export function compileProjectExtension(input: CompileProjectGraphInput & {
     phaseIds: [...input.project.phaseIds, ...phases.map((phase) => phase.id)],
     currentPhaseId: firstPhaseId,
   });
-  return { project, projectPlan, phases, phasePlans, steps, tickets, kpis, deliverables };
+  const managementPlan = reviseManagementPlan(input.managementPlan, {
+    milestonePhaseIds: [...input.managementPlan.milestonePhaseIds, ...phases.map((phase) => phase.id)],
+    scopeBaseline: [...input.managementPlan.scopeBaseline, input.draft.requirementDigest],
+    status: 'baselined',
+    baselinedAt: new Date().toISOString(),
+  });
+  return { project, projectPlan, managementPlan, phases, phasePlans, steps, tickets, kpis, deliverables };
 }
 
 export function compilePhaseMaterialization(input: {
@@ -181,6 +210,7 @@ export function compilePhaseMaterialization(input: {
   phase: Phase;
   phasePlan: PhasePlan;
   epic: WorkTicket;
+  actors: ActorRegistration[];
 }): CompiledPhaseMaterialization {
   if (input.phase.state !== 'created' || input.phase.stepIds.length > 0) {
     throw new Error(`Phase ${input.phase.name} is already materialized or has started`);
@@ -197,6 +227,8 @@ export function compilePhaseMaterialization(input: {
     phaseId: input.phase.id,
     projectId: input.project.id,
     epicEnvelope: extractObjectEnvelope(input.epic),
+    actorByRole: new Map(input.actors.map((actor) => [actor.role, actor])),
+    pmActorId: input.project.pmActorId,
     now: new Date().toISOString(),
   });
   const phase = PhaseSchema.parse({
@@ -243,9 +275,18 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     now,
   });
   const projectId = projectEnvelope.id;
+  const actors = DOMAIN_ROLES.map((role) => createActorRegistration(projectId, role, now));
+  const actorByRole = new Map(actors.map((actor) => [actor.role, actor]));
+  const pmActor = requireActor(actorByRole, 'project-manager');
   const projectPlanEnvelope = createObjectEnvelope({
     name: 'phasePlan',
     objectType: 'plan',
+    projectId,
+    now,
+  });
+  const managementPlanEnvelope = createObjectEnvelope({
+    name: 'project-management-plan',
+    objectType: 'project-management-plan',
     projectId,
     now,
   });
@@ -283,6 +324,8 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     phaseId: activePhaseEnvelope.id,
     projectId,
     epicEnvelope: epicEnvelopes.get(activeDraftPhase.id)!,
+    actorByRole,
+    pmActorId: pmActor.id,
     now,
   });
 
@@ -296,6 +339,8 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
       phaseId: phase.id,
       role: 'project-manager',
       agent: 'Planner',
+      creatorActorId: pmActor.id,
+      requiredCapabilities: ['project-management', 'phase-control'],
       priority: TICKET_PRIORITY.high,
       rootTicketId: epic.id,
       description: draftPhase.objective,
@@ -303,6 +348,7 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
       dependencyTicketIds: dependencies,
       state: 'created',
       source: { kind: 'plan', correlationId: projectPlanEnvelope.id, externalId: draftPhase.id },
+      submittedAt: now,
       workKind: 'phase',
     }) as WorkTicket;
   });
@@ -386,8 +432,24 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     intent: input.draft.intent,
     projectType: input.draft.projectType,
     projectPlanId: projectPlan.id,
+    managementPlanId: managementPlanEnvelope.id,
+    pmActorId: pmActor.id,
     phaseIds: phases.map((phase) => phase.id),
     currentPhaseId: activePhaseEnvelope.id,
+  });
+
+  const managementPlan = ProjectManagementPlanSchema.parse({
+    ...managementPlanEnvelope,
+    pmActorId: pmActor.id,
+    objective: input.draft.requirementDigest,
+    scopeBaseline: draftPhases.flatMap((phase) => phase.scope.length > 0 ? phase.scope : [phase.objective]),
+    successCriteria: draftPhases.map((phase) => phase.verificationGate?.summary ?? `${phase.id} verification passes.`),
+    constraints: [],
+    stakeholderRefs: input.topicSourceRef ? [input.topicSourceRef] : [],
+    milestonePhaseIds: phases.map((phase) => phase.id),
+    actorRegistrationIds: actors.map((actor) => actor.id),
+    status: 'baselined',
+    baselinedAt: now,
   });
 
   const graph: CompiledProjectGraph = {
@@ -399,6 +461,8 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     tickets,
     kpis,
     deliverables,
+    actors,
+    managementPlan,
   };
   assertDomainGraph(graph);
   return graph;
@@ -410,6 +474,8 @@ function compileActivePhase(input: {
   phaseId: ObjectId;
   projectId: ObjectId;
   epicEnvelope: ReturnType<typeof createObjectEnvelope>;
+  actorByRole: Map<DomainRole, ActorRegistration>;
+  pmActorId: ObjectId;
   now: string;
 }): { steps: Step[]; tickets: Ticket[]; kpis: Kpi[]; deliverables: Deliverable[] } {
   const orderedDraftSteps = STEP_TYPES.map((type) =>
@@ -502,6 +568,8 @@ function compileActivePhase(input: {
       stepId: step.id,
       role: step.role,
       agent: step.agent,
+      creatorActorId: input.pmActorId,
+      requiredCapabilities: capabilitiesForRole(step.role),
       priority: TICKET_PRIORITY.high,
       parentTicketId: input.epicEnvelope.id,
       rootTicketId: input.epicEnvelope.id,
@@ -510,12 +578,21 @@ function compileActivePhase(input: {
       dependencyTicketIds: [],
       state: 'created',
       source: { kind: 'plan', correlationId: input.epicEnvelope.id, externalId: step.name },
+      submittedAt: input.now,
       workKind: 'v-model-step',
       maxAttempts: step.maxAttempts,
     }) as WorkTicket;
     storyByStep.set(step.id, story);
     tickets.push(story);
-    registerTasks(step, input.draft.steps.find((item) => item.id === step.name.split('-').at(-1))?.subTasks ?? [], story, input.epicEnvelope.id, tickets, input.now);
+    registerTasks(
+      step,
+      input.draft.steps.find((item) => item.id === step.name.split('-').at(-1))?.subTasks ?? [],
+      story,
+      input.epicEnvelope.id,
+      tickets,
+      requireActor(input.actorByRole, step.role).id,
+      input.now,
+    );
   }
   for (const step of steps) {
     const story = storyByStep.get(step.id)!;
@@ -538,6 +615,8 @@ function compileActivePhase(input: {
     phaseId: input.phaseId,
     role: 'project-manager',
     agent: 'Planner',
+    creatorActorId: input.pmActorId,
+    requiredCapabilities: ['project-management', 'delivery-control'],
     priority: TICKET_PRIORITY.high,
     parentTicketId: input.epicEnvelope.id,
     rootTicketId: input.epicEnvelope.id,
@@ -546,6 +625,7 @@ function compileActivePhase(input: {
     dependencyTicketIds: steps.map((step) => storyByStep.get(step.id)!.id),
     state: 'created',
     source: { kind: 'plan', correlationId: input.epicEnvelope.id, externalId: `${input.phase.id}:delivery` },
+    submittedAt: input.now,
     workKind: 'delivery',
   }));
   return { steps, tickets, kpis, deliverables };
@@ -557,6 +637,7 @@ function registerTasks(
   parent: WorkTicket,
   epicId: ObjectId,
   tickets: Ticket[],
+  creatorActorId: ObjectId,
   now: string,
   depth = 1,
 ): void {
@@ -577,6 +658,8 @@ function registerTasks(
       stepId: step.id,
       role: step.role,
       agent: step.agent,
+      creatorActorId,
+      requiredCapabilities: capabilitiesForRole(step.role),
       priority: TICKET_PRIORITY.normal,
       parentTicketId: parent.id,
       rootTicketId: epicId,
@@ -584,11 +667,12 @@ function registerTasks(
       acceptance: [draftTask.acceptance ?? step.acceptance[0]!],
       state: 'created',
       source: { kind: 'plan', correlationId: epicId, externalId: draftTask.id },
+      submittedAt: now,
       workKind: 'planned-work',
       maxAttempts: parent.maxAttempts,
     }) as WorkTicket;
     tickets.push(task);
-    registerTasks(step, draftTask.subTasks ?? [], task, epicId, tickets, now, depth + 1);
+    registerTasks(step, draftTask.subTasks ?? [], task, epicId, tickets, creatorActorId, now, depth + 1);
   }
 }
 
@@ -601,9 +685,6 @@ function normalizedDraftPhases(plan: DraftPlan): DraftPhase[] {
 }
 
 function normalizeStepType(type: DraftStep['phase']): StepType {
-  if (type === 'CODE') return 'CODING';
-  if (type === 'MODULE_TEST') return 'SYSTEM_TEST';
-  if (type === 'FUNCTIONAL_TEST') return 'ACCEPTANCE_TEST';
   return type;
 }
 
@@ -618,6 +699,31 @@ function domainRoleFor(step: DraftStep, type: StepType) {
   return type === 'INTEGRATION_TEST' ? 'integrator' as const : 'tester' as const;
 }
 
+function createActorRegistration(projectId: ObjectId, role: DomainRole, now: string): ActorRegistration {
+  return ActorRegistrationSchema.parse({
+    ...createObjectEnvelope({ name: `actor-${role}`, objectType: 'actor-registration', projectId, now }),
+    actorKind: 'llm-agent',
+    role,
+    agent: defaultAgentForRole(role),
+    capabilities: capabilitiesForRole(role),
+    supportedTicketTypes: supportedTicketTypesForRole(role),
+    supportedStepTypes: STEP_TYPES.filter((type) => roleForStepType(type) === role),
+    state: 'active',
+    capacity: role === 'project-manager' ? 255 : 1,
+    activeAssignmentIds: [],
+    registeredAt: now,
+  });
+}
+
+function requireActor(
+  actors: ReadonlyMap<DomainRole, ActorRegistration>,
+  role: DomainRole,
+): ActorRegistration {
+  const actor = actors.get(role);
+  if (!actor) throw new Error(`Project role ${role} has not registered an actor`);
+  return actor;
+}
+
 function defaultKpis(type: StepType): Array<{
   description: string;
   metric: string;
@@ -626,7 +732,7 @@ function defaultKpis(type: StepType): Array<{
   tolerance: number;
   weight: number;
 }> {
-  if (type === 'REQUIREMENT_ANALYSIS' || type === 'HIGH_LEVEL_DESIGN' || type === 'DETAILED_DESIGN' || type === 'CODING') {
+  if (type === 'REQUIREMENT_ANALYSIS' || type === 'HIGH_LEVEL_DESIGN' || type === 'DETAILED_DESIGN' || type === 'CODE') {
     return [
       { description: `${type} completion`, metric: 'completion', comparator: 'gte', target: 0.95, tolerance: 0.02, weight: 0.5 },
       { description: `${type} upstream alignment`, metric: 'upstreamAlignment', comparator: 'gte', target: type === 'REQUIREMENT_ANALYSIS' ? 0.95 : 0.9, tolerance: 0.02, weight: 0.5 },
@@ -635,8 +741,8 @@ function defaultKpis(type: StepType): Array<{
   const metrics: Record<string, Array<[string, number]>> = {
     UNIT_TEST: [['lineCoverage', 0.8], ['branchCoverage', 0.7], ['testCasePassRate', 1]],
     INTEGRATION_TEST: [['interfaceCoverage', 0.85], ['integrationScenarioCoverage', 0.85], ['testCasePassRate', 1]],
-    SYSTEM_TEST: [['moduleCoverage', 0.9], ['contractCoverage', 0.9], ['testCasePassRate', 1]],
-    ACCEPTANCE_TEST: [['functionalCoverage', 0.95], ['requirementCoverage', 0.95], ['endToEndPassRate', 1]],
+    MODULE_TEST: [['moduleCoverage', 0.9], ['contractCoverage', 0.9], ['testCasePassRate', 1]],
+    FUNCTIONAL_TEST: [['functionalCoverage', 0.95], ['requirementCoverage', 0.95], ['endToEndPassRate', 1]],
   };
   return metrics[type]!.map(([metric, target]) => ({
     description: `${type} ${metric}`,

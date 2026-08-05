@@ -31,7 +31,7 @@ export interface ProjectMemoryContract {
 }
 
 export interface ProjectMemory {
-  version: '1';
+  version: '2';
   updatedAt: string;
   language?: Language;
   intent?: PlanIntent;
@@ -55,7 +55,7 @@ export async function loadProjectMemory(ws: Workspace): Promise<ProjectMemory | 
   try {
     const raw = await ws.readFile(PROJECT_MEMORY_PATH);
     const parsed = JSON.parse(raw) as ProjectMemory;
-    if (!parsed || parsed.version !== '1' || typeof parsed.summary !== 'string' || !Array.isArray(parsed.keyFiles)) {
+    if (!parsed || parsed.version !== '2' || typeof parsed.summary !== 'string' || !Array.isArray(parsed.keyFiles)) {
       return null;
     }
     if (!Array.isArray(parsed.modules)) parsed.modules = [];
@@ -164,7 +164,7 @@ export async function buildProjectMemory(
   }
 
   return {
-    version: '1',
+    version: '2',
     updatedAt: new Date().toISOString(),
     language,
     intent,

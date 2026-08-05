@@ -1,78 +1,22 @@
-import { z } from 'zod';
 import type { Workspace } from '../../workspace/workspace.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { ObjectType } from '../../domain/objects/object_type.js';
 import type { ObjectEnvelope } from '../../domain/objects/object_envelope.js';
-import { ProjectSchema, type Project } from '../../domain/projects/project.js';
-import { PhaseSchema, type Phase } from '../../domain/phases/phase.js';
-import { StepSchema, type Step } from '../../domain/steps/step.js';
-import { TicketSchema, type Ticket } from '../../domain/tickets/ticket.js';
-import { KpiSchema, QualityAssessmentSchema, type Kpi, type QualityAssessment } from '../../domain/quality/quality.js';
+import type { Project } from '../../domain/projects/project.js';
 import {
-  ChangelistSchema,
-  CheckpointSchema,
-  DeliverableSchema,
-  type Changelist,
-  type Checkpoint,
-  type Deliverable,
-} from '../../domain/evidence/evidence.js';
+  PersistedDomainObjectSchema,
+  type PersistedDomainObject,
+} from '../../domain/objects/persisted.js';
+import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import {
-  PhasePlanSchema,
-  ProjectPlanSchema,
-  type PhasePlan,
-  type ProjectPlan,
-} from '../../domain/planning/plan.js';
-import type {
-  CompiledPhaseMaterialization,
-  CompiledProjectGraph,
-  CompiledProjectExtension,
-} from '../../domain/planning/compiler.js';
-import {
-  DomainAuditEventSchema,
-  DomainLogSchema,
-  ReportSchema,
-  type DomainAuditEvent,
-  type DomainLog,
-  type Report,
-} from '../../domain/observability/records.js';
-import { assertDomainGraph } from '../../domain/workflow/domain_graph.js';
-import { ObjectRegistry, sha256Content } from '../registry/object_registry.js';
+  ObjectRegistry,
+  sha256Content,
+  type RegistryBatchOperation,
+} from '../registry/object_registry.js';
 
-export type PersistedDomainObject =
-  | Project
-  | Phase
-  | Step
-  | Ticket
-  | Kpi
-  | QualityAssessment
-  | Checkpoint
-  | Changelist
-  | Deliverable
-  | ProjectPlan
-  | PhasePlan
-  | Report
-  | DomainLog
-  | DomainAuditEvent;
-
-const PersistedDomainObjectSchema = z.union([
-  ProjectSchema,
-  PhaseSchema,
-  StepSchema,
-  TicketSchema,
-  KpiSchema,
-  QualityAssessmentSchema,
-  CheckpointSchema,
-  ChangelistSchema,
-  DeliverableSchema,
-  ProjectPlanSchema,
-  PhasePlanSchema,
-  ReportSchema,
-  DomainLogSchema,
-  DomainAuditEventSchema,
-]);
-
-export class DomainObjectRepository {
+export class DomainObjectRepository implements DomainObjectRepositoryPort {
   readonly registry: ObjectRegistry;
+  private commitQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly workspace: Workspace) {
     this.registry = new ObjectRegistry(workspace);
@@ -83,35 +27,25 @@ export class DomainObjectRepository {
   }
 
   async insert(object: PersistedDomainObject, state?: string): Promise<void> {
-    const parsed = PersistedDomainObjectSchema.parse(object);
-    const objectRef = domainObjectPath(parsed);
-    const content = `${JSON.stringify(parsed, null, 2)}\n`;
-    await this.workspace.writeFileAtomic(objectRef, content);
-    await this.registry.register({
-      envelope: parsed,
-      objectRef,
-      contentHash: sha256Content(content),
-      parentId: registryParentId(parsed),
-      state,
-    });
+    await this.commitObjects([{ object, state, mode: 'register' }]);
   }
 
   async update(object: PersistedDomainObject, state?: string): Promise<void> {
     const parsed = PersistedDomainObjectSchema.parse(object);
-    if (parsed.objectType === 'checkpoint') {
-      throw new Error(`Checkpoint ${parsed.id} is immutable and cannot be updated`);
+    if (parsed.objectType === 'checkpoint' || parsed.objectType === 'ticket-trace-event') {
+      throw new Error(`${parsed.objectType} ${parsed.id} is immutable and cannot be updated`);
     }
-    const current = this.registry.require(parsed.id, parsed.objectType);
-    const objectRef = current.objectRef;
-    const content = `${JSON.stringify(parsed, null, 2)}\n`;
-    await this.workspace.writeFileAtomic(objectRef, content);
-    await this.registry.update({
-      envelope: parsed,
-      objectRef,
-      contentHash: sha256Content(content),
-      parentId: registryParentId(parsed),
-      state,
-    });
+    this.registry.require(parsed.id, parsed.objectType);
+    await this.commitObjects([{ object: parsed, state, mode: 'update' }]);
+  }
+
+  async commit(objects: readonly PersistedDomainObject[]): Promise<void> {
+    const operations = objects.map((object) => ({
+      object,
+      state: objectState(object),
+      mode: this.registry.get(object.id) ? 'update' as const : 'register' as const,
+    }));
+    await this.commitObjects(operations);
   }
 
   async read(id: ObjectId): Promise<PersistedDomainObject> {
@@ -149,50 +83,40 @@ export class DomainObjectRepository {
     return project;
   }
 
-  async persistCompiledGraph(graph: CompiledProjectGraph): Promise<void> {
-    assertDomainGraph(graph);
-    await this.insert(graph.project, graph.project.state);
-    const remaining: PersistedDomainObject[] = [
-      graph.projectPlan,
-      ...graph.phases,
-      ...graph.phasePlans,
-      ...graph.steps,
-      ...graph.tickets,
-      ...graph.kpis,
-      ...graph.deliverables,
-    ];
-    for (const object of remaining) {
-      await this.insert(object, objectState(object));
-    }
-  }
-
-  async persistPhaseMaterialization(materialization: CompiledPhaseMaterialization): Promise<void> {
-    await this.update(materialization.epic, materialization.epic.state);
-    for (const object of [
-      ...materialization.steps,
-      ...materialization.tickets,
-      ...materialization.kpis,
-      ...materialization.deliverables,
-    ]) {
-      await this.insert(object, objectState(object));
-    }
-    await this.update(materialization.phasePlan, 'materialized');
-    await this.update(materialization.phase, materialization.phase.state);
-  }
-
-  async persistProjectExtension(extension: CompiledProjectExtension): Promise<void> {
-    for (const object of [
-      ...extension.phases,
-      ...extension.phasePlans,
-      ...extension.tickets,
-      ...extension.steps,
-      ...extension.kpis,
-      ...extension.deliverables,
-    ]) {
-      await this.insert(object, objectState(object));
-    }
-    await this.update(extension.projectPlan, 'materialized');
-    await this.update(extension.project, extension.project.state);
+  private commitObjects(operations: readonly {
+    object: PersistedDomainObject;
+    state?: string;
+    mode: 'register' | 'update';
+  }[]): Promise<void> {
+    const commit = async () => {
+      const registryOperations: RegistryBatchOperation[] = [];
+      for (const operation of operations) {
+        const parsed = PersistedDomainObjectSchema.parse(operation.object);
+        if (
+          operation.mode === 'update' &&
+          (parsed.objectType === 'checkpoint' || parsed.objectType === 'ticket-trace-event')
+        ) {
+          throw new Error(`${parsed.objectType} ${parsed.id} is immutable and cannot be updated`);
+        }
+        const objectRef = domainObjectPath(parsed);
+        const content = `${JSON.stringify(parsed, null, 2)}\n`;
+        await this.workspace.writeFileAtomic(objectRef, content);
+        registryOperations.push({
+          mode: operation.mode,
+          input: {
+            envelope: parsed,
+            objectRef,
+            contentHash: sha256Content(content),
+            parentId: registryParentId(parsed),
+            state: operation.state ?? objectState(parsed),
+          },
+        });
+      }
+      await this.registry.commitBatch(registryOperations);
+    };
+    const result = this.commitQueue.then(commit, commit);
+    this.commitQueue = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   async retireProject(projectId: ObjectId): Promise<void> {
@@ -215,7 +139,7 @@ export class DomainObjectRepository {
 }
 
 export function domainObjectPath(object: ObjectEnvelope): string {
-  return `.xcompiler/objects/${object.objectType}/${object.id}.json`;
+  return `.xcompiler/objects/${object.objectType}/${object.id}/r${object.revision}.json`;
 }
 
 function registryParentId(object: PersistedDomainObject): ObjectId | undefined {
@@ -228,6 +152,20 @@ function registryParentId(object: PersistedDomainObject): ObjectId | undefined {
       return object.phaseId;
     case 'ticket':
       return object.parentTicketId ?? object.phaseId;
+    case 'actor-registration':
+      return object.projectId;
+    case 'ticket-assignment':
+      return object.ticketId;
+    case 'ticket-trace-event':
+      return object.ticketId;
+    case 'project-management-plan':
+      return object.projectId;
+    case 'risk-record':
+      return object.projectId;
+    case 'decision-record':
+      return object.projectId;
+    case 'interaction-request':
+      return object.relatedTicketId ?? object.projectId;
     case 'kpi':
       return object.subjectId;
     case 'quality-assessment':
@@ -245,11 +183,14 @@ function registryParentId(object: PersistedDomainObject): ObjectId | undefined {
     case 'log':
     case 'audit-event':
       return object.subject?.id ?? object.projectId;
+    case 'domain-event':
+      return object.aggregate.id;
   }
 }
 
 function objectState(object: PersistedDomainObject): string | undefined {
   if ('state' in object && typeof object.state === 'string') return object.state;
+  if ('status' in object && typeof object.status === 'string') return object.status;
   if (object.objectType === 'plan') return object.planKind === 'phase' && !object.materialized
     ? 'planned'
     : 'materialized';

@@ -15,3 +15,4 @@ export {
 } from './object_envelope.js';
 export { objectRef, ObjectRefSchema, type ObjectRef } from './object_ref.js';
 export { OBJECT_TYPES, ObjectTypeSchema, type ObjectType } from './object_type.js';
+export { PersistedDomainObjectSchema, type PersistedDomainObject } from './persisted.js';

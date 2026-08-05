@@ -3,16 +3,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Plan } from '../src/core/plan.js';
-import { DomainExecutionEngine, type DomainEngineOptions } from '../src/application/execution/domain_engine.js';
+import { ProjectOrchestrator, type ProjectOrchestratorOptions } from '../src/application/project_management/orchestrator.js';
 import type { AttemptInput, AttemptResult } from '../src/application/execution/attempt_runner.js';
 import { compileProjectGraph } from '../src/domain/planning/compiler.js';
-import { QualityAssessmentService } from '../src/domain/quality/assessment_service.js';
+import { QualityAssessmentService } from '../src/application/execution/quality_assessment_service.js';
+import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
 import type { Step } from '../src/domain/steps/step.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { PluginHost } from '../src/plugins/host.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
-describe('DomainExecutionEngine', () => {
+describe('ProjectOrchestrator', () => {
   it('keeps infrastructure failures on the same Ticket without opening a Bug', async () => {
     const setup = await fixture();
     let first = true;
@@ -28,12 +29,13 @@ describe('DomainExecutionEngine', () => {
             failureLog: 'OpenAI-compatible provider request failed status=429',
             changedFiles: [],
             wikiEntryIds: [],
+            testOutcomes: [],
           };
         }
         return passingAttempt(setup.repository, input.domainStep);
       },
     };
-    const engine = new DomainExecutionEngine(options(setup.workspace, setup.repository, runner), setup.plan);
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const failed = await engine.run(setup.graph.phases[0]!.id);
 
     expect(failed.failureReason).toContain('remains active for retry');
@@ -54,7 +56,7 @@ describe('DomainExecutionEngine', () => {
     const setup = await fixture();
     const calls: string[] = [];
     const runner = passingRunner(setup.repository, calls);
-    const engine = new DomainExecutionEngine(options(setup.workspace, setup.repository, runner), setup.plan);
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const result = await engine.run(setup.graph.phases[0]!.id);
 
     expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
@@ -82,6 +84,7 @@ describe('DomainExecutionEngine', () => {
             failureLog: 'expected source, received undefined',
             changedFiles: [],
             wikiEntryIds: [],
+            testOutcomes: [],
           };
         }
         const result = await passingAttempt(setup.repository, input.domainStep);
@@ -92,7 +95,7 @@ describe('DomainExecutionEngine', () => {
         persistedWikiTickets.push(ticketId);
       },
     };
-    const engine = new DomainExecutionEngine(options(setup.workspace, setup.repository, runner), setup.plan);
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const result = await engine.run(setup.graph.phases[0]!.id);
 
     expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
@@ -132,6 +135,7 @@ describe('DomainExecutionEngine', () => {
             failureLog: 'expected source, received undefined',
             changedFiles: [],
             wikiEntryIds: [],
+            testOutcomes: [],
           };
         }
         if (input.domainStep.type === 'INTEGRATION_TEST' && input.mode === 'change-request' && !failedParentCr) {
@@ -142,12 +146,13 @@ describe('DomainExecutionEngine', () => {
             failureLog: 'integration contract mismatch',
             changedFiles: [],
             wikiEntryIds: [],
+            testOutcomes: [],
           };
         }
         return passingAttempt(setup.repository, input.domainStep);
       },
     };
-    const engine = new DomainExecutionEngine(options(setup.workspace, setup.repository, runner), setup.plan);
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const result = await engine.run(setup.graph.phases[0]!.id);
 
     expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
@@ -184,6 +189,7 @@ describe('DomainExecutionEngine', () => {
             failureLog: 'expected item, received undefined',
             changedFiles: [],
             wikiEntryIds: [],
+            testOutcomes: [],
           };
         }
         if (
@@ -200,12 +206,13 @@ describe('DomainExecutionEngine', () => {
             assessment,
             changedFiles: [],
             wikiEntryIds: [],
+            testOutcomes: [],
           };
         }
         return passingAttempt(setup.repository, input.domainStep);
       },
     };
-    const engine = new DomainExecutionEngine(options(setup.workspace, setup.repository, runner), setup.plan);
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const result = await engine.run(setup.graph.phases[0]!.id);
 
     expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
@@ -227,8 +234,8 @@ describe('DomainExecutionEngine', () => {
 function options(
   workspace: Workspace,
   repository: DomainObjectRepository,
-  attemptRunner: DomainEngineOptions['attemptRunner'],
-): DomainEngineOptions {
+  attemptRunner: ProjectOrchestratorOptions['attemptRunner'],
+): ProjectOrchestratorOptions {
   return {
     workspace,
     repository,
@@ -236,10 +243,10 @@ function options(
     plugins: new PluginHost(),
     git: {
       ensureRepo: async () => undefined,
-    } as DomainEngineOptions['git'],
-    sandbox: {} as DomainEngineOptions['sandbox'],
-    router: {} as DomainEngineOptions['router'],
-    audit: { event: async () => undefined } as unknown as DomainEngineOptions['audit'],
+    } as ProjectOrchestratorOptions['git'],
+    sandbox: {} as ProjectOrchestratorOptions['sandbox'],
+    router: {} as ProjectOrchestratorOptions['router'],
+    audit: { event: async () => undefined } as unknown as ProjectOrchestratorOptions['audit'],
   };
 }
 
@@ -269,6 +276,7 @@ async function passingAttempt(repository: DomainObjectRepository, step: Step): P
     commit: `commit-${step.name}`,
     solutionPlan: `Complete ${step.name} incrementally.`,
     wikiEntryIds: [],
+    testOutcomes: [],
   };
 }
 
@@ -290,7 +298,7 @@ async function fixture() {
   await repository.load();
   const plan = samplePlan();
   const graph = compileProjectGraph({ draft: plan, topic: 'Build a TS service.', projectName: 'service' });
-  await repository.persistCompiledGraph(graph);
+  await new ProjectGraphPersistenceService(repository).persistGraph(graph);
   return { workspace, repository, plan, graph };
 }
 

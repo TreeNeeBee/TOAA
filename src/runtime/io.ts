@@ -7,32 +7,40 @@ export type RuntimeLogLevel =
   | 'accent'
   | 'raw';
 
+import { randomUUID } from 'node:crypto';
+
 import type {
   ToolExecutionEvent,
   ToolPermissionRequester,
   ToolPermissionRequest,
 } from '../tools/types.js';
 
-export interface RuntimeLogEvent {
+export interface RuntimeEventEnvelope {
+  eventId: string;
+  eventVersion: 1;
+  occurredAt: string;
+}
+
+export interface RuntimeLogEvent extends RuntimeEventEnvelope {
   type: 'log';
   level: RuntimeLogLevel;
   message: string;
 }
 
-export interface RuntimeResultEvent {
+export interface RuntimeResultEvent extends RuntimeEventEnvelope {
   type: 'result';
   command: 'build' | 'run';
   status: string;
   data?: Record<string, unknown>;
 }
 
-export interface RuntimeProgressEvent {
+export interface RuntimeProgressEvent extends RuntimeEventEnvelope {
   type: 'progress';
   status: 'start' | 'succeed' | 'fail';
   message: string;
 }
 
-export interface RuntimeToolCallEvent {
+export interface RuntimeToolCallEvent extends RuntimeEventEnvelope {
   type: 'tool_call';
   callId: string;
   status: ToolExecutionEvent['status'];
@@ -45,7 +53,7 @@ export interface RuntimeToolCallEvent {
   error?: string;
 }
 
-export interface RuntimeFileChangedEvent {
+export interface RuntimeFileChangedEvent extends RuntimeEventEnvelope {
   type: 'file_changed';
   callId: string;
   stepId: string;
@@ -54,7 +62,7 @@ export interface RuntimeFileChangedEvent {
   path: string;
 }
 
-export interface RuntimePatchProposedEvent {
+export interface RuntimePatchProposedEvent extends RuntimeEventEnvelope {
   type: 'patch_proposed';
   callId: string;
   stepId: string;
@@ -63,13 +71,13 @@ export interface RuntimePatchProposedEvent {
   patch: string;
 }
 
-export interface RuntimePermissionEvent {
+export interface RuntimePermissionEvent extends RuntimeEventEnvelope {
   type: 'permission';
   status: 'requested' | 'approved' | 'denied';
   request: ToolPermissionRequest;
 }
 
-export interface RuntimeWorkflowEvent {
+export interface RuntimeWorkflowEvent extends RuntimeEventEnvelope {
   type: 'workflow';
   event:
     | 'project_planned'
@@ -100,6 +108,12 @@ export type RuntimeEvent =
   | RuntimePatchProposedEvent
   | RuntimePermissionEvent
   | RuntimeWorkflowEvent;
+
+export type RuntimeEventInput = RuntimeEvent extends infer Event
+  ? Event extends RuntimeEventEnvelope
+    ? Omit<Event, keyof RuntimeEventEnvelope>
+    : never
+  : never;
 
 export interface RuntimeProgress {
   succeed(message: string): void | Promise<void>;
@@ -143,7 +157,7 @@ export const silentRuntimeIO: RuntimeIO = {
 };
 
 export function runtimeLog(io: RuntimeIO, level: RuntimeLogLevel, message: string): Promise<void> {
-  return Promise.resolve(io.emit({ type: 'log', level, message }));
+  return emitRuntimeEvent(io, { type: 'log', level, message });
 }
 
 export function runtimeResult(
@@ -152,7 +166,16 @@ export function runtimeResult(
   status: string,
   data?: Record<string, unknown>,
 ): Promise<void> {
-  return Promise.resolve(io.emit({ type: 'result', command, status, data }));
+  return emitRuntimeEvent(io, { type: 'result', command, status, data });
+}
+
+export function emitRuntimeEvent(io: RuntimeIO, event: RuntimeEventInput): Promise<void> {
+  return Promise.resolve(io.emit({
+    ...event,
+    eventId: randomUUID(),
+    eventVersion: 1,
+    occurredAt: new Date().toISOString(),
+  } as RuntimeEvent));
 }
 
 export function requireRuntimeInteraction(io: RuntimeIO, operation: string): RuntimeInteraction {

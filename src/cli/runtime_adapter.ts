@@ -1,7 +1,7 @@
 import chalk from 'chalk';
 import { confirm, editor, input, select } from '@inquirer/prompts';
 import { spinner as ora } from '../util/spinner.js';
-import type { RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimeProgress } from '../runtime/io.js';
+import type { RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimeProgress } from '../runtime.js';
 
 function renderLog(level: RuntimeLogLevel, message: string): void {
   switch (level) {
@@ -42,6 +42,21 @@ export function createCliRuntimeIO(): RuntimeIO {
       };
     },
     interaction: createCliInteraction(),
+    requestPermission: async (request) => {
+      const approved = await confirm({
+        message: [
+          `${request.operationType}: ${request.target}`,
+          request.reason,
+          `Risk: ${request.risk}`,
+          `Scope: ${request.scope}`,
+        ].join('\n'),
+        default: false,
+      });
+      return {
+        approved,
+        reason: approved ? 'Approved by CLI user.' : request.denyBehavior,
+      };
+    },
   };
 }
 

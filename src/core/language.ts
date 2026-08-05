@@ -32,7 +32,7 @@ export interface LanguageProfile {
   readonly codeExtensions: string[];
 
   /**
-   * 是否由 runtime（cli/execute）根据 plan.dependencies 生成 manifest。
+   * 是否由 Runtime Run 用例根据 plan.dependencies 生成 manifest。
    *  - Python：true —— 渲染器把依赖写入 requirements.txt，HIGH_LEVEL_DESIGN 不得直接产出该文件。
    *  - TypeScript：false —— package.json 由 HIGH_LEVEL_DESIGN 步骤撰写（含 scripts / devDependencies）。
    */

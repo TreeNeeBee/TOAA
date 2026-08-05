@@ -72,6 +72,8 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   stepId: ObjectIdSchema.optional(),
   role: DomainRoleSchema,
   agent: ExecutionAgentSchema,
+  creatorActorId: ObjectIdSchema,
+  requiredCapabilities: z.array(z.string().min(1)).default([]),
   priority: z.number().int().min(TICKET_PRIORITY_MIN).max(TICKET_PRIORITY_MAX),
   parentTicketId: ObjectIdSchema.optional(),
   rootTicketId: ObjectIdSchema,
@@ -83,11 +85,19 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   relatedTicketIds: z.array(ObjectIdSchema).default([]),
   logIds: z.array(ObjectIdSchema).default([]),
   changelistIds: z.array(ObjectIdSchema).default([]),
+  assignmentIds: z.array(ObjectIdSchema).default([]),
+  activeAssignmentId: ObjectIdSchema.optional(),
+  traceFirstEventId: ObjectIdSchema.optional(),
+  traceLastEventId: ObjectIdSchema.optional(),
+  traceEventCount: z.number().int().nonnegative().default(0),
+  traceChainHash: z.string().regex(/^sha256:[a-f0-9]{64}$/u).optional(),
   attempts: z.number().int().nonnegative().default(0),
   maxAttempts: z.number().int().positive().default(3),
   state: z.enum(TICKET_STATES),
   pendingReason: PendingReasonSchema.optional(),
   source: TicketSourceSchema,
+  submittedAt: z.string().datetime({ offset: true }),
+  registeredAt: z.string().datetime({ offset: true }).optional(),
   solution: TicketSolutionSchema.optional(),
   resolvedAt: z.string().datetime({ offset: true }).optional(),
   closedAt: z.string().datetime({ offset: true }).optional(),
@@ -113,8 +123,13 @@ export const BugTicketSchema = TicketBaseSchema.extend({
   ]),
   severity: z.enum(['low', 'medium', 'high', 'critical']),
   failure: z.object({
+    category: z.enum(['llm-provider', 'tool', 'test', 'quality', 'contract', 'internal']),
+    code: z.string().min(1),
     message: z.string().min(1),
     summary: z.string().min(1),
+    retryable: z.boolean(),
+    switchProvider: z.boolean(),
+    details: z.record(z.string(), z.unknown()).optional(),
     rawEvidenceRef: z.string().min(1).optional(),
     failedStepId: ObjectIdSchema,
     failedStepType: z.enum(STEP_TYPES),
@@ -184,27 +199,44 @@ export function transitionTicket(
   next: TicketState,
   options: { pendingReason?: z.infer<typeof PendingReasonSchema>; now?: string } = {},
 ): Ticket {
-  if (!assertStateTransition('ticket', ticket.id, ticket.state, next, TICKET_TRANSITIONS)) return ticket;
-  if (next === 'pending' && !options.pendingReason) {
-    throw new Error(`Ticket ${ticket.id} requires pendingReason when entering pending`);
+  return transitionTicketPath(ticket, [next], options);
+}
+
+export function transitionTicketPath(
+  ticket: Ticket,
+  path: readonly TicketState[],
+  options: { pendingReason?: z.infer<typeof PendingReasonSchema>; now?: string } = {},
+): Ticket {
+  if (path.length === 0) return ticket;
+  let current = ticket.state;
+  for (const next of path) {
+    if (!assertStateTransition('ticket', ticket.id, current, next, TICKET_TRANSITIONS)) continue;
+    if (next === 'pending' && !options.pendingReason) {
+      throw new Error(`Ticket ${ticket.id} requires pendingReason when entering pending`);
+    }
+    if (
+      next === 'resolved' &&
+      ['bug', 'enhancement', 'change-request'].includes(ticket.type) &&
+      ticket.solution?.status !== 'verified'
+    ) {
+      throw new Error(`Ticket ${ticket.id} requires a verified solution before resolution`);
+    }
+    if (next === 'in_progress' && !ticket.activeAssignmentId) {
+      throw new Error(`Ticket ${ticket.id} requires an accepted active assignment before execution`);
+    }
+    current = next;
   }
-  if (
-    next === 'resolved' &&
-    ['bug', 'enhancement', 'change-request'].includes(ticket.type) &&
-    ticket.solution?.status !== 'verified'
-  ) {
-    throw new Error(`Ticket ${ticket.id} requires a verified solution before resolution`);
-  }
+  if (current === ticket.state) return ticket;
   const now = options.now ?? new Date().toISOString();
   const envelope = reviseObjectEnvelope(ticket, { now });
   return TicketSchema.parse({
     ...ticket,
     ...envelope,
-    state: next,
-    pendingReason: next === 'pending' ? options.pendingReason : undefined,
-    resolvedAt: next === 'resolved' ? now : ticket.resolvedAt,
-    closedAt: next === 'closed' ? now : ticket.closedAt,
-    cancelledAt: next === 'cancelled' ? now : ticket.cancelledAt,
+    state: current,
+    pendingReason: current === 'pending' ? options.pendingReason : undefined,
+    resolvedAt: path.includes('resolved') ? now : ticket.resolvedAt,
+    closedAt: path.includes('closed') ? now : ticket.closedAt,
+    cancelledAt: path.includes('cancelled') ? now : ticket.cancelledAt,
   });
 }
 

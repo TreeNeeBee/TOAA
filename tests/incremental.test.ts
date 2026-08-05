@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildPlan } from '../src/agents/planner.js';
-import { resolveCompileLanguage } from '../src/cli/compile.js';
+import { resolveCompileLanguage } from '../src/application/planning/requirement_intake.js';
 import { loadIncrementalBaseline } from '../src/core/incremental.js';
 import { PROJECT_MEMORY_PATH, refreshProjectMemory } from '../src/core/project_memory.js';
 import { renderPlanMarkdown } from '../src/core/render.js';

@@ -1,6 +1,11 @@
 import type { ChatMessage, ChatOptions, LLMClient } from './types.js';
 import { Agent } from 'undici';
 import { detectCyclicTokenLoop, detectRepeatedTextLoop, RepeatTokenDetector } from './stream_watchdog.js';
+import {
+  LLMRequestError,
+  isLLMRequestError,
+  llmFailureCodeForStatus,
+} from './errors.js';
 
 export const DEFAULT_OPENAI_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 export const DEFAULT_OPENAI_CONNECT_TIMEOUT_MS = 60 * 1000;
@@ -67,6 +72,7 @@ export class OpenAIClient implements LLMClient {
     }
     if (options?.onToken) return this.streamChat(url, body, options);
     const ctrl = new AbortController();
+    const unbindAbort = bindAbortSignal(options?.signal, (reason) => ctrl.abort(reason));
     const timeoutMs = this.cfg.requestTimeoutMs ?? DEFAULT_OPENAI_REQUEST_TIMEOUT_MS;
     const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs) : null;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -90,6 +96,7 @@ export class OpenAIClient implements LLMClient {
       throw wrapOpenAIError(this.cfg, err, 'non-stream');
     } finally {
       if (timer) clearTimeout(timer);
+      unbindAbort();
     }
   }
 
@@ -108,6 +115,7 @@ export class OpenAIClient implements LLMClient {
       if (!abortReason) abortReason = err;
       ctrl.abort(err);
     };
+    const unbindAbort = bindAbortSignal(options.signal, (reason) => abort(abortError(reason)));
 
     let wallTimer =
       timeoutMs > 0
@@ -138,6 +146,7 @@ export class OpenAIClient implements LLMClient {
       if (wallTimer) clearTimeout(wallTimer);
       wallTimer = null;
       if (idleTimer) clearTimeout(idleTimer);
+      unbindAbort();
     };
 
     const headers: Record<string, string> = {
@@ -322,13 +331,28 @@ function wrapOpenAIError(cfg: OpenAIConfig, err: unknown, mode: 'stream' | 'non-
   }
   const detail = errorDetail(cause);
   const hint = hintForOpenAIError(cfg, cause);
-  const wrapped = new Error(`${parts.join(' ')}: ${detail}. ${hint}`, { cause });
-  wrapped.name = 'OpenAICompatibleRequestError';
-  return wrapped;
+  const statusCode = isHttpFailure(cause) ? cause.status : undefined;
+  const code = statusCode
+    ? llmFailureCodeForStatus(statusCode)
+    : /timed out|idle|wall-clock/iu.test(cause.message)
+      ? 'request_timeout'
+      : /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND/iu.test(cause.message)
+        ? 'connection_failed'
+        : 'request_failed';
+  return new LLMRequestError(`${parts.join(' ')}: ${detail}. ${hint}`, {
+    code,
+    provider,
+    model: cfg.model,
+    endpoint: baseUrl,
+    mode,
+    statusCode,
+    retryable: code === 'request_timeout' || code === 'connection_failed' || code === 'rate_limited' || code === 'provider_server_error',
+    switchProvider: code !== 'invalid_response',
+  }, { cause });
 }
 
 function isWrappedOpenAIError(err: unknown): err is Error {
-  return err instanceof Error && err.name === 'OpenAICompatibleRequestError';
+  return isLLMRequestError(err);
 }
 
 function isHttpFailure(err: Error): err is Error & OpenAIHttpFailure {
@@ -478,4 +502,25 @@ function findSseSeparator(buf: string): { index: number; length: number } | null
   if (lf < 0) return crlf < 0 ? null : { index: crlf, length: 4 };
   if (crlf < 0 || lf < crlf) return { index: lf, length: 2 };
   return { index: crlf, length: 4 };
+}
+
+function bindAbortSignal(
+  signal: AbortSignal | undefined,
+  abort: (reason: unknown) => void,
+): () => void {
+  if (!signal) return () => undefined;
+  const listener = () => abort(signal.reason);
+  if (signal.aborted) {
+    listener();
+    return () => undefined;
+  }
+  signal.addEventListener('abort', listener, { once: true });
+  return () => signal.removeEventListener('abort', listener);
+}
+
+function abortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === 'string' ? reason : 'Runtime task cancelled');
+  error.name = 'AbortError';
+  return error;
 }

@@ -13,7 +13,7 @@ describe('new domain lifecycle', () => {
     const step = StepSchema.parse({
       ...envelope,
       phaseId: phase.id,
-      type: 'CODING',
+      type: 'CODE',
       title: 'Implement core behavior',
       description: 'Implement the approved detailed design.',
       role: 'developer',
@@ -43,6 +43,8 @@ describe('new domain lifecycle', () => {
     const phase = createObjectEnvelope({ name: 'P1', objectType: 'phase', projectId: project.id });
     const failedStep = createObjectEnvelope({ name: 'P1-S005', objectType: 'step', projectId: project.id });
     const targetStep = createObjectEnvelope({ name: 'P1-S004', objectType: 'step', projectId: project.id });
+    const creator = createObjectEnvelope({ name: 'developer', objectType: 'actor-registration', projectId: project.id });
+    const assignment = createObjectEnvelope({ name: 'assignment', objectType: 'ticket-assignment', projectId: project.id });
     const ticketEnvelope = createObjectEnvelope({ name: 'BUG-P1-001', objectType: 'ticket', projectId: project.id });
     const bug = TicketSchema.parse({
       ...ticketEnvelope,
@@ -51,21 +53,28 @@ describe('new domain lifecycle', () => {
       stepId: failedStep.id,
       role: 'developer',
       agent: 'Debugger',
+      creatorActorId: creator.id,
+      activeAssignmentId: assignment.id,
       priority: 192,
       rootTicketId: ticketEnvelope.id,
       description: 'Unit test failed.',
       acceptance: ['The failed test passes.'],
       state: 'created',
       source: { kind: 'runtime', correlationId: ticketEnvelope.id },
+      submittedAt: '2026-08-01T00:00:00.000Z',
       bugKind: 'test-failure',
       severity: 'high',
       failure: {
+        category: 'test',
+        code: 'unit_assertion_failed',
         message: 'expected 2, received 1',
         summary: 'Aggregation result is incorrect.',
+        retryable: true,
+        switchProvider: false,
         failedStepId: failedStep.id,
         failedStepType: 'UNIT_TEST',
         targetStepId: targetStep.id,
-        targetStepType: 'CODING',
+        targetStepType: 'CODE',
         verificationStepId: failedStep.id,
         verificationStepType: 'UNIT_TEST',
       },

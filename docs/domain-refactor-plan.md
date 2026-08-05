@@ -1,5 +1,8 @@
 # XCompiler Domain Refactor Plan
 
+> Historical record: this completed v0.2 domain refactor is superseded by
+> `docs/XCompiler_refactor_plan.md` for the intentionally breaking 0.3 architecture.
+
 ## Objective
 
 Replace the current plan-driven execution projection with one domain model in which:
@@ -70,11 +73,11 @@ V-model Step types are:
 1. `REQUIREMENT_ANALYSIS`
 2. `HIGH_LEVEL_DESIGN`
 3. `DETAILED_DESIGN`
-4. `CODING`
+4. `CODE`
 5. `UNIT_TEST`
 6. `INTEGRATION_TEST`
-7. `SYSTEM_TEST`
-8. `ACCEPTANCE_TEST`
+7. `MODULE_TEST`
+8. `FUNCTIONAL_TEST`
 
 `Phase` means an iteration container and is not another name for a V-model Step.
 

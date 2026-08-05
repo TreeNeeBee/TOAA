@@ -1,6 +1,14 @@
 import { Help, InvalidArgumentError, type Command } from 'commander';
-import { PLAN_INTENTS, type PlanIntent } from '../core/plan.js';
 import { normaliseLocale, t, type Locale } from '../i18n/index.js';
+import {
+  PLAN_INTENTS,
+  RECORD_REPLAY_MODES,
+  type FixtureAction,
+  type PlanIntent,
+  type RecordReplayMode,
+} from '../runtime.js';
+
+const FIXTURE_ACTIONS = ['prepare', 'inspect', 'verify', 'refresh'] as const;
 
 const LOCALE_ALIASES = new Set([
   'en', 'us', 'uk', 'gb', 'en-us', 'en-gb',
@@ -66,4 +74,22 @@ export function parseNonNegativeInteger(value: string): number {
     throw new InvalidArgumentError(t().cli.invalidNonNegativeInteger(value));
   }
   return Number(value);
+}
+
+export function parseRecordReplayMode(value: string): RecordReplayMode {
+  const normalized = value.trim().toLowerCase();
+  if (!RECORD_REPLAY_MODES.includes(normalized as RecordReplayMode)) {
+    throw new InvalidArgumentError(t().cli.invalidRecordReplayMode(value, RECORD_REPLAY_MODES.join(', ')));
+  }
+  return normalized as RecordReplayMode;
+}
+
+export function parseFixtureAction(value: string): FixtureAction {
+  const normalized = value.trim().toLowerCase();
+  if (!FIXTURE_ACTIONS.includes(normalized as FixtureAction)) {
+    throw new InvalidArgumentError(
+      `Invalid fixture action "${value}"; expected one of: ${FIXTURE_ACTIONS.join(', ')}.`,
+    );
+  }
+  return normalized as FixtureAction;
 }

@@ -149,6 +149,8 @@ export interface Messages {
     optBaselinePlan: string;
     optProjectFile: string;
     optDebugWikiPath: string;
+    optRecordReplay: string;
+    optRecordReplayPath: string;
     argPlan: string;
     argProjectFile: string;
     argStepId: string;
@@ -163,6 +165,7 @@ export interface Messages {
     invalidPhase: (value: string, allowed: string) => string;
     invalidStepId: (value: string) => string;
     invalidNonNegativeInteger: (value: string) => string;
+    invalidRecordReplayMode: (value: string, allowed: string) => string;
     helpUsage: string;
     helpArguments: string;
     helpOptions: string;

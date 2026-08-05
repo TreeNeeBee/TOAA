@@ -1,6 +1,6 @@
 import path from 'node:path';
-import { loadPlanTarget, savePhasePlan, savePlan } from '../core/storage.js';
-import { assertPlanValid, topoSort } from '../core/lint.js';
+import { loadPlanTarget } from '../core/storage.js';
+import { topoSort } from '../core/lint.js';
 import { AuditLogger } from '../audit/audit.js';
 import { Workspace } from '../workspace/workspace.js';
 import { GitService } from '../workspace/git.js';
@@ -11,15 +11,10 @@ import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
 import { createSandbox } from '../sandbox/factory.js';
 import {
-  DomainExecutionEngine,
-  type DomainEngineResult,
-} from '../application/execution/domain_engine.js';
+  ProjectOrchestrator,
+  type ProjectOrchestratorResult,
+} from '../application/project_management/orchestrator.js';
 import { acquireLock, LockError } from '../core/lock.js';
-import {
-  Planner,
-  buildPlan,
-  type DraftPhasePlan,
-} from '../agents/planner.js';
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
 import { runProjectAudit } from '../core/project_audit.js';
@@ -29,8 +24,6 @@ import {
 import { refreshProjectMemory } from '../core/project_memory.js';
 import { updateProjectFile } from '../core/project_file.js';
 import { DOC_NAMES } from '../core/docs.js';
-import { renderPlanMarkdown } from '../core/render.js';
-import { advancePhasePlan, phasePlanFileName, type PhasePlan } from '../core/phase_plan.js';
 import type { Language, Plan, PlanIntent } from '../core/plan.js';
 import { setLocale, t } from '../i18n/index.js';
 import { PluginHost } from '../plugins/host.js';
@@ -39,17 +32,21 @@ import { hasXcEnv } from '../config/env.js';
 import type { ProjectAuditResult } from '../core/project_audit.js';
 import type { ToolExecutionEvent, ToolPermissionRequest } from '../tools/types.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
-import { compilePhaseMaterialization } from '../domain/planning/compiler.js';
-import { ProjectPlanSchema } from '../domain/planning/plan.js';
-import { reviseObjectEnvelope } from '../domain/objects/object_envelope.js';
-import type { ObjectId } from '../domain/identity/object_id.js';
-import { DomainAuditTrail } from '../domain/observability/audit_trail.js';
+import { DomainAuditTrail } from '../application/observability/domain_audit_trail.js';
+import { FileProjectProjectionWriter } from '../infrastructure/projections/index.js';
 import {
+  emitRuntimeEvent,
   runtimeLog,
   runtimeResult,
   silentRuntimeIO,
   type RuntimeIO,
 } from './io.js';
+import { createRuntimeRecordReplay } from './record_replay.js';
+import { withRecordReplaySandbox } from '../infrastructure/record_replay/sandbox.js';
+import { ProjectPermissionService } from '../application/project_management/permission_service.js';
+import { PhaseMaterializationService } from '../application/project_management/phase_materialization_service.js';
+import { PhaseProgressionService } from '../application/planning/phase_progression_service.js';
+import type { RecordReplayMode } from '../application/record_replay/types.js';
 
 export interface ExecuteOptions {
   planPath: string;
@@ -72,11 +69,17 @@ export interface ExecuteOptions {
   io?: RuntimeIO;
   /** Allow human terminal progress from lower-level engines. Defaults to false; CLI adapters opt in. */
   terminalOutput?: boolean;
+  /** Override external-interaction fixture behavior for this invocation. */
+  recordReplayMode?: RecordReplayMode;
+  /** Workspace-relative fixture root override. */
+  recordReplayPath?: string;
+  /** Cancels active PM/Agent/provider work. */
+  abortSignal?: AbortSignal;
 }
 
 export interface ExecuteResult {
   status: 'ok' | 'failed' | 'error' | 'dry-run';
-  engine?: DomainEngineResult;
+  engine?: ProjectOrchestratorResult;
   audit?: ProjectAuditResult;
   message?: string;
   exitCode?: number;
@@ -142,8 +145,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     throw new Error(`Canonical Phase ${plan.phaseId} is missing from Project ${domainProject.name}`);
   }
   if (domainPhase.stepIds.length === 0) {
-    await materializeNextDomainPhase({
-      repository: domainRepository,
+    await new PhaseMaterializationService(domainRepository).materialize({
       projectId: domainProject.id,
       phaseId: domainPhase.id,
       plan,
@@ -223,15 +225,22 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
 
   const scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
+  const recordReplay = createRuntimeRecordReplay(cfg, ws, {
+    mode: opts.recordReplayMode,
+    path: opts.recordReplayPath,
+  });
   let unavailableProviders: Set<string>;
   try {
-    const pf = await preflightProviders(cfg, scoreStore, audit);
-    unavailableProviders = new Set(pf.unreachable);
-    if (pf.zeroed.length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
-    }
-    if (Object.keys(pf.autoAdded).length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+    unavailableProviders = new Set();
+    if (recordReplay.mode !== 'replay') {
+      const pf = await preflightProviders(cfg, scoreStore, audit);
+      unavailableProviders = new Set(pf.unreachable);
+      if (pf.zeroed.length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
+      }
+      if (Object.keys(pf.autoAdded).length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+      }
     }
   } catch (err) {
     await runtimeLog(io, 'error', t().system.unhandledError((err as Error).message));
@@ -240,7 +249,22 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     await runtimeResult(io, 'run', 'error', { message: (err as Error).message, exitCode: 7 });
     return { status: 'error', message: (err as Error).message, exitCode: 7 };
   }
-  const router = new LLMRouter(cfg, audit, scoreStore, unavailableProviders, pluginHost);
+  const router = new LLMRouter(
+    cfg,
+    audit,
+    scoreStore,
+    unavailableProviders,
+    pluginHost,
+    undefined,
+    recordReplay,
+  );
+  const phaseProgression = new PhaseProgressionService(
+    ws,
+    router,
+    audit,
+    io.terminalOutput === true,
+    opts.abortSignal,
+  );
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   if (recoverUnadvancedPhase) {
     if (!target.phasePlan || !target.phasePlanPath || !domainProject.currentPhaseId) {
@@ -248,22 +272,16 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         `Project ${domainProject.name} advanced beyond ${domainPhase.name}, but the PhasePlan recovery context is missing.`,
       );
     }
-    const recovery = await completeAndPrepareNextPhase({
+    const recovery = await phaseProgression.completeAndPrepareNext({
       phasePlan: target.phasePlan,
       phasePlanPath: target.phasePlanPath,
-      ws,
-      router,
-      audit,
-      io,
       currentPlanPath: planAbs,
-      currentPlan: plan,
       iterationDelivered: true,
     });
     if (!recovery.nextPlan) {
       throw new Error(`Project ${domainProject.name} points to a next Phase but PhasePlan has no next plan`);
     }
-    await materializeNextDomainPhase({
-      repository: domainRepository,
+    await new PhaseMaterializationService(domainRepository).materialize({
       projectId: domainProject.id,
       phaseId: domainProject.currentPhaseId,
       plan: recovery.nextPlan,
@@ -299,17 +317,20 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
   }
   const git = new GitService(ws);
-  const sandbox = createSandbox(cfg, ws, audit, plan.language);
+  const sandbox = withRecordReplaySandbox(
+    createSandbox(cfg, ws, audit, plan.language),
+    recordReplay,
+  );
+  const permissionService = new ProjectPermissionService(domainRepository, domainProject);
   const requestPermission = io.requestPermission
-    ? async (request: ToolPermissionRequest) => {
-        await io.emit({ type: 'permission', status: 'requested', request });
-        const decision = await io.requestPermission!(request);
-        await io.emit({ type: 'permission', status: decision.approved ? 'approved' : 'denied', request });
-        return decision;
-      }
+    ? (request: ToolPermissionRequest) => permissionService.request(
+        request,
+        io.requestPermission!,
+        (status) => emitRuntimeEvent(io, { type: 'permission', status, request }),
+      )
     : undefined;
   let finalProjectAudit: ProjectAuditResult | undefined;
-  const engine = new DomainExecutionEngine({
+  const engine = new ProjectOrchestrator({
     workspace: ws,
     git,
     sandbox,
@@ -317,15 +338,17 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     audit,
     repository: domainRepository,
     plugins: pluginHost,
+    projectionWriter: new FileProjectProjectionWriter(ws),
     maxRoundsPerStep: cfg.agent.max_rounds_per_step,
     maxDebugRoundsPerStep: cfg.agent.max_debug_rounds_per_step,
     maxEditLinesPerStep: cfg.agent.max_edit_lines_per_step,
-    maxWriteChunkBytes: cfg.agent.max_write_chunk_bytes,
     terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
     debugWikiPath: opts.debugWikiPath ? path.resolve(opts.debugWikiPath) : undefined,
+    recordReplay,
     requestPermission,
+    abortSignal: opts.abortSignal,
     onToolEvent: async (event: ToolExecutionEvent) => {
-      await io.emit({
+      await emitRuntimeEvent(io, {
         type: 'tool_call',
         callId: event.callId,
         status: event.status,
@@ -338,7 +361,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         error: event.error,
       });
       if (event.patch && event.status === 'started') {
-        await io.emit({
+        await emitRuntimeEvent(io, {
           type: 'patch_proposed',
           callId: event.callId,
           stepId: event.stepId,
@@ -349,7 +372,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       }
       if (event.status === 'completed' && event.ok && event.changedFiles) {
         for (const changed of event.changedFiles) {
-          await io.emit({
+          await emitRuntimeEvent(io, {
             type: 'file_changed',
             callId: event.callId,
             stepId: event.stepId,
@@ -361,7 +384,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       }
     },
     onTransition: async (event) => {
-      await io.emit({ type: 'workflow', ...event });
+      await emitRuntimeEvent(io, { type: 'workflow', ...event });
       await domainAudit.recordEvent({
         projectId: event.projectId,
         subject: event.ticketId
@@ -444,21 +467,15 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     }
     const iterationDelivered = true;
     const phaseAdvance = target.phasePlan && target.phasePlanPath && iterationDelivered
-      ? await completeAndPrepareNextPhase({
+      ? await phaseProgression.completeAndPrepareNext({
           phasePlan: target.phasePlan,
           phasePlanPath: target.phasePlanPath,
-          ws,
-          router,
-          audit,
-          io,
           currentPlanPath: planAbs,
-          currentPlan: plan,
           iterationDelivered,
         })
       : undefined;
     if (phaseAdvance?.nextPlan && r.nextPhaseId) {
-      await materializeNextDomainPhase({
-        repository: domainRepository,
+      await new PhaseMaterializationService(domainRepository).materialize({
         projectId: domainProject.id,
         phaseId: r.nextPhaseId,
         plan: phaseAdvance.nextPlan,
@@ -537,159 +554,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
   } finally {
     await lock.release();
-  }
-}
-
-async function materializeNextDomainPhase(input: {
-  repository: DomainObjectRepository;
-  projectId: ObjectId;
-  phaseId: ObjectId;
-  plan: Plan;
-}): Promise<void> {
-  const projectObject = await input.repository.read(input.projectId);
-  const phaseObject = await input.repository.read(input.phaseId);
-  if (projectObject.objectType !== 'project') throw new Error(`Object ${input.projectId} is not a Project`);
-  if (phaseObject.objectType !== 'phase') throw new Error(`Object ${input.phaseId} is not a Phase`);
-  const phasePlanObject = await input.repository.read(phaseObject.planId);
-  const epicObject = await input.repository.read(phaseObject.epicTicketId);
-  if (phasePlanObject.objectType !== 'plan' || phasePlanObject.planKind !== 'phase') {
-    throw new Error(`Phase ${phaseObject.name} does not reference a PhasePlan`);
-  }
-  if (epicObject.objectType !== 'ticket' || epicObject.type !== 'epic') {
-    throw new Error(`Phase ${phaseObject.name} does not reference an Epic Ticket`);
-  }
-  const materialization = compilePhaseMaterialization({
-    draft: input.plan,
-    project: projectObject,
-    phase: phaseObject,
-    phasePlan: phasePlanObject,
-    epic: epicObject,
-  });
-  await input.repository.persistPhaseMaterialization(materialization);
-  const projectPlanObject = await input.repository.read(projectObject.projectPlanId);
-  if (projectPlanObject.objectType !== 'plan' || projectPlanObject.planKind !== 'project') {
-    throw new Error(`Project ${projectObject.name} does not reference a ProjectPlan`);
-  }
-  const projectPlan = ProjectPlanSchema.parse({
-    ...projectPlanObject,
-    ...reviseObjectEnvelope(projectPlanObject),
-    activePhaseId: phaseObject.id,
-  });
-  await input.repository.update(projectPlan, 'materialized');
-}
-
-async function completeAndPrepareNextPhase(args: {
-  phasePlan: PhasePlan;
-  phasePlanPath: string;
-  ws: Workspace;
-  router: LLMRouter;
-  audit: AuditLogger;
-  io: RuntimeIO;
-  currentPlanPath: string;
-  currentPlan: Plan;
-  iterationDelivered: boolean;
-}): Promise<{ completedPhaseId: string; phasePlan: PhasePlan; nextPlan?: Plan }> {
-  if (!args.iterationDelivered) {
-    throw new Error('cannot advance implementation phase before its Delivery Feature and Epic close');
-  }
-  const transition = advancePhasePlan(args.phasePlan);
-  const next = transition.nextPhase;
-  if (!next) {
-    await savePhasePlan(args.phasePlanPath, transition.phasePlan);
-    await args.audit.event('plan.persist', `completed final implementation phase ${transition.completedPhaseId}`, {
-      messageId: 'execute.phase_completed',
-      phaseId: transition.completedPhaseId,
-      phasePlanPath: args.phasePlanPath,
-    });
-    return {
-      completedPhaseId: transition.completedPhaseId,
-      phasePlan: transition.phasePlan,
-    };
-  }
-
-  next.planPath ??= phasePlanFileName(next.id);
-  const nextPlanPath = path.resolve(path.dirname(args.phasePlanPath), next.planPath);
-  assertWorkspacePath(args.ws.root, nextPlanPath);
-  const topic = await args.ws.exists(DOC_NAMES.topic)
-    ? await args.ws.readFile(DOC_NAMES.topic)
-    : transition.phasePlan.requirementDigest;
-  let baselineSummary = transition.phasePlan.baselineSummary;
-  try {
-    const memory = await refreshProjectMemory(args.ws, {
-      planPath: args.currentPlanPath,
-      language: transition.phasePlan.language,
-      intent: transition.phasePlan.intent,
-    });
-    baselineSummary = memory.summary;
-  } catch (err) {
-    await args.audit.event('note', `could not refresh phase baseline: ${(err as Error).message}`, {
-      messageId: 'execute.phase_baseline_refresh_failed',
-      phaseId: next.id,
-    });
-  }
-
-  const draftPhasePlan: DraftPhasePlan = {
-    requirementDigest: transition.phasePlan.requirementDigest,
-    globalPrompt: transition.phasePlan.globalPrompt,
-    projectType: transition.phasePlan.projectType,
-    complexityAssessment: transition.phasePlan.complexityAssessment,
-    implementationPhases: transition.phasePlan.phases.map(({ planPath: _planPath, ...phase }) => phase),
-  };
-  const planner = new Planner(
-    args.router.for('Planner'),
-    args.audit,
-    transition.phasePlan.language,
-    args.io.terminalOutput === true,
-  );
-  const draft = await planner.decomposePhase(
-    {
-      rawRequirement: topic,
-      clarifications: [],
-      userAddenda: transition.phasePlan.userAddenda,
-      baselineContext: baselineSummary,
-      intent: transition.phasePlan.intent,
-    },
-    draftPhasePlan,
-    next.id,
-  );
-  const nextPlan = buildPlan(draft, {
-    language: transition.phasePlan.language,
-    intent: transition.phasePlan.intent,
-    userAddenda: transition.phasePlan.userAddenda,
-    baselineSummary,
-  });
-  if (nextPlan.phaseId !== next.id) {
-    throw new Error(`materialized plan phase ${nextPlan.phaseId} does not match activated phase ${next.id}`);
-  }
-  assertPlanValid(nextPlan);
-
-  // Persist the materialized plan first. A crash cannot point phasePlan.json at a missing file.
-  await savePlan(nextPlanPath, nextPlan);
-  await savePhasePlan(args.phasePlanPath, transition.phasePlan);
-  await args.ws.writeFile(DOC_NAMES.plan, renderPlanMarkdown(nextPlan));
-  await refreshProjectMemory(args.ws, {
-    planPath: nextPlanPath,
-    language: nextPlan.language,
-    intent: nextPlan.intent,
-  });
-  await args.audit.event('plan.persist', `prepared implementation phase ${next.id}`, {
-    messageId: 'execute.phase_prepared',
-    completedPhaseId: transition.completedPhaseId,
-    nextPhaseId: next.id,
-    nextPlanPath,
-    phasePlanPath: args.phasePlanPath,
-  });
-  return {
-    completedPhaseId: transition.completedPhaseId,
-    phasePlan: transition.phasePlan,
-    nextPlan,
-  };
-}
-
-function assertWorkspacePath(workspace: string, target: string): void {
-  const relative = path.relative(path.resolve(workspace), path.resolve(target));
-  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error(`phase plan path escapes workspace: ${target}`);
   }
 }
 

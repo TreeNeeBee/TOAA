@@ -1,5 +1,14 @@
 locale: zh  # CLI / prompt 语言：en 或 zh
 
+# 通用外部交互记录/重放。replay 模式禁止实时访问；找不到或记录冲突会明确失败。
+# 记录文件会脱敏并进行完整性校验，默认存放在当前工程的 .xcompiler 目录。
+record_replay:
+  mode: off  # off | record | replay | auto | refresh
+  path: .xcompiler/record-replay
+  # subprocess must stay enabled when verification Steps are prepared for offline replay.
+  channels: [http, llm, subprocess]
+  redacted_fields: []
+
 llm:
   # 模型选择必须手动指定：每个角色都要在下方 roles 中显式列出 provider，
   # 不再支持 llm.default 隐式全局默认 provider。
@@ -78,10 +87,9 @@ agent:
   # EditGuard 单 Step 累计行数预算。auto 会按 phase/tools/outputs/prompt 上下文自适应；
   # 如需固定硬上限，可设为数字，例如 400。
   # max_edit_lines_per_step: auto
-  # write_file / append_file 的单次 content 窗口无需配置：Runtime 会根据当前 Provider 的
-  # context_window、实际 prompt 占用和响应安全预留自动更新；仅当单个逻辑文件超过当前窗口时
-  # 才需要 append_file。兼容场景如确需固定硬上限，可在 agent 下手动设置
-  # max_write_chunk_bytes 为正整数字节数；通常不建议覆盖自动窗口。
+  # write_file / append_file 的单次 content 窗口无需也不允许单独配置：Runtime 会根据当前
+  # Provider 的 context_window、实际 prompt 占用和响应安全预留自动更新。单个逻辑文件超过
+  # 当前窗口时，使用 append_file 做模块化增量写入。
   # 目标工程语言由 topic / 现有工程基线判定：明确写 Python/TS 时自动选择；
   # 无法判断时在澄清阶段询问；非交互或 topic 模式仍无法判断则默认 Python。
   sandboxes:

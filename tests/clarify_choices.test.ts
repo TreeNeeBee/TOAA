@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatClarificationQuestion, inferCompileLanguageFromText, resolveClarificationAnswer } from '../src/cli/compile.js';
+import { formatClarificationQuestion, inferCompileLanguageFromText, resolveClarificationAnswer } from '../src/application/planning/requirement_intake.js';
 import { setLocale } from '../src/i18n/index.js';
 import type { ClarifyQuestion } from '../src/agents/planner.js';
 

@@ -11,6 +11,8 @@ export interface LLMProviderWindow {
 }
 
 export interface ChatOptions {
+  /** Cancels an in-flight provider request when the owning Runtime task is cancelled. */
+  signal?: AbortSignal;
   temperature?: number;
   maxTokens?: number;
   /** Force JSON-only response if provider supports it. */

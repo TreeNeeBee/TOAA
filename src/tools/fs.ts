@@ -83,8 +83,6 @@ export const readFileTool: Tool<
   },
 };
 
-export type WriteChunkBytes = number | 'auto';
-
 export interface WriteChunkBudgetContext {
   phase?: string;
   role?: string;
@@ -96,17 +94,14 @@ export interface WriteChunkBudgetContext {
   contextWindowTokens?: number;
 }
 
-/** Legacy public baseline; auto budgets are now derived from the active model context window. */
-export const DEFAULT_WRITE_CHUNK_BYTES = 6000;
-
 export function resolveWriteChunkBytes(
-  configured: WriteChunkBytes | undefined,
+  currentWindow: number | undefined,
   ctx: WriteChunkBudgetContext = {},
 ): number {
+  if (typeof currentWindow === 'number' && currentWindow > 0) return currentWindow;
   return resolveSkillOperationWindow({
     contextWindowTokens: ctx.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
     promptChars: ctx.contextChars,
-    configuredWriteChunkBytes: configured,
   }).writeChunkBytes;
 }
 

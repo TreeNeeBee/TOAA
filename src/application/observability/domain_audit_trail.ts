@@ -1,15 +1,15 @@
-import { createObjectEnvelope, reviseObjectEnvelope } from '../objects/object_envelope.js';
-import type { ObjectId } from '../identity/object_id.js';
-import type { ObjectRef } from '../objects/object_ref.js';
-import { ProjectSchema } from '../projects/project.js';
-import { TicketSchema } from '../tickets/ticket.js';
-import type { DomainObjectRepository } from '../../infrastructure/repository/domain_object_repository.js';
+import { createObjectEnvelope, reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
+import type { ObjectId } from '../../domain/identity/object_id.js';
+import type { ObjectRef } from '../../domain/objects/object_ref.js';
+import { ProjectSchema } from '../../domain/projects/project.js';
+import { TicketSchema } from '../../domain/tickets/ticket.js';
+import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import {
   DomainAuditEventSchema,
   DomainLogSchema,
   type DomainAuditEvent,
   type DomainLog,
-} from './records.js';
+} from '../../domain/observability/records.js';
 
 interface TraceInput {
   projectId: ObjectId;
@@ -19,7 +19,7 @@ interface TraceInput {
 }
 
 export class DomainAuditTrail {
-  constructor(private readonly repository: DomainObjectRepository) {}
+  constructor(private readonly repository: DomainObjectRepositoryPort) {}
 
   async recordEvent(input: TraceInput & {
     kind: string;

@@ -1,4 +1,4 @@
-import type { Tool } from './types.js';
+import type { Tool, ToolResult } from './types.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { t } from '../i18n/index.js';
@@ -43,6 +43,8 @@ interface HttpFetchData {
   truncated?: boolean;
   totalBytes?: number;
   savedTo?: string;
+  /** Persisted only inside record/replay entries so replay can restore saveAs. */
+  _recordedBodyBase64?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -90,88 +92,107 @@ export const httpFetchTool: Tool<HttpFetchArgs, HttpFetchData> = {
       }
     }
 
-    const controller = new AbortController();
-    const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
-    let res: Response;
-    try {
-      res = await fetch(args.url, {
-        method,
-        headers: args.headers,
-        body: args.body,
-        signal: controller.signal,
-        redirect: 'follow',
-      });
-    } catch (err) {
-      if (timer) clearTimeout(timer);
-      const msg = (err as Error).message || String(err);
-      return { ok: false, error: `http_fetch: request failed: ${msg}` };
-    }
+    const executeLive = async (): Promise<ToolResult<HttpFetchData>> => {
+      const controller = new AbortController();
+      const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const res = await fetch(args.url, {
+          method,
+          headers: args.headers,
+          body: args.body,
+          signal: controller.signal,
+          redirect: 'follow',
+        });
+        const headers: Record<string, string> = {};
+        res.headers.forEach((value, key) => {
+          headers[key] = value;
+        });
+        const contentType = headers['content-type'] ?? '';
 
-    const headers: Record<string, string> = {};
-    res.headers.forEach((v, k) => {
-      headers[k] = v;
-    });
-    const contentType = headers['content-type'] ?? '';
+        if (args.saveAs) {
+          const buf = Buffer.from(await res.arrayBuffer());
+          const trimmed = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+          await ctx.audit?.event('tool.call', t().audit.httpFetchSaved(method, args.url, args.saveAs, trimmed.length), {
+            messageId: 'audit.http_fetch_saved',
+            stepId: ctx.stepId,
+            status: res.status,
+          });
+          return {
+            ok: res.ok,
+            data: {
+              status: res.status,
+              ok: res.ok,
+              url: res.url,
+              headers,
+              contentType,
+              savedTo: args.saveAs,
+              truncated: buf.length > maxBytes,
+              totalBytes: buf.length,
+              _recordedBodyBase64: trimmed.toString('base64'),
+            },
+            summary: `http_fetch ${method} ${args.url} → ${res.status} (saved ${trimmed.length}B to ${args.saveAs})`,
+          };
+        }
 
-    if (args.saveAs) {
-      // Stream-to-disk path — let the workspace handle the bytes; cap at maxBytes.
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (timer) clearTimeout(timer);
-      const trimmed = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
-      const abs = saveAsAbs!;
-      await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, trimmed);
-      await ctx.audit?.event('tool.call', t().audit.httpFetchSaved(method, args.url, args.saveAs, trimmed.length), {
-        messageId: 'audit.http_fetch_saved',
-        stepId: ctx.stepId,
-        status: res.status,
-      });
-      return {
-        ok: res.ok,
-        data: {
+        const arr = new Uint8Array(await res.arrayBuffer());
+        const truncated = arr.length > maxBytes;
+        const slice = truncated ? arr.subarray(0, maxBytes) : arr;
+        let bodyText: string;
+        try {
+          bodyText = new TextDecoder('utf-8', { fatal: false }).decode(slice);
+        } catch {
+          bodyText = `[binary response, ${arr.length} bytes; use saveAs to download]`;
+        }
+        await ctx.audit?.event('tool.call', t().audit.httpFetchResponse(method, args.url, res.status, arr.length), {
+          messageId: 'audit.http_fetch_response',
+          stepId: ctx.stepId,
           status: res.status,
+          truncated,
+        });
+        return {
           ok: res.ok,
-          url: res.url,
-          headers,
-          contentType,
-          savedTo: args.saveAs,
-          truncated: buf.length > maxBytes,
-          totalBytes: buf.length,
-        },
-        summary: `http_fetch ${method} ${args.url} → ${res.status} (saved ${trimmed.length}B to ${args.saveAs})`,
-      };
-    }
-
-    // Inline body — cap at maxBytes so a runaway server doesn't blow up the prompt.
-    const arr = new Uint8Array(await res.arrayBuffer());
-    if (timer) clearTimeout(timer);
-    const truncated = arr.length > maxBytes;
-    const slice = truncated ? arr.subarray(0, maxBytes) : arr;
-    let bodyText: string;
-    try {
-      bodyText = new TextDecoder('utf-8', { fatal: false }).decode(slice);
-    } catch {
-      bodyText = `[binary response, ${arr.length} bytes; use saveAs to download]`;
-    }
-    await ctx.audit?.event('tool.call', t().audit.httpFetchResponse(method, args.url, res.status, arr.length), {
-      messageId: 'audit.http_fetch_response',
-      stepId: ctx.stepId,
-      status: res.status,
-      truncated,
-    });
-    return {
-      ok: res.ok,
-      data: {
-        status: res.status,
-        ok: res.ok,
-        url: res.url,
-        headers,
-        contentType,
-        bodyText,
-        truncated,
-        totalBytes: arr.length,
-      },
-      summary: `http_fetch ${method} ${args.url} → ${res.status} (${arr.length}B${truncated ? `, truncated to ${maxBytes}B` : ''})`,
+          data: {
+            status: res.status,
+            ok: res.ok,
+            url: res.url,
+            headers,
+            contentType,
+            bodyText,
+            truncated,
+            totalBytes: arr.length,
+          },
+          summary: `http_fetch ${method} ${args.url} → ${res.status} (${arr.length}B${truncated ? `, truncated to ${maxBytes}B` : ''})`,
+        };
+      } catch (err) {
+        const msg = (err as Error).message || String(err);
+        return { ok: false, error: `http_fetch: request failed: ${msg}` };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     };
+
+    const result = ctx.recordReplay?.enabled('http')
+      ? await ctx.recordReplay.execute({
+          channel: 'http',
+          operation: 'fetch',
+          request: {
+            url: args.url,
+            method,
+            headers: args.headers,
+            body: args.body,
+            timeoutMs,
+            maxBytes,
+            saveAs: args.saveAs,
+          },
+        }, executeLive)
+      : await executeLive();
+
+    if (args.saveAs && saveAsAbs && result.data?._recordedBodyBase64) {
+      const body = Buffer.from(result.data._recordedBodyBase64, 'base64');
+      await fs.mkdir(path.dirname(saveAsAbs), { recursive: true });
+      await fs.writeFile(saveAsAbs, body);
+      delete result.data._recordedBodyBase64;
+    }
+    return result;
   },
 };

@@ -19,6 +19,8 @@ import {
   normalizeContextWindowTokens,
   resolveSkillOperationWindow,
 } from './window.js';
+import { LLMRequestError, isLLMRequestError } from './errors.js';
+import type { RecordReplayController } from '../application/record_replay/controller.js';
 
 
 type ProviderConfig = XCompilerConfig['llm']['providers'][string];
@@ -50,10 +52,13 @@ export class LLMRouter {
     private readonly plugins?: PluginHost,
     private readonly probe: ProviderAvailabilityProbe = (name, provider) =>
       probeLLMProviderAvailability(provider, resolveLLMProbeTimeoutMs(provider)),
+    private readonly recordReplay?: RecordReplayController,
   ) {
     for (const [name, p] of Object.entries(cfg.llm.providers)) {
       const client = createClient(name, p);
-      if (client) this.clients.set(name, client);
+      if (client) this.clients.set(name, recordReplay?.enabled('llm')
+        ? recordReplayClient(name, client, recordReplay)
+        : client);
     }
   }
 
@@ -62,6 +67,9 @@ export class LLMRouter {
    * 瞬时断连重试三个时机调用。结果按 maxAgeMs 缓存，永不抛错。
    */
   private async availability(name: string, maxAgeMs = PROBE_CACHE_TTL_MS): Promise<LLMProbeResult | undefined> {
+    if (this.recordReplay?.mode === 'replay') {
+      return { ok: true, latencyMs: 0, detail: 'offline replay' };
+    }
     const provider = this.cfg.llm.providers[name];
     if (!provider) return undefined;
     const cached = this.probeCache.get(name);
@@ -87,13 +95,16 @@ export class LLMRouter {
   for(role: Role): LLMClient {
     const candidates = this.resolveChain(role);
     if (candidates.length === 0) {
-      throw new Error(`LLM provider not configured for role: ${role}`);
+      throw new LLMRequestError(`LLM provider not configured for role: ${role}`, {
+        code: 'provider_not_configured', mode: 'router', retryable: false, switchProvider: false,
+      });
     }
     const ranked = this.rankByScore(candidates);
     if (ranked.length === 0) {
-      throw new Error(
+      throw new LLMRequestError(
         `No usable LLM provider for role ${role}: candidates [${candidates.join(', ')}] ` +
           `are disabled or unreachable in this run. Run preflight or restore at least one provider in config.`,
+        { code: 'provider_unavailable', mode: 'router', retryable: true, switchProvider: true },
       );
     }
     const clients = ranked
@@ -104,7 +115,9 @@ export class LLMRouter {
       }))
       .filter((x): x is { name: string; client: LLMClient; contextWindowTokens: number } => !!x.client);
     if (clients.length === 0) {
-      throw new Error(`No usable LLM provider in chain for role ${role}: [${ranked.join(', ')}]`);
+      throw new LLMRequestError(`No usable LLM provider in chain for role ${role}: [${ranked.join(', ')}]`, {
+        code: 'provider_unavailable', mode: 'router', retryable: true, switchProvider: true,
+      });
     }
     const composite = new FallbackClient(
       clients,
@@ -415,8 +428,16 @@ class FallbackClient implements LLMClient {
       }
     }
     if (failures.length > 0) {
-      throw new Error(
+      throw new LLMRequestError(
         `all LLM providers failed for role ${this.role}: ${failures.map((f) => truncateFailure(f, 500)).join(' | ')}`,
+        {
+          code: 'all_providers_failed',
+          mode: 'router',
+          retryable: true,
+          switchProvider: true,
+          details: { role: this.role, failures },
+        },
+        { cause: lastErr },
       );
     }
     throw lastErr instanceof Error ? lastErr : new Error('all LLM providers failed');
@@ -563,4 +584,30 @@ function createClient(
     });
   }
   return null;
+}
+
+function recordReplayClient(
+  provider: string,
+  inner: LLMClient,
+  controller: RecordReplayController,
+): LLMClient {
+  return {
+    name: inner.name,
+    async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+      return controller.execute({
+        channel: 'llm',
+        operation: 'chat',
+        request: {
+          provider,
+          model: inner.name,
+          messages,
+          options: {
+            temperature: options?.temperature,
+            maxTokens: options?.maxTokens,
+            responseFormat: options?.responseFormat,
+          },
+        },
+      }, () => inner.chat(messages, options));
+    },
+  };
 }

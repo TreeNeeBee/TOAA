@@ -15,6 +15,7 @@ import { compileProjectGraph } from '../src/domain/planning/compiler.js';
 import { StepSchema } from '../src/domain/steps/step.js';
 import { reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
+import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
 describe('XCompiler project file', () => {
@@ -155,7 +156,7 @@ async function canonicalWorkspace() {
     topic: 'Build a Python application.',
     projectName: 'sample',
   });
-  await repository.persistCompiledGraph(graph);
+  await new ProjectGraphPersistenceService(repository).persistGraph(graph);
   return { workspace, repository, graph };
 }
 

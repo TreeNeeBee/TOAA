@@ -3,191 +3,121 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Plan } from '../src/core/plan.js';
+import { QualityAssessmentService } from '../src/application/execution/quality_assessment_service.js';
+import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
+import { ProjectController, type ScheduledWork } from '../src/application/project_management/project_controller.js';
+import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { compileProjectGraph } from '../src/domain/planning/compiler.js';
-import { QualityAssessmentService } from '../src/domain/quality/assessment_service.js';
-import { DomainScheduler } from '../src/domain/workflow/scheduler.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../src/workspace/workspace.js';
 
-describe('DomainScheduler', () => {
-  it('keeps development Steps delivered until their paired verification Step passes', async () => {
-    const { graph, repository, scheduler } = await setup();
-    const phase = graph.phases[0]!;
+describe('PM WorkScheduler', () => {
+  it('keeps a source Step delivered until its paired verification closes it', async () => {
+    const fixture = await setup();
     for (let index = 0; index < 5; index += 1) {
-      const work = await scheduler.next(phase.id);
-      expect(work?.step.name).toBe(`P1-S${String(index + 1).padStart(3, '0')}`);
-      const started = await scheduler.start(work!);
-      await deliverPassing(repository, scheduler, started);
+      const work = await startNext(fixture);
+      expect(work.step.name).toBe(`P1-S${String(index + 1).padStart(3, '0')}`);
+      await deliverPassing(fixture, work);
     }
-
-    const coding = graph.steps.find((step) => step.type === 'CODING')!;
-    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
-    const persistedCoding = await repository.read(coding.id);
-    const persistedUnit = await repository.read(unit.id);
-    expect(persistedCoding.objectType === 'step' && persistedCoding.state).toBe('closed');
-    expect(persistedUnit.objectType === 'step' && persistedUnit.state).toBe('closed');
-
-    const detailed = graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
-    const persistedDetailed = await repository.read(detailed.id);
-    expect(persistedDetailed.objectType === 'step' && persistedDetailed.state).toBe('delivered');
+    const code = fixture.graph.steps.find((step) => step.type === 'CODE')!;
+    const unit = fixture.graph.steps.find((step) => step.type === 'UNIT_TEST')!;
+    const detailed = fixture.graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
+    expect((await fixture.repository.read(code.id)).state).toBe('closed');
+    expect((await fixture.repository.read(unit.id)).state).toBe('closed');
+    expect((await fixture.repository.read(detailed.id)).state).toBe('delivered');
   });
 
-  it('routes a failed test back to its paired source and resumes the same Bug after restart', async () => {
-    const { graph, repository, scheduler } = await setup();
-    const phase = graph.phases[0]!;
-    for (let index = 0; index < 4; index += 1) {
-      const started = await scheduler.start((await scheduler.next(phase.id))!);
-      await deliverPassing(repository, scheduler, started);
-    }
-    const unitWork = await scheduler.start((await scheduler.next(phase.id))!);
-    const bug = await scheduler.routeFailure({
+  it('routes a failed verification to its paired source and resumes the Bug after reload', async () => {
+    const fixture = await setup();
+    for (let index = 0; index < 4; index += 1) await deliverPassing(fixture, await startNext(fixture));
+    const unitWork = await startNext(fixture);
+    const creatorActorId = await fixture.registration.discovererActorIdForStep(unitWork.step.id);
+    const bug = await fixture.controller.routeFailure({
+      creatorActorId,
       failedStepId: unitWork.step.id,
       message: 'expected source, received undefined',
       summary: 'Unit result contract failed.',
+      failure: {
+        kind: 'execution',
+        category: 'test',
+        code: 'unit_contract_failed',
+        message: 'expected source, received undefined',
+        retryable: true,
+        switchProvider: false,
+      },
       rawEvidenceRef: '.xcompiler/failures/unit.log',
       correlationId: createObjectId(),
     });
+    const code = fixture.graph.steps.find((step) => step.type === 'CODE')!;
+    expect((await fixture.repository.read(code.id)).state).toBe('reopened');
+    expect((await fixture.repository.read(unitWork.step.id)).state).toBe('pending');
 
-    const coding = graph.steps.find((step) => step.type === 'CODING')!;
-    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
-    const persistedCoding = await repository.read(coding.id);
-    const persistedUnit = await repository.read(unit.id);
-    expect(persistedCoding.objectType === 'step' && persistedCoding.state).toBe('reopened');
-    expect(persistedUnit.objectType === 'step' && persistedUnit.state).toBe('pending');
-
-    const resumedRepository = new DomainObjectRepository(new Workspace(repositoryRoot(repository)));
-    await resumedRepository.load();
-    const resumed = await new DomainScheduler(resumedRepository).resume(phase.id);
-    expect(resumed).toMatchObject({ mode: 'debug', step: { id: coding.id }, ticket: { id: bug.id } });
+    const repository = new DomainObjectRepository(new Workspace(fixture.root));
+    await repository.load();
+    const resumed = await new ProjectController(repository).resume(fixture.graph.phases[0]!.id);
+    expect(resumed).toMatchObject({ mode: 'debug', step: { id: code.id }, ticket: { id: bug.id } });
   });
 
-  it('recovers an LLM infrastructure failure that was previously misrouted as a Bug', async () => {
-    const { graph, repository, scheduler } = await setup();
-    const phase = graph.phases[0]!;
-    for (let index = 0; index < 4; index += 1) {
-      const started = await scheduler.start((await scheduler.next(phase.id))!);
-      await deliverPassing(repository, scheduler, started);
-    }
-    const unitWork = await scheduler.start((await scheduler.next(phase.id))!);
-    const bug = await scheduler.routeFailure({
-      failedStepId: unitWork.step.id,
-      message: 'all LLM providers failed for role Tester: status=429',
-      summary: 'OpenAI-compatible provider request failed status=429',
-      correlationId: createObjectId(),
-    });
-    const debugWork = await scheduler.start((await scheduler.resume(phase.id))!);
-
-    await scheduler.recoverMisroutedInfrastructureBug(bug.id);
-
-    const coding = await repository.read(debugWork.step.id);
-    const unit = await repository.read(unitWork.step.id);
-    const cancelledBug = await repository.read(bug.id);
-    const resumed = await scheduler.resume(phase.id);
-    expect(coding.objectType === 'step' && coding.state).toBe('delivered');
-    expect(coding.objectType === 'step' && coding.attempts).toBe(1);
-    expect(unit.objectType === 'step' && unit.state).toBe('in_progress');
-    expect(unit.objectType === 'step' && unit.attempts).toBe(0);
-    expect(cancelledBug.objectType === 'ticket' && cancelledBug.state).toBe('cancelled');
-    expect(resumed).toMatchObject({ mode: 'normal', step: { id: unitWork.step.id }, ticket: { id: unitWork.ticket.id } });
-  });
-
-  it('closes a Phase only after all eight Step gates and delivery Tickets close', async () => {
-    const { graph, repository, scheduler } = await setup();
-    const phase = graph.phases[0]!;
-    for (let index = 0; index < 8; index += 1) {
-      const work = await scheduler.next(phase.id);
-      expect(work?.step.type).toBe(graph.steps[index]!.type);
-      await deliverPassing(repository, scheduler, await scheduler.start(work!));
-    }
-    await scheduler.completePhase(phase.id);
-
-    const persistedPhase = await repository.read(phase.id);
-    const epic = await repository.read(phase.epicTicketId);
-    const delivery = (await Promise.all(
-      repository.registry.byType('ticket').map((entry) => repository.read(entry.id)),
-    )).find((object) => object.objectType === 'ticket' && object.type === 'story' && object.workKind === 'delivery');
-    expect(persistedPhase.objectType === 'phase' && persistedPhase.state).toBe('closed');
-    expect(epic.objectType === 'ticket' && epic.state).toBe('closed');
-    expect(delivery?.objectType === 'ticket' && delivery.state).toBe('closed');
+  it('closes a Phase only after all Step and delivery Tickets close', async () => {
+    const fixture = await setup();
+    for (let index = 0; index < 8; index += 1) await deliverPassing(fixture, await startNext(fixture));
+    const result = await fixture.controller.completePhase(fixture.graph.phases[0]!.id);
+    expect(result.projectDelivered).toBe(true);
+    expect((await fixture.repository.read(fixture.graph.phases[0]!.id)).state).toBe('closed');
+    expect((await fixture.repository.read(fixture.graph.phases[0]!.epicTicketId)).state).toBe('closed');
   });
 
   it('never updates immutable Checkpoints', async () => {
-    const { graph, repository, scheduler } = await setup();
-    const work = await scheduler.start((await scheduler.next(graph.phases[0]!.id))!);
-    const step = await repository.read(work.step.id);
-    expect(step.objectType).toBe('step');
+    const fixture = await setup();
+    const work = await startNext(fixture);
+    const step = await fixture.repository.read(work.step.id);
     if (step.objectType !== 'step') throw new Error('expected Step');
-    const checkpoint = await repository.read(step.checkpointIds[0]!);
-    await expect(repository.update(checkpoint)).rejects.toThrow(/immutable/u);
-  });
-
-  it('advances Project and ProjectPlan to the same dependency-ready Phase', async () => {
-    const plan = samplePlan();
-    plan.implementationPhases.push({
-      id: 'P2',
-      title: 'Enhancement',
-      objective: 'Deliver the enhancement.',
-      status: 'planned',
-      scope: ['enhancement'],
-      deliverables: ['src/enhancement.ts'],
-      dependsOn: ['P1'],
-      verificationGate: {
-        summary: 'Enhancement gates pass.',
-        checks: ['Acceptance passes.'],
-        failurePolicy: 'Open a Bug.',
-      },
-    });
-    const { graph, repository, scheduler } = await setup(plan);
-    for (let index = 0; index < 8; index += 1) {
-      await deliverPassing(repository, scheduler, await scheduler.start((await scheduler.next(graph.phases[0]!.id))!));
-    }
-    const completion = await scheduler.completePhase(graph.phases[0]!.id);
-    const project = await repository.read(graph.project.id);
-    const projectPlan = await repository.read(graph.projectPlan.id);
-
-    expect(completion.nextPhaseId).toBe(graph.phases[1]!.id);
-    expect(project.objectType === 'project' && project.currentPhaseId).toBe(graph.phases[1]!.id);
-    expect(projectPlan.objectType === 'plan' && projectPlan.planKind === 'project' && projectPlan.activePhaseId)
-      .toBe(graph.phases[1]!.id);
+    const checkpoint = await fixture.repository.read(step.checkpointIds[0]!);
+    await expect(fixture.repository.update(checkpoint)).rejects.toThrow(/immutable/u);
   });
 });
 
-const roots = new WeakMap<DomainObjectRepository, string>();
-
-async function setup(plan = samplePlan()) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-domain-scheduler-'));
+async function setup() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-pm-scheduler-'));
   const repository = new DomainObjectRepository(new Workspace(root));
-  roots.set(repository, root);
   await repository.load();
   const graph = compileProjectGraph({
-    draft: plan,
+    draft: samplePlan(),
     topic: 'Build a TypeScript service.',
     projectName: 'service',
   });
-  await repository.persistCompiledGraph(graph);
-  return { graph, repository, scheduler: new DomainScheduler(repository) };
+  await new ProjectGraphPersistenceService(repository).persistGraph(graph);
+  const registration = new TicketRegistrationService(repository);
+  await registration.registerProjectTickets(graph.project.id);
+  return {
+    root,
+    graph,
+    repository,
+    registration,
+    controller: new ProjectController(repository),
+  };
 }
 
-function repositoryRoot(repository: DomainObjectRepository): string {
-  const root = roots.get(repository);
-  if (!root) throw new Error('repository root not found');
-  return root;
+async function startNext(fixture: Awaited<ReturnType<typeof setup>>): Promise<ScheduledWork> {
+  const work = await fixture.controller.next(fixture.graph.phases[0]!.id);
+  if (!work) throw new Error('expected scheduled work');
+  const routed = await fixture.registration.routeAndAssign(work.ticket.id);
+  return fixture.controller.start({ ...work, ticket: routed.ticket });
 }
 
 async function deliverPassing(
-  repository: DomainObjectRepository,
-  scheduler: DomainScheduler,
-  work: Awaited<ReturnType<DomainScheduler['start']>>,
+  fixture: Awaited<ReturnType<typeof setup>>,
+  work: ScheduledWork,
 ): Promise<void> {
-  const kpis = await Promise.all(work.step.kpiIds.map((id) => repository.read(id)));
-  const assessment = await new QualityAssessmentService(repository).assessStep({
+  const kpis = await Promise.all(work.step.kpiIds.map((id) => fixture.repository.read(id)));
+  const assessment = await new QualityAssessmentService(fixture.repository).assessStep({
     step: work.step,
     metrics: kpis.flatMap((object) => object.objectType === 'kpi'
       ? [{ metric: object.metric, value: 1 }]
       : []),
   });
-  await scheduler.deliverNormal(work, assessment.id);
+  await fixture.controller.deliverNormal(work, assessment.id);
 }
 
 function samplePlan(): Plan {

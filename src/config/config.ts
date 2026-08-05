@@ -212,15 +212,29 @@ const AgentSchema = z.object({
     max_rounds_per_step: z.number().int().positive().default(6),
     max_debug_rounds_per_step: z.number().int().positive().optional(),
     max_edit_lines_per_step: z.union([z.literal('auto'), z.number().int().positive()]).default('auto'),
-    max_write_chunk_bytes: z.union([z.literal('auto'), z.number().int().positive()]).default('auto'),
     sandboxes: SandboxesSchema,
   }).strict();
+
+const RecordReplaySchema = z.object({
+  /** off=live, record=append, replay=offline, auto=replay/live append, refresh=live superseding append. */
+  mode: z.enum(['off', 'record', 'replay', 'auto', 'refresh']).default('off'),
+  /** Workspace-relative recording root. */
+  path: z.string().min(1).default('.xcompiler/record-replay'),
+  channels: z.array(z.enum(['http', 'llm', 'subprocess', 'tool'])).default(['http', 'llm', 'subprocess']),
+  redacted_fields: z.array(z.string().min(1)).default([]),
+}).strict().default({
+  mode: 'off',
+  path: '.xcompiler/record-replay',
+  channels: ['http', 'llm', 'subprocess'],
+  redacted_fields: [],
+});
 
 const ConfigSchema = z.object({
   /** CLI / prompt locale. Accepts 'en' (default) or 'zh'. */
   locale: LocaleSchema.default('en'),
   llm: LlmSchema,
   agent: AgentSchema,
+  record_replay: RecordReplaySchema,
 }).strict();
 
 export type XCompilerConfig = z.infer<typeof ConfigSchema>;

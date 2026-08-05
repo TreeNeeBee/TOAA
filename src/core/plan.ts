@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export const PLAN_VERSION = '2';
+
 /**
  * Planned V-model phases.
  *
@@ -235,7 +237,7 @@ export function stepExecutionKey(
 
 export const PlanSchema = z
   .object({
-    version: z.literal('1'),
+    version: z.literal(PLAN_VERSION),
     language: z.enum(LANGUAGES).default('python'),
     intent: z.enum(PLAN_INTENTS).default('greenfield'),
     /** Materialized implementation phase for this phase-specific plan file. */

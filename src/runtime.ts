@@ -1,5 +1,6 @@
 /** 无 Commander 副作用的程序化运行入口，供宿主应用和插件加载器使用。 */
 export { XCOMPILER_VERSION, XCOMPILER_PLUGIN_API_VERSION } from './version.js';
+export { PLAN_INTENTS, type PlanIntent } from './core/plan.js';
 export { runCompile, CompileExitError, type CompileOptions } from './runtime/build.js';
 export { runExecute, type ExecuteOptions, type ExecuteResult } from './runtime/run.js';
 export {
@@ -20,6 +21,8 @@ export {
 export {
   silentRuntimeIO,
   type RuntimeEvent,
+  type RuntimeEventEnvelope,
+  type RuntimeEventInput,
   type RuntimeIO,
   type RuntimeInteraction,
   type RuntimeLogEvent,
@@ -113,6 +116,25 @@ export {
   type ShowOutputStatus,
   type ShowResult,
 } from './runtime/inspect.js';
+export {
+  runFixtureCommand,
+  type FixtureAction,
+  type RuntimeFixtureOptions,
+  type RuntimeFixtureResult,
+} from './runtime/fixtures.js';
+export {
+  FixtureService,
+  type FixtureGroupInspection,
+  type FixtureInspectionReport,
+} from './application/record_replay/fixture_service.js';
+export {
+  RECORD_REPLAY_MODES,
+  RecordReplayError,
+  type RecordReplayChannel,
+  type RecordReplayEntry,
+  type RecordReplayFailureCode,
+  type RecordReplayMode,
+} from './application/record_replay/types.js';
 export { PluginHost } from './plugins/host.js';
 export { checkPluginCompatibility } from './plugins/compatibility.js';
 export type {
@@ -132,6 +154,10 @@ import {
   type ShowOptions,
 } from './runtime/inspect.js';
 import type { RuntimeIO } from './runtime/io.js';
+import {
+  runFixtureCommand,
+  type RuntimeFixtureOptions,
+} from './runtime/fixtures.js';
 import {
   runAppendCommand,
   runBuildCommand,
@@ -194,6 +220,10 @@ export class XCompilerRuntime {
 
   show(opts: ShowOptions): ReturnType<typeof runShowCommand> {
     return runShowCommand(opts);
+  }
+
+  fixtures(opts: RuntimeFixtureOptions): ReturnType<typeof runFixtureCommand> {
+    return runFixtureCommand(this.withDefaults(opts));
   }
 
   private withDefaults<T extends { io?: RuntimeIO }>(opts: T): T {

@@ -97,10 +97,10 @@ describe('config locale', () => {
     expect(config.agent.max_edit_lines_per_step).toBe('auto');
   });
 
-  it('defaults write chunk byte budget to auto', async () => {
+  it('derives write chunk bytes from context_window instead of accepting a fixed config field', async () => {
     const cfgPath = await writeConfig(baseConfig());
     const { config } = await loadConfigWithPath(cfgPath);
-    expect(config.agent.max_write_chunk_bytes).toBe('auto');
+    expect('max_write_chunk_bytes' in config.agent).toBe(false);
   });
 
   it('keeps numeric-looking provider env vars as strings', async () => {

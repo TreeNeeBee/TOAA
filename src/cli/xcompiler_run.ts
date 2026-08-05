@@ -1,13 +1,12 @@
 import { Command } from 'commander';
-import { runRunCommand } from '../runtime/commands.js';
-import type { ExecuteResult } from '../runtime/run.js';
+import { XCOMPILER_VERSION, XCompilerRuntime, type ExecuteResult } from '../runtime.js';
 import { setLocale, t } from '../i18n/index.js';
-import { XCOMPILER_VERSION } from '../version.js';
-import { configureLocalizedHelp, localeFromArgv, parseLocale } from './arguments.js';
+import { configureLocalizedHelp, localeFromArgv, parseLocale, parseRecordReplayMode } from './arguments.js';
 import { xcEnv } from '../config/env.js';
 import { createCliRuntimeIO } from './runtime_adapter.js';
 
 setLocale(localeFromArgv(process.argv) ?? xcEnv('LANG') ?? 'en');
+const runtime = new XCompilerRuntime({ io: createCliRuntimeIO() });
 
 const program = new Command();
 configureLocalizedHelp(program);
@@ -25,8 +24,10 @@ program
   .option('--force', t().cli.optForce, false)
   .option('--project-file <file>', t().cli.optProjectFile)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (planArg, opts) => {
-    const result = await runRunCommand({
+    const result = await runtime.runCommand({
       planArg,
       output: opts.output,
       workspace: opts.workspace,
@@ -35,8 +36,9 @@ program
       force: !!opts.force,
       projectFilePath: opts.projectFile,
       debugWikiPath: opts.debugWikiPath,
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
       cwd: process.cwd(),
-      io: createCliRuntimeIO(),
     });
     applyExecuteExitCode(result);
   });

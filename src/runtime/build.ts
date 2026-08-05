@@ -38,7 +38,7 @@ import {
   type CompiledProjectExtension,
   type CompiledProjectGraph,
 } from '../domain/planning/compiler.js';
-import { DomainAuditTrail } from '../domain/observability/audit_trail.js';
+import { DomainAuditTrail } from '../application/observability/domain_audit_trail.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
 import { AuditLogger } from '../audit/audit.js';
 import { acquireLock, LockError } from '../core/lock.js';
@@ -49,11 +49,33 @@ import type { XCompilerPlugin } from '../plugins/types.js';
 import { hasXcEnv, xcEnv } from '../config/env.js';
 import {
   requireRuntimeInteraction,
+  emitRuntimeEvent,
   runtimeLog,
   runtimeResult,
   silentRuntimeIO,
   type RuntimeIO,
 } from './io.js';
+import { createRuntimeRecordReplay } from './record_replay.js';
+import type { RecordReplayMode } from '../application/record_replay/types.js';
+import { ProjectGraphPersistenceService } from '../application/planning/project_graph_persistence_service.js';
+import { ProjectPlanningGovernanceService } from '../application/planning/project_planning_governance_service.js';
+import { FileProjectProjectionWriter } from '../infrastructure/projections/index.js';
+import {
+  formatClarificationQuestion,
+  resolveClarificationAnswer,
+  resolveCompileLanguage,
+} from '../application/planning/requirement_intake.js';
+
+export {
+  formatClarificationQuestion,
+  inferCompileLanguageFromText,
+  resolveClarificationAnswer,
+  resolveCompileLanguage,
+} from '../application/planning/requirement_intake.js';
+export type {
+  CompileLanguageResolution,
+  CompileLanguageResolutionInput,
+} from '../application/planning/requirement_intake.js';
 
 export interface CompileOptions {
   workspace: string;
@@ -81,6 +103,12 @@ export interface CompileOptions {
   pluginStrict?: boolean;
   /** Runtime event and interaction adapter. CLI supplies a terminal implementation; SDKs may stay silent. */
   io?: RuntimeIO;
+  /** Override external-interaction fixture behavior for this invocation. */
+  recordReplayMode?: RecordReplayMode;
+  /** Workspace-relative fixture root override. */
+  recordReplayPath?: string;
+  /** Cancels active planning/provider requests. */
+  abortSignal?: AbortSignal;
 }
 
 /** CLI 可映射为退出码、程序化调用方可捕获并安全收尾的编译终止。 */
@@ -89,136 +117,6 @@ export class CompileExitError extends Error {
     super(message);
     this.name = 'CompileExitError';
   }
-}
-
-export function formatClarificationQuestion(q: ClarifyQuestion): string {
-  const choiceRange = formatClarificationChoiceRange(q.options);
-  const lines = [
-    `${q.id} [${q.category}] ${q.question}`,
-    `  ↳ ${q.why}`,
-  ];
-  for (const option of q.options) {
-    lines.push(`  ${option.label}. ${option.answer}`);
-  }
-  lines.push(`  ${t().compile.clarifyChoiceHint(choiceRange)}`);
-  return lines.join('\n');
-}
-
-function formatClarificationChoiceRange(options: ClarifyOption[]): string {
-  if (options.length === 0) return 'A-E';
-  const first = options[0]?.label ?? 'A';
-  const last = options[options.length - 1]?.label ?? first;
-  return first === last ? first : `${first}-${last}`;
-}
-
-export function resolveClarificationAnswer(q: ClarifyQuestion, rawAnswer: string): string {
-  const answer = rawAnswer.trim();
-  const label = answer.toUpperCase();
-  if (/^[A-E]$/u.test(label)) {
-    const option = q.options.find((candidate) => candidate.label === label);
-    if (option) return `${option.label}. ${option.answer}`;
-  }
-  return answer;
-}
-
-export interface CompileLanguageResolutionInput {
-  rawRequirement: string;
-  clarifications?: PlannerInput['clarifications'];
-  userAddenda?: string;
-  intent?: PlanIntent;
-  baseline?: { language?: Language; languageSource?: string; summary?: string };
-}
-
-export interface CompileLanguageResolution {
-  language: Language;
-  source: 'baseline' | 'topic' | 'clarification' | 'default';
-  ambiguous: boolean;
-}
-
-export function resolveCompileLanguage(
-  configuredLanguage: Language,
-  intent: PlanIntent,
-  baseline: { language?: Language },
-): Language;
-export function resolveCompileLanguage(input: CompileLanguageResolutionInput): CompileLanguageResolution;
-export function resolveCompileLanguage(
-  inputOrConfigured: CompileLanguageResolutionInput | Language,
-  intent?: PlanIntent,
-  baseline?: { language?: Language },
-): CompileLanguageResolution | Language {
-  if (typeof inputOrConfigured === 'string') {
-    return isIncrementalIntent(intent ?? 'greenfield')
-      ? baseline?.language ?? inputOrConfigured
-      : inputOrConfigured;
-  }
-  const input = inputOrConfigured;
-  if (isIncrementalIntent(input.intent ?? 'greenfield') && input.baseline?.language) {
-    return { language: input.baseline.language, source: 'baseline', ambiguous: false };
-  }
-  const topicInferred = inferCompileLanguageFromText(input.rawRequirement);
-  if (topicInferred) {
-    return {
-      language: topicInferred,
-      source: 'topic',
-      ambiguous: false,
-    };
-  }
-  const clarificationText = formatLanguageClarificationText(input.clarifications ?? []);
-  const clarifiedInferred = inferCompileLanguageFromText([
-    clarificationText,
-    input.userAddenda ?? '',
-  ].join('\n'));
-  if (clarifiedInferred) {
-    return { language: clarifiedInferred, source: 'clarification', ambiguous: false };
-  }
-  return { language: 'python', source: 'default', ambiguous: true };
-}
-
-export function inferCompileLanguageFromText(text: string): Language | undefined {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[，。；：、（）【】]/gu, ' ')
-    .replace(/\s+/gu, ' ');
-  const pythonStrong =
-    /\bpython\b/u.test(normalized) ||
-    /python\s*脚本/u.test(normalized) ||
-    /\.py\b/u.test(normalized) ||
-    /\bpytest\b/u.test(normalized) ||
-    /\bpip\b/u.test(normalized);
-  const typescriptStrong =
-    /\btypescript\b/u.test(normalized) ||
-    /\btype\s*script\b/u.test(normalized) ||
-    /(^|[^a-z0-9])ts\s*(程序|工程|项目|脚本|语言|实现)/u.test(normalized) ||
-    /\.tsx?\b/u.test(normalized) ||
-    /\btsx\b/u.test(normalized);
-  if (pythonStrong && !typescriptStrong) return 'python';
-  if (typescriptStrong && !pythonStrong) return 'typescript';
-  const pythonWeak =
-    /\bopenpyxl\b/u.test(normalized) ||
-    /\bpandas\b/u.test(normalized) ||
-    /\bfastapi\b/u.test(normalized) ||
-    /\bflask\b/u.test(normalized);
-  const typescriptWeak =
-    /\bnode(?:\.js)?\b/u.test(normalized) ||
-    /\bnpm\b/u.test(normalized) ||
-    /\bvitest\b/u.test(normalized) ||
-    /\bpackage\.json\b/u.test(normalized) ||
-    /\bjavascript\b/u.test(normalized) ||
-    /\bjs\s*(程序|工程|项目|脚本|语言|实现)\b/u.test(normalized);
-  if ((pythonStrong || pythonWeak) && !(typescriptStrong || typescriptWeak)) return 'python';
-  if ((typescriptStrong || typescriptWeak) && !(pythonStrong || pythonWeak)) return 'typescript';
-  return undefined;
-}
-
-function formatLanguageClarificationText(input: PlannerInput['clarifications']): string {
-  return input
-    .map((item) => [
-      item.question,
-      item.answer,
-      item.why ?? '',
-      ...(item.options ?? []).map((option) => option.answer),
-    ].join('\n'))
-    .join('\n\n');
 }
 
 export async function runCompile(opts: CompileOptions): Promise<{ planPath?: string }> {
@@ -273,15 +171,21 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await pluginHost.emit('compile.start', { workspace: ws.root, intent, topicMode });
   scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
+  const recordReplay = createRuntimeRecordReplay(cfg, ws, {
+    mode: opts.recordReplayMode,
+    path: opts.recordReplayPath,
+  });
   let unavailableProviders = new Set<string>();
   try {
-    const pf = await preflightProviders(cfg, scoreStore, audit);
-    unavailableProviders = new Set(pf.unreachable);
-    if (pf.zeroed.length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
-    }
-    if (Object.keys(pf.autoAdded).length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+    if (recordReplay.mode !== 'replay') {
+      const pf = await preflightProviders(cfg, scoreStore, audit);
+      unavailableProviders = new Set(pf.unreachable);
+      if (pf.zeroed.length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
+      }
+      if (Object.keys(pf.autoAdded).length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+      }
     }
   } catch (err) {
     await runtimeLog(io, 'error', t().system.unhandledError((err as Error).message));
@@ -289,7 +193,15 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     await scoreStore.flush();
     throw new CompileExitError(7, (err as Error).message);
   }
-  const router = new LLMRouter(cfg, audit, scoreStore, unavailableProviders, pluginHost);
+  const router = new LLMRouter(
+    cfg,
+    audit,
+    scoreStore,
+    unavailableProviders,
+    pluginHost,
+    undefined,
+    recordReplay,
+  );
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   const baseline =
     isIncrementalIntent(intent)
@@ -356,7 +268,13 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   let clarificationQuestions: ClarifyQuestion[] = [];
   trace(`clarify.section.flag yes=${opts.yes} topicMode=${topicMode}`);
   if (!opts.yes && !topicMode) {
-    const clarifyPlanner = new Planner(plannerClient, audit, initialLanguage.language, io.terminalOutput === true);
+    const clarifyPlanner = new Planner(
+      plannerClient,
+      audit,
+      initialLanguage.language,
+      io.terminalOutput === true,
+      opts.abortSignal,
+    );
     trace('ora.clarify.start');
     const spin = io.progress(M.compile.spinClarify, { animate: false });
     trace('ora.clarify.started');
@@ -507,7 +425,13 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   trace('ora.spin2.started');
   let draft;
   try {
-    const planner = new Planner(plannerClient, audit, language, io.terminalOutput === true);
+    const planner = new Planner(
+      plannerClient,
+      audit,
+      language,
+      io.terminalOutput === true,
+      opts.abortSignal,
+    );
     const plannerInput: PlannerInput = {
       rawRequirement: finalTopicMd,
       clarifications,
@@ -613,6 +537,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
 
   const repository = new DomainObjectRepository(ws);
   await repository.load();
+  const graphPersistence = new ProjectGraphPersistenceService(repository);
   const previousProject = await repository.findProject();
   let persistedPlan = parsed.data;
   if (isIncrementalIntent(intent)) {
@@ -707,7 +632,18 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     if (predecessorEpicObject.objectType !== 'ticket' || predecessorEpicObject.type !== 'epic') {
       throw new Error(`Phase ${predecessorPhaseObject.name} does not reference an Epic Ticket`);
     }
-    graph = compileProjectExtension({
+    const managementPlanObject = await repository.read(previousProject.managementPlanId);
+    if (managementPlanObject.objectType !== 'project-management-plan') {
+      throw new Error(`Project ${previousProject.name} does not reference a Project Management Plan`);
+    }
+    const actorObjects = await repository.list({
+      objectType: 'actor-registration',
+      projectId: previousProject.id,
+    });
+    const actors = actorObjects.filter(
+      (object) => object.objectType === 'actor-registration',
+    );
+    const extension = compileProjectExtension({
       draft: persistedPlan,
       topic: finalTopicMd,
       topicSourceRef: DOC_NAMES.topic,
@@ -716,18 +652,35 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       projectPlan: projectPlanObject,
       predecessorPhase: predecessorPhaseObject,
       predecessorEpic: predecessorEpicObject,
+      actors,
+      managementPlan: managementPlanObject,
     });
-    await repository.persistProjectExtension(graph);
+    await graphPersistence.persistExtension(extension);
+    graph = extension;
   } else {
-    graph = compileProjectGraph({
+    const compiled = compileProjectGraph({
       draft: persistedPlan,
       topic: finalTopicMd,
       topicSourceRef: DOC_NAMES.topic,
       projectName: path.basename(ws.root) || 'project',
     });
-    await repository.persistCompiledGraph(graph);
+    await graphPersistence.persistGraph(compiled);
     if (previousProject) await repository.retireProject(previousProject.id);
+    graph = compiled;
   }
+  await new ProjectPlanningGovernanceService(
+    repository,
+    new FileProjectProjectionWriter(ws),
+  ).baseline({
+    project: graph.project,
+    plan: persistedPlan,
+    clarifications: clarifications.map((item) => ({
+      question: item.question,
+      answer: item.answer,
+      why: item.why,
+      options: item.options?.map((option) => `${option.label}. ${option.answer}`),
+    })),
+  });
   await new DomainAuditTrail(repository).recordEvent({
     projectId: graph.project.id,
     subject: { id: graph.projectPlan.activePhaseId, objectType: 'phase' },
@@ -747,7 +700,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     phaseIds: graph.phases.map((phase) => phase.id),
     activePhaseId: graph.projectPlan.activePhaseId,
   });
-  await io.emit({
+  await emitRuntimeEvent(io, {
     type: 'workflow',
     event: 'project_planned',
     projectId: graph.project.id,

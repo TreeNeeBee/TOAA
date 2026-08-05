@@ -11,7 +11,7 @@ import type { PlanIntent } from './plan.js';
 
 export const XCOMPILER_PROJECT_FILE_EXTENSION = '.xc';
 export const XCOMPILER_PROJECT_MANIFEST_KIND = 'xcompiler.project-manifest';
-export const XCOMPILER_PROJECT_MANIFEST_VERSION = 1;
+export const XCOMPILER_PROJECT_MANIFEST_VERSION = 2;
 
 const ProjectProgressStepSchema = z.object({
   id: ObjectIdSchema,

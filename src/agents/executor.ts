@@ -1,7 +1,6 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import { jsonrepair } from 'jsonrepair';
 import type { ChatOptions, LLMClient } from '../llm/types.js';
 import {
   V_MODEL_DEVELOPMENT_PHASES,
@@ -30,6 +29,29 @@ import { makeStreamReporter } from '../llm/stream.js';
 import { t } from '../i18n/index.js';
 import { updateOperationWindow } from '../llm/window.js';
 import { renderExecutionPromptPolicy } from './prompt_policy.js';
+import {
+  extractBugResolutionPlan,
+  extractValidationDefect,
+  isCompleteTurnJson,
+  parseTurn,
+  type LLMAction,
+  type LLMTurn,
+} from './execution/turn_parser.js';
+import {
+  compactExecutionMessages,
+  renderExecutionUserPrompt,
+} from './execution/prompt_renderer.js';
+import {
+  missingQualityAssessmentFields,
+  renderExecutionFeedback,
+} from './execution/feedback_renderer.js';
+import {
+  describeToolForStep,
+  normalizeActions,
+  safeRunTool,
+} from './execution/tool_action_normalizer.js';
+
+export { isCompleteTurnJson } from './execution/turn_parser.js';
 
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
 const RECOVERY_PROBE_ACTIONS_PER_ROUND = 4;
@@ -52,6 +74,7 @@ const MAX_DIRECT_REPAIR_PROBE_ROUNDS = 4;
 
 export interface ExecutorOptions {
   llm: LLMClient;
+  signal?: AbortSignal;
   /** Enables direct human terminal stream rendering for the CLI adapter only. */
   streamOutput?: boolean;
   /** 同一 Step 内最多对话轮数，避免无限循环。 */
@@ -62,8 +85,6 @@ export interface ExecutorOptions {
   advisoryFailureTools?: string[];
   /** Fine-grained failed calls that should be treated as diagnostics instead of blocking completion. */
   advisoryFailureRules?: AdvisoryFailureRule[];
-  /** Explicit bytes remain a hard override; auto follows the active provider context window. */
-  maxWriteChunkBytes?: number | 'auto';
 }
 
 export interface ExecutorRunInput {
@@ -108,7 +129,7 @@ export interface ExecutorRunInput {
 export interface ExecutorRunResult {
   success: boolean;
   rounds: number;
-  toolCalls: Array<{ tool: string; ok: boolean; summary?: string; error?: string }>;
+  toolCalls: ToolCallRecord[];
   finalThought?: string;
   /** Debugger 处理 Bug Ticket 时输出的可复用方案，成功后写回 Ticket/debug-wiki。 */
   bugResolutionPlan?: string;
@@ -119,6 +140,16 @@ export interface ExecutorRunResult {
   error?: string;
   /** 健康度统计：用于调用方做"滑动窗口"自适应重试决策。 */
   metrics: ExecutorRunMetrics;
+}
+
+export interface ToolCallRecord {
+  callId?: string;
+  tool: string;
+  args?: Record<string, unknown>;
+  ok: boolean;
+  summary?: string;
+  error?: string;
+  data?: unknown;
 }
 
 export interface ExecutorRunMetrics {
@@ -138,50 +169,10 @@ export interface ExecutorRunMetrics {
   providers: string[];
 }
 
-interface LLMAction {
-  tool: string;
-  args: Record<string, unknown>;
-}
-
 export interface AdvisoryFailureRule {
   tool?: string;
   pathPrefix?: string;
   errorIncludes?: string;
-}
-
-interface LLMTurn {
-  thoughts?: string;
-  bugResolutionPlan?: string;
-  bug_resolution_plan?: string;
-  resolutionPlan?: string;
-  handlingPlan?: string;
-  fixPlan?: string;
-  validationDefect?: string | null;
-  validation_defect?: string | null;
-  validationFailure?: string | null;
-  validation_failure?: string | null;
-  qualityAssessment?: unknown;
-  quality_assessment?: unknown;
-  actions?: unknown;
-  done?: boolean;
-}
-
-interface TurnFeedbackContext {
-  declaredDone: boolean;
-  actionCount: number;
-  unresolvedFailures?: string[];
-  readOnlyLoopWarning?: { rounds: number; targets: string };
-  missingOutputStallWarning?: { rounds: number; missing: string };
-  readOnlyRecoveryWarning?: boolean;
-  diagnosticProbeAllowance?: {
-    remainingRounds: number;
-    maxActionsPerRound: number;
-  };
-  noProgressWarning?: { rounds: number };
-  repairEvidenceMissing?: boolean;
-  bugResolutionPlanMissing?: boolean;
-  postMutationVerificationRequired?: boolean;
-  qualityAssessmentMissing?: string[];
 }
 
 export class StepExecutor {
@@ -214,7 +205,7 @@ export class StepExecutor {
       debug: !!inp.debugContext,
       changeRequest: !!inp.changeRequest,
     });
-    const userPrompt = renderUserPrompt(inp, toolDocs, initialMissingOutputs);
+    const userPrompt = renderExecutionUserPrompt(inp, toolDocs, initialMissingOutputs);
     const profile = inp.languageProfile ?? getLanguageProfile('python');
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
@@ -290,7 +281,7 @@ export class StepExecutor {
       let provider: string | undefined;
       let text: string;
       try {
-        const chatMessages = compactMessagesForChat(messages, !!inp.debugContext);
+        const chatMessages = compactExecutionMessages(messages, !!inp.debugContext);
         const directRepairProbeRounds =
           directRepairProbeRoundsByGeneration.get(mutationGeneration) ?? 0;
         const allowNovelDirectRepairProbe =
@@ -337,7 +328,6 @@ export class StepExecutor {
             updateOperationWindow(inp.ctx, {
               contextWindowTokens: providerWindow?.contextWindowTokens ?? inp.ctx.contextWindowTokens,
               promptChars: chatMessages.reduce((sum, message) => sum + message.content.length, 0),
-              configuredWriteChunkBytes: this.opts.maxWriteChunkBytes ?? 'auto',
             });
             const refreshedToolDocs = inp.tools
               .map((tool) =>
@@ -345,7 +335,7 @@ export class StepExecutor {
               )
               .join('\n');
             if (messages[1]) {
-              messages[1].content = renderUserPrompt(inp, refreshedToolDocs, initialMissingOutputs);
+              messages[1].content = renderExecutionUserPrompt(inp, refreshedToolDocs, initialMissingOutputs);
             }
             chatOptions.maxTokens = inp.ctx.responseTokenBudget;
             rep.reset();
@@ -359,7 +349,7 @@ export class StepExecutor {
             rep.onToken(chunk);
           },
         };
-        text = await this.opts.llm.chat(chatMessages, chatOptions);
+        text = await this.opts.llm.chat(chatMessages, { ...chatOptions, signal: this.opts.signal });
         providers.add(provider ?? this.opts.llm.name);
       } catch (err) {
         rep.done('failed');
@@ -790,7 +780,15 @@ export class StepExecutor {
           error: r.error,
           changedFiles: r.ok ? changedFilesForAction(a.tool, a.args, r) : undefined,
         });
-        calls.push({ tool: a.tool, ok: r.ok, summary: r.summary, error: r.error });
+        calls.push({
+          callId,
+          tool: a.tool,
+          args: a.args,
+          ok: r.ok,
+          summary: r.summary,
+          error: r.error,
+          data: r.data,
+        });
         turnResults.push({ ...r, tool: a.tool });
       }
       if (actions.length > 0 || normalizedActions.invalid.length > 0) {
@@ -1176,7 +1174,7 @@ export class StepExecutor {
       messages.push({ role: 'assistant', content: compactTurnForHistory(turn, toolMap) });
       messages.push({
         role: 'user',
-        content: renderFeedback(turnResults, verify, {
+        content: renderExecutionFeedback(turnResults, verify, {
           declaredDone: turn.done === true,
           actionCount: actions.length,
           unresolvedFailures: [...unresolvedToolFailures.values()],
@@ -1940,222 +1938,6 @@ function changedFilesForAction(tool: string, args: unknown, result: ToolResult):
   return actionTargetPaths(tool, args);
 }
 
-function normalizeActions(raw: unknown, toolMap?: Map<string, Tool>): {
-  actions: LLMAction[];
-  invalid: Array<{ index: number; raw: unknown; result: ToolResult & { tool: string } }>;
-} {
-  if (raw === undefined || raw === null) return { actions: [], invalid: [] };
-  if (!Array.isArray(raw)) {
-    return {
-      actions: [],
-      invalid: [{
-        index: -1,
-        raw,
-        result: {
-          tool: 'invalid_action',
-          ok: false,
-          error: 'invalid actions field: expected an array of tool calls',
-        },
-      }],
-    };
-  }
-  const actions: LLMAction[] = [];
-  const invalid: Array<{ index: number; raw: unknown; result: ToolResult & { tool: string } }> = [];
-  raw.forEach((item, index) => {
-    if (!isPlainRecord(item)) {
-      invalid.push({
-        index,
-        raw: item,
-        result: { tool: 'invalid_action', ok: false, error: `invalid action at index ${index}: expected object` },
-      });
-      return;
-    }
-    if (typeof item.tool !== 'string' || item.tool.trim().length === 0) {
-      invalid.push({
-        index,
-        raw: item,
-        result: { tool: 'invalid_action', ok: false, error: `invalid action at index ${index}: missing string tool` },
-      });
-      return;
-    }
-    const normalizedArgs = normalizeActionArgs(item.tool, item.args);
-    if (!normalizedArgs.ok) {
-      invalid.push({
-        index,
-        raw: item,
-        result: { tool: item.tool, ok: false, error: `invalid action at index ${index}: ${normalizedArgs.error}` },
-      });
-      return;
-    }
-    const selectedTool = toolMap?.get(item.tool);
-    const schemaError = selectedTool
-      ? validateToolArgsAgainstSchema(selectedTool, normalizedArgs.args)
-      : undefined;
-    if (schemaError) {
-      invalid.push({
-        index,
-        raw: item,
-        result: { tool: item.tool, ok: false, error: schemaError },
-      });
-      return;
-    }
-    actions.push({ tool: item.tool, args: normalizedArgs.args });
-  });
-  return { actions, invalid };
-}
-
-function validateToolArgsAgainstSchema(tool: Tool, args: Record<string, unknown>): string | undefined {
-  for (const [key, rawDescriptor] of Object.entries(tool.argsSchema)) {
-    if (typeof rawDescriptor !== 'string') continue;
-    const token = rawDescriptor.trim().split(/\s+/, 1)[0] ?? '';
-    const optional = token.endsWith('?');
-    const expectedType = optional ? token.slice(0, -1) : token;
-    const value = args[key];
-
-    if (value === undefined || value === null) {
-      if (optional) continue;
-      return formatToolArgError(tool, key, expectedType);
-    }
-    if (expectedType === 'string' && typeof value !== 'string') {
-      return formatToolArgError(tool, key, expectedType);
-    }
-    if (expectedType === 'number' && (typeof value !== 'number' || !Number.isFinite(value))) {
-      return formatToolArgError(tool, key, expectedType);
-    }
-    if (expectedType === 'boolean' && typeof value !== 'boolean') {
-      return formatToolArgError(tool, key, expectedType);
-    }
-    if (
-      expectedType === 'string[]' &&
-      (!Array.isArray(value) || value.some((item) => typeof item !== 'string'))
-    ) {
-      return formatToolArgError(tool, key, expectedType);
-    }
-    if (
-      expectedType.startsWith('Record<') &&
-      (!isPlainRecord(value))
-    ) {
-      return formatToolArgError(tool, key, expectedType);
-    }
-    if (key === 'path' && typeof value === 'string' && value.trim().length === 0) {
-      return formatToolArgError(tool, key, expectedType);
-    }
-  }
-  return undefined;
-}
-
-function formatToolArgError(tool: Tool, key: string, expectedType: string): string {
-  const expected = JSON.stringify(tool.argsSchema);
-  if (key === 'path' && expectedType === 'string') {
-    return `invalid ${tool.name} args: path must be a non-empty string; expected args=${expected}`;
-  }
-  const label =
-    expectedType === 'string[]'
-      ? 'a string array'
-      : expectedType.startsWith('Record<')
-        ? 'an object'
-        : `a ${expectedType || 'valid'} value`;
-  return `invalid ${tool.name} args: ${key} must be ${label}; expected args=${expected}`;
-}
-
-function normalizeActionArgs(
-  tool: string,
-  rawArgs: unknown,
-): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
-  if (isPlainRecord(rawArgs)) return { ok: true, args: rawArgs };
-  if (rawArgs === undefined || rawArgs === null) return { ok: true, args: {} };
-
-  if (typeof rawArgs === 'string') {
-    const key = STRING_ARG_TOOL_KEYS[tool];
-    if (key) return { ok: true, args: { [key]: rawArgs } };
-  }
-
-  if (Array.isArray(rawArgs)) {
-    if (tool === 'run_tests' || tool === 'run_program') {
-      const args = rawArgs.filter((item): item is string => typeof item === 'string');
-      if (args.length === rawArgs.length) return { ok: true, args: { args } };
-    }
-    const key = STRING_ARG_TOOL_KEYS[tool];
-    if (key && typeof rawArgs[0] === 'string') {
-      const out: Record<string, unknown> = { [key]: rawArgs[0] };
-      if (tool === 'read_file' && typeof rawArgs[1] === 'number') out.maxBytes = rawArgs[1];
-      return { ok: true, args: out };
-    }
-  }
-
-  return { ok: false, error: 'args must be an object' };
-}
-
-const STRING_ARG_TOOL_KEYS: Record<string, string> = {
-  apply_patch: 'patch',
-  code_search: 'query',
-  http_fetch: 'url',
-  list_dir: 'path',
-  read_file: 'path',
-};
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function describeToolForStep(tool: Tool, ctx: ToolContext, step: Step): string {
-  const details = [tool.description];
-  const inputs = compactPathCandidates(step.inputs);
-  const outputs = compactPathCandidates(step.outputs);
-  const writable = compactPathCandidates(ctx.allowedWrites);
-
-  if (tool.name === 'read_file') {
-    details.push(
-      `args.path is required: use one concrete workspace-relative file path; never omit it. ` +
-      `Step path hints: inputs=[${inputs}], outputs=[${outputs}]. ` +
-      `Current read window: ${ctx.readChunkBytes ?? '(runtime default)'}B; when truncated, continue with args.offset=nextOffset.`,
-    );
-  } else if (tool.name === 'write_file' || tool.name === 'append_file' || tool.name === 'replace_in_file') {
-    details.push(
-      `args.path is required and must be a concrete workspace-relative path allowed by this Step. ` +
-      `Path candidates: outputs=[${outputs}], writable=[${writable}].`,
-    );
-    if (tool.name === 'replace_in_file') {
-      details.push('The target must already exist; use read_file on that exact path before replacing when current bytes are uncertain.');
-    }
-  } else if (tool.name === 'apply_patch') {
-    details.push(
-      `Every target in the unified diff +++ header must be workspace-relative and allowed by this Step. ` +
-      `Path candidates: outputs=[${outputs}], writable=[${writable}].`,
-    );
-  } else if (tool.name === 'list_dir') {
-    details.push('args.path is optional; when present, use a concrete workspace-relative directory path.');
-  } else if (tool.name === 'code_search') {
-    details.push('args.root is optional; when present, use a concrete workspace-relative directory path.');
-  } else if (tool.name === 'http_fetch') {
-    details.push(
-      `args.saveAs is optional; when present, it must be a concrete workspace-relative path in writable=[${writable}].`,
-    );
-  } else if (tool.name === 'run_program' || tool.name === 'run_tests') {
-    details.push('args.cwd is optional; when present, it must be a concrete workspace-relative directory path.');
-  }
-
-  if ((tool.name === 'write_file' || tool.name === 'append_file') && ctx.writeChunkBytes) {
-    details.push(`Current Step content chunk limit: ${ctx.writeChunkBytes}B.`);
-  }
-  return details.join(' ');
-}
-
-function compactPathCandidates(paths: string[], limit = 10): string {
-  if (paths.length === 0) return '(none declared)';
-  const visible = paths.slice(0, limit);
-  const omitted = paths.length - visible.length;
-  return `${visible.join(', ')}${omitted > 0 ? `, ... (+${omitted})` : ''}`;
-}
-
-async function safeRunTool(t: Tool, args: unknown, ctx: ToolContext): Promise<ToolResult> {
-  try {
-    return await t.run(args as never, ctx);
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
-  }
-}
-
 function computeMetrics(p: {
   rounds: number;
   parseFailures: number;
@@ -2212,718 +1994,10 @@ function isTextOutput(output: string): boolean {
     /\.(?:cjs|css|csv|hbs|html?|ini|json|jsx?|md|mjs|py|toml|tsx?|txt|xml|ya?ml)$/iu.test(output);
 }
 
-function renderUserPrompt(
-  inp: ExecutorRunInput,
-  toolDocs: string,
-  initialMissingOutputs: string[] = [],
-): string {
-  const role = inp.executionRole ?? inp.step.role;
-  const compactContext = !!inp.debugContext;
-  const snippets = inp.contextSnippets ?? [];
-  const debugRepairSnippetCount = Math.max(
-    1,
-    snippets.filter((snippet) => isDebugRepairSnippet(snippet.path)).length,
-  );
-  const debugRepairBudgetChars = Math.floor(
-    (inp.ctx.contextWindowTokens ?? 128 * 1024) * 3 * 0.3,
-  );
-  const debugRepairSnippetLimit = Math.max(
-    1_800,
-    Math.min(6_000, Math.floor(debugRepairBudgetChars / debugRepairSnippetCount)),
-  );
-  const snippetLimit = compactContext ? 900 : 2200;
-  const architectureLimit = compactContext ? 3000 : 8000;
-  const failureLogLimit = compactContext ? 2200 : 4000;
-  const ctxBlock = snippets
-    .map((s) =>
-      `### ${s.path}\n\`\`\`\n${truncate(
-        s.content,
-        s.path === '.xcompiler/architecture-contract.json' ||
-          s.path.startsWith('.xcompiler/objects/ticket/')
-          ? architectureLimit
-          : compactContext && isDebugRepairSnippet(s.path)
-            ? debugRepairSnippetLimit
-            : snippetLimit,
-      )}\n\`\`\``,
-    )
-    .join('\n\n');
-  const debugRepairPacket = compactContext && snippets.some((snippet) =>
-    isDebugRepairSnippet(snippet.path)
-  )
-    ? [
-        '## debug repair packet',
-        'The source, test, manifest, and config snippets below were loaded from the current workspace for this attempt.',
-        'Use any complete snippet directly for patch/write actions; do not spend another turn rereading it.',
-        'Only read a file again when its snippet explicitly ends with a truncation marker and the missing section is required for the repair.',
-        '',
-      ].join('\n')
-    : '';
-  const dbg = inp.debugContext
-    ? [
-        inp.debugContext.bugTicketId ? `## bug ticket\nid: ${inp.debugContext.bugTicketId}\n` : '',
-        inp.debugContext.debugBrief ? `${inp.debugContext.debugBrief}\n` : '',
-        `## compact failure evidence\n\`\`\`\n${truncate(inp.debugContext.failureLog, failureLogLimit)}\n\`\`\`\n`,
-        inp.debugContext.suggestions ? `\n${inp.debugContext.suggestions}\n` : '',
-      ].join('\n')
-    : '';
-  const verificationScope = inp.debugContext?.verificationScope
-    ? [
-        '## inherited paired verification gate',
-        `verification step: ${inp.debugContext.verificationScope.stepId}`,
-        `verification phase: ${inp.debugContext.verificationScope.phase}`,
-        'exact executable tests:',
-        ...inp.debugContext.verificationScope.testArgs.map((testPath) => `- ${testPath}`),
-        'This Bug was routed back from the paired verification Step. Repair only the root cause exposed by these tests.',
-        'Use run_tests without replacing the inherited selectors. Do not run broad compiler or all-project test commands that include tests owned by later V-model Steps.',
-        'A defect outside this exact gate belongs to its own owning Step and Ticket; do not absorb it into the current Bug.',
-        '',
-      ].join('\n')
-    : '';
-  const missingOutputPriority = initialMissingOutputs.length > 0
-    ? [
-        '## highest-priority required-output gate',
-        'The following exact required outputs are missing at this attempt start:',
-        initialMissingOutputs.map((output) => `- ${output}`).join('\n'),
-        'Create these exact paths before rewriting outputs that already exist. ' +
-          'A write/progress round that does not reduce this list is not progress.',
-        '',
-      ].join('\n')
-    : '';
-  const changeRequestBlock = inp.changeRequest
-    ? [
-        '## active change-request ticket',
-        `id: ${inp.changeRequest.id}`,
-        `revision: ${inp.changeRequest.revision}`,
-        `state: ${inp.changeRequest.state}`,
-        `source ticket: ${inp.changeRequest.sourceTicketId}`,
-        `objective: ${inp.changeRequest.description}`,
-        `contract delta: ${inp.changeRequest.contractDelta.summary}`,
-        'This CR carries an accepted upstream contract change. It is not an enhancement finding.',
-        'This is incremental CR execution against the existing project baseline.',
-        'Apply only the affected contract and artifacts for this Step. Preserve unrelated files and accepted behavior.',
-        'Do not regenerate the whole phase, project, design, or test suite.',
-        '',
-      ].join('\n')
-    : '';
-  const enhancementBlock = inp.enhancement
-    ? [
-        '## active enhancement ticket',
-        `id: ${inp.enhancement.id}`,
-        `kind: ${inp.enhancement.enhancementKind}`,
-        `finding: ${inp.enhancement.finding}`,
-        `verification step: ${inp.enhancement.verificationStepId}`,
-        'Append or patch only the missing, incomplete, or below-threshold content.',
-        'Preserve accepted baseline behavior and artifacts. Do not regenerate the whole phase or project.',
-        'For coverage gaps, use measured coverage evidence to add focused tests around uncovered production behavior. ' +
-          'Do not rewrite accepted production code merely to inflate a metric.',
-        '',
-      ].join('\n')
-    : '';
-  const workTicketBlock = inp.ticket
-    ? [
-        '## active work ticket',
-        `id: ${inp.ticket.id}`,
-        `type: ${inp.ticket.type}`,
-        `state: ${inp.ticket.state}`,
-        `parent: ${inp.ticket.parentTicketId ?? 'none'}`,
-        `acceptance: ${inp.ticket.acceptance.join(' | ') || inp.step.acceptance}`,
-        'Complete only this ticket and its declared sub-tasks/artifacts.',
-        '',
-      ].join('\n')
-    : '';
-  return [
-    `# Step ${inp.step.id} — ${inp.step.title}`,
-    `phase: ${inp.step.phase}`,
-    `role: ${role}`,
-    `acceptance: ${inp.step.acceptance}`,
-    '',
-    missingOutputPriority,
-    workTicketBlock,
-    enhancementBlock,
-    changeRequestBlock,
-    '## description',
-    inp.step.description,
-    '',
-    '## required outputs',
-    inp.step.outputs.map((o) => `- ${o}`).join('\n'),
-    '',
-    renderPhaseWriteBoundary(inp.step),
-    '',
-    '## writable paths (tool allowlist)',
-    inp.ctx.allowedWrites.map((o) => `- ${o}`).join('\n'),
-    '',
-    '## active model operation window',
-    `context_window_tokens: ${inp.ctx.contextWindowTokens ?? '(runtime default)'}`,
-    `response_token_budget: ${inp.ctx.responseTokenBudget ?? '(runtime default)'}`,
-    `read_file_chunk_bytes: ${inp.ctx.readChunkBytes ?? '(runtime default)'}`,
-    `write_content_chunk_bytes: ${inp.ctx.writeChunkBytes ?? '(runtime default)'}`,
-    `tool_feedback_chars: ${inp.ctx.feedbackCharBudget ?? '(runtime default)'}`,
-    '',
-    inp.step.subTasks && inp.step.subTasks.length > 0
-      ? `## step subtasks (execute inside this macro Step)\n${renderStepSubTasks(inp.step.subTasks, 0)}\n`
-      : '',
-    '## available tools',
-    toolDocs || '(none)',
-    '',
-    inp.step.inputs.length > 0
-      ? `## inputs (already produced):\n${inp.step.inputs.map((i) => `- ${i}`).join('\n')}\n`
-      : '',
-    debugRepairPacket,
-    verificationScope,
-    ctxBlock ? `## context\nTreat these existing files as the current project truth. Extend or refactor them in place; do not replace the project with a tiny parallel implementation.\n\n${ctxBlock}\n` : '',
-    dbg,
-    t().prompts.executorUserPromptOutro,
-  ]
-    .filter(Boolean)
-    .join('\n');
-}
-
-function isDebugRepairSnippet(rel: string): boolean {
-  const normalized = rel.replaceAll('\\', '/');
-  return normalized.startsWith('src/') ||
-    normalized.startsWith('tests/') ||
-    /^(?:package\.json|tsconfig(?:\.[^/]+)?\.json|requirements(?:-[^/]+)?\.txt|pyproject\.toml)$/u.test(normalized) ||
-    /^(?:config|src\/config)\/.+\.(?:json|toml|ya?ml)$/u.test(normalized);
-}
-
-function renderPhaseWriteBoundary(step: Step): string {
-  if (!isDeclarativeOutputPhase(step.phase)) return '';
-  return [
-    '## phase write boundary',
-    'Only the paths listed under writable paths may be created or changed in this phase.',
-    'REQUIREMENT_ANALYSIS, HIGH_LEVEL_DESIGN, and DETAILED_DESIGN own specifications and their paired executable tests; product implementation belongs to CODE.',
-    'A paired test may import planned product source paths before those source files exist. Do not create src/** stubs, placeholder implementations, or production behavior merely to make those imports resolve in this phase.',
-  ].join('\n');
-}
-
-function renderStepSubTasks(tasks: NonNullable<Step['subTasks']>, depth: number): string {
-  const indent = '  '.repeat(depth);
-  return tasks
-    .flatMap((task) => {
-      const outputs = task.outputs && task.outputs.length > 0 ? ` outputs=[${task.outputs.join(', ')}]` : '';
-      const lines = [
-        `${indent}- ${task.id}: ${task.title}${outputs}`,
-        `${indent}  ${task.description}`,
-      ];
-      if (task.acceptance) lines.push(`${indent}  acceptance: ${task.acceptance}`);
-      if (task.subTasks && task.subTasks.length > 0) lines.push(renderStepSubTasks(task.subTasks, depth + 1));
-      return lines;
-    })
-    .join('\n');
-}
-
-function compactMessagesForChat<T extends { role: 'system' | 'user' | 'assistant'; content: string }>(
-  messages: T[],
-  compact: boolean,
-): T[] {
-  if (!compact || messages.length <= 6) return messages;
-  const system = messages[0];
-  const initialUser = messages[1];
-  if (!system || !initialUser) return messages;
-  const recent = messages.slice(-4);
-  return [system, initialUser, ...recent];
-}
-
-function renderFeedback(
-  results: Array<ToolResult & { tool: string }>,
-  verify: { ok: boolean; missing: string[] },
-  turn: TurnFeedbackContext,
-  operationWindow: {
-    feedbackCharBudget?: number;
-    readChunkBytes?: number;
-  } = {},
-): string {
-  const M = t().prompts;
-  const lines: string[] = [M.executorFeedbackHeader];
-  const failureDetails = [
-    ...results.filter((result) => !result.ok).map((result) => result.error ?? result.summary ?? ''),
-    ...(turn.unresolvedFailures ?? []),
-  ];
-  let detailBudget = operationWindow.feedbackCharBudget ?? 12_000;
-  for (const r of results) {
-    lines.push(`- ${r.tool}: ${r.ok ? 'OK' : 'FAIL'} — ${truncate(r.summary ?? r.error ?? '', 1800)}`);
-    const detail = renderToolResultDetail(r, detailBudget, operationWindow.readChunkBytes);
-    if (detail) {
-      lines.push(detail.text);
-      detailBudget -= detail.used;
-    }
-  }
-  if (verify.ok) {
-    lines.push(M.executorFeedbackVerifyOk);
-    if (turn.repairEvidenceMissing) {
-      lines.push(M.executorFeedbackRepairEvidenceMissing);
-    }
-  } else {
-    lines.push(M.executorFeedbackVerifyMissing(verify.missing.join(', ')));
-    if (turn.declaredDone && turn.actionCount === 0) {
-      lines.push(
-        `Invalid completion: required outputs are still missing. ` +
-        `Next response must include concrete write actions that create: ${verify.missing.join(', ')}. ` +
-        `Do not return done=true with actions=[] until those files exist.`,
-      );
-    }
-  }
-  if (turn.readOnlyLoopWarning) {
-    lines.push(
-      M.executorFeedbackReadOnlyLoopWarning(
-        turn.readOnlyLoopWarning.rounds,
-        turn.readOnlyLoopWarning.targets,
-      ),
-    );
-  }
-  if (turn.missingOutputStallWarning) {
-    lines.push(
-      `Output progress warning: required outputs have not decreased for ${turn.missingOutputStallWarning.rounds} write/progress rounds. ` +
-      `Create these exact missing outputs next: ${turn.missingOutputStallWarning.missing}. ` +
-      'Do not keep rewriting files that already satisfy declared outputs.',
-    );
-  }
-  if (turn.readOnlyRecoveryWarning) {
-    if (turn.diagnosticProbeAllowance) {
-      lines.push(
-        M.executorFeedbackDiagnosticProbeAllowance(
-          turn.diagnosticProbeAllowance.remainingRounds,
-          turn.diagnosticProbeAllowance.maxActionsPerRound,
-        ),
-      );
-    } else {
-      lines.push(M.executorFeedbackReadOnlyRecoveryRequired);
-    }
-    if (!verify.ok && verify.missing.length > 0) {
-      lines.push(
-        `Direct repair target: required outputs are still missing: ${verify.missing.join(', ')}. ` +
-        `Next response must create or update those exact paths with write_file/apply_patch/replace_in_file, ` +
-        `or run a concrete verification command if they already exist. Do not spend another round only reading files.`,
-      );
-    }
-  }
-  if (turn.noProgressWarning) {
-    lines.push(
-      'No-progress warning: actions=[] with done=false does not advance the step. ' +
-      'The next response must run a concrete tool action or return done=true only when completion is already verified.',
-    );
-  }
-  if (turn.bugResolutionPlanMissing) {
-    lines.push(M.executorFeedbackBugResolutionPlanMissing);
-  }
-  if (turn.postMutationVerificationRequired) {
-    lines.push(M.executorFeedbackPostMutationVerificationRequired);
-  }
-  if (turn.qualityAssessmentMissing && turn.qualityAssessmentMissing.length > 0) {
-    lines.push(
-      `Quality gate protocol is incomplete. Required fields/evidence are missing: ` +
-      `${turn.qualityAssessmentMissing.join(', ')}. ` +
-      'Do not rewrite verified outputs. Return actions=[] and done=true with a complete qualityAssessment ' +
-      'backed by the existing artifact, test-report, or command evidence.',
-    );
-  }
-  if (failureDetails.some((failure) => /path must be a non-empty string/i.test(failure))) {
-    lines.push(
-      'Tool contract violation: file write/read tools require args.path to be a non-empty relative workspace path. ' +
-      'Retry with an explicit path from the current Step inputs, outputs, or writable allowlist.',
-    );
-  }
-  if (turn.unresolvedFailures && turn.unresolvedFailures.length > 0) {
-    lines.push(
-      `Unresolved tool failures remain: ${turn.unresolvedFailures.map((failure) => truncate(failure, 1200)).join('; ')}`,
-    );
-    if (turn.unresolvedFailures.some((failure) => /replace_in_file FAIL .*expected 1 occurrences of find, found 0/i.test(failure))) {
-      lines.push(
-        'Replace miss recovery: the find string does not match the current file. ' +
-        'Do not retry the same find text. Next response must use the exact current file bytes shown by read_file/tool hints, ' +
-        'or switch to apply_patch/write_file on the same target with a minimal repair, then run verification.',
-      );
-    }
-    if (turn.unresolvedFailures.some((failure) => /content must be a string/i.test(failure))) {
-      lines.push(
-        'Tool contract violation: write_file/append_file require args.content to be a literal string. ' +
-        'Do not send contentBytes, arrays, objects, or omitted content; retry the same target with a valid content string.',
-      );
-    }
-    if (turn.unresolvedFailures.some((failure) => /invalid add_dependency args/i.test(failure))) {
-      lines.push(
-        'Tool contract violation: add_dependency requires args.packages as a non-empty string array, ' +
-        'for example {"packages":["cheerio@1.0.0"]}; set dev=true for test/build tooling.',
-      );
-    }
-    if (turn.declaredDone) {
-      lines.push(
-        `Invalid completion: do not return done=true until each failed tool call is corrected ` +
-        `or superseded by a successful tool call on the same target.`,
-      );
-    }
-  }
-  return lines.join('\n');
-}
-
-function missingQualityAssessmentFields(
-  step: Step,
-  assessment: StageQualityAssessment | undefined,
-  freshAfterTools = true,
-  allowMetricGaps = false,
-): string[] {
-  // Legacy/programmatic Step objects without an explicit gate retain the
-  // lightweight Executor contract. Plans produced by Planner always persist
-  // the resolved gate, so real V-model execution enforces the evidence fields.
-  if (!step.qualityGate) return [];
-  if (!assessment) return ['qualityAssessment'];
-  const missing: string[] = [];
-  if (!freshAfterTools) {
-    missing.push('qualityAssessment.postToolEvidence');
-  }
-  if ((V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase)) {
-    if (typeof assessment.completion !== 'number') {
-      missing.push('qualityAssessment.completion');
-    }
-    if (typeof assessment.upstreamAlignment !== 'number') {
-      missing.push('qualityAssessment.upstreamAlignment');
-    }
-  }
-  for (const metric of Object.keys(resolveQualityGate(step).metrics)) {
-    if (
-      typeof assessment.metrics[metric] !== 'number' &&
-      !(allowMetricGaps && assessment.gaps.some((gap) => qualityGapNamesMetric(gap, metric)))
-    ) {
-      missing.push(`qualityAssessment.metrics.${metric}`);
-    }
-  }
-  if (assessment.evidence.length === 0) {
-    missing.push('qualityAssessment.evidence');
-  }
-  return missing;
-}
-
-function qualityGapNamesMetric(gap: string, metric: string): boolean {
-  const normalizedGap = gap.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
-  const normalizedMetric = metric.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
-  return normalizedMetric.length > 0 && normalizedGap.includes(normalizedMetric);
-}
-
-function renderToolResultDetail(
-  result: ToolResult & { tool: string },
-  remainingBudget: number,
-  readChunkBytes?: number,
-): { text: string; used: number } | undefined {
-  if (!result.ok || remainingBudget <= 200) return undefined;
-  const budget = Math.min(
-    remainingBudget,
-    result.tool === 'read_file' ? (readChunkBytes ?? 6000) : 3000,
-  );
-  const data = isPlainRecord(result.data) ? result.data : undefined;
-  if (result.tool === 'read_file' && typeof data?.content === 'string') {
-    const content = truncate(data.content, budget);
-    return {
-      text: ['  content:', '<<<BEGIN read_file content', content, 'END read_file content>>>'].join('\n'),
-      used: content.length,
-    };
-  }
-  if (result.tool === 'list_dir' && Array.isArray(data?.entries)) {
-    const entries = data.entries.filter((entry): entry is string => typeof entry === 'string');
-    if (entries.length === 0) return { text: '  entries: (empty)', used: 18 };
-    const text = `  entries:\n${truncate(entries.map((entry) => `  - ${entry}`).join('\n'), budget)}`;
-    return { text, used: text.length };
-  }
-  if (result.tool === 'code_search' && Array.isArray(data?.matches)) {
-    const matches = data.matches
-      .filter((match): match is { path: string; line: number; text: string } =>
-        isPlainRecord(match) &&
-        typeof match.path === 'string' &&
-        typeof match.line === 'number' &&
-        typeof match.text === 'string',
-      )
-      .map((match) => `${match.path}:${match.line}: ${match.text}`);
-    if (matches.length === 0) return undefined;
-    const text = `  matches:\n${truncate(matches.map((match) => `  - ${match}`).join('\n'), budget)}`;
-    return { text, used: text.length };
-  }
-  return undefined;
-}
-
-function parseTurn(text: string): LLMTurn {
-  const cleaned = stripFence(text).trim();
-  // 1) 直接解析最常见的"单一 JSON 对象"输出
-  const direct = tryParseTurnCandidate(cleaned);
-  if (direct) return direct;
-  // 2) 扫描首个完整的平衡花括号对象（兼容 LLM 返回多段 ```json``` 拼接、
-  //    或 JSON 前后带散文 / 多个对象）。逐字符按 {/} 计数，跳过字符串与转义。
-  const first = extractFirstJsonObject(cleaned);
-  if (first) {
-    const parsed = tryParseTurnCandidate(first);
-    if (parsed) {
-      const firstEnd = cleaned.indexOf(first) + first.length;
-      const hasTrailingDone = /"done"\s*:/u.test(cleaned.slice(firstEnd));
-      if (typeof parsed.done === 'boolean' || !hasTrailingDone) return parsed;
-    }
-  }
-  // 3) 终极兜底：原来的 first-{ to last-} 切片
-  const a = cleaned.indexOf('{');
-  const b = cleaned.lastIndexOf('}');
-  if (a >= 0 && b > a) {
-    const parsed = tryParseTurnCandidate(cleaned.slice(a, b + 1));
-    if (parsed) return parsed;
-  }
-  const salvaged = salvageMalformedTurn(cleaned);
-  if (salvaged) return salvaged;
-  return {};
-}
-
-function salvageMalformedTurn(text: string): LLMTurn | null {
-  const actions: unknown[] = [];
-  const re = /\{\s*"tool"\s*:/g;
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(text))) {
-    const candidate = extractJsonObjectAt(text, match.index);
-    if (!candidate) continue;
-    const parsed = tryParseJson(repairJsonCandidate(candidate));
-    if (isPlainRecord(parsed) && typeof parsed.tool === 'string') {
-      actions.push(parsed);
-    }
-    re.lastIndex = match.index + Math.max(1, candidate.length);
-  }
-  if (actions.length === 0) return null;
-  const thoughtMatch = text.match(/"thoughts"\s*:\s*"((?:\\.|[^"\\])*)"/u);
-  const doneMatch = [...text.matchAll(/"done"\s*:\s*(true|false)/gu)].at(-1);
-  return {
-    thoughts: thoughtMatch ? parseJsonStringLiteral(thoughtMatch[1] ?? '') : undefined,
-    actions,
-    done: doneMatch ? doneMatch[1] === 'true' : false,
-  };
-}
-
-function parseJsonStringLiteral(value: string): string | undefined {
-  try {
-    return JSON.parse(`"${value}"`) as string;
-  } catch {
-    return undefined;
-  }
-}
-
-export function isCompleteTurnJson(text: string): boolean {
-  const cleaned = stripFence(text).trim();
-  if (!/"done"\s*:/.test(cleaned)) return false;
-  const last = cleaned.at(-1);
-  if (last !== '}' && last !== ']') return false;
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  if (start < 0 || end <= start) return false;
-  const candidate = cleaned.slice(start, end + 1);
-  // Streaming must stop only on strict JSON. Applying jsonrepair here can turn a
-  // prefix such as `content":"import` into a seemingly complete action and
-  // truncate the provider stream before the file payload arrives.
-  const turn = isTurnObject(tryParseJson(candidate));
-  return !!turn && typeof turn.done === 'boolean' && Array.isArray(turn.actions);
-}
-
-/** 返回 s 中第一个语法上完整的 `{...}` 子串（按字符串/转义正确计数花括号）。 */
-function extractFirstJsonObject(s: string): string | null {
-  const start = s.indexOf('{');
-  if (start < 0) return null;
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i]!;
-    if (inStr) {
-      if (escape) escape = false;
-      else if (ch === '\\') escape = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') {
-      inStr = true;
-    } else if (ch === '{') {
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0) return s.slice(start, i + 1);
-    }
-  }
-  return null;
-}
-
-/** 返回 s 中从 start 开始的语法上完整 `{...}` 子串。 */
-function extractJsonObjectAt(s: string, start: number): string | null {
-  if (s[start] !== '{') return null;
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i]!;
-    if (inStr) {
-      if (escape) escape = false;
-      else if (ch === '\\') escape = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') {
-      inStr = true;
-    } else if (ch === '{') {
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0) return s.slice(start, i + 1);
-    }
-  }
-  return null;
-}
-
-function stripFence(s: string): string {
-  return s.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '');
-}
-
 function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + `\n... [truncated ${s.length - n} chars]` : s;
 }
 
-function tryParseTurnCandidate(candidate: string): LLMTurn | null {
-  const exact = isTurnObject(tryParseJson(candidate));
-  if (exact) return exact;
-  const trimmed = candidate.trim();
-  if (extractFirstJsonObject(trimmed) !== trimmed) {
-    return null;
-  }
-  const repaired = repairJsonCandidate(candidate);
-  if (repaired !== candidate) {
-    const parsed = isTurnObject(tryParseJson(repaired));
-    if (parsed) return parsed;
-  }
-  return null;
-}
-
-function tryParseJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function repairJsonCandidate(text: string): string {
-  const normalized = normalizeJsonLikeStrings(text).trim();
-  try {
-    return jsonrepair(normalized).trim();
-  } catch {
-    return normalized;
-  }
-}
-
-function isTurnObject(value: unknown): LLMTurn | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const nativeTool = normalizeNativeToolUse(record);
-  if (nativeTool) {
-    return {
-      thoughts: 'execute provider-native tool request',
-      actions: [nativeTool],
-      done: false,
-    };
-  }
-  return record as LLMTurn;
-}
-
-function normalizeNativeToolUse(value: Record<string, unknown>): LLMAction | undefined {
-  if (
-    (value.type === 'tool_use' || value.type === 'tool_call') &&
-    typeof value.name === 'string' &&
-    isPlainRecord(value.input ?? value.arguments)
-  ) {
-    return {
-      tool: value.name,
-      args: (value.input ?? value.arguments) as Record<string, unknown>,
-    };
-  }
-  if (typeof value.tool === 'string' && isPlainRecord(value.args)) {
-    return { tool: value.tool, args: value.args };
-  }
-  if (value.type === 'tool_call' && isPlainRecord(value.function)) {
-    const fn = value.function;
-    if (typeof fn.name !== 'string') return undefined;
-    const rawArgs = fn.arguments;
-    if (isPlainRecord(rawArgs)) return { tool: fn.name, args: rawArgs };
-    if (typeof rawArgs === 'string') {
-      const parsed = tryParseJson(rawArgs);
-      if (isPlainRecord(parsed)) return { tool: fn.name, args: parsed };
-    }
-  }
-  return undefined;
-}
-
-function extractBugResolutionPlan(turn: LLMTurn): string | undefined {
-  const candidates = [
-    turn.bugResolutionPlan,
-    turn.bug_resolution_plan,
-    turn.resolutionPlan,
-    turn.handlingPlan,
-    turn.fixPlan,
-  ];
-  for (const value of candidates) {
-    if (typeof value === 'string' && value.trim().length > 0) {
-      return truncate(value.trim(), 2400);
-    }
-  }
-  return undefined;
-}
-
-function extractValidationDefect(turn: LLMTurn): string | undefined {
-  const candidates = [
-    turn.validationDefect,
-    turn.validation_defect,
-    turn.validationFailure,
-    turn.validation_failure,
-  ];
-  for (const value of candidates) {
-    if (typeof value === 'string' && value.trim().length > 0) {
-      return truncate(value.trim(), 2400);
-    }
-  }
-  return undefined;
-}
-
-function normalizeJsonLikeStrings(text: string): string {
-  let out = '';
-  let inStr = false;
-  let escape = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]!;
-    if (!inStr) {
-      out += ch;
-      if (ch === '"') inStr = true;
-      continue;
-    }
-    if (escape) {
-      out += ch;
-      escape = false;
-      continue;
-    }
-    if (ch === '\\') {
-      out += ch;
-      escape = true;
-      continue;
-    }
-    if (ch === '\r') continue;
-    if (ch === '\n') {
-      out += '\\n';
-      continue;
-    }
-    if (ch === '"') {
-      const next = nextNonWhitespaceChar(text, i + 1);
-      if (next === ':' || next === ',' || next === '}' || next === ']' || next === '') {
-        out += ch;
-        inStr = false;
-      } else {
-        out += '\\"';
-      }
-      continue;
-    }
-    out += ch;
-  }
-  return out;
-}
-
-function nextNonWhitespaceChar(text: string, start: number): string {
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i]!;
-    if (!/\s/.test(ch)) return ch;
-  }
-  return '';
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
