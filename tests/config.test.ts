@@ -62,6 +62,18 @@ describe('config locale', () => {
     await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/ui_language/);
   });
 
+  it('explains removed 0.2 keys instead of dumping the schema error', async () => {
+    // 0.3 does not migrate old config, so the failure has to say what to do about it.
+    const cfgPath = await writeConfig(
+      baseConfig({ agent: { max_steps: 50, max_debug_retries: 3 } }),
+    );
+    const failure = await loadConfigWithPath(cfgPath).catch((error: Error) => error.message);
+    expect(failure).toContain('agent.max_steps');
+    expect(failure).toContain('agent.max_debug_retries');
+    expect(failure).toContain('config.example.yaml');
+    expect(failure).not.toContain('unrecognized_keys');
+  });
+
   it('parses the optional Ollama think flag', async () => {
     const cfg = baseConfig();
     const llm = cfg.llm as Record<string, unknown>;

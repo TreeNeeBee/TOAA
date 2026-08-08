@@ -19,11 +19,28 @@ export interface AttemptFailure {
  * enter the V-model defect loop. Keep this deliberately provider-specific so a
  * network/API failure produced by the project itself still becomes a Bug.
  */
+/** Classifies a reason this runtime authored, so provider phrasing in it is trustworthy. */
 export function classifyAttemptFailure(reason: unknown): AttemptFailureKind {
-  return classifyFailure(reason).kind;
+  return classifyFailure(reason, { trustProviderText: true }).kind;
 }
 
-export function classifyFailure(reason: unknown): AttemptFailure {
+export interface ClassifyFailureOptions {
+  /**
+   * Opt in to reading provider phrasing out of the text as evidence that *our* provider failed.
+   *
+   * Defaults to false, because trust is a property of where the string came from and nothing at the
+   * type level marks that. Only text this runtime authored about its own model calls may opt in.
+   * Anything captured from the generated project is subject data: XCompiler can legitimately be
+   * asked to build an LLM application whose own output says "all LLM providers failed", and reading
+   * that as infrastructure would cycle providers forever instead of routing a real defect to Debug.
+   */
+  trustProviderText?: boolean;
+}
+
+export function classifyFailure(
+  reason: unknown,
+  options: ClassifyFailureOptions = {},
+): AttemptFailure {
   if (isLLMRequestError(reason)) {
     return {
       kind: 'infrastructure',
@@ -48,6 +65,17 @@ export function classifyFailure(reason: unknown): AttemptFailure {
     };
   }
   const message = reason instanceof Error ? reason.message : String(reason ?? '');
+  if (options.trustProviderText === true && PROVIDER_FAILURE_TEXT.test(message)) {
+    return {
+      kind: 'infrastructure',
+      category: 'llm-provider',
+      code: 'provider_call_failed',
+      message,
+      retryable: true,
+      switchProvider: true,
+      statusCode: parseStatusCode(message),
+    };
+  }
   return {
     kind: 'execution',
     category: 'internal',
@@ -56,4 +84,21 @@ export function classifyFailure(reason: unknown): AttemptFailure {
     retryable: true,
     switchProvider: false,
   };
+}
+
+/**
+ * Bounded textual fallback for provider failures that reach classification already stringified —
+ * a Ticket's recorded `reason`/`failureLog` rather than a live `LLMRequestError`. Without it an
+ * outage of our own model provider is recorded as a defect in the generated project.
+ *
+ * It deliberately matches only phrasing this runtime emits for its own provider calls. A network
+ * failure produced *by the generated project* ("run_tests failed: external API returned HTTP 429")
+ * must stay `execution` so it still becomes a Bug, per the failure-routing rules.
+ */
+const PROVIDER_FAILURE_TEXT =
+  /\ball LLM providers failed\b|\bOpenAI-compatible provider request failed\b|\bstream idle before first token\b|\bprovider_call_failed\b/iu;
+
+function parseStatusCode(message: string): number | undefined {
+  const match = /\bstatus=(\d{3})\b/u.exec(message);
+  return match ? Number.parseInt(match[1]!, 10) : undefined;
 }

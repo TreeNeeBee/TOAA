@@ -3,7 +3,7 @@ import { XCOMPILER_VERSION, XCompilerRuntime, type ExecuteResult } from '../runt
 import { setLocale, t } from '../i18n/index.js';
 import { configureLocalizedHelp, localeFromArgv, parseLocale, parseRecordReplayMode } from './arguments.js';
 import { xcEnv } from '../config/env.js';
-import { createCliRuntimeIO } from './runtime_adapter.js';
+import { createCliRuntimeIO, createNonInteractiveCliRuntimeIO } from './runtime_adapter.js';
 
 setLocale(localeFromArgv(process.argv) ?? xcEnv('LANG') ?? 'en');
 const runtime = new XCompilerRuntime({ io: createCliRuntimeIO() });
@@ -28,6 +28,8 @@ program
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (planArg, opts) => {
     const result = await runtime.runCommand({
+      // Execution asks nothing: the human gates all live in `build`.
+      io: createNonInteractiveCliRuntimeIO(),
       planArg,
       output: opts.output,
       workspace: opts.workspace,

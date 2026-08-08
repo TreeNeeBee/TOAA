@@ -11,8 +11,47 @@ const ROLE_CAPABILITIES: Readonly<Record<DomainRole, readonly string[]>> = {
   tester: ['unit-verification', 'module-verification', 'functional-verification'],
 };
 
+/**
+ * What each Step actually demands, as opposed to everything its role can do.
+ *
+ * A development Step authors both its own artifact and the tests of the Step it is paired with in
+ * the V-model, so it demands the design capability of that pair. Routing can only discriminate
+ * between two actors of one role if Tickets ask for the narrow set.
+ */
+const STEP_CAPABILITIES: Readonly<Record<StepType, readonly string[]>> = {
+  REQUIREMENT_ANALYSIS: ['requirement-analysis', 'functional-test-design'],
+  HIGH_LEVEL_DESIGN: ['high-level-design', 'module-test-design'],
+  DETAILED_DESIGN: ['detailed-design', 'integration-test-design'],
+  CODE: ['code', 'unit-test-design'],
+  FUNCTIONAL_TEST: ['functional-verification'],
+  MODULE_TEST: ['module-verification'],
+  INTEGRATION_TEST: ['integration-verification', 'contract-verification'],
+  UNIT_TEST: ['unit-verification'],
+};
+
+/** The working mode a corrective Ticket adds on top of the Step's own capabilities. */
+const TICKET_TYPE_CAPABILITY: Partial<Readonly<Record<TicketType, string>>> = {
+  bug: 'debug',
+  'change-request': 'change-implementation',
+};
+
 export function capabilitiesForRole(role: DomainRole): string[] {
   return [...ROLE_CAPABILITIES[role]];
+}
+
+/**
+ * The capabilities a Ticket against `type` must demand of its assignee.
+ *
+ * Always a subset of the owning role's declared capabilities, so narrowing can never make a Ticket
+ * unroutable to the role that owns its Step.
+ */
+export function capabilitiesForStep(type: StepType, ticketType?: TicketType): string[] {
+  const declared = ROLE_CAPABILITIES[roleForStepType(type)];
+  const mode = ticketType ? TICKET_TYPE_CAPABILITY[ticketType] : undefined;
+  // A mode capability applies only where the role declares it: a Change Request propagates into
+  // Steps whose roles have no separate change-implementation capability.
+  const extra = mode && declared.includes(mode) ? [mode] : [];
+  return [...STEP_CAPABILITIES[type], ...extra];
 }
 
 export function roleForStepType(type: StepType): DomainRole {

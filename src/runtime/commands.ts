@@ -1,6 +1,10 @@
 import path from 'node:path';
 import { loadXCompilerProject } from '../core/project_file.js';
 import { DEFAULT_PHASE_PLAN_FILE } from '../core/phase_plan.js';
+import {
+  ContainerLayoutError,
+  findProjectContainer,
+} from '../workspace/project_container.js';
 import { runCompile, type CompileOptions } from './build.js';
 import { runExecute, type ExecuteOptions, type ExecuteResult } from './run.js';
 import {
@@ -79,15 +83,24 @@ export type RuntimeRunCommandOptions =
 export async function runRunCommand(opts: RuntimeRunCommandOptions): Promise<ExecuteResult> {
   const cwd = opts.cwd ?? process.cwd();
   const explicit = opts.output ?? opts.workspace;
-  const workspace = explicit
+  // Any of these may name the container, a worktree inside it, or a file within one — `-w` is
+  // documented as the container, but the plan path printed by `build` points into the working copy.
+  // Resolving through the layout accepts all three instead of assuming one.
+  const start = explicit
     ? path.resolve(explicit)
     : opts.planArg
       ? path.dirname(path.resolve(opts.planArg))
       : cwd;
-  const planPath = opts.planArg ? path.resolve(opts.planArg) : await defaultRunnablePlanPath(workspace);
+  const container = await findProjectContainer(start);
+  if (!container) {
+    throw new ContainerLayoutError(start, 'no enclosing project container was found');
+  }
+  const planPath = opts.planArg
+    ? path.resolve(opts.planArg)
+    : path.join(container.canonical().workspace.root, DEFAULT_PHASE_PLAN_FILE);
   return runExecute({
     ...opts,
-    workspace,
+    workspace: container.root,
     planPath,
     projectCommand: 'run',
   });
@@ -103,7 +116,8 @@ export async function runLoadCommand(opts: RuntimeLoadCommandOptions): Promise<E
   return runExecute({
     ...opts,
     planPath: project.planPath,
-    workspace: project.workspace,
+    // The container, not the working copy: `runExecute` resolves state and worktrees from it.
+    workspace: project.container,
     configPath: opts.configPath ? path.resolve(opts.configPath) : project.configPath,
     projectFilePath: project.filePath,
     projectCommand: 'load',
@@ -129,7 +143,7 @@ export async function runAppendCommand(opts: RuntimeAppendCommandOptions): Promi
   const planPath = opts.planOut ? path.resolve(opts.planOut) : project.planPath;
   const compiled = await runCompile({
     ...opts,
-    workspace: project.workspace,
+    workspace: project.container,
     configPath,
     baselinePlanFile: project.planPath,
     outputFile: planPath,
@@ -139,7 +153,7 @@ export async function runAppendCommand(opts: RuntimeAppendCommandOptions): Promi
   if (!compiled.planPath) return { workspace: project.workspace };
   const execution = await runExecute({
     planPath: compiled.planPath,
-    workspace: project.workspace,
+    workspace: project.container,
     configPath,
     force: !!opts.force,
     projectFilePath: project.filePath,
@@ -155,6 +169,4 @@ export async function runAppendCommand(opts: RuntimeAppendCommandOptions): Promi
   return { workspace: project.workspace, planPath: compiled.planPath, execution };
 }
 
-async function defaultRunnablePlanPath(workspace: string): Promise<string> {
-  return path.join(workspace, DEFAULT_PHASE_PLAN_FILE);
-}
+

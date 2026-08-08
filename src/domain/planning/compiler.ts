@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import type {
-  ImplementationPhase as DraftPhase,
-  Plan as DraftPlan,
-  Step as DraftStep,
-  StepSubtask as DraftTask,
-} from '../../core/plan.js';
+  PlanDraftPhase as DraftPhase,
+  PlanDraft as DraftPlan,
+  PlanDraftStep as DraftStep,
+  PlanDraftTask as DraftTask,
+} from './plan_draft.js';
 import { createObjectEnvelope, extractObjectEnvelope, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import type { ObjectId } from '../identity/object_id.js';
 import { ProjectSchema, transitionProject, type Project } from '../projects/project.js';
@@ -32,12 +32,13 @@ import {
 } from './plan.js';
 import { assertDomainGraph, type DomainGraph } from '../workflow/domain_graph.js';
 import { DOMAIN_ROLES, type DomainRole } from '../workflow/role.js';
+import { capabilitiesForStep, roleForStepType } from '../workflow/role_profile.js';
 import {
-  capabilitiesForRole,
-  defaultAgentForRole,
-  roleForStepType,
-  supportedTicketTypesForRole,
-} from '../workflow/role_profile.js';
+  RoleDefinitionSchema,
+  seedRoleDefinition,
+  type RoleDefinition,
+  type RoleTemplateOverlay,
+} from '../workflow/role_definition.js';
 import {
   ActorRegistrationSchema,
   ProjectManagementPlanSchema,
@@ -51,6 +52,7 @@ export interface CompiledProjectGraph extends DomainGraph {
   phasePlans: PhasePlan[];
   kpis: Kpi[];
   deliverables: Deliverable[];
+  roleDefinitions: RoleDefinition[];
   actors: ActorRegistration[];
   managementPlan: ProjectManagementPlan;
 }
@@ -60,6 +62,8 @@ export interface CompileProjectGraphInput {
   topic: string;
   topicSourceRef?: string;
   projectName: string;
+  /** Installation-level role identity overrides, read outside the Domain and passed in. */
+  roleTemplates?: RoleTemplateOverlay;
 }
 
 export interface CompiledPhaseMaterialization {
@@ -275,7 +279,10 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     now,
   });
   const projectId = projectEnvelope.id;
-  const actors = DOMAIN_ROLES.map((role) => createActorRegistration(projectId, role, now));
+  const roleDefinitions = DOMAIN_ROLES.map(
+    (role) => createRoleDefinition(projectId, role, now, input.roleTemplates ?? {}),
+  );
+  const actors = roleDefinitions.map((definition) => createActorRegistration(projectId, definition, now));
   const actorByRole = new Map(actors.map((actor) => [actor.role, actor]));
   const pmActor = requireActor(actorByRole, 'project-manager');
   const projectPlanEnvelope = createObjectEnvelope({
@@ -461,6 +468,7 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     tickets,
     kpis,
     deliverables,
+    roleDefinitions,
     actors,
     managementPlan,
   };
@@ -510,7 +518,11 @@ function compileActivePhase(input: {
       type,
       title: draftStep.title,
       description: draftStep.description,
-      role: domainRoleFor(draftStep, type),
+      // The V-model position decides who owns a Step; the planner's agent hint only decides which
+      // prompt persona runs it. Deriving the role from the hint instead let a plan hand requirement
+      // analysis to a developer, contradicting both the role's supportedStepTypes and the
+      // capabilities its Tickets demand.
+      role: roleForStepType(type),
       agent: draftStep.role,
       state: 'created',
       dependencyStepIds: draftStep.dependsOn.map((name) => stepEnvelopes.get(name)?.id).filter(isObjectId),
@@ -569,7 +581,7 @@ function compileActivePhase(input: {
       role: step.role,
       agent: step.agent,
       creatorActorId: input.pmActorId,
-      requiredCapabilities: capabilitiesForRole(step.role),
+      requiredCapabilities: capabilitiesForStep(step.type),
       priority: TICKET_PRIORITY.high,
       parentTicketId: input.epicEnvelope.id,
       rootTicketId: input.epicEnvelope.id,
@@ -646,7 +658,14 @@ function registerTasks(
   }
   for (const [index, draftTask] of draftTasks.entries()) {
     const envelope = createObjectEnvelope({
-      name: `${step.name}-T${String(index + 1).padStart(2, '0')}${depth === 2 ? 'S' : ''}`,
+      // A subtask is numbered within its own parent, so naming it after the Step alone gave every
+      // parent's first subtask the same name — three `P1-S004-T01S` in one Phase, pointing at three
+      // different Tickets. Names are the identity every log line, audit entry, and evidence bundle
+      // shows, so deriving the child's from the parent's makes it unique by construction rather than
+      // by a counter someone has to remember to make global.
+      name: depth === 1
+        ? `${step.name}-T${String(index + 1).padStart(2, '0')}`
+        : `${parent.name}S${String(index + 1).padStart(2, '0')}`,
       objectType: 'ticket',
       projectId: step.projectId,
       now,
@@ -659,7 +678,7 @@ function registerTasks(
       role: step.role,
       agent: step.agent,
       creatorActorId,
-      requiredCapabilities: capabilitiesForRole(step.role),
+      requiredCapabilities: capabilitiesForStep(step.type),
       priority: TICKET_PRIORITY.normal,
       parentTicketId: parent.id,
       rootTicketId: epicId,
@@ -676,7 +695,7 @@ function registerTasks(
   }
 }
 
-function normalizedDraftPhases(plan: DraftPlan): DraftPhase[] {
+function normalizedDraftPhases(plan: DraftPlan): readonly DraftPhase[] {
   const phases = plan.implementationPhases;
   if (phases.length === 0) throw new Error('Project plan must contain at least one Phase');
   const current = phases.filter((phase) => phase.status === 'current');
@@ -692,22 +711,35 @@ function isDevelopmentStepType(type: StepType): type is keyof typeof SOURCE_TO_V
   return Object.hasOwn(SOURCE_TO_VERIFICATION_STEP, type);
 }
 
-function domainRoleFor(step: DraftStep, type: StepType) {
-  if (step.role === 'Planner') return 'requirements-engineer' as const;
-  if (step.role === 'Architect') return 'system-engineer' as const;
-  if (step.role === 'Coder' || step.role === 'Debugger') return 'developer' as const;
-  return type === 'INTEGRATION_TEST' ? 'integrator' as const : 'tester' as const;
+function createRoleDefinition(
+  projectId: ObjectId,
+  role: DomainRole,
+  now: string,
+  templates: RoleTemplateOverlay,
+): RoleDefinition {
+  return RoleDefinitionSchema.parse({
+    ...createObjectEnvelope({
+      name: `role-${role}`,
+      objectType: 'role-definition',
+      projectId,
+      now,
+    }),
+    ...seedRoleDefinition(role, templates),
+  });
 }
 
-function createActorRegistration(projectId: ObjectId, role: DomainRole, now: string): ActorRegistration {
+function createActorRegistration(
+  projectId: ObjectId,
+  definition: RoleDefinition,
+  now: string,
+): ActorRegistration {
+  const role = definition.role;
   return ActorRegistrationSchema.parse({
     ...createObjectEnvelope({ name: `actor-${role}`, objectType: 'actor-registration', projectId, now }),
     actorKind: 'llm-agent',
     role,
-    agent: defaultAgentForRole(role),
-    capabilities: capabilitiesForRole(role),
-    supportedTicketTypes: supportedTicketTypesForRole(role),
-    supportedStepTypes: STEP_TYPES.filter((type) => roleForStepType(type) === role),
+    roleDefinitionId: definition.id,
+    agent: definition.defaultAgent,
     state: 'active',
     capacity: role === 'project-manager' ? 255 : 1,
     activeAssignmentIds: [],

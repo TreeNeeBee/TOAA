@@ -36,17 +36,24 @@ export interface SubprocessSandboxOptions {
   audit?: AuditLogger;
   /** 目标语言，决定运行时（venv/pip/pytest vs node_modules/npm/vitest）。默认 python。 */
   language?: Language;
-  /** 沙盒根目录相对 workspace，默认 `.sandbox` */
-  sandboxDir?: string;
+  /**
+   * 环境根目录（宿主绝对路径）。位于容器状态目录下，不在工作副本内，
+   * 因此增删 worktree 不会破坏已准备好的环境。
+   */
+  environmentRoot: string;
+  /** Shared package download cache; falls back to the environment's own when absent. */
+  downloadCacheRoot?: string;
   /** Python 解释器。默认从 PATH 找 python3 / python。 */
   pythonBin?: string;
+  /** Package registry for dependency resolution; unset leaves the tool's own default. */
+  registry?: string;
   /** 是否继承宿主进程环境。默认 false；显式启用会把宿主凭据暴露给项目代码。 */
   inheritEnv?: boolean;
 }
 
 /**
  * SubprocessSandbox：
- *  - 在 workspace/.sandbox/venv 内创建 Python 虚拟环境
+ *  - 在 <environmentRoot>/venv 内创建 Python 虚拟环境（环境根在容器状态目录下）
  *  - `requirements.txt` 哈希作为缓存键，未变更跳过 pip install
  *  - exec(): 强制 wall-clock 超时（subprocess 模式下 cpu/memory 仅做软限制）
  *
@@ -57,18 +64,18 @@ export class SubprocessSandbox implements Sandbox {
   readonly kind = 'subprocess' as const;
   private readonly language: Language;
   private readonly sandboxAbs: string;
+  private readonly downloadCacheAbs: string;
   private readonly venvAbs: string;
   private readonly cacheFile: string;
   private pyBin: string | null = null;
 
   constructor(private readonly opts: SubprocessSandboxOptions) {
     this.language = opts.language ?? 'python';
-    const dir = opts.sandboxDir ?? '.sandbox';
-    this.sandboxAbs = opts.ws.abs(dir);
-    // venv 目录名 = 项目名（workspace 目录的 basename，做安全清洗），方便 `source` 后
-    // shell prompt 显示 `(<projectName>)`，多项目时一眼可辨。
-    const projectName = sanitizeVenvName(path.basename(opts.ws.root));
-    this.venvAbs = path.join(this.sandboxAbs, projectName);
+    this.sandboxAbs = opts.environmentRoot;
+    this.downloadCacheAbs = opts.downloadCacheRoot ?? opts.environmentRoot;
+    // 环境根路径本身已经标识了归属（project/phase/role），因此 venv 目录名固定；
+    // 若沿用 workspace basename，每个 worktree 都会得到不同的 venv 名而无法共享。
+    this.venvAbs = path.join(this.sandboxAbs, 'venv');
     this.cacheFile = path.join(
       this.sandboxAbs,
       this.language === 'typescript' ? 'package.sha256' : 'requirements.sha256',
@@ -121,8 +128,8 @@ export class SubprocessSandbox implements Sandbox {
       await Promise.all([
         fs.mkdir(path.join(this.sandboxAbs, 'home'), { recursive: true }),
         fs.mkdir(path.join(this.sandboxAbs, 'tmp'), { recursive: true }),
-        fs.mkdir(path.join(this.sandboxAbs, 'npm-cache'), { recursive: true }),
-        fs.mkdir(path.join(this.sandboxAbs, 'pip-cache'), { recursive: true }),
+        fs.mkdir(path.join(this.downloadCacheAbs, 'npm-cache'), { recursive: true }),
+        fs.mkdir(path.join(this.downloadCacheAbs, 'pip-cache'), { recursive: true }),
       ]);
     }
     if (this.language === 'typescript') {
@@ -176,7 +183,7 @@ export class SubprocessSandbox implements Sandbox {
     }
     if (reqContent.trim().length > 0) {
       const progressWatch = createInstallProgressWatch(
-        [this.venvAbs, path.join(this.sandboxAbs, 'pip-cache')],
+        [this.venvAbs, path.join(this.downloadCacheAbs, 'pip-cache')],
         this.opts.limits,
         'pip install',
       );
@@ -226,7 +233,7 @@ export class SubprocessSandbox implements Sandbox {
       ? ['ci', '--ignore-scripts', '--no-audit', '--no-fund']
       : ['install', '--ignore-scripts', '--no-audit', '--no-fund'];
     const progressWatch = createInstallProgressWatch(
-      [this.opts.ws.abs('node_modules'), path.join(this.sandboxAbs, 'npm-cache')],
+      [this.opts.ws.abs('node_modules'), path.join(this.downloadCacheAbs, 'npm-cache')],
       this.opts.limits,
       'npm install',
     );
@@ -236,11 +243,33 @@ export class SubprocessSandbox implements Sandbox {
       progressIdleTimeoutMs: progressWatch.idleTimeoutMs,
       progressPaths: progressWatch.paths,
     });
-    const r = await execRaw('npm', installArgs, {
+    let r = await execRaw('npm', installArgs, {
       cwd: this.opts.ws.root,
       env: this.baseEnvironment(),
       progressWatch,
     });
+    // `npm ci` refuses when the manifest and the lockfile disagree, and says to run `npm install`.
+    // They disagree routinely here: HIGH_LEVEL_DESIGN authors package.json by writing the file, and
+    // no lockfile comes with it. Making each caller remember to ask for a refresh puts one decision
+    // in three places — and all three of them were failing silently, so no environment was ever
+    // updated after the manifest changed.
+    const refreshArgs = installRetryArgs(installArgs, r);
+    if (refreshArgs) {
+      await this.opts.audit?.event(
+        'sandbox.exec',
+        t().sandboxLog.command('subprocess', `npm ${refreshArgs.join(' ')}`),
+        {
+          messageId: 'sandbox.command',
+          cwd: this.opts.ws.root,
+          reason: 'lockfile out of sync with the manifest',
+        },
+      );
+      r = await execRaw('npm', refreshArgs, {
+        cwd: this.opts.ws.root,
+        env: this.baseEnvironment(),
+        progressWatch,
+      });
+    }
     if (r.exitCode !== 0) {
       throw new Error(formatExecFailure(`npm dependency install failed (cwd=${this.opts.ws.root})`, r));
     }
@@ -304,6 +333,18 @@ export class SubprocessSandbox implements Sandbox {
     return r;
   }
 
+  /**
+   * The registry the host resolves packages from, and nothing else from its npm configuration.
+   *
+   * `HOME` is redirected to an empty sandbox directory so host credentials never reach a generated
+   * project. That also discards `~/.npmrc`, and with it the registry endpoint: npm then falls back
+   * to the public default, which a network using a mirror does not reach — measured at 181ms with
+   * the host configuration and still running after five minutes without it.
+   *
+   * Configured rather than inherited: which registry a generated project resolves from is a project
+   * decision, and an endpoint picked up silently from the host is one nobody chose. Unset leaves the
+   * tool's own default in place.
+   */
   private baseEnvironment(): NodeJS.ProcessEnv {
     if (this.opts.inheritEnv === true) return { ...process.env };
     return {
@@ -312,8 +353,17 @@ export class SubprocessSandbox implements Sandbox {
       TMPDIR: path.join(this.sandboxAbs, 'tmp'),
       CI: '1',
       NO_COLOR: '1',
-      NPM_CONFIG_CACHE: path.join(this.sandboxAbs, 'npm-cache'),
+      NPM_CONFIG_CACHE: path.join(this.downloadCacheAbs, 'npm-cache'),
       NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+      ...(this.opts.registry ? { NPM_CONFIG_REGISTRY: this.opts.registry } : {}),
+      // Measured against a weak network: a cold install of one test runner took ten minutes, and
+      // npm abandoned it at `ETIMEDOUT` on a socket read well before that. Its defaults assume a
+      // fast link. Retrying longer costs nothing when the link is fast, and is the difference
+      // between a project that builds and one that never gets past its first dependency.
+      NPM_CONFIG_FETCH_RETRIES: '5',
+      NPM_CONFIG_FETCH_RETRY_MINTIMEOUT: '20000',
+      NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT: '120000',
+      NPM_CONFIG_FETCH_TIMEOUT: '600000',
     };
   }
 
@@ -341,7 +391,7 @@ export class SubprocessSandbox implements Sandbox {
     const progressWatch = createInstallProgressWatch(
       [
         this.language === 'typescript' ? this.opts.ws.abs('node_modules') : this.venvAbs,
-        path.join(this.sandboxAbs, this.language === 'typescript' ? 'npm-cache' : 'pip-cache'),
+        path.join(this.downloadCacheAbs, this.language === 'typescript' ? 'npm-cache' : 'pip-cache'),
       ],
       this.opts.limits,
       this.language === 'typescript' ? 'npm install' : 'pip install',
@@ -367,6 +417,37 @@ function nodeDependencySignature(packageJson: string, lockfile: string): string 
 export function sanitizeVenvName(name: string): string {
   const cleaned = name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   return cleaned.length > 0 ? cleaned : 'venv';
+}
+
+/**
+ * npm's own signal that the lockfile no longer matches the manifest.
+ *
+ * `EUSAGE` is npm's error code for it, so the code is the test and the sentence is only the
+ * fallback for a version that stops emitting one.
+ */
+/**
+ * The command to run instead when an install failed for a reason the next command fixes.
+ *
+ * Only one case so far, and npm names it itself: `npm ci` refuses when the manifest and the lockfile
+ * disagree and tells you to run `npm install`. They disagree routinely here, because
+ * HIGH_LEVEL_DESIGN authors package.json by writing the file and no lockfile comes with it.
+ *
+ * Decided here rather than at each caller. Three sync paths would otherwise each have to remember to
+ * ask for a lockfile refresh, and all three were failing this way at once — silently, so no
+ * environment was ever updated after the manifest changed.
+ */
+export function installRetryArgs(
+  attempted: readonly string[],
+  result: { exitCode: number; stderr: string },
+): string[] | undefined {
+  if (result.exitCode === 0 || attempted[0] !== 'ci') return undefined;
+  if (!isLockfileOutOfSync(result.stderr)) return undefined;
+  return ['install', '--ignore-scripts', '--no-audit', '--no-fund'];
+}
+
+export function isLockfileOutOfSync(stderr: string): boolean {
+  return /\bEUSAGE\b/u.test(stderr) ||
+    /can only install packages when your package\.json and package-lock\.json/iu.test(stderr);
 }
 
 export function createInstallProgressWatch(

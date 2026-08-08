@@ -90,6 +90,22 @@ describe('LLMRouter fallback chain', () => {
     expect(client.name).toBe('chain[openai:gpt>ollama:qwen]');
   });
 
+  it('an actor provider pool overrides the role pool and does not inherit global fallbacks', () => {
+    const cfg = mkCfg({
+      fallbacks: ['openai'],
+      role_fallbacks: { Coder: ['ollama_code'] },
+    });
+    const router = new LLMRouter(cfg);
+    // Neither the role pool, the role fallbacks, nor the global fallbacks contribute: the bound
+    // actor gets exactly the providers it was bound to.
+    expect(router.for('Coder', { providerPool: ['ollama_design'] }).name).toBe('ollama:gemma');
+    expect(router.for('Coder', { providerPool: ['openai', 'ollama_design'] }).name)
+      .toBe('chain[openai:gpt>ollama:gemma]');
+    // An absent or empty binding leaves the configured resolution untouched.
+    expect(router.for('Coder', {}).name).toBe('ollama:qwen');
+    expect(router.for('Coder', { providerPool: [] }).name).toBe('ollama:qwen');
+  });
+
   it('FallbackClient.chat tries each provider in order', async () => {
     // Manually construct a router and patch internal clients via reflection
     const cfg = mkCfg({ fallbacks: ['openai'] });

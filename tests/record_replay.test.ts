@@ -63,4 +63,40 @@ describe('generic record/replay', () => {
       request: { command: 'npm test' },
     }, async () => ({ exitCode: 0 }))).rejects.toMatchObject<RecordReplayError>({ code: 'replay_miss' });
   });
+
+  it('accounts for replayed, recorded, and unmanaged interactions as delivery evidence', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-record-replay-usage-'));
+    const store = new FileRecordReplayStore(root);
+    const record = new RecordReplayController({ mode: 'record', store, enabledChannels: ['http'] });
+    await record.execute(
+      { channel: 'http', operation: 'GET', request: { url: 'https://example.test/a' } },
+      async () => ({ status: 200 }),
+    );
+    // `subprocess` is outside the enabled channels here, so it runs live and is reported as such.
+    await record.execute(
+      { channel: 'subprocess', operation: 'test', request: { command: 'npm test' } },
+      async () => ({ exitCode: 0 }),
+    );
+    expect(record.evidence().usage.http).toEqual({ replayed: 0, recorded: 1, live: 0 });
+    expect(record.evidence().usage.subprocess).toEqual({ replayed: 0, recorded: 0, live: 1 });
+    // `subprocess` is not fixture-controlled here, so it must be reported as unmanaged rather than
+    // silently counted as "nothing happened".
+    expect(record.evidence().managedChannels).toEqual(['http']);
+
+    const replay = new RecordReplayController({ mode: 'replay', store, enabledChannels: ['http'] });
+    await replay.execute(
+      { channel: 'http', operation: 'GET', request: { url: 'https://example.test/a' } },
+      async () => ({ status: 500 }),
+    );
+    expect(replay.evidence().usage.http).toEqual({ replayed: 1, recorded: 0, live: 0 });
+  });
+
+  it('reports no managed channels when fixtures are off, so evidence cannot claim replay', async () => {
+    // Callers skip execute() entirely when a channel is disabled, so counters stay zero for a run
+    // that made real calls. Evidence must therefore key off managedChannels, not the counters.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-record-replay-off-'));
+    const off = new RecordReplayController({ mode: 'off', store: new FileRecordReplayStore(root) });
+    expect(off.enabled('llm')).toBe(false);
+    expect(off.evidence()).toMatchObject({ mode: 'off', managedChannels: [] });
+  });
 });

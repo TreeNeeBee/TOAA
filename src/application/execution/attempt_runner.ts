@@ -1,10 +1,14 @@
 import type { AuditLogger } from '../../audit/audit.js';
-import { StepExecutor, type ExecutorRunResult } from '../../agents/executor.js';
+import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
 import { ensureEssentialToolRefs } from '../../agents/calibration.js';
 import {
   buildDebugBrief,
 } from '../../core/debug_brief.js';
 import { DebugWiki, defaultDebugWikiPath, type DebugWikiMatch } from '../../core/debug_wiki.js';
+import {
+  ContextAssembler,
+  type AssembledContext,
+} from '../context/context_assembler.js';
 import {
   buildDownstreamContextSnippet,
   computeDebugAllowedWrites,
@@ -17,7 +21,13 @@ import { getLanguageProfile, type LanguageProfile } from '../../core/language.js
 import type { Plan, Step as ExecutionStep } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
 import type { Step } from '../../domain/steps/step.js';
-import { TicketSchema, type BugTicket, type Ticket } from '../../domain/tickets/ticket.js';
+import {
+  TicketSchema,
+  appendTicketCommit,
+  type BugTicket,
+  type Ticket,
+  type TicketCommit,
+} from '../../domain/tickets/ticket.js';
 import { reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import { QualityAssessmentService } from './quality_assessment_service.js';
 import type { QualityAssessment } from '../../domain/quality/quality.js';
@@ -25,6 +35,7 @@ import type { Changelist } from '../../domain/evidence/evidence.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import { DomainAuditTrail } from '../observability/domain_audit_trail.js';
 import type { LLMRouter } from '../../llm/router.js';
+import type { RoutingActor } from '../project_management/role_registry.js';
 import { resolveSkillOperationWindow } from '../../llm/window.js';
 import type { PluginHost } from '../../plugins/host.js';
 import type { Sandbox } from '../../sandbox/types.js';
@@ -56,7 +67,6 @@ import {
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
   type AttemptMode,
-  type AttemptVerificationScope,
 } from './attempt_policy.js';
 
 export {
@@ -67,10 +77,24 @@ export {
   resolveAttemptVerificationScope,
 } from './attempt_policy.js';
 
+/**
+ * The working copy an attempt actually runs in, together with the Git and sandbox bindings for it.
+ *
+ * Resolved per attempt rather than fixed at construction, because a Ticket develops in its own
+ * worktree: the canonical working copy is only the default for work that has no ChangeSet yet.
+ */
+export interface ExecutionScope {
+  workspace: Workspace;
+  git: GitService;
+  sandbox: Sandbox;
+}
+
 export interface AttemptRunnerOptions {
   workspace: Workspace;
   git: GitService;
   sandbox: Sandbox;
+  /** Resolves the scope for one attempt; defaults to the canonical workspace bindings. */
+  resolveScope?: (input: AttemptInput) => Promise<ExecutionScope>;
   router: LLMRouter;
   audit: AuditLogger;
   repository: DomainObjectRepositoryPort;
@@ -84,8 +108,16 @@ export interface AttemptRunnerOptions {
   onToolEvent?: ToolExecutionReporter;
   terminalOutput?: boolean;
   debugWikiPath?: string;
+  /**
+   * Project-scoped Debug Wiki root, under container state. Without it findings would accumulate in
+   * the shared installation tier, where one project's build quirk becomes a retrieval candidate for
+   * every unrelated project.
+   */
+  projectDebugWikiPath?: string;
   recordReplay?: RecordReplayController;
   abortSignal?: AbortSignal;
+  /** Character budget for the assembled context block. Unset means no trimming. */
+  contextBudgetChars?: number;
 }
 
 export interface AttemptInput {
@@ -94,10 +126,23 @@ export interface AttemptInput {
   domainStep: Step;
   ticket: Ticket;
   mode: AttemptMode;
+  /**
+   * The actor holding this Ticket, with the definition it instantiates. Resolved by PM at routing
+   * time rather than here, because which actor holds the work is an assignment fact; the runner
+   * only reads what that actor is and which models it may use.
+   */
+  assignee?: RoutingActor;
 }
 
 export interface AttemptResult {
   ok: boolean;
+  /**
+   * Packages this Step asked for and is not allowed to add itself.
+   *
+   * Reported rather than acted on here: which Step owns the manifest is a Domain rule, and the
+   * transition back to it belongs to PM.
+   */
+  dependencyRequest?: { packages: string[]; reason: string };
   failureKind?: AttemptFailureKind;
   failure?: AttemptFailure;
   reason?: string;
@@ -117,6 +162,7 @@ export class DomainAttemptRunner {
   private readonly skills: SkillRegistry;
   private readonly quality: QualityAssessmentService;
   private readonly wiki: DebugWiki;
+  private readonly context: ContextAssembler;
   private readonly profile: LanguageProfile;
   private readonly traces: DomainAuditTrail;
 
@@ -125,8 +171,16 @@ export class DomainAttemptRunner {
     this.skills = options.skills ?? buildDefaultSkills();
     this.quality = new QualityAssessmentService(options.repository);
     this.traces = new DomainAuditTrail(options.repository);
-    this.wiki = new DebugWiki(options.debugWikiPath ?? defaultDebugWikiPath(options.workspace.root));
+    this.wiki = new DebugWiki(
+      options.debugWikiPath ?? defaultDebugWikiPath(options.workspace.root),
+      // Findings about this codebase go to the project tier; the installation tiers stay shared.
+      { projectPath: options.projectDebugWikiPath },
+    );
     this.profile = getLanguageProfile(language);
+    this.context = new ContextAssembler(options.repository, {
+      wiki: this.wiki,
+      language: this.profile.id,
+    });
   }
 
   async initialize(): Promise<void> {
@@ -209,14 +263,25 @@ export class DomainAttemptRunner {
     return this.runAttempt(input);
   }
 
+  private canonicalScope(): ExecutionScope {
+    return {
+      workspace: this.options.workspace,
+      git: this.options.git,
+      sandbox: this.options.sandbox,
+    };
+  }
+
   private async runAttempt(input: AttemptInput): Promise<AttemptResult> {
-    const baseline = await this.options.git.snapshot(input.domainStep.id, input.domainStep.attempts, 'attempt baseline');
+    const scope = await this.options.resolveScope?.(input) ?? this.canonicalScope();
+    // Persist the baseline before doing any work. Held only in memory, a crash between snapshot and
+    // rollback would leave the working copy changed with nothing recording where to return.
+    const baseline = await this.recordTicketCommit(scope, input, 'baseline', 'attempt baseline');
     let wikiMatches: DebugWikiMatch[] = [];
     try {
       if (isVerification(input.domainStep)) {
-        const inspection = await this.testValidator().inspect(input.plan, input.executionStep);
+        const inspection = await this.testValidator(scope).inspect(input.plan, input.executionStep);
         if (!inspection.ok) {
-          return await this.failAndRollback(baseline, input, {
+          return await this.failAndRollback(scope, baseline, input, {
             reason: `${input.domainStep.type} test assets are incomplete`,
             failureLog: inspection.failureLog,
             failure: {
@@ -231,10 +296,13 @@ export class DomainAttemptRunner {
         }
       }
 
+      // One assembly per attempt: it is both the context the role sees and the single Debug Wiki
+      // retrieval, so the snapshot below records exactly what reached the model.
+      const assembled = await this.assembleContext(input);
       const debugContext = input.ticket.type === 'bug'
-        ? await this.buildDebugContext(input.ticket, input.executionStep)
+        ? debugContextFrom(input.ticket, input.executionStep, assembled.debugWikiMatches)
         : undefined;
-      wikiMatches = debugContext?.matches ?? [];
+      wikiMatches = assembled.debugWikiMatches;
       if (wikiMatches.length > 0 && input.ticket.type === 'bug') {
         await this.wiki.recordUse(wikiMatches.map((match) => match.entry.id), {
           brief: debugContext!.brief,
@@ -247,7 +315,7 @@ export class DomainAttemptRunner {
         });
       }
 
-      const environment = await this.buildEnvironment(input, debugContext?.suggestions);
+      const environment = await this.buildEnvironment(scope, input, debugContext?.suggestions);
       const result = await environment.executor.run({
         step: input.executionStep,
         stepName: input.domainStep.name,
@@ -274,7 +342,13 @@ export class DomainAttemptRunner {
               }
             : undefined,
         } : undefined,
+        layeredContext: assembled.text,
         globalPrompt: input.plan.globalPrompt,
+        roleIdentity: input.assignee && {
+          rolePrompt: input.assignee.definition.rolePrompt,
+          capabilityPrompt: input.assignee.definition.capabilityPrompt,
+          prohibitions: input.assignee.definition.prohibitions,
+        },
         languageProfile: this.profile,
       });
       if (!result.success) {
@@ -305,12 +379,13 @@ export class DomainAttemptRunner {
             reason: result.error,
           });
         }
-        return await this.failAndRollback(baseline, input, {
+        return await this.failAndRollback(scope, baseline, input, {
           reason: result.error ?? 'Step executor did not complete',
           failureLog: renderExecutorFailure(result),
           failureKind,
           failure,
           executor: result,
+          dependencyRequest: dependencyRequestFrom(result.toolCalls),
           wikiEntryIds: wikiMatches.map((match) => match.entry.id),
         });
       }
@@ -320,7 +395,7 @@ export class DomainAttemptRunner {
         reconcileMeasuredQualityAssessment(result.qualityAssessment, result.toolCalls),
       );
       if (!assessment.passed) {
-        return await this.failAndRollback(baseline, input, {
+        return await this.failAndRollback(scope, baseline, input, {
           reason: `Quality gate failed: ${assessment.gaps.join('; ')}`,
           failureLog: assessment.gaps.join('\n'),
           assessment,
@@ -336,13 +411,18 @@ export class DomainAttemptRunner {
           wikiEntryIds: wikiMatches.map((match) => match.entry.id),
         });
       }
-      const status = await this.options.git.raw().status();
+      const status = await scope.git.raw().status();
       const changedFiles = status.files.map((file) => normalizeGitPath(file.path));
       const changes = status.files.map((file) => ({
         path: normalizeGitPath(file.path),
         operation: gitChangeOperation(file.index, file.working_dir),
       }));
-      const commit = await this.options.git.snapshot(input.domainStep.id, input.domainStep.attempts, 'verified change');
+      // The manifest can be delivered as a plain file output, not only through add_dependency, and
+      // writing it changes nothing about the sandbox on its own. A design that declared its
+      // dependencies and left the environment without them hands every later Step a project whose
+      // toolchain is not installed.
+      await this.syncSandboxIfManifestChanged(scope, changedFiles);
+      const commit = await this.recordTicketCommit(scope, input, 'verified', 'verified change');
       return {
         ok: true,
         assessment,
@@ -355,8 +435,9 @@ export class DomainAttemptRunner {
         testOutcomes: collectTestOutcomes(result.toolCalls, input.domainStep.type),
       };
     } catch (error) {
-      const failure = classifyFailure(error);
-      return this.failAndRollback(baseline, input, {
+      // A thrown error on our own execution path carries a message this runtime authored.
+      const failure = classifyFailure(error, { trustProviderText: true });
+      return this.failAndRollback(scope, baseline, input, {
         reason: error instanceof Error ? error.message : String(error),
         failureLog: error instanceof Error ? error.stack ?? error.message : String(error),
         failureKind: failure.kind,
@@ -366,7 +447,7 @@ export class DomainAttemptRunner {
     }
   }
 
-  private async buildEnvironment(input: AttemptInput, debugSuggestions?: string) {
+  private async buildEnvironment(scope: ExecutionScope, input: AttemptInput, debugSuggestions?: string) {
     const incremental = input.mode !== 'normal';
     const verificationScope = resolveAttemptVerificationScope(
       input.plan,
@@ -421,7 +502,7 @@ export class DomainAttemptRunner {
       promptChars: budgetContext.contextChars,
     });
     const guard = new EditGuard({
-      ws: this.options.workspace,
+      ws: scope.workspace,
       stepId: input.domainStep.id,
       maxLines: this.options.maxEditLinesPerStep ?? 'auto',
       budgetContext,
@@ -431,11 +512,12 @@ export class DomainAttemptRunner {
       return this.options.plugins.size > 0 ? this.options.plugins.wrapTool(guarded) : guarded;
     });
     const context: ToolContext = {
-      ws: this.options.workspace,
-      sandbox: this.options.sandbox,
+      ws: scope.workspace,
+      sandbox: scope.sandbox,
       audit: this.options.audit,
       allowedWrites,
       stepId: input.domainStep.id,
+      phase: input.domainStep.type,
       language: input.plan.language,
       contextWindowTokens: window.contextWindowTokens,
       responseTokenBudget: window.responseTokenBudget,
@@ -448,7 +530,7 @@ export class DomainAttemptRunner {
       onToolEvent: this.options.onToolEvent,
       recordReplay: this.options.recordReplay,
     };
-    const snippets = await this.contextSnippets(input);
+    const snippets = await this.contextSnippets(scope, input);
     const rounds = resolveAttemptRoundLimit(
       input.mode,
       this.options.maxRoundsPerStep ?? 6,
@@ -456,7 +538,10 @@ export class DomainAttemptRunner {
     );
     return {
       executor: new StepExecutor({
-        llm: this.options.router.for(input.mode === 'debug' ? 'Debugger' : input.domainStep.agent),
+        llm: this.options.router.for(
+          input.mode === 'debug' ? 'Debugger' : input.domainStep.agent,
+          { providerPool: input.assignee?.actor.llmBinding?.providerPool },
+        ),
         signal: this.options.abortSignal,
         streamOutput: this.options.terminalOutput === true,
         maxRounds: rounds,
@@ -469,7 +554,7 @@ export class DomainAttemptRunner {
     };
   }
 
-  private async contextSnippets(input: AttemptInput): Promise<Array<{ path: string; content: string }>> {
+  private async contextSnippets(scope: ExecutionScope, input: AttemptInput): Promise<Array<{ path: string; content: string }>> {
     const candidates = new Set([
       ...input.executionStep.inputs,
       ...(input.mode === 'normal' ? [] : input.executionStep.outputs),
@@ -498,8 +583,8 @@ export class DomainAttemptRunner {
     const downstream = buildDownstreamContextSnippet(input.plan, input.executionStep);
     if (downstream) snippets.push({ path: `.xcompiler/downstream/${input.domainStep.name}.md`, content: downstream });
     for (const candidate of candidates) {
-      if (!candidate || candidate.endsWith('/') || !(await this.options.workspace.exists(candidate))) continue;
-      snippets.push({ path: candidate, content: await this.options.workspace.readFile(candidate) });
+      if (!candidate || candidate.endsWith('/') || !(await scope.workspace.exists(candidate))) continue;
+      snippets.push({ path: candidate, content: await scope.workspace.readFile(candidate) });
     }
     return snippets;
   }
@@ -523,7 +608,12 @@ export class DomainAttemptRunner {
     return this.quality.assessStep({
       step,
       metrics,
-      evidence: value?.evidence ?? [],
+      // A precondition the Step does not own is recorded, not held against it. It reaches the gate
+      // as evidence so the assessment still shows why the Step could go no further.
+      evidence: [
+        ...(value?.evidence ?? []),
+        ...(value?.blockedBy ?? []).map((blocker) => `blocked by: ${blocker}`),
+      ],
       gaps: [
         ...(value?.gaps ?? []),
         ...((value?.tolerance.failedTests ?? 0) > step.tolerance.maxFailedTests
@@ -539,26 +629,102 @@ export class DomainAttemptRunner {
     });
   }
 
-  private async buildDebugContext(ticket: BugTicket, step: ExecutionStep) {
-    const brief = buildDebugBrief({
-      reason: ticket.failure.summary,
-      failureLog: ticket.failure.message,
-      phase: step.phase,
-      targetPhase: step.phase,
+  /**
+   * Assembles the layered context for this attempt and records what it contained.
+   *
+   * The snapshot is persisted rather than kept in memory because its purpose is replay: an attempt
+   * can only be re-run against the context it actually saw if the revisions of every source and the
+   * wiki entries retrieved survive the run.
+   */
+  private async assembleContext(input: AttemptInput): Promise<AssembledContext> {
+    const assembled = await this.context.assemble({
+      projectId: input.domainStep.projectId,
+      phaseId: input.domainStep.phaseId,
+      stepId: input.domainStep.id,
+      ticketId: input.ticket.id,
+      budgetChars: this.options.contextBudgetChars,
+      debugBrief: input.ticket.type === 'bug'
+        ? debugBriefFor(input.ticket, input.executionStep)
+        : undefined,
     });
-    const matches = await this.wiki.search(brief, { language: this.profile.id, limit: 3 });
-    const suggestions = matches.length === 0 ? undefined : [
-      'Relevant debug-wiki entries (validate before applying):',
-      ...matches.map((match) => `- ${match.entry.id}: ${match.entry.solution}`),
-    ].join('\n');
-    return { brief, matches, suggestions };
+    await this.traces.recordLog({
+      projectId: input.domainStep.projectId,
+      subject: { id: input.ticket.id, objectType: 'ticket' },
+      level: 'info',
+      message: `context assembled for ${input.domainStep.name}`,
+      data: {
+        phaseId: input.domainStep.phaseId,
+        stepId: input.domainStep.id,
+        mode: input.mode,
+        attempt: input.domainStep.attempts,
+        snapshot: assembled.snapshot,
+      },
+      correlationId: input.ticket.source.correlationId,
+    });
+    return assembled;
   }
 
-  private testValidator(): TestPhaseValidator {
-    return new TestPhaseValidator(this.options.workspace);
+  private testValidator(scope: ExecutionScope): TestPhaseValidator {
+    return new TestPhaseValidator(scope.workspace);
+  }
+
+  /**
+   * Snapshots the working copy and records the commit on the Ticket in one step, so the Ticket is
+   * always the authority on what can be rolled back to.
+   */
+  /** Rebuilds the sandbox when an attempt delivered a new dependency manifest. */
+  private async syncSandboxIfManifestChanged(
+    scope: ExecutionScope,
+    changedFiles: readonly string[],
+  ): Promise<void> {
+    const manifest = this.profile.manifestFile;
+    if (!deliveredManifest(changedFiles, manifest)) return;
+    try {
+      const built = await scope.sandbox.build(manifest);
+      await this.options.audit.event('sandbox.exec', `sandbox synced after ${manifest} changed`, {
+        messageId: 'execute.sandbox_synced',
+        rebuilt: built.rebuilt,
+        reason: built.reason,
+      });
+    } catch (error) {
+      // Reported, not thrown: the Step did deliver its design, and a Step that cannot resolve the
+      // packages will say so itself with the condition in front of it.
+      await this.options.audit.event('note', `sandbox sync failed after ${manifest} changed: ${(error as Error).message}`, {
+        messageId: 'execute.sandbox_sync_failed',
+      });
+    }
+  }
+
+  private async recordTicketCommit(
+    scope: ExecutionScope,
+    input: AttemptInput,
+    kind: TicketCommit['kind'],
+    summary: string,
+  ): Promise<string> {
+    const revision = await scope.git.snapshot(
+      input.domainStep.id,
+      input.domainStep.attempts,
+      summary,
+    );
+    const current = await this.options.repository.read(input.ticket.id);
+    if (current.objectType !== 'ticket') throw new Error(`Object ${input.ticket.id} is not a Ticket`);
+    const updated = appendTicketCommit(current, {
+      revision,
+      kind,
+      attempt: input.domainStep.attempts,
+      stepId: input.domainStep.id,
+      summary,
+      recordedAt: new Date().toISOString(),
+    });
+    await this.options.repository.update(
+      TicketSchema.parse({ ...updated, ...reviseObjectEnvelope(updated) }),
+      updated.state,
+    );
+    return revision;
   }
 
   private async failAndRollback(
+    scope: ExecutionScope,
     baseline: string,
     input: AttemptInput,
     failure: Omit<AttemptResult, 'ok' | 'changedFiles' | 'wikiEntryIds' | 'testOutcomes'> & {
@@ -566,8 +732,12 @@ export class DomainAttemptRunner {
       testOutcomes?: TestOutcome[];
     },
   ): Promise<AttemptResult> {
-    await this.options.git.revertTo(baseline);
-    const classified = failure.failure ?? classifyFailure(failure.reason ?? failure.failureLog);
+    await scope.git.revertTo(baseline);
+    // `reason` is authored by this runtime, so provider phrasing in it is trustworthy evidence.
+    // `failureLog` is captured from the generated project and must not be text-matched.
+    const classified = failure.failure ?? (failure.reason !== undefined
+      ? classifyFailure(failure.reason)
+      : classifyFailure(failure.failureLog, { trustProviderText: false }));
     const failureKind = failure.failureKind ?? classified.kind;
     const testOutcomes = failure.testOutcomes ?? collectTestOutcomes(
       failure.executor?.toolCalls ?? [],
@@ -637,10 +807,6 @@ function isVerification(step: Step): boolean {
   return ['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.type);
 }
 
-function isVerificationPhase(phase: ExecutionStep['phase']): boolean {
-  return ['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(phase);
-}
-
 function renderExecutorFailure(result: ExecutorRunResult): string {
   return [
     result.error ?? 'Executor failed.',
@@ -655,10 +821,59 @@ export function changelistEntries(files: readonly string[]) {
   }));
 }
 
+/**
+ * The packages a Step asked for and was refused because another phase owns the manifest.
+ *
+ * Read from the tool's code rather than its message: an earlier wording change here silently
+ * switched a Step from retrying to aborting, and this decides whether the whole flow rolls back.
+ */
+/**
+ * Whether an attempt delivered the dependency manifest.
+ *
+ * Matched at a path boundary so a file merely ending in the manifest's name — `vendor-package.json`
+ * — does not trigger a rebuild of an environment nothing asked to change.
+ */
+export function deliveredManifest(changedFiles: readonly string[], manifestFile: string): boolean {
+  return changedFiles.some((file) => file === manifestFile || file.endsWith(`/${manifestFile}`));
+}
+
+function dependencyRequestFrom(
+  calls: readonly ToolCallRecord[],
+): { packages: string[]; reason: string } | undefined {
+  const refused = calls.filter((call) => call.code === 'dependency_not_owned');
+  if (refused.length === 0) return undefined;
+  const packages = [...new Set(refused.flatMap((call) => {
+    const asked = (call.args as { packages?: unknown } | undefined)?.packages;
+    return Array.isArray(asked) ? asked.filter((item): item is string => typeof item === 'string') : [];
+  }))];
+  if (packages.length === 0) return undefined;
+  return { packages, reason: refused[0]!.error ?? 'A Step requested packages it does not own.' };
+}
+
 function gitChangeOperation(index: string, workingDirectory: string): Changelist['entries'][number]['operation'] {
   const status = `${index}${workingDirectory}`;
   if (status.includes('D')) return 'delete';
   if (status.includes('R')) return 'rename';
   if (status.includes('A') || status.includes('?')) return 'create';
   return 'update';
+}
+
+function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {
+  return buildDebugBrief({
+    reason: ticket.failure.summary,
+    failureLog: ticket.failure.message,
+    phase: step.phase,
+    targetPhase: step.phase,
+  });
+}
+
+function debugContextFrom(ticket: BugTicket, step: ExecutionStep, matches: DebugWikiMatch[]) {
+  return {
+    brief: debugBriefFor(ticket, step),
+    matches,
+    suggestions: matches.length === 0 ? undefined : [
+      'Relevant debug-wiki entries (validate before applying):',
+      ...matches.map((match) => `- ${match.entry.id}: ${match.entry.solution}`),
+    ].join('\n'),
+  };
 }

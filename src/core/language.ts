@@ -97,6 +97,9 @@ const typescriptProfile: LanguageProfile = {
   displayName: 'TypeScript',
   manifestFile: 'package.json',
   codeExtensions: ['.ts', '.tsx'],
+  // HIGH_LEVEL_DESIGN authors package.json; the runtime does not seed it. Creating the sandbox and
+  // filling it with dependencies are separate events — the environment exists before the V-model
+  // starts, and the manifest that populates it arrives when the design that chose it does.
   seedManifestFromDeps: false,
   defaultDockerImage: 'node:24-slim',
   renderManifest(deps) {
@@ -126,7 +129,13 @@ const typescriptProfile: LanguageProfile = {
     }
     return `tests/${stepId.toLowerCase()}.test.ts`;
   },
-  plannerPromptOverride: '',
+  // `vitest run` discovers only `**/*.{test,spec}.?(c|m)[jt]s?(x)`. A planner carrying Python habits
+  // declares `tests/test_thing.ts`, which vitest silently does not collect: the gate then fails with
+  // "No test files found" and no role can repair it, because the name came from the Step's declared
+  // outputs rather than from anything the executor chose.
+  plannerPromptOverride: '\n\nTypeScript test files must be named `<name>.test.ts` or `<name>.spec.ts` ' +
+    '(for example `tests/modules/scrapers.test.ts`). `vitest run` collects no other name, so a Step ' +
+    'declaring `tests/test_scrapers.ts` produces a suite that can never run.',
   executorPromptOverride: '',
   async autoFixImports(ws, audit) {
     return autoFixTypeScriptTypeOnlyImports(ws, audit);

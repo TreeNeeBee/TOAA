@@ -1,3 +1,4 @@
+import { isUnownedStepFailure } from '../../tools/types.js';
 import type { ExecutorRunResult } from '../../agents/executor.js';
 import {
   buildDebugBrief,
@@ -8,7 +9,7 @@ import type { Plan, Step } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
 import { pairedTestAssetPaths } from '../../core/test_assets.js';
 import type { DomainLog } from '../../domain/observability/records.js';
-import type { Ticket } from '../../domain/tickets/ticket.js';
+import { workStepId, type Ticket } from '../../domain/tickets/ticket.js';
 
 export type AttemptMode = 'normal' | 'debug' | 'enhancement' | 'change-request';
 
@@ -48,6 +49,13 @@ export function reconcileMeasuredQualityAssessment(
   toolCalls: ExecutorRunResult['toolCalls'],
 ): StageQualityAssessment | undefined {
   if (!value) return value;
+  // A Step that could not run its tests because the manifest belongs to another phase reports that
+  // honestly, and the gate fails it for every gap it reports — punishing accuracy. The declared
+  // outputs still gate the Step; this only stops a condition it does not own from counting as work
+  // it failed to deliver. The fourth guard to need the same fact.
+  if (toolCalls.some((call) => isUnownedStepFailure(call.code))) {
+    value = { ...value, gaps: [] };
+  }
   const summaries = toolCalls
     .filter((call) => call.ok && call.tool === 'run_tests' && call.summary)
     .map((call) => call.summary!);
@@ -114,11 +122,9 @@ export function resolveAttemptVerificationScope(
     : ticket.type === 'enhancement'
       ? ticket.verificationStepId
       : undefined;
-  const targetStepId = ticket.type === 'bug'
-    ? ticket.failure.targetStepId
-    : ticket.type === 'enhancement'
-      ? ticket.targetStepId
-      : undefined;
+  // Same rule PM routes and WorkScheduler dispatches by; keeping a local copy is how routing and
+  // scheduling drifted apart before.
+  const targetStepId = workStepId(ticket);
   const inheritedFromTicket =
     verificationStepId !== undefined &&
     targetStepId === executionStep.id &&

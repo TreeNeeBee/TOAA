@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { Workspace } from '../src/workspace/workspace.js';
-import { isCompleteTurnJson, StepExecutor } from '../src/agents/executor.js';
+import { isCompleteTurnJson, StepExecutor, verifyOutputs } from '../src/agents/executor.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 import type { Step } from '../src/core/plan.js';
 import { getLanguageProfile } from '../src/core/language.js';
@@ -11,6 +11,7 @@ import type { Tool, ToolContext, ToolExecutionEvent } from '../src/tools/types.j
 import { readFileTool, writeFileTool } from '../src/tools/fs.js';
 import { replaceInFileTool } from '../src/tools/edit.js';
 import { runTestsTool } from '../src/tools/sandbox.js';
+import { seedRoleDefinition } from '../src/domain/workflow/role_definition.js';
 
 class CapturingLLM implements LLMClient {
   readonly name = 'cap';
@@ -83,6 +84,53 @@ describe('StepExecutor system prompt assembly', () => {
     expect(events).toHaveLength(2);
     expect(events.every((event) => event.stepId === canonicalId)).toBe(true);
     expect(events.every((event) => event.stepName === 'P1-S004')).toBe(true);
+  });
+
+  it('injects the assignee role identity into the system message', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const identity = seedRoleDefinition('developer');
+    const r = await exec.run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+      roleIdentity: {
+        rolePrompt: identity.rolePrompt,
+        capabilityPrompt: identity.capabilityPrompt,
+        prohibitions: identity.prohibitions,
+      },
+    });
+    expect(r.success).toBe(true);
+    expect(llm.lastSystem).toContain('## Your role');
+    expect(llm.lastSystem).toContain(identity.rolePrompt);
+    expect(llm.lastSystem).toContain(identity.capabilityPrompt);
+    for (const rule of identity.prohibitions) expect(llm.lastSystem).toContain(rule);
+  });
+
+  it('injects the assembled layered context, and nothing when there is none', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    await exec.run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+      layeredContext: '## Project\nobjective: ship the CLI\n\n## Ticket P1-S004-STORY\nconstraint: no network',
+    });
+    expect(llm.lastSystem).toContain('objective: ship the CLI');
+    expect(llm.lastSystem).toContain('constraint: no network');
+
+    const bare = new CapturingLLM();
+    await new StepExecutor({ llm: bare, maxRounds: 2 })
+      .run({ step: baseStep, tools: [writeFileTool], ctx, layeredContext: '   ' });
+    expect(bare.lastSystem).not.toContain('objective:');
+    expect(bare.lastSystem.length).toBeLessThan(llm.lastSystem.length);
+  });
+
+  it('omits the role block when no actor identity is supplied', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
+    expect(llm.lastSystem).not.toContain('## Your role');
   });
 
   it('injects globalPrompt + step.systemPrompt into system message', async () => {
@@ -247,7 +295,7 @@ describe('StepExecutor system prompt assembly', () => {
     const ctxWithAudit = { ...ctx, audit };
     const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx: ctxWithAudit });
     expect(r.success).toBe(true);
-    const jsonl = await fs.readFile(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const jsonl = await fs.readFile(path.join(tmp, 'audit.jsonl'), 'utf8');
     const lines = jsonl.trim().split('\n').map((l) => JSON.parse(l));
     const turns = lines.filter((l) => l.kind === 'executor.turn');
     expect(turns.length).toBeGreaterThan(0);
@@ -272,7 +320,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastUser).toContain('role: Debugger');
     expect(llm.lastUser).not.toContain('role: Coder');
 
-    const jsonl = await fs.readFile(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const jsonl = await fs.readFile(path.join(tmp, 'audit.jsonl'), 'utf8');
     const turns = jsonl.trim().split('\n').map((l) => JSON.parse(l)).filter((l) => l.kind === 'executor.turn');
     expect(turns[0].data.role).toBe('Debugger');
   });
@@ -1156,6 +1204,7 @@ describe('StepExecutor system prompt assembly', () => {
             metrics: { testCasePassRate: 1 },
             tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
             evidence: ['reports/unit-test-report.md'],
+            unavailableMetrics: ['lineCoverage', 'branchCoverage'],
             gaps: [
               'lineCoverage is unavailable because @vitest/coverage-v8 is missing',
               'branchCoverage is unavailable because @vitest/coverage-v8 is missing',
@@ -1478,7 +1527,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.success).toBe(true);
     expect(await ws.exists('src/x.py')).toBe(true);
     expect(r.toolCalls.find((c) => c.tool === 'invalid_action' && !c.ok)?.error).toContain('missing string tool');
-    const jsonl = await fs.readFile(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const jsonl = await fs.readFile(path.join(tmp, 'audit.jsonl'), 'utf8');
     expect(jsonl).toContain('audit.executor_invalid_actions_ignored');
   });
 
@@ -1502,6 +1551,78 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.error).toContain('unresolved tool failures remain');
     expect(r.toolCalls.find((c) => c.tool === 'write_file' && !c.ok)?.error).toContain('write denied');
     await expect(fs.readFile(path.join(tmp, 'src/x.py'), 'utf8')).resolves.toBe('x = 1\n');
+  });
+
+  it('does not count a repeated run against a missing manifest as no progress', async () => {
+    // Three guards had to be told the same thing: unresolved-failure tracking, the mutation-repeat
+    // breaker, and this one. A Step that reruns its tests while the manifest is still another
+    // Step's undelivered output is not failing to progress — it cannot progress, and saying so is
+    // not the same as looping.
+    const blocked = { ...ctx, allowedWrites: ['src/'] } as typeof ctx;
+    class RerunsLLM implements LLMClient {
+      readonly name = 'reruns';
+      private round = 0;
+      async chat(): Promise<string> {
+        this.round += 1;
+        return JSON.stringify({
+          thoughts: 'write the output, then try to run it',
+          actions: [
+            ...(this.round === 1
+              ? [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }]
+              : []),
+            { tool: 'run_tests', args: {} },
+          ],
+          done: this.round >= 3,
+        });
+      }
+    }
+    const failing: Tool = {
+      name: 'run_tests',
+      description: 'stub',
+      argsSchema: {},
+      async run() {
+        return { ok: false, code: 'manifest_missing' as const, error: 'npm test exit=254\nNo package.json' };
+      },
+    };
+    const exec = new StepExecutor({ llm: new RerunsLLM(), maxRounds: 4 });
+    const r = await exec.run({ step: baseStep, tools: [writeFileTool, failing], ctx: blocked });
+
+    expect(r.error ?? '').not.toContain('verification command repeated');
+    expect(r.success).toBe(true);
+  });
+
+  it('does not hold a missing manifest against a Step that cannot own it', async () => {
+    // REQUIREMENT_ANALYSIS writes its acceptance tests and runs them; a TypeScript project has no
+    // package.json until HIGH_LEVEL_DESIGN. Counting that as an unresolved failure blocks a
+    // completion no role in this phase can earn, so the Step burns its debug rounds instead.
+    const blocked = { ...ctx, allowedWrites: ['src/'] } as typeof ctx;
+    class MissingManifestLLM implements LLMClient {
+      readonly name = 'missing-manifest';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'write the output, then try to run it',
+          actions: [
+            { tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } },
+            { tool: 'run_tests', args: {} },
+          ],
+          done: true,
+        });
+      }
+    }
+    const failing: Tool = {
+      name: 'run_tests',
+      description: 'stub',
+      argsSchema: {},
+      async run() {
+        return { ok: false, code: 'manifest_missing' as const, error: 'npm test exit=254\nNo package.json' };
+      },
+    };
+    const exec = new StepExecutor({ llm: new MissingManifestLLM(), maxRounds: 1 });
+    const r = await exec.run({ step: baseStep, tools: [writeFileTool, failing], ctx: blocked });
+
+    expect(r.toolCalls.find((c) => c.tool === 'run_tests')?.ok).toBe(false);
+    expect(r.error ?? '').not.toContain('unresolved tool failures remain');
+    expect(r.success).toBe(true);
   });
 
   it('allows completion when a pathless write_file arg failure is repaired by a later valid write_file', async () => {
@@ -3027,5 +3148,75 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(true);
     expect(llm.messageCounts).toEqual([2, 4, 6, 6, 6]);
+  });
+});
+
+describe('glob outputs', () => {
+  it('accepts a declared pattern satisfied by a real file', async () => {
+    // A Step declares `tests/functional/**/*.test.ts` before any of those files exist. Checking the
+    // pattern as a literal filename can never succeed, so the Step could not report completion no
+    // matter what it wrote — and stopped for no progress instead.
+    const step = { ...baseStep, outputs: ['tests/functional/**/*.test.ts'] };
+    expect((await verifyOutputs({ step, tools: [], ctx })).missing)
+      .toEqual(['tests/functional/**/*.test.ts']);
+
+    await ws.writeFile('tests/functional/cli-acceptance.test.ts', 'export const x = 1;\n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(true);
+  });
+
+  it('is not satisfied by a file that fails to match, or by an empty one', async () => {
+    const step = { ...baseStep, outputs: ['tests/unit/*.test.ts'] };
+    await ws.writeFile('tests/unit/notes.md', 'not a test\n');
+    await ws.writeFile('tests/unit/deep/nested.test.ts', 'export const y = 1;\n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(false);
+
+    // `*` does not cross a separator, so the nested file above must not count; a direct one does.
+    await ws.writeFile('tests/unit/empty.test.ts', '   \n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(false);
+    await ws.writeFile('tests/unit/real.test.ts', 'export const z = 1;\n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(true);
+  });
+});
+
+describe('design-phase policy', () => {
+  const capture = async (phase: Step['phase']): Promise<string> => {
+    const llm = new CapturingLLM();
+    await new StepExecutor({ llm, maxRounds: 1 })
+      .run({ step: { ...baseStep, phase, outputs: ['src/x.py'] }, tools: [writeFileTool], ctx });
+    return llm.lastSystem;
+  };
+
+  it('tells a design Step its paired tests are run elsewhere and fail by construction', async () => {
+    // Without this, REQUIREMENT_ANALYSIS runs the acceptance tests it just authored, reads their
+    // failure as a defect, and spends every attempt implementing product code owned by CODE.
+    for (const phase of ['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN'] as const) {
+      const system = await capture(phase);
+      expect(system, phase).toContain('Design Step');
+      expect(system, phase).toContain('paired verification Step');
+      // Rule D tells the Step the deferral is expected; without this it reports that expectation as
+      // a quality gap, and the gate fails the Step for every gap it reports — punishing it for
+      // being accurate.
+      expect(system, phase).toContain('Do not record that deferral as a quality gap');
+    }
+  });
+
+  it('says nothing of the sort to an implementation or verification Step', async () => {
+    for (const phase of ['CODE', 'UNIT_TEST', 'FUNCTIONAL_TEST'] as const) {
+      expect(await capture(phase), phase).not.toContain('Design Step');
+    }
+  });
+
+  it('withdraws the rule in Debug, where repairing the design is the whole point', async () => {
+    // A Bug reaches a design Step only because its paired verification opened one. Telling that
+    // attempt not to repair failing assertions would suppress the repair it exists to make.
+    const llm = new CapturingLLM();
+    await new StepExecutor({ llm, maxRounds: 1 }).run({
+      step: { ...baseStep, phase: 'DETAILED_DESIGN', outputs: ['src/x.py'] },
+      tools: [writeFileTool],
+      ctx,
+      debugContext: { reason: 'integration gate failed', failureLog: 'contract mismatch' },
+    });
+    expect(llm.lastSystem).not.toContain('Design Step');
+    expect(llm.lastSystem).toContain('DEBUG mode');
   });
 });

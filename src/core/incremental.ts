@@ -20,6 +20,7 @@ export interface IncrementalBaseline {
  */
 export async function loadIncrementalBaseline(
   ws: Workspace,
+  state: Workspace,
   opts: { planPath?: string; maxChars?: number } = {},
 ): Promise<IncrementalBaseline> {
   const sections: string[] = [];
@@ -39,7 +40,7 @@ export async function loadIncrementalBaseline(
     languageSource = plan.language ? planLabel || DEFAULT_PHASE_PLAN_FILE : undefined;
   }
 
-  const memory = await refreshProjectMemory(ws, {
+  const memory = await refreshProjectMemory(ws, state, {
     planPath: planSource,
     language,
     intent: plan?.intent,

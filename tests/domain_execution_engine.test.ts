@@ -12,6 +12,7 @@ import type { Step } from '../src/domain/steps/step.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { PluginHost } from '../src/plugins/host.js';
 import { Workspace } from '../src/workspace/workspace.js';
+import { reviseActor } from '../src/domain/project_management/index.js';
 
 describe('ProjectOrchestrator', () => {
   it('keeps infrastructure failures on the same Ticket without opening a Bug', async () => {
@@ -50,6 +51,75 @@ describe('ProjectOrchestrator', () => {
 
     const resumed = await engine.run(setup.graph.phases[0]!.id);
     expect(resumed.failedStepId, JSON.stringify(resumed)).toBeUndefined();
+  });
+
+  it('hands each attempt the provider binding of the actor that was assigned the work', async () => {
+    const setup = await fixture();
+    const developer = setup.graph.actors.find((actor) => actor.role === 'developer')!;
+    await setup.repository.update(reviseActor(developer, {
+      llmBinding: { providerPool: ['bound_provider'] },
+    }));
+    const seen = new Map<string, readonly string[] | undefined>();
+    const runner = {
+      initialize: async () => undefined,
+      run: async (input: AttemptInput): Promise<AttemptResult> => {
+        seen.set(input.domainStep.name, input.assignee?.actor.llmBinding?.providerPool);
+        return passingAttempt(setup.repository, input.domainStep);
+      },
+    };
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
+    await engine.run(setup.graph.phases[0]!.id);
+
+    const steps = await Promise.all(setup.graph.steps.map((step) => setup.repository.read(step.id)));
+    const developerSteps = steps.filter((step) => step.objectType === 'step' && step.role === 'developer');
+    expect(developerSteps.length).toBeGreaterThan(0);
+    for (const step of developerSteps) {
+      expect(seen.get(step.name), step.name).toEqual(['bound_provider']);
+    }
+    // Every other role is unbound, so nothing overrides the configured pool for their attempts.
+    for (const step of steps) {
+      if (step.objectType !== 'step' || step.role === 'developer') continue;
+      expect(seen.get(step.name), step.name).toBeUndefined();
+    }
+  });
+
+  it('rolls back to HIGH_LEVEL_DESIGN when a Step reports a package it does not own', async () => {
+    // A Step needing a dependency has not produced a defect. Opening a Bug would ask the wrong role
+    // to repair the wrong artifact; the need belongs to the design that owns the whole set.
+    const setup = await fixture();
+    const design = setup.graph.steps.find((step) => step.type === 'HIGH_LEVEL_DESIGN')!;
+    const coding = setup.graph.steps.find((step) => step.type === 'CODE')!;
+    let asked = false;
+    const runner = {
+      initialize: async () => undefined,
+      run: async (input: AttemptInput): Promise<AttemptResult> => {
+        if (input.domainStep.id === coding.id && !asked) {
+          asked = true;
+          return {
+            ok: false,
+            reason: 'needs packages',
+            failureLog: 'add_dependency is owned by HIGH_LEVEL_DESIGN',
+            dependencyRequest: { packages: ['zod'], reason: 'schema validation' },
+            changedFiles: [],
+            wikiEntryIds: [],
+            testOutcomes: [],
+          };
+        }
+        return passingAttempt(setup.repository, input.domainStep);
+      },
+    };
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
+    await engine.run(setup.graph.phases[0]!.id);
+
+    expect(asked).toBe(true);
+    const tickets = await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id });
+    const dependency = tickets.find((ticket) =>
+      ticket.objectType === 'ticket' && ticket.type === 'change-request' && ticket.name.startsWith('DEP-'));
+    expect(dependency, tickets.map((t) => t.objectType === 'ticket' ? t.name : '').join(',')).toBeDefined();
+    // It targets the design, not the Step that asked, and no Bug was opened for it.
+    expect(dependency?.objectType === 'ticket' && dependency.type === 'change-request'
+      && dependency.targetStepId).toBe(design.id);
+    expect(tickets.some((t) => t.objectType === 'ticket' && t.type === 'bug')).toBe(false);
   });
 
   it('delivers an entire V-model from dependency-ready Tickets', async () => {
@@ -160,15 +230,34 @@ describe('ProjectOrchestrator', () => {
       .filter((ticket) => ticket.objectType === 'ticket');
     const bugs = tickets.filter((ticket) => ticket.type === 'bug');
     const requests = tickets.filter((ticket) => ticket.type === 'change-request');
+    const stepIds = (...names: string[]) =>
+      names.map((name) => setup.graph.steps.find((step) => step.name === name)!.id).sort();
+    const targetsOf = (sourceTicketId: string) => requests
+      .filter((ticket) => ticket.type === 'change-request' && ticket.sourceTicketId === sourceTicketId)
+      .map((ticket) => (ticket.type === 'change-request' ? ticket.targetStepId : ''))
+      .sort();
+
     expect(bugs).toHaveLength(2);
-    expect(requests).toHaveLength(2);
     expect(bugs.every((ticket) => ticket.state === 'closed')).toBe(true);
     expect(requests.every((ticket) => ticket.state === 'closed')).toBe(true);
-    const child = requests.find((ticket) => ticket.type === 'change-request' && ticket.parentChangeRequestId);
-    expect(child?.type === 'change-request' && child.parentChangeRequestId).toBe(
-      requests.find((ticket) => ticket.id !== child?.id)?.id,
-    );
-    expect(calls.filter((call) => call === 'P1-S006:change-request')).toHaveLength(3);
+
+    // The Bug raised while a Change Request was being applied attaches to that CR, not to the
+    // Story of the Step it failed on.
+    const failedRequest = requests.find((ticket) =>
+      ticket.type === 'change-request' && ticket.targetStepId === stepIds('P1-S006')[0])!;
+    const repairBug = bugs.find((ticket) => ticket.parentTicketId === failedRequest.id);
+    expect(repairBug, 'the downstream CR failure opens a Bug attached to that CR').toBeDefined();
+
+    // Each chain advances one Step at a time, and the two chains here do not overlap. The Bug at
+    // the head walks the rest of the V-model. The repair chain stops at S005, where it meets the
+    // CR it was repairing: that CR resumes and applies S006 itself, carrying the repair onward,
+    // rather than the Step being handed the same delta by both chains.
+    const rootBug = bugs.find((ticket) => ticket.id !== repairBug!.id)!;
+    expect(targetsOf(rootBug.id)).toEqual(stepIds('P1-S005', 'P1-S006', 'P1-S007', 'P1-S008'));
+    expect(targetsOf(repairBug!.id)).toEqual(stepIds('P1-S004', 'P1-S005'));
+
+    // S006 is attempted twice: the application that failed, and the one after the repair landed.
+    expect(calls.filter((call) => call === 'P1-S006:change-request')).toHaveLength(2);
     expect(calls).toContain('P1-S003:debug');
   });
 
@@ -221,15 +310,86 @@ describe('ProjectOrchestrator', () => {
       .filter((ticket) => ticket.objectType === 'ticket');
     const bugs = tickets.filter((ticket) => ticket.type === 'bug');
     const enhancements = tickets.filter((ticket) => ticket.type === 'enhancement');
+    const requests = tickets.filter((ticket) => ticket.type === 'change-request');
     expect(bugs).toHaveLength(1);
     expect(enhancements).toHaveLength(1);
     expect(enhancements[0]?.state).toBe('closed');
-    const childRequest = tickets.find((ticket) =>
-      ticket.type === 'change-request' && ticket.sourceTicketId === enhancements[0]?.id,
-    );
-    expect(childRequest?.type === 'change-request' && childRequest.parentChangeRequestId).toBeTruthy();
+    expect(requests.every((ticket) => ticket.state === 'closed')).toBe(true);
+
+    // The shortfall attaches to the Change Request whose gate rejected it, which is what makes it
+    // that CR's own quality debt rather than a defect against the Step's Story.
+    expect(requests.some((ticket) => ticket.id === enhancements[0]?.parentTicketId)).toBe(true);
+
+    // It opens no chain of its own. The CR it repairs is parked on the very Step the repair would
+    // propagate to, and resumes to re-apply that Step carrying the repair — so the Step is never
+    // handed the same delta by two chains at once.
+    expect(requests.some((ticket) =>
+      ticket.type === 'change-request' && ticket.sourceTicketId === enhancements[0]?.id)).toBe(false);
+    expect(calls.filter((call) => call === 'P1-S005:change-request')).toHaveLength(2);
   });
 });
+
+  // The merge gate judges the merged result; a Step's own attempt judges its worktree. A gate that
+  // says the merged project is broken has discovered a defect, and halting the run left the one
+  // finding that most clearly describes a broken project with nowhere to go.
+  it('turns a failing merge gate into a Bug instead of halting the run', async () => {
+    const setup = await fixture();
+    const calls: string[] = [];
+    let gateFailures = 0;
+    const base = options(setup.workspace, setup.repository, passingRunner(setup.repository, calls));
+    const engine = new ProjectOrchestrator({
+      ...base,
+      integrateTicket: async () => {
+        // Only the first delivery is rejected; the repair must be able to land afterwards.
+        if (gateFailures > 0) return { status: 'merged' };
+        gateFailures += 1;
+        return {
+          status: 'failed',
+          reason: 'merge gate failed for ticket/code',
+          failureLog: 'tests: tests exited 1\nsrc/cli.ts is not defined',
+        };
+      },
+    }, setup.plan);
+    const outcome = await engine.run(setup.graph.phases[0]!.id);
+
+    const tickets = await setup.repository.list({
+      objectType: 'ticket',
+      projectId: setup.graph.project.id,
+    });
+    const bug = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.type === 'bug');
+    expect(bug, tickets.map((t) => (t.objectType === 'ticket' ? `${t.name}:${t.type}` : '')).join(',')).toBeDefined();
+    // The gate's own checks are the evidence; PM routes, it does not author the finding.
+    expect(JSON.stringify(bug)).toContain('src/cli.ts is not defined');
+    expect(outcome.failureReason ?? '').not.toContain('merge gate failed');
+  });
+
+  // A gate that passed but was not merged is not an error and must not stop the run — but a run that
+  // completes having merged nothing looked completely healthy, and finding out why meant reading
+  // Merge Request revisions by hand.
+  it('records a gate that passed but was not merged, without stopping', async () => {
+    const setup = await fixture();
+    const calls: string[] = [];
+    const notes: Array<Record<string, unknown>> = [];
+    const base = options(setup.workspace, setup.repository, passingRunner(setup.repository, calls));
+    const engine = new ProjectOrchestrator({
+      ...base,
+      audit: {
+        event: async (_kind: string, message: string, fields: Record<string, unknown>) => {
+          notes.push({ message, ...fields });
+        },
+      } as never,
+      integrateTicket: async () => ({
+        status: 'awaiting-authorization',
+        reason: 'this repository already existed when XCompiler was pointed at it',
+      }),
+    }, setup.plan);
+    const outcome = await engine.run(setup.graph.phases[0]!.id);
+
+    expect(outcome.failureReason ?? '').not.toContain('awaiting-authorization');
+    const recorded = notes.filter((note) => note.messageId === 'domain.merge_awaiting_authorization');
+    expect(recorded.length).toBeGreaterThan(0);
+    expect(String(recorded[0]!.reason)).toContain('already existed');
+  });
 
 function options(
   workspace: Workspace,

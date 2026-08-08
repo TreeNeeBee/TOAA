@@ -47,7 +47,7 @@ XCompiler 把 Phase 迭代模型和 V 模型结合起来。Planner 先生成总�
 V 模型行为：
 
 - 每个 Phase 固定包含八个领域 Step：需求分析、概要设计、详细设计、编码、单元测试、集成测试、系统测试、验收测试。
-- Planner JSON 是不可变的执行规格，不再保存运行状态。Runtime 将其编译为使用 UUIDv7 全局标识的 Project、Phase、Step、Ticket、KPI、Changelist、Checkpoint、Report、Log 和 AuditEvent 对象。
+- Planner JSON 是不可变的执行规格，不再保存运行状态。Runtime 将其编译为领域对象，只有这些对象持有生命周期状态。每个对象都带同一套 envelope —— UUIDv7 `id`、`objectType`、`projectId`、`revision` 和时间戳 —— 并统一经对象注册表提交：Project、ProjectPlan/PhasePlan、Phase、Step、Ticket、ActorRegistration、TicketAssignment、TicketTraceEvent、ProjectManagementPlan、Decision、Risk、InteractionRequest、KPI、QualityAssessment、Changelist、Checkpoint、Deliverable、Report、Log、AuditEvent 和 DomainEvent。
 - 需求分析、概要设计、详细设计、编码会同步生成对应的验收、系统、集成、单元测试计划和可执行用例。
 - `HIGH_LEVEL_DESIGN` 定义系统级接口、外部 API、第三方库选型和依赖确认。
 - `DETAILED_DESIGN` 定义模块内部结构和具体实现方案。
@@ -76,7 +76,7 @@ V 模型行为：
 - **Agents / Skills**：每个阶段的角色化 prompt 与工具白名单。
 - **Tools**：文件编辑、程序/测试执行、API fetch、依赖修改、git 快照，全部受门禁约束。
 - **LLM Router**：角色链、动态评分、cluster fallback、OpenAI-compatible/Ollama 客户端、审计。
-- **Workspace**：Planner 计划文件、`<name>.xc` 清单、`.xcompiler/registry/` 注册表、`.xcompiler/objects/<type>/<uuid>.json` 领域对象、人类审计日志、Debug Wiki、Project memory 和交付报告。
+- **Workspace**：Planner 计划文件、`<name>.xc` 清单、`.xcompiler/registry/` 注册表、`.xcompiler/objects/<type>/<uuid>/r<N>.json` 领域对象（按 revision 不可变）、人类审计日志、Debug Wiki、Project memory 和交付报告。
 
 注册表追加事件是恢复依据，快照索引可重建。每个条目记录对象 ID、类型、路径、父对象、revision、内容哈希和生命周期状态。
 
@@ -222,6 +222,15 @@ npm run typecheck
 npm run lint
 npm test
 npm run build
+```
+
+测试套件按所需能力分档，受限环境（例如禁止监听 127.0.0.1）仍可完整跑确定性门禁，
+而不会把环境限制误报成产品缺陷：
+
+```bash
+npm run test:core          # 仅确定性用例；不开端口、不拉子进程
+npm run test:integration   # 需要本机回环 HTTP 服务与真实子进程
+npm run test:e2e           # 拉起真实 CLI/ACP 进程
 ```
 
 Release gate 始终执行当前完整测试集，不使用固定的历史测试数量作为验收声明。

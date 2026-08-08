@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { analyzeArchitectureDemand, missingArchitectureDocumentTokens } from '../src/core/architecture.js';
 import { lintPlan } from '../src/core/lint.js';
-import { PlanSchema, type ArchitectureModule, type Plan, type Step } from '../src/core/plan.js';
+import { PLAN_VERSION, PlanSchema, type ArchitectureModule, type Plan, type Step } from '../src/core/plan.js';
 import { renderPlanMarkdown } from '../src/core/render.js';
 
 const baseDeliveryDocs = ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'];
@@ -67,7 +67,7 @@ function complexPlan(): Plan {
     dependsOn: ['S011', ...codeSteps.map((item) => item.id)],
   });
   return {
-    version: '1',
+    version: PLAN_VERSION,
     language: 'python',
     intent: 'greenfield',
     projectType: 'application',

@@ -3,6 +3,7 @@ import { loadPlanTarget } from '../core/storage.js';
 import { topoSort } from '../core/lint.js';
 import { AuditLogger } from '../audit/audit.js';
 import { Workspace } from '../workspace/workspace.js';
+import { ProjectContainer } from '../workspace/project_container.js';
 import { GitService } from '../workspace/git.js';
 import { loadConfigWithPath } from '../config/config.js';
 import { LLMRouter } from '../llm/router.js';
@@ -10,10 +11,18 @@ import { reportRoleModelAdvice } from '../llm/role_advice.js';
 import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
 import { createSandbox } from '../sandbox/factory.js';
+import { sandboxDownloadCachePath, sandboxEnvironmentPath } from '../sandbox/environment.js';
 import {
   ProjectOrchestrator,
   type ProjectOrchestratorResult,
 } from '../application/project_management/orchestrator.js';
+import type { AttemptInput, ExecutionScope } from '../application/execution/attempt_runner.js';
+import { TicketChangeSetService } from '../application/workspace/ticket_change_set_service.js';
+import { MergeGateService } from '../application/workspace/merge_gate_service.js';
+import { MergeIntegrationService } from '../application/workspace/merge_integration_service.js';
+import { prepareScopeEnvironment } from '../application/execution/scope_environment.js';
+import { runMergeGateChecks } from '../application/workspace/merge_gate_checks.js';
+import { containerOwnershipRecord, GitRepositoryService } from '../infrastructure/git/git_repository_service.js';
 import { acquireLock, LockError } from '../core/lock.js';
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
@@ -23,8 +32,7 @@ import {
 } from '../core/project_report.js';
 import { refreshProjectMemory } from '../core/project_memory.js';
 import { updateProjectFile } from '../core/project_file.js';
-import { DOC_NAMES } from '../core/docs.js';
-import type { Language, Plan, PlanIntent } from '../core/plan.js';
+import type { Language, PlanIntent } from '../core/plan.js';
 import { setLocale, t } from '../i18n/index.js';
 import { PluginHost } from '../plugins/host.js';
 import type { XCompilerPlugin } from '../plugins/types.js';
@@ -94,7 +102,11 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   } catch {
     /* ignore */
   }
-  const ws = new Workspace(path.resolve(opts.workspace));
+  // `-w <dir>` addresses the project container. Project state lives at <dir>/.xcompiler and the
+  // working copy at <dir>/worktrees/<branch>, so a sandbox mounting the working copy cannot reach
+  // XCompiler's own registry, audit trail, or fixtures.
+  const container = new ProjectContainer(path.resolve(opts.workspace));
+  const ws = container.canonical().workspace;
   const { config: cfg, path: cfgPath, missingEnv } = await loadConfigWithPath(opts.configPath);
   // AuditLogger 会立即创建过程日志，因此必须先应用配置语言。
   if (!hasXcEnv('LANG')) setLocale(cfg.locale);
@@ -103,7 +115,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
   let lock;
   try {
-    lock = await acquireLock(ws.root, 'xcompiler_run', { force: !!opts.force });
+    lock = await acquireLock(container.state.root, 'xcompiler_run', { force: !!opts.force });
   } catch (err) {
     if (err instanceof LockError) {
       await runtimeLog(io, 'error', t().system.unhandledError(err.message));
@@ -113,7 +125,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     throw err;
   }
   try {
-  const audit = new AuditLogger({ root: ws.root, command: 'xcompiler_run' });
+  const audit = new AuditLogger({ root: ws.root, stateRoot: container.state.root, command: 'xcompiler_run' });
   await audit.start({
     workspace: ws.root,
     plan: opts.planPath,
@@ -130,7 +142,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   let planAbs = target.planPath;
   let publicPlanPath = target.phasePlanPath ?? target.planPath;
   let plan = target.plan;
-  const domainRepository = new DomainObjectRepository(ws);
+  const domainRepository = new DomainObjectRepository(container.state);
   await domainRepository.load();
   const domainAudit = new DomainAuditTrail(domainRepository);
   let domainProject = await domainRepository.findProject();
@@ -164,6 +176,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
   let projectFilePath = await updateProjectFile({
     workspace: ws.root,
+    container: container.root,
     planPath: publicPlanPath,
     configPath: cfgPath,
     projectFilePath: opts.projectFilePath,
@@ -260,6 +273,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   );
   const phaseProgression = new PhaseProgressionService(
     ws,
+    container.state,
     router,
     audit,
     io.terminalOutput === true,
@@ -309,6 +323,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     await runtimeLog(io, 'success', `recovered ${domainPhase.name} from the canonical Project state`);
     projectFilePath = await updateProjectFile({
       workspace: ws.root,
+      container: container.root,
       planPath: publicPlanPath,
       configPath: cfgPath,
       projectFilePath,
@@ -317,9 +332,86 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
   }
   const git = new GitService(ws);
+  // Canonical, per-role CODE, and gate environments each install separately — that isolation is
+  // about installed state. The archives they download are identical and immutable, so they share one
+  // cache and fetch each package once for the whole project.
+  const downloadCacheRoot = sandboxDownloadCachePath(container.state.root, domainProject.id);
+  const canonicalEnvironmentRoot = sandboxEnvironmentPath(container.state.root, {
+    scope: 'canonical',
+    projectId: domainProject.id,
+  });
   const sandbox = withRecordReplaySandbox(
-    createSandbox(cfg, ws, audit, plan.language),
+    createSandbox(cfg, ws, canonicalEnvironmentRoot, audit, plan.language, downloadCacheRoot),
     recordReplay,
+  );
+  // The sandbox is a precondition, not something each Step discovers for itself. A run that
+  // continues without one spends its whole budget on Steps whose every verification is going to
+  // fail for a reason none of them owns, and reports those as defects in the generated project.
+  try {
+    await sandbox.build(profile.manifestFile);
+  } catch (err) {
+    const message =
+      `sandbox is not ready, so execution cannot start: ${(err as Error).message}. ` +
+      'Dependencies resolve through the registry configured for this language sandbox; ' +
+      'set agent.sandboxes.<language>.local.registry if the default is unreachable here.';
+    await audit.event('note', message, { messageId: 'execute.sandbox_not_ready' });
+    await runtimeResult(io, 'run', 'error', { message, exitCode: 7 });
+    return { status: 'error', message, exitCode: 7 };
+  }
+
+  const changeSets = new TicketChangeSetService(
+    domainRepository,
+    container,
+    new GitRepositoryService(ws.root),
+  );
+  // CODE develops in its own worktree; every other Step works in the canonical copy, so the working
+  // copy an attempt runs in is resolved per attempt rather than fixed here. Scopes are cached by
+  // ChangeSet — or by the canonical copy itself, which they share — because rebuilding the Git and
+  // sandbox bindings for every attempt would be pure overhead under serial execution.
+  const scopeCache = new Map<string, ExecutionScope>();
+  const resolveScope = async (input: AttemptInput): Promise<ExecutionScope> => {
+    const resolved = await changeSets.ensureFor(input.ticket, input.domainStep);
+    const scopeKey = resolved.changeSet?.id ?? 'canonical';
+    const cached = scopeCache.get(scopeKey);
+    if (cached) return cached;
+    const scopeWorkspace = new Workspace(resolved.root);
+    // Only CODE has concurrent workers, so only CODE takes a per-role environment.
+    const environmentRoot = sandboxEnvironmentPath(
+      container.state.root,
+      input.domainStep.type === 'CODE'
+        ? {
+            scope: 'development',
+            projectId: domainProject.id,
+            phaseId: input.domainStep.phaseId,
+            roleId: input.domainStep.role,
+          }
+        : { scope: 'canonical', projectId: domainProject.id },
+    );
+    const scope: ExecutionScope = {
+      workspace: scopeWorkspace,
+      git: new GitService(scopeWorkspace),
+      sandbox: withRecordReplaySandbox(
+        createSandbox(cfg, scopeWorkspace, environmentRoot, audit, plan.language, downloadCacheRoot),
+        recordReplay,
+      ),
+    };
+    await prepareScopeEnvironment({
+      sandbox: scope.sandbox,
+      manifestFile: profile.manifestFile,
+      isolated: resolved.changeSet !== undefined,
+      root: resolved.root,
+      audit,
+    });
+    scopeCache.set(scopeKey, scope);
+    return scope;
+  };
+  const repositoryGit = new GitRepositoryService(ws.root);
+  const repositoryInfo = await repositoryGit.ensureRepository(
+    undefined,
+    {
+      initialBranch: container.canonicalBranch,
+      ownershipRecord: containerOwnershipRecord(container.state),
+    },
   );
   const permissionService = new ProjectPermissionService(domainRepository, domainProject);
   const requestPermission = io.requestPermission
@@ -329,6 +421,59 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         (status) => emitRuntimeEvent(io, { type: 'permission', status, request }),
       )
     : undefined;
+  const mergeGates = new MergeGateService(
+    domainRepository,
+    container,
+    repositoryGit,
+    container.canonicalBranch,
+  );
+  const mergeIntegration = new MergeIntegrationService({
+    repository: domainRepository,
+    gates: mergeGates,
+    git: repositoryGit,
+    targetBranch: container.canonicalBranch,
+    // A repository that already existed belongs to whoever created it, so a validated change waits
+    // for explicit authorization rather than being written onto their mainline.
+    mayMerge: repositoryInfo.ownership === 'xcompiler-created',
+    authorizeMerge: requestPermission
+      ? (changeSet) => requestPermission({
+          operationType: 'git_operation',
+          target: `merge ${changeSet.sourceBranch} into ${container.canonicalBranch}`,
+          reason: 'Land the validated CODE ChangeSet so downstream V-model Steps test the new code.',
+          risk: 'Creates one squash commit on the canonical project branch.',
+          scope: 'canonical project repository',
+          skippable: false,
+          denyBehavior: 'Keep the ChangeSet gate-passed and stop delivery before downstream testing.',
+          metadata: {
+            changeSetId: changeSet.id,
+            rootTicketId: changeSet.rootTicketId,
+            generation: changeSet.generation,
+          },
+        })
+      : undefined,
+    releaseChangeSet: async (changeSetId) => {
+      await changeSets.release(changeSetId);
+    },
+    runChecks: async (root) => {
+      const candidate = new Workspace(root);
+      const gateSandbox = withRecordReplaySandbox(
+        createSandbox(
+          cfg,
+          candidate,
+          sandboxEnvironmentPath(container.state.root, {
+            scope: 'gate',
+            projectId: domainProject.id,
+            phaseId: domainPhase.id,
+          }),
+          audit,
+          plan.language,
+          downloadCacheRoot,
+        ),
+        recordReplay,
+      );
+      return runMergeGateChecks(gateSandbox, plan.language, recordReplay);
+    },
+  });
   let finalProjectAudit: ProjectAuditResult | undefined;
   const engine = new ProjectOrchestrator({
     workspace: ws,
@@ -338,14 +483,21 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     audit,
     repository: domainRepository,
     plugins: pluginHost,
-    projectionWriter: new FileProjectProjectionWriter(ws),
+    // Container state, not the working copy. The projection is XCompiler's own bookkeeping and is
+    // rewritten constantly; written into the generated project it was tracked by Git, and the
+    // squash merge refused a dirty working copy — XCompiler's own cache blocked XCompiler's merge.
+    projectionWriter: new FileProjectProjectionWriter(new Workspace(container.state.root)),
     maxRoundsPerStep: cfg.agent.max_rounds_per_step,
     maxDebugRoundsPerStep: cfg.agent.max_debug_rounds_per_step,
     maxEditLinesPerStep: cfg.agent.max_edit_lines_per_step,
     terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
     debugWikiPath: opts.debugWikiPath ? path.resolve(opts.debugWikiPath) : undefined,
+    projectDebugWikiPath: container.state.abs('debug-wiki'),
     recordReplay,
     requestPermission,
+    resolveScope,
+    integrateTicket: (rootTicketId) => mergeIntegration.integrateTicket(domainProject.id, rootTicketId),
+    integratePhase: (phaseId) => mergeIntegration.integratePhase(domainProject.id, phaseId),
     abortSignal: opts.abortSignal,
     onToolEvent: async (event: ToolExecutionEvent) => {
       await emitRuntimeEvent(io, {
@@ -407,6 +559,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       });
       projectFilePath = await updateProjectFile({
         workspace: ws.root,
+        container: container.root,
         planPath: publicPlanPath,
         configPath: cfgPath,
         projectFilePath,
@@ -444,7 +597,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
 
   try {
     const r = await engine.run(domainPhase.id);
-    await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
+    await persistProjectMemory(ws, container.state, audit, planAbs, plan.language, plan.intent);
     if (r.failedStepId) {
       await runtimeLog(io, 'error', t().execute.runInterrupted(r.failedStepId, r.executedSteps, r.totalSteps));
       if (r.failureReason) {
@@ -490,6 +643,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           projectAudit: finalProjectAudit,
           finalDelivery: !phaseAdvance?.nextPlan,
           repository: domainRepository,
+          recordReplay: recordReplay.evidence(),
         })
       : undefined;
     if (reportPath) {
@@ -516,6 +670,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
     await updateProjectFile({
       workspace: ws.root,
+      container: container.root,
       planPath: publicPlanPath,
       configPath: cfgPath,
       projectFilePath,
@@ -537,10 +692,11 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     if (stack && stack !== msg) {
       await runtimeLog(io, 'dim', stack);
     }
-    await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
+    await persistProjectMemory(ws, container.state, audit, planAbs, plan.language, plan.intent);
     await audit.end({ status: 'error', message: msg, stack });
     await updateProjectFile({
       workspace: ws.root,
+      container: container.root,
       planPath: publicPlanPath,
       configPath: cfgPath,
       projectFilePath,
@@ -559,13 +715,14 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
 
 async function persistProjectMemory(
   ws: Workspace,
+  state: Workspace,
   audit: AuditLogger,
   planPath: string,
   language: Language,
   intent: PlanIntent,
 ): Promise<void> {
   try {
-    await refreshProjectMemory(ws, { planPath, language, intent });
+    await refreshProjectMemory(ws, state, { planPath, language, intent });
   } catch (err) {
     await audit.event('note', t().execute.projectMemoryRefreshFailed((err as Error).message), {
       messageId: 'execute.project_memory_refresh_failed',

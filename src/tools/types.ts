@@ -2,6 +2,7 @@ import type { Workspace } from '../workspace/workspace.js';
 import type { Sandbox } from '../sandbox/types.js';
 import type { AuditLogger } from '../audit/audit.js';
 import type { Language } from '../core/plan.js';
+import type { StepType } from '../domain/steps/step.js';
 import type { RecordReplayController } from '../application/record_replay/controller.js';
 
 export type ToolPermissionOperation =
@@ -66,6 +67,14 @@ export interface ToolContext {
   allowedWrites: string[];
   /** 当前 Step 的 id（仅用于审计）。 */
   stepId: string;
+  /**
+   * The V-model phase being executed.
+   *
+   * Some tools are owned by one phase: the dependency manifest is authored by HIGH_LEVEL_DESIGN so
+   * that one design decides the whole dependency set, and a Step elsewhere that needs a package
+   * raises a Change Request to it rather than editing the manifest under it.
+   */
+  phase?: StepType;
   /** 目标语言（决定依赖清单文件等）。默认 python。 */
   language?: Language;
   /** 当前 Step 的 write_file / append_file 单次 content 字节预算。 */
@@ -90,11 +99,41 @@ export interface ToolContext {
   recordReplay?: RecordReplayController;
 }
 
+/** Stable identifiers for failures other modules must recognise without reading the message. */
+export type ToolFailureCode =
+  | 'write_denied'
+  /** The run could not happen: an artifact another Step owns does not exist yet. */
+  | 'manifest_missing'
+  /** The dependency manifest belongs to another phase; the need has to travel there. */
+  | 'dependency_not_owned'
+  /** The command needs product source that CODE has not written yet. */
+  | 'product_not_implemented';
+
+/**
+ * Whether a failure describes a condition this Step does not own and cannot repair.
+ *
+ * Three separate places have to make this judgment — the verification-repeat breaker, the
+ * unresolved-failure record, and the quality gate — and each one that holds an unownable failure
+ * against a Step blocks a completion no role there can earn. Listing the codes at each site is how
+ * the third one gets forgotten, which is exactly what happened when `manifest_missing` was added.
+ */
+export function isUnownedStepFailure(code: ToolFailureCode | undefined): boolean {
+  return code === 'manifest_missing' || code === 'product_not_implemented';
+}
+
 /** 单次工具调用的结果统一结构。 */
 export interface ToolResult<T = unknown> {
   ok: boolean;
   data?: T;
   error?: string;
+  /**
+   * Set when a caller has to branch on *why* this failed.
+   *
+   * Matching the message text instead is how a wording change silently alters control flow: the
+   * executor's loop-breaker keyed on the old denial prose and switched behaviour the moment that
+   * prose was improved.
+   */
+  code?: ToolFailureCode;
   /** 用于摘要展示。 */
   summary?: string;
 }
@@ -128,16 +167,90 @@ export class ToolRegistry {
   }
 }
 
-/** 判断给定相对路径是否落在 allowedWrites 任何一项之下。 */
+/**
+ * 判断给定相对路径是否落在 allowedWrites 任何一项之下。
+ *
+ * Entries may be concrete paths, directory prefixes, or globs. Globs are not decoration: a Step
+ * routinely declares outputs like `tests/modules/*.ts` before the individual files exist, and the
+ * same list is shown to the model as its writable candidates. Matching them literally told the model
+ * a path was writable and then refused every file under it, which is unfixable from the model's side
+ * and burns a Step's whole round budget.
+ *
+ * Only decides *which* in-workspace path a Step may write; containment is enforced separately when
+ * the path is resolved, so a pattern can never reach outside the workspace.
+ */
 export function isAllowedWrite(rel: string, allowed: string[]): boolean {
   const norm = normalizeRel(rel);
   return allowed.some((a) => {
     const an = normalizeRel(a);
     if (norm === an) return true;
+    if (isGlob(an)) return globToRegExp(an).test(norm);
     if (an.endsWith('/')) return norm.startsWith(an);
     // 目录前缀（不含 / 的也按目录前缀匹配）
     return norm === an || norm.startsWith(an + '/');
   });
+}
+
+/**
+ * Names what *is* writable, not merely that this path is not.
+ *
+ * A denial the model cannot act on costs a full round every time it guesses again; the allowlist is
+ * in the system prompt but many rounds back and possibly trimmed, so it is repeated here.
+ */
+export function deniedWrite<T>(
+  action: 'write' | 'append',
+  rel: string,
+  allowed: readonly string[],
+): ToolResult<T> {
+  const list = allowed.length > 0 ? allowed.join(', ') : '(none declared for this Step)';
+  return {
+    ok: false,
+    code: 'write_denied',
+    error: `${action} denied: ${rel} is not in this Step's writable allowlist=[${list}]. ` +
+      'Write to one of those paths, or a path matching one of those patterns.',
+  };
+}
+
+/** Whether a declared path is a pattern rather than one concrete file. */
+export function isPathPattern(pattern: string): boolean {
+  return isGlob(normalizeRel(pattern));
+}
+
+/** Matches a concrete workspace-relative path against a declared pattern. */
+export function matchesPathPattern(rel: string, pattern: string): boolean {
+  return globToRegExp(normalizeRel(pattern)).test(normalizeRel(rel));
+}
+
+function isGlob(pattern: string): boolean {
+  return /[*?]/u.test(pattern);
+}
+
+/**
+ * `**` crosses directory separators, `*` and `?` do not. Everything else is matched literally, so a
+ * pattern cannot smuggle in regular-expression syntax.
+ */
+function globToRegExp(pattern: string): RegExp {
+  let source = '';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!;
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        // `a/**/b` must also match `a/b`, so the separator that follows is absorbed here.
+        const separator = pattern[index + 2] === '/';
+        source += separator ? '(?:.*/)?' : '.*';
+        index += separator ? 2 : 1;
+        continue;
+      }
+      source += '[^/]*';
+      continue;
+    }
+    if (char === '?') {
+      source += '[^/]';
+      continue;
+    }
+    source += char.replace(/[.+^${}()|[\]\\]/gu, '\\$&');
+  }
+  return new RegExp(`^${source}$`, 'u');
 }
 
 function normalizeRel(p: string): string {

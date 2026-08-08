@@ -14,12 +14,29 @@ import {
   type RegistryBatchOperation,
 } from '../registry/object_registry.js';
 
+/**
+ * Object files are written once per revision at `<stateRoot>/objects/<type>/<id>/r<revision>.json`,
+ * so a given ref never changes content and a read cache needs no invalidation: a new revision is a
+ * new ref. The cache matters because PM repeatedly re-reads the object graph (routing, projections,
+ * blocker sweeps), which is otherwise a file read per object per query.
+ */
+const OBJECT_CACHE_LIMIT = 4096;
+
 export class DomainObjectRepository implements DomainObjectRepositoryPort {
   readonly registry: ObjectRegistry;
   private commitQueue: Promise<void> = Promise.resolve();
+  private readonly objectCache = new Map<string, PersistedDomainObject>();
 
   constructor(private readonly workspace: Workspace) {
     this.registry = new ObjectRegistry(workspace);
+  }
+
+  private cacheObject(objectRef: string, object: PersistedDomainObject): void {
+    if (this.objectCache.size >= OBJECT_CACHE_LIMIT) {
+      const oldest = this.objectCache.keys().next();
+      if (!oldest.done) this.objectCache.delete(oldest.value);
+    }
+    this.objectCache.set(objectRef, object);
   }
 
   async load(): Promise<void> {
@@ -50,12 +67,15 @@ export class DomainObjectRepository implements DomainObjectRepositoryPort {
 
   async read(id: ObjectId): Promise<PersistedDomainObject> {
     const entry = this.registry.require(id);
+    const cached = this.objectCache.get(entry.objectRef);
+    if (cached) return cached;
     const object = PersistedDomainObjectSchema.parse(
       JSON.parse(await this.workspace.readFile(entry.objectRef)),
     );
     if (object.id !== id || object.objectType !== entry.objectType) {
       throw new Error(`Domain object ${id} does not match its registry entry`);
     }
+    this.cacheObject(entry.objectRef, object);
     return object;
   }
 
@@ -101,6 +121,9 @@ export class DomainObjectRepository implements DomainObjectRepositoryPort {
         const objectRef = domainObjectPath(parsed);
         const content = `${JSON.stringify(parsed, null, 2)}\n`;
         await this.workspace.writeFileAtomic(objectRef, content);
+        // Safe even if the registry batch below fails: the registry would still point at the
+        // previous ref, so this entry simply never gets looked up.
+        this.cacheObject(objectRef, parsed);
         registryOperations.push({
           mode: operation.mode,
           input: {
@@ -139,7 +162,7 @@ export class DomainObjectRepository implements DomainObjectRepositoryPort {
 }
 
 export function domainObjectPath(object: ObjectEnvelope): string {
-  return `.xcompiler/objects/${object.objectType}/${object.id}/r${object.revision}.json`;
+  return `objects/${object.objectType}/${object.id}/r${object.revision}.json`;
 }
 
 function registryParentId(object: PersistedDomainObject): ObjectId | undefined {
@@ -158,6 +181,18 @@ function registryParentId(object: PersistedDomainObject): ObjectId | undefined {
       return object.ticketId;
     case 'ticket-trace-event':
       return object.ticketId;
+    case 'workspace-handle':
+      return object.ownerTicketId ?? object.projectId;
+    case 'ticket-change-set':
+      return object.rootTicketId;
+    case 'merge-request':
+      return object.changeSetId;
+    case 'merge-gate-run':
+      return object.mergeRequestId;
+    case 'context-record':
+      return object.scope === 'project' ? object.projectId : object.ownerId;
+    case 'role-definition':
+      return object.projectId;
     case 'project-management-plan':
       return object.projectId;
     case 'risk-record':

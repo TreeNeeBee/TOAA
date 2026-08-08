@@ -27,6 +27,17 @@ export const STEP_TYPE_ORDER = Object.fromEntries(
   STEP_TYPES.map((type, index) => [type, index]),
 ) as Record<StepType, number>;
 
+/**
+ * The one phase that decides the project's dependency set.
+ *
+ * Stated once because two independent places act on it: `add_dependency` refuses everywhere else,
+ * and the tool calibration decides who is handed the tool. They disagreed — the refusal routed a
+ * Change Request to HIGH_LEVEL_DESIGN, and HIGH_LEVEL_DESIGN's tools did not include
+ * `add_dependency`, so the flow ended at a Step that had been told to do something it had no way to
+ * do. A CODE Debugger, which does carry the tool, was the only role that could reach it at all.
+ */
+export const DEPENDENCY_MANIFEST_OWNER: StepType = 'HIGH_LEVEL_DESIGN';
+
 export const SOURCE_TO_VERIFICATION_STEP = Object.fromEntries(V_MODEL_STEP_PAIRS) as Record<DevelopmentStepType, VerificationStepType>;
 export const VERIFICATION_TO_SOURCE_STEP = Object.fromEntries(
   V_MODEL_STEP_PAIRS.map(([source, verification]) => [verification, source]),

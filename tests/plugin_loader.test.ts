@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadPluginSources } from '../src/plugins/loader.js';
+import { XCOMPILER_PLUGIN_API_VERSION } from '../src/version.js';
 
 async function fixture(minXCompilerVersion: string): Promise<{
   root: string;
@@ -17,7 +18,7 @@ async function fixture(minXCompilerVersion: string): Promise<{
   const manifest = {
     id: 'fixture.loader',
     version: '1.0.0',
-    apiVersion: 1,
+    apiVersion: XCOMPILER_PLUGIN_API_VERSION,
     minXCompilerVersion,
   };
   await fs.writeFile(manifestPath, JSON.stringify(manifest), 'utf8');

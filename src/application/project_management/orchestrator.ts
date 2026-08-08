@@ -5,6 +5,7 @@ import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
 import { ProjectController, type ScheduledWork } from './project_controller.js';
 import { TicketRegistrationService } from './ticket_registration_service.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
+import type { RoutingActor } from './role_registry.js';
 import type { PluginHost } from '../../plugins/host.js';
 import type { ToolPermissionRequest } from '../../tools/types.js';
 import {
@@ -37,6 +38,24 @@ export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, '
     recordVerifiedBugResolution?(ticketId: ObjectId): Promise<void>;
   };
   finalGate?: () => Promise<{ ok: boolean; reason?: string; failureLog?: string }>;
+  /**
+   * Carries the Phase's ChangeSets onto the mainline once its work is finished.
+   *
+   * Runs after the final gate and before the Phase is delivered: delivering a Phase whose change
+   * never landed would let the next Phase build on work the mainline does not have.
+   */
+  /**
+   * Lands a delivered Ticket's change on the mainline.
+   *
+   * Called as each Step delivers, because the next Step reads its output: a change still on its own
+   * branch is invisible to everything that follows it in the V-model.
+   */
+  integrateTicket?: (rootTicketId: ObjectId) => Promise<{ status: string; reason?: string; failureLog?: string }>;
+  integratePhase?: (phaseId: ObjectId) => Promise<{
+    status: 'merged' | 'nothing-to-merge' | 'failed' | 'blocked' | 'awaiting-authorization';
+    reason?: string;
+    failureLog?: string;
+  }>;
   onTransition?: (event: {
     event: 'phase_started' | 'step_started' | 'ticket_started' | 'ticket_routed' | 'step_delivered' | 'phase_delivered' | 'project_delivered';
     projectId: ObjectId;
@@ -171,6 +190,43 @@ export class ProjectOrchestrator {
             continue;
           }
         }
+        if (this.options.integratePhase) {
+          const integration = await this.options.integratePhase(phase.id);
+          if (integration.status === 'blocked' || integration.status === 'awaiting-authorization') {
+            // Neither is a defect in the project: the gate could not run, or the mainline is not
+            // ours to write to. Both stop delivery without inventing a Bug.
+            return this.failure(
+              phase.id, steps.length, executed, undefined,
+              integration.reason ?? `merge integration ${integration.status}`,
+            );
+          }
+          if (integration.status === 'failed') {
+            const acceptance = steps.find((step) => step.type === 'FUNCTIONAL_TEST');
+            if (!acceptance) {
+              return this.failure(
+                phase.id, steps.length, executed, undefined,
+                integration.reason ?? 'merge gate failed',
+              );
+            }
+            // The gate observed the failure, so it creates the Bug and PM routes it.
+            await this.scheduler.routeFailure({
+              creatorActorId: await this.tickets.discovererActorIdForStep(acceptance.id),
+              failedStepId: acceptance.id,
+              message: integration.failureLog ?? integration.reason ?? 'Merge gate failed.',
+              summary: integration.reason ?? 'Merge gate failed.',
+              failure: {
+                kind: 'execution',
+                category: 'test',
+                code: 'merge_gate_failed',
+                message: integration.failureLog ?? integration.reason ?? 'Merge gate failed.',
+                retryable: true,
+                switchProvider: false,
+              },
+              correlationId: createObjectId(),
+            });
+            continue;
+          }
+        }
         try {
           const completion = await this.scheduler.completePhase(phase.id);
           await this.transition({
@@ -198,12 +254,14 @@ export class ProjectOrchestrator {
         }
       }
 
+      let assignee: RoutingActor | undefined;
       const executionStep = projection.byDomainStepId.get(work.step.id);
       if (!executionStep) {
         return this.failure(phase.id, steps.length, executed, work.step, `Execution specification missing for ${work.step.name}`);
       }
       try {
-        const routed = await this.tickets.routeAndAssign(work.ticket.id);
+        const routed = await this.tickets.routeAndAssign(work.ticket.id, { forStepId: work.step.id });
+        assignee = await this.tickets.routingActorById(routed.assignment.assigneeActorId);
         work = { ...work, ticket: routed.ticket };
         work = await this.scheduler.start(work);
       } catch (error) {
@@ -240,6 +298,7 @@ export class ProjectOrchestrator {
         domainStep: work.step,
         ticket: work.ticket,
         mode: work.mode,
+        assignee,
       });
       executed += 1;
       await this.options.plugins.emit('step.after', { plan: projection.plan, step: executionStep, ok: result.ok });
@@ -247,6 +306,45 @@ export class ProjectOrchestrator {
       const disposition = await this.results.process({ phase, work, steps, result });
       if (disposition.action === 'stop') {
         return this.failure(phase.id, steps.length, executed, work.step, disposition.reason);
+      }
+      if (result.ok && this.options.integrateTicket) {
+        // The delivering Ticket itself. Its ChangeSet is keyed on the CODE Story that owns the
+        // branch, and a Bug or CR repairing that Story is recorded on the same ChangeSet — whereas
+        // `rootTicketId` is the Phase Epic, which owns no branch and matches nothing.
+        const landed = await this.options.integrateTicket(work.ticket.id);
+        // A failing gate found a defect in the merged result and says so with its own checks, so it
+        // takes the repair path every other discovered defect takes. `blocked` is different in kind:
+        // the gate could not run, nothing about the project was shown to be wrong, and there is
+        // nothing to ask anyone to repair.
+        if (landed.status === 'failed') {
+          const gate = await this.results.processIntegrationFailure({
+            phase,
+            work,
+            reason: landed.reason ?? 'merge gate rejected the change',
+            failureLog: landed.failureLog,
+          });
+          if (gate.action === 'stop') {
+            return this.failure(phase.id, steps.length, executed, work.step, gate.reason);
+          }
+        } else if (landed.status === 'awaiting-authorization') {
+          // Not an error, but it must not be silent: the run completes having merged nothing, and a
+          // live run spent a whole pass looking successful while every ChangeSet sat unmerged. The
+          // gate had passed; only the authorization was missing.
+          await this.options.audit.event('note', `${work.step.name} passed its gate but was not merged`, {
+            messageId: 'domain.merge_awaiting_authorization',
+            projectId: work.step.projectId,
+            phaseId: phase.id,
+            stepId: work.step.id,
+            stepName: work.step.name,
+            ticketId: work.ticket.id,
+            reason: landed.reason,
+          });
+        } else if (landed.status === 'blocked') {
+          return this.failure(
+            phase.id, steps.length, executed, work.step,
+            landed.reason ?? 'merge integration blocked',
+          );
+        }
       }
 
     }

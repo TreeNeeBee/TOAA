@@ -1,14 +1,15 @@
 import { createObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
-import { TicketSchema, type Ticket } from '../../domain/tickets/ticket.js';
+import { TicketSchema, workStepId, type Ticket } from '../../domain/tickets/ticket.js';
 import {
   TicketAssignmentSchema,
   reviseActor,
+  transitionAssignment,
   type ActorRegistration,
   type TicketAssignment,
 } from '../../domain/project_management/index.js';
-import { RoleRegistry } from './role_registry.js';
+import { RoleRegistry, routingRequirement, type RoutingActor } from './role_registry.js';
 import { TicketTraceService } from './ticket_trace_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 import type { PersistedDomainObject } from '../../domain/objects/persisted.js';
@@ -93,24 +94,40 @@ export class TicketRegistrationService {
 
   async routeAndAssign(
     ticketId: ObjectId,
-    options: { inheritedFromTicketId?: ObjectId } = {},
+    options: {
+      inheritedFromTicketId?: ObjectId;
+      forStepId?: ObjectId;
+      /**
+       * An administrative assignment: PM is closing work that was resolved elsewhere, not
+       * dispatching it. It reserves no capacity, because nobody is going to execute it and holding
+       * a seat for it can starve the actor of the work that actually needs doing.
+       */
+      administrative?: boolean;
+    } = {},
   ): Promise<{ ticket: Ticket; assignment: TicketAssignment }> {
     let ticket = await this.register(ticketId);
+    const routingStepId = options.forStepId ?? workStepId(ticket);
+    const stepObject = routingStepId ? await this.repository.read(routingStepId) : undefined;
+    const step = stepObject?.objectType === 'step' ? stepObject : undefined;
+    let releasedAssignment: TicketAssignment | undefined;
     if (ticket.activeAssignmentId) {
       const existing = await this.repository.read(ticket.activeAssignmentId);
       if (existing.objectType !== 'ticket-assignment') {
         throw new Error(`Ticket ${ticket.name} active assignment is invalid`);
       }
-      return { ticket, assignment: existing };
+      const owner = await this.roles.resolve(existing.assigneeActorId);
+      // A Change Request keeps propagating into Steps owned by other roles; when the current owner
+      // cannot perform the next application, PM releases and re-routes instead of failing the Ticket.
+      const blocked = this.roles.ineligibility(owner, ticket, step, { ignoreAssignmentId: existing.id });
+      if (!blocked) return { ticket, assignment: existing };
+      releasedAssignment = existing;
     }
-    const stepObject = ticket.stepId ? await this.repository.read(ticket.stepId) : undefined;
-    const step = stepObject?.objectType === 'step' ? stepObject : undefined;
     const parentAssignment = options.inheritedFromTicketId
       ? await this.assignmentForTicket(options.inheritedFromTicketId)
       : undefined;
     const assignee = parentAssignment
       ? await this.requireEligibleInheritedOwner(ticket, parentAssignment.assigneeActorId, step)
-      : await this.roles.route(ticket, step);
+      : await this.roles.route(ticket, step, { ignoreCapacity: options.administrative === true });
     const pm = await this.projectManager(ticket.projectId);
     const now = new Date().toISOString();
     const assignment = TicketAssignmentSchema.parse({
@@ -125,14 +142,32 @@ export class TicketRegistrationService {
       assignedByActorId: pm.id,
       previousAssignmentId: ticket.assignmentIds.at(-1),
       parentAssignmentId: parentAssignment?.id,
-      capacityConsumed: !parentAssignment,
+      capacityConsumed: !parentAssignment && options.administrative !== true,
       state: 'accepted',
-      requiredCapabilities: ticket.requiredCapabilities,
+      requiredCapabilities: routingRequirement(ticket, step).capabilities,
       reason: `Selected ${assignee.role} by capability, readiness, capacity, quality, and stable tie-break.`,
       proposedAt: now,
       acceptedAt: now,
     });
     const built = await this.traces.build(ticket, [
+      ...(releasedAssignment
+        ? [{
+            eventType: 'reassigned' as const,
+            initiatorActorId: pm.id,
+            initiatorRole: pm.role,
+            assignmentId: releasedAssignment.id,
+            fromOwnerActorId: releasedAssignment.assigneeActorId,
+            toOwnerActorId: assignee.id,
+            fromAssignmentState: releasedAssignment.state,
+            toAssignmentState: 'released' as const,
+            reasonCode: 'pm.reassigned_for_step',
+            reason: step
+              ? `Previous owner cannot process ${step.name}; Project Manager re-routed ${ticket.name}.`
+              : `Project Manager re-routed ${ticket.name}.`,
+            correlationId: ticket.source.correlationId,
+            causationId: ticket.id,
+          }]
+        : []),
       {
         eventType: 'routed',
         initiatorActorId: pm.id,
@@ -175,9 +210,10 @@ export class TicketRegistrationService {
       assignmentIds: [...ticket.assignmentIds, assignment.id],
       activeAssignmentId: assignment.id,
     });
-    const routingOptions = (await this.roles.actors(ticket.projectId))
-      .filter((actor) => actor.state === 'active' && actor.supportedTicketTypes.includes(ticket.type))
-      .map((actor) => actor.name);
+    const routingOptions = (await this.roles.routingActors(ticket.projectId))
+      .filter(({ actor, definition }) =>
+        actor.state === 'active' && definition.supportedTicketTypes.includes(ticket.type))
+      .map(({ actor }) => actor.name);
     const routingDecision = await this.governance.prepareDecision({
       projectId: ticket.projectId,
       decisionType: 'routing',
@@ -198,10 +234,28 @@ export class TicketRegistrationService {
       routingDecision.decision,
       routingDecision.managementPlan,
     ];
+    if (releasedAssignment) objects.push(transitionAssignment(releasedAssignment, 'released', now));
+    // Collect capacity edits per actor so a re-route that lands on the same actor still commits one
+    // revision rather than two conflicting ones.
+    const capacityEdits = new Map<ObjectId, { actor: ActorRegistration; ids: ObjectId[] }>();
+    const capacityEdit = (actor: ActorRegistration) => {
+      const found = capacityEdits.get(actor.id);
+      if (found) return found;
+      const created = { actor, ids: [...actor.activeAssignmentIds] };
+      capacityEdits.set(actor.id, created);
+      return created;
+    };
+    if (releasedAssignment?.capacityConsumed) {
+      const previous = await this.roles.require(releasedAssignment.assigneeActorId);
+      const edit = capacityEdit(previous);
+      edit.ids = edit.ids.filter((id) => id !== releasedAssignment.id);
+    }
     if (assignment.capacityConsumed) {
-      objects.push(reviseActor(assignee, {
-        activeAssignmentIds: [...assignee.activeAssignmentIds, assignment.id],
-      }));
+      const edit = capacityEdit(assignee);
+      edit.ids = [...edit.ids, assignment.id];
+    }
+    for (const edit of capacityEdits.values()) {
+      objects.push(reviseActor(edit.actor, { activeAssignmentIds: edit.ids }));
     }
     objects.push(ticket, createDomainEvent({
       projectId: ticket.projectId,
@@ -266,6 +320,16 @@ export class TicketRegistrationService {
     return actor.id;
   }
 
+  /** The registered actor behind an assignment, for callers that hold an assignment rather than a Ticket. */
+  async actorById(actorId: ObjectId): Promise<ActorRegistration> {
+    return this.roles.require(actorId);
+  }
+
+  /** The same actor with the Role Definition it instantiates, for callers that need its identity. */
+  async routingActorById(actorId: ObjectId): Promise<RoutingActor> {
+    return this.roles.resolve(actorId);
+  }
+
   private async projectManager(projectId: ObjectId): Promise<ActorRegistration> {
     const actors = await this.roles.actors(projectId);
     const pm = actors.find((actor) => actor.role === 'project-manager' && actor.state === 'active');
@@ -301,14 +365,16 @@ export class TicketRegistrationService {
     actorId: ObjectId,
     step: Parameters<RoleRegistry['eligible']>[1],
   ): Promise<ActorRegistration> {
-    const actor = await this.roles.require(actorId);
+    const { actor, definition } = await this.roles.resolve(actorId);
     const required = new Set(ticket.requiredCapabilities);
+    // Deliberately not a capacity check: an inherited assignment consumes none, so refusing a parent
+    // owner who is already at capacity would strand its own sub-Ticket.
     if (
       actor.state !== 'active' ||
       actor.role !== ticket.role ||
-      !actor.supportedTicketTypes.includes(ticket.type) ||
-      (step && actor.supportedStepTypes.length > 0 && !actor.supportedStepTypes.includes(step.type)) ||
-      [...required].some((capability) => !actor.capabilities.includes(capability))
+      !definition.supportedTicketTypes.includes(ticket.type) ||
+      (step && definition.supportedStepTypes.length > 0 && !definition.supportedStepTypes.includes(step.type)) ||
+      [...required].some((capability) => !definition.capabilities.includes(capability))
     ) {
       throw new Error(`Parent Ticket owner ${actor.name} cannot inherit ${ticket.name}`);
     }

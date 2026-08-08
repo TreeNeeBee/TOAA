@@ -16,10 +16,42 @@ export interface RecordReplayControllerOptions {
   redactedFields?: readonly string[];
 }
 
+/** Per-channel accounting of how external interactions were satisfied during a run. */
+export interface RecordReplayChannelUsage {
+  /** Served from an existing recording; no external call was made. */
+  replayed: number;
+  /** Executed live and written to a fixture. */
+  recorded: number;
+  /** Executed live without recording, because the channel is not under fixture control. */
+  live: number;
+}
+
+export type RecordReplayUsage = Record<RecordReplayChannel, RecordReplayChannelUsage>;
+
+/**
+ * Delivery evidence about external interactions.
+ *
+ * `managedChannels` matters as much as the counters: callers wrap a channel only when
+ * `enabled(channel)` is true, so an unmanaged channel produces no counts at all while still making
+ * real calls. Reporting counters alone would let a run with fixtures switched off look like a run
+ * that replayed everything.
+ */
+export interface RecordReplayEvidence {
+  mode: RecordReplayMode;
+  managedChannels: RecordReplayChannel[];
+  usage: RecordReplayUsage;
+}
+
 export class RecordReplayController {
   private readonly channels: ReadonlySet<RecordReplayChannel>;
   private readonly redactedFields: ReadonlySet<string>;
   private readonly modeScope = new AsyncLocalStorage<RecordReplayMode>();
+  private readonly usageByChannel: RecordReplayUsage = {
+    http: { replayed: 0, recorded: 0, live: 0 },
+    llm: { replayed: 0, recorded: 0, live: 0 },
+    subprocess: { replayed: 0, recorded: 0, live: 0 },
+    tool: { replayed: 0, recorded: 0, live: 0 },
+  };
 
   constructor(private readonly options: RecordReplayControllerOptions) {
     this.channels = new Set(options.enabledChannels ?? ['http', 'llm']);
@@ -48,11 +80,23 @@ export class RecordReplayController {
     return this.mode !== 'off' && this.channels.has(channel);
   }
 
+  /** Delivery evidence: what this run replayed versus what it actually reached out for. */
+  evidence(): RecordReplayEvidence {
+    return {
+      mode: this.mode,
+      managedChannels: this.mode === 'off' ? [] : [...this.channels],
+      usage: structuredClone(this.usageByChannel),
+    };
+  }
+
   async execute<TRequest, TResponse>(
     input: RecordReplayRequest<TRequest>,
     live: () => Promise<TResponse>,
   ): Promise<TResponse> {
-    if (!this.enabled(input.channel)) return live();
+    if (!this.enabled(input.channel)) {
+      this.usageByChannel[input.channel].live += 1;
+      return live();
+    }
     const request = redactAndCanonicalize(input.request, this.redactedFields);
     assertNoObviousSecret(request);
     const requestKey = hashValue({ channel: input.channel, operation: input.operation, request });
@@ -69,6 +113,7 @@ export class RecordReplayController {
     }
     const match = active.at(-1);
     if (match && (this.mode === 'replay' || this.mode === 'auto')) {
+      this.usageByChannel[input.channel].replayed += 1;
       return structuredClone(match.response) as TResponse;
     }
     if (this.mode === 'replay') {
@@ -97,6 +142,7 @@ export class RecordReplayController {
     };
     const entry: RecordReplayEntry = { ...base, entryHash: hashValue(base) };
     await this.options.store.append(entry);
+    this.usageByChannel[input.channel].recorded += 1;
     return response;
   }
 }

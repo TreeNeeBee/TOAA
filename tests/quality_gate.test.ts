@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   defaultQualityGateForPhase,
   evaluateQualityGate,
-  reconcileDevelopmentQualityAssessment,
+  normalizeQualityAssessment,
 } from '../src/core/quality_gate.js';
 import type { Step } from '../src/core/plan.js';
 
@@ -52,54 +52,38 @@ describe('LLM quality evidence normalization', () => {
     }).passed).toBe(true);
   });
 
-  it('removes stale missing-output and deferred paired-test notes only', () => {
-    const step = {
-      ...testStep('HIGH_LEVEL_DESIGN'),
-      outputs: ['docs/02-high-level-design.md', 'tests/modules/core.test.ts'],
-      tools: ['write_file', 'read_file'],
-    };
-    const reconciled = reconcileDevelopmentQualityAssessment(step, {
-      completion: 0,
-      upstreamAlignment: 1,
-      metrics: {},
-      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
-      evidence: [],
-      gaps: [
-        'missing required output: tests/modules/core.test.ts',
-        'run_tests is not authorized here; tests will be executed in MODULE_TEST',
-      ],
-    }, []);
-    expect(reconciled?.completion).toBe(1);
-    expect(reconciled?.gaps).toEqual([]);
-    expect(evaluateQualityGate(step, reconciled).passed).toBe(true);
-  });
-
   it('preserves semantic defects even when files exist', () => {
     const step = { ...testStep('CODE'), outputs: ['src/main.ts'] };
     const gap = 'src/main.ts is missing retry behavior required by the design';
-    const reconciled = reconcileDevelopmentQualityAssessment(step, {
+    const assessment = {
       completion: 0.6,
       upstreamAlignment: 1,
       metrics: {},
       tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
-      evidence: [], gaps: [gap],
-    }, []);
-    expect(reconciled?.gaps).toEqual([gap]);
-    expect(evaluateQualityGate(step, reconciled).passed).toBe(false);
+      evidence: ['src/main.ts'], gaps: [gap], blockedBy: [],
+    };
+    expect(evaluateQualityGate(step, assessment).passed).toBe(false);
   });
 
-  it('defers downstream coverage findings to the paired verification gate', () => {
+  it('does not infer ownership from metric names in free text', () => {
     const step = { ...testStep('CODE'), outputs: ['src/main.ts'] };
-    const reconciled = reconcileDevelopmentQualityAssessment(step, {
+    const misplaced = {
       completion: 1,
       upstreamAlignment: 1,
       metrics: { lineCoverage: 0.39 },
       tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
       evidence: ['npm test -- --coverage'],
       gaps: ['lineCoverage 0.39 is below the UNIT_TEST target 0.80'],
-    }, []);
-    expect(reconciled?.gaps).toEqual([]);
-    expect(evaluateQualityGate(step, reconciled).passed).toBe(true);
+      blockedBy: [],
+    };
+    expect(evaluateQualityGate(step, misplaced).passed).toBe(false);
+
+    const structured = {
+      ...misplaced,
+      gaps: [],
+      blockedBy: ['UNIT_TEST owns the lineCoverage gate'],
+    };
+    expect(evaluateQualityGate(step, structured).passed).toBe(true);
   });
 });
 
@@ -116,3 +100,63 @@ function testStep(phase: Step['phase']): Step {
     maxAttempts: 3,
   };
 }
+
+describe('preconditions a Step does not own', () => {
+  // From a live run: DETAILED_DESIGN reported "Test pass rate is 0 because product source files are
+  // not yet implemented; this is expected per V-model ... and is not a defect of this step" — an
+  // accurate statement about something CODE had not written yet — and the gate failed the Step for
+  // it, because a gate fails a Step for every gap it reports. The mechanism meant to drop such gaps
+  // matches internal metric identifiers against free prose, and lost to a model writing "test pass
+  // rate" where it expected "testCasePassRate".
+  it('are parsed into their own field, not into gaps', () => {
+    const parsed = normalizeQualityAssessment({
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['docs/03-detailed-design.md'],
+      unavailableMetrics: [],
+      gaps: [],
+      blockedBy: ['product source is not implemented yet; it is the CODE Step output'],
+    });
+
+    expect(parsed?.gaps).toEqual([]);
+    expect(parsed?.blockedBy).toEqual([
+      'product source is not implemented yet; it is the CODE Step output',
+    ]);
+  });
+
+  it('do not fail the gate, while a real gap still does', () => {
+    const step = {
+      id: 'S003', phase: 'DETAILED_DESIGN', title: 'x', description: 'x',
+      systemPrompt: 'x', role: 'Architect', tools: [], inputs: [], outputs: [],
+      dependsOn: [], acceptance: 'ok',
+    } as unknown as Step;
+    const base = {
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['docs/03-detailed-design.md'],
+    };
+
+    const blocked = evaluateQualityGate(step, { ...base, gaps: [], blockedBy: ['CODE has not run'] });
+    expect(blocked.passed).toBe(true);
+
+    const real = evaluateQualityGate(step, { ...base, gaps: ['the module contract is undefined'], blockedBy: [] });
+    expect(real.passed).toBe(false);
+  });
+
+  it('accepts the snake_case spelling a model may emit', () => {
+    const parsed = normalizeQualityAssessment({
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: [],
+      unavailable_metrics: ['lineCoverage'],
+      gaps: [],
+      blocked_by: ['the manifest is written by HIGH_LEVEL_DESIGN'],
+    });
+    expect(parsed?.blockedBy).toEqual(['the manifest is written by HIGH_LEVEL_DESIGN']);
+    expect(parsed?.unavailableMetrics).toEqual(['lineCoverage']);
+  });
+});

@@ -131,6 +131,10 @@ agent:
       local:
         sandbox_dir: .sandbox/typescript
         inherit_env: false
+        # Package registry the sandbox resolves dependencies from. Leave unset to use npm's default.
+        # The sandbox redirects HOME so host credentials never reach a generated project, which also
+        # discards ~/.npmrc — set this when your network resolves packages through a mirror.
+        # registry: https://registry.npmmirror.com/
         limits:
           cpu: 1
           memory_mb: 1024

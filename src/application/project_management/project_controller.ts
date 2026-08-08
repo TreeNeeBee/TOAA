@@ -235,6 +235,12 @@ export class ProjectController {
     return this.corrective.routeQualityGap(input);
   }
 
+  routeDependencyChange(
+    input: Parameters<CorrectiveWorkflowService['routeDependencyChange']>[0],
+  ): ReturnType<CorrectiveWorkflowService['routeDependencyChange']> {
+    return this.corrective.routeDependencyChange(input);
+  }
+
   async propagateCorrectiveChange(input: {
     work: ScheduledWork;
     qualityAssessmentId: ObjectId;
@@ -251,7 +257,7 @@ export class ProjectController {
       commit?: string;
       verification: string[];
     };
-  }): Promise<ChangeRequestTicket> {
+  }): Promise<ChangeRequestTicket | undefined> {
     return this.corrective.propagateCorrectiveChange(input);
   }
 
@@ -308,15 +314,9 @@ export class ProjectController {
     );
     if (!delivery || !epic) throw new Error(`Phase ${phase.name} delivery Ticket graph is incomplete`);
     delivery = (await this.registration.routeAndAssign(delivery.id)).ticket as WorkTicket;
-    delivery = await this.saveTicketTransitionPath(
-      delivery,
-      ['in_progress', 'resolved', 'closed'],
-    ) as WorkTicket;
+    await this.saveTicketTransitionPath(delivery, ['in_progress', 'resolved', 'closed']);
     epic = (await this.registration.routeAndAssign(epic.id)).ticket as WorkTicket;
-    epic = await this.saveTicketTransitionPath(
-      epic,
-      ['in_progress', 'resolved', 'closed'],
-    ) as WorkTicket;
+    await this.saveTicketTransitionPath(epic, ['in_progress', 'resolved', 'closed']);
     phase = await this.savePhaseTransition(phase, 'delivered');
     await this.savePhaseTransition(phase, 'closed');
     let project = await this.requireProject(phase.projectId);
@@ -328,7 +328,7 @@ export class ProjectController {
       ),
     );
     if (next) {
-      project = await this.state.selectCurrentPhase(project, next);
+      await this.state.selectCurrentPhase(project, next);
       return { nextPhaseId: next.id, projectDelivered: false };
     }
     if (project.state !== 'in_progress') {

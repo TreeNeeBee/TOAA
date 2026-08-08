@@ -8,10 +8,18 @@ export interface DomainRegistryEntryView {
   name: string;
   objectType: ObjectType;
   projectId: ObjectId;
-  /** Stable content reference for the current revision; usable as a Checkpoint snapshot ref. */
-  objectRef: string;
   revision: number;
   state?: string;
+}
+
+/**
+ * A logical, storage-independent reference to one object revision.
+ *
+ * Evidence such as Checkpoint snapshots must be expressible without knowing how the repository
+ * stores objects, so that an in-memory or non-file adapter can satisfy the same contract.
+ */
+export function objectRevisionRef(entry: Pick<DomainRegistryEntryView, 'id' | 'revision'>): string {
+  return `${entry.id}@r${entry.revision}`;
 }
 
 export interface DomainRegistryReader {

@@ -91,7 +91,12 @@ export class AttemptResultProcessor {
           verification: result.assessment.evidence,
         },
       });
-      await this.routeTicket(phase, work, request.id, request.type, request.source.correlationId);
+      // No Change Request means the repair had nowhere to propagate: the Change Request it was
+      // raised inside re-applies that Step itself and carries the repair onward. The corrective
+      // Ticket closed in place, so there is nothing to route.
+      if (request) {
+        await this.routeTicket(phase, work, request.id, request.type, request.source.correlationId);
+      }
     } else if (work.ticket.type === 'change-request') {
       const completion = await this.options.controller.completeChangeRequestStep({
         work,
@@ -152,6 +157,21 @@ export class AttemptResultProcessor {
       reason: result.reason,
       failureLog: result.failureLog,
     });
+    // Before anything else: a Step that needs a package it does not own has not produced a defect,
+    // and opening a Bug against it would ask the wrong role to repair the wrong artifact. The need
+    // goes back to the design that owns the manifest, and PM parks this Step until it answers.
+    if (result.dependencyRequest) {
+      const routed = await this.options.controller.routeDependencyChange({
+        requestingStepId: work.step.id,
+        requestingTicket: work.ticket,
+        packages: result.dependencyRequest.packages,
+        reason: result.dependencyRequest.reason,
+        creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
+        correlationId: work.ticket.source.correlationId,
+      });
+      await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+      return { action: 'continue' };
+    }
     if (result.failureKind === 'infrastructure') {
       const reason = result.reason ?? 'LLM infrastructure request failed.';
       await this.options.controller.deferInfrastructureFailure(work, reason);
@@ -225,6 +245,52 @@ export class AttemptResultProcessor {
       summary: result.reason ?? 'Step execution failed.',
       failure: result.failure ?? fallbackExecutionFailure(result.reason),
       correlationId: createObjectId(),
+    });
+    await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+    return { action: 'continue' };
+  }
+
+  /**
+   * Turns a merge gate's verdict into the repair the gate discovered.
+   *
+   * The gate runs the project's own build and tests against what would actually land, so a failure
+   * here is a defect in the delivered change even though the Step's own attempt passed — the two
+   * judge different things, and only this one judges the merged result. Halting the run instead left
+   * the one finding that most clearly describes a broken project with nowhere to go.
+   *
+   * The evidence is the gate's own failing checks, verbatim. PM registers and routes; it does not
+   * author the technical content — the same division that applies to every other discovering actor.
+   */
+  async processIntegrationFailure(input: {
+    phase: Phase;
+    work: ScheduledWork;
+    reason: string;
+    failureLog?: string;
+  }): Promise<AttemptDisposition> {
+    const { phase, work } = input;
+    await this.options.audit.event('note', `${work.step.name} merge gate rejected the change`, {
+      messageId: 'domain.merge_gate_rejected',
+      projectId: work.step.projectId,
+      phaseId: phase.id,
+      stepId: work.step.id,
+      stepName: work.step.name,
+      ticketId: work.ticket.id,
+      reason: input.reason,
+      failureLog: input.failureLog,
+    });
+    // Without a paired Step there is no Step to route the repair to, and inventing one would attach
+    // the defect to whatever happened to be nearby.
+    if (!work.step.pairedStepId) {
+      return { action: 'stop', reason: input.reason };
+    }
+    const routed = await this.options.controller.routeFailure({
+      failedStepId: work.step.id,
+      message: input.failureLog ?? input.reason,
+      summary: input.reason,
+      failure: fallbackExecutionFailure(input.reason),
+      correlationId: work.ticket.source.correlationId,
+      causationId: work.ticket.id,
+      creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
     });
     await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
     return { action: 'continue' };

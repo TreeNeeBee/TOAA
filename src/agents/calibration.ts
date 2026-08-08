@@ -542,9 +542,13 @@ const WRITE_CAPABLE_TOOL_REFS = new Set([
   'skill:refactorer',
 ]);
 
+import { DEPENDENCY_MANIFEST_OWNER } from '../domain/steps/step.js';
+
 const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
   REQUIREMENT_ANALYSIS: ['skill:author'],
-  HIGH_LEVEL_DESIGN: ['skill:author'],
+  // The phase that owns the manifest is handed the tool for it. `skill:dep_resolver` existed and was
+  // wired to nobody, so the Step every dependency Change Request routes to could not act on one.
+  HIGH_LEVEL_DESIGN: ['skill:author', 'skill:dep_resolver'],
   DETAILED_DESIGN: ['skill:author'],
   CODE: ['skill:author'],
   UNIT_TEST: ['skill:tester'],
@@ -553,7 +557,11 @@ const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
   FUNCTIONAL_TEST: ['skill:tester'],
 };
 
+// Phases whose defaults are merged in rather than used only as a fallback. A verification phase
+// cannot verify without a runner, and the manifest owner cannot own a manifest it has no tool to
+// edit — in both cases the planner's list is a preference, not the whole story.
 const PHASE_DEFAULT_TOOLS_REQUIRED = new Set([
+  DEPENDENCY_MANIFEST_OWNER,
   'UNIT_TEST',
   'INTEGRATION_TEST',
   'MODULE_TEST',

@@ -37,6 +37,20 @@ import {
   type TicketAssignment,
   type TicketTraceEvent,
 } from '../project_management/index.js';
+import {
+  TicketChangeSetSchema,
+  WorkspaceHandleSchema,
+  type TicketChangeSet,
+  type WorkspaceHandle,
+} from '../workspace/change_set.js';
+import {
+  MergeGateRunSchema,
+  MergeRequestSchema,
+  type MergeGateRun,
+  type MergeRequest,
+} from '../workspace/merge_request.js';
+import { ContextRecordSchema, type ContextRecord } from '../context/context_record.js';
+import { RoleDefinitionSchema, type RoleDefinition } from '../workflow/role_definition.js';
 import { DomainEventSchema, type DomainEvent } from '../observability/domain_event.js';
 
 export type PersistedDomainObject =
@@ -47,6 +61,12 @@ export type PersistedDomainObject =
   | ActorRegistration
   | TicketAssignment
   | TicketTraceEvent
+  | WorkspaceHandle
+  | TicketChangeSet
+  | MergeRequest
+  | MergeGateRun
+  | ContextRecord
+  | RoleDefinition
   | ProjectManagementPlan
   | RiskRecord
   | DecisionRecord
@@ -71,6 +91,12 @@ export const PersistedDomainObjectSchema: z.ZodType<PersistedDomainObject> = z.u
   ActorRegistrationSchema,
   TicketAssignmentSchema,
   TicketTraceEventSchema,
+  WorkspaceHandleSchema,
+  TicketChangeSetSchema,
+  MergeRequestSchema,
+  MergeGateRunSchema,
+  ContextRecordSchema,
+  RoleDefinitionSchema,
   ProjectManagementPlanSchema,
   RiskRecordSchema,
   DecisionRecordSchema,

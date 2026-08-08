@@ -241,8 +241,8 @@ phasePlan.json                         Planner Phase outline
 plan.P<N>.json                         current Planner execution spec
 .xcompiler/registry/events.jsonl       append-only registry events
 .xcompiler/registry/index.json         rebuildable registry snapshot
-.xcompiler/objects/<type>/<uuid>.json  canonical domain objects
-.xcompiler/project-status.json         rebuildable PM status projection
+.xcompiler/objects/<type>/<uuid>/r<N>.json  canonical domain objects, immutable per revision
+.xcompiler/cache/pm/project-status.json    rebuildable PM status projection
 .xcompiler/record-replay/              redacted external-interaction fixtures
 .xcompiler/audit.jsonl                 detailed operational audit
 docs/process_log.md                    human-readable process log

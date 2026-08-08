@@ -1,35 +1,40 @@
 import { z } from 'zod';
+import {
+  PLAN_DRAFT_COMPLEXITY_LEVELS,
+  type PlanDraftComplexityLevel,
+} from '../domain/planning/plan_draft.js';
+import {
+  DEVELOPMENT_STEP_TYPES,
+  SOURCE_TO_VERIFICATION_STEP,
+  STEP_TYPES,
+  VERIFICATION_STEP_TYPES,
+  VERIFICATION_TO_SOURCE_STEP,
+  V_MODEL_STEP_PAIRS,
+  type DevelopmentStepType,
+  type StepType,
+  type VerificationStepType,
+} from '../domain/steps/step.js';
 
 export const PLAN_VERSION = '2';
 
 /**
  * Planned V-model phases.
  *
+ * The Domain owns this vocabulary; the plan file re-exports it so there is exactly one definition
+ * of the V-model end to end rather than a second list that can silently drift.
+ *
  * DEBUG deliberately does not belong here: it is an execution mode entered after
  * a failed gate and routed back to the paired source phase.
  */
-export const V_MODEL_PAIRS = [
-  ['REQUIREMENT_ANALYSIS', 'FUNCTIONAL_TEST'],
-  ['HIGH_LEVEL_DESIGN', 'MODULE_TEST'],
-  ['DETAILED_DESIGN', 'INTEGRATION_TEST'],
-  ['CODE', 'UNIT_TEST'],
-] as const;
+export const V_MODEL_PAIRS = V_MODEL_STEP_PAIRS;
 
-export type VModelDevelopmentPhase = (typeof V_MODEL_PAIRS)[number][0];
-export type VModelTestPhase = (typeof V_MODEL_PAIRS)[number][1];
-export type Phase = VModelDevelopmentPhase | VModelTestPhase;
+export type VModelDevelopmentPhase = DevelopmentStepType;
+export type VModelTestPhase = VerificationStepType;
+export type Phase = StepType;
 
-export const V_MODEL_DEVELOPMENT_PHASES = V_MODEL_PAIRS.map(
-  ([phase]) => phase,
-) as readonly VModelDevelopmentPhase[];
-export const V_MODEL_TEST_PHASES = [...V_MODEL_PAIRS].reverse().map(
-  ([, phase]) => phase,
-) as readonly VModelTestPhase[];
-
-export const PHASES = [
-  ...V_MODEL_DEVELOPMENT_PHASES,
-  ...V_MODEL_TEST_PHASES,
-] as unknown as readonly [Phase, ...Phase[]];
+export const V_MODEL_DEVELOPMENT_PHASES = DEVELOPMENT_STEP_TYPES;
+export const V_MODEL_TEST_PHASES = VERIFICATION_STEP_TYPES;
+export const PHASES = STEP_TYPES;
 
 export const EXECUTION_MODES = ['NORMAL', 'DEBUG'] as const;
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
@@ -38,14 +43,10 @@ export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 export const REQUIRED_V_MODEL_PHASES = PHASES;
 
 /** Synchronous test-design mapping generated while executing the corresponding left-side phase. */
-export const V_MODEL_SOURCE_TO_TEST_PHASE = Object.fromEntries(
-  V_MODEL_PAIRS,
-) as Record<VModelDevelopmentPhase, VModelTestPhase>;
+export const V_MODEL_SOURCE_TO_TEST_PHASE = SOURCE_TO_VERIFICATION_STEP;
 
 /** Test failure rollback target: a failed test phase debugs from its paired source phase. */
-export const V_MODEL_TEST_TO_SOURCE_PHASE = Object.fromEntries(
-  V_MODEL_PAIRS.map(([source, test]) => [test, source]),
-) as Record<VModelTestPhase, VModelDevelopmentPhase>;
+export const V_MODEL_TEST_TO_SOURCE_PHASE = VERIFICATION_TO_SOURCE_STEP;
 
 export const PHASE_ORDER = Object.fromEntries(
   PHASES.map((phase, index) => [phase, index]),
@@ -64,8 +65,9 @@ export const PROJECT_TYPES = ['application', 'library', 'mixed'] as const;
 export type ProjectType = (typeof PROJECT_TYPES)[number];
 
 /** Planner's first-pass project complexity estimate. */
-export const COMPLEXITY_LEVELS = ['simple', 'moderate', 'complex'] as const;
-export type ComplexityLevel = (typeof COMPLEXITY_LEVELS)[number];
+// Owned by the Domain planning contract so compilation and the plan file agree by construction.
+export const COMPLEXITY_LEVELS = PLAN_DRAFT_COMPLEXITY_LEVELS;
+export type ComplexityLevel = PlanDraftComplexityLevel;
 
 /** Implementation phase status. Only `current` is materialized as executable Steps. */
 export const IMPLEMENTATION_PHASE_STATUSES = ['current', 'planned', 'complete', 'deferred'] as const;

@@ -14,6 +14,7 @@ export class ProjectGraphPersistenceService {
       graph.project,
       graph.projectPlan,
       graph.managementPlan,
+      ...graph.roleDefinitions,
       ...graph.actors,
       ...graph.phases,
       ...graph.phasePlans,

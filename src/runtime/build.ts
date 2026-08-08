@@ -6,7 +6,7 @@ import { LLMRouter } from '../llm/router.js';
 import { reportRoleModelAdvice } from '../llm/role_advice.js';
 import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
-import { Workspace } from '../workspace/workspace.js';
+import { ProjectContainer } from '../workspace/project_container.js';
 import { archiveIfExists } from '../workspace/doc_archive.js';
 import {
   Planner,
@@ -60,6 +60,8 @@ import type { RecordReplayMode } from '../application/record_replay/types.js';
 import { ProjectGraphPersistenceService } from '../application/planning/project_graph_persistence_service.js';
 import { ProjectPlanningGovernanceService } from '../application/planning/project_planning_governance_service.js';
 import { FileProjectProjectionWriter } from '../infrastructure/projections/index.js';
+import { Workspace } from '../workspace/workspace.js';
+import { defaultRoleTemplatePath, loadRoleTemplates } from '../infrastructure/roles/role_template_store.js';
 import {
   formatClarificationQuestion,
   resolveClarificationAnswer,
@@ -79,6 +81,14 @@ export type {
 
 export interface CompileOptions {
   workspace: string;
+  /**
+   * The Project's name.
+   *
+   * Carried as data rather than recovered from `workspace`. A name that round-trips through a
+   * directory path cannot be read back reliably: which component is the name depends on the layout,
+   * and under the container split the last component is the canonical branch, not the project.
+   */
+  name?: string;
   configPath?: string;
   inputFile?: string;
   /**
@@ -121,7 +131,11 @@ export class CompileExitError extends Error {
 
 export async function runCompile(opts: CompileOptions): Promise<{ planPath?: string }> {
   const io = opts.io ?? silentRuntimeIO;
-  const ws = new Workspace(path.resolve(opts.workspace));
+  // `-w <dir>` addresses the project container. Project state lives at <dir>/.xcompiler and the
+  // working copy at <dir>/worktrees/<branch>, so a sandbox mounting the working copy cannot reach
+  // XCompiler's own registry, audit trail, or fixtures.
+  const container = new ProjectContainer(path.resolve(opts.workspace));
+  const ws = container.canonical().workspace;
   const { config: cfg, path: cfgPath, missingEnv } = await loadConfigWithPath(opts.configPath);
   // Locale 必须在第一条输出之前生效，确保终端与审计文件从头到尾使用同一语言。
   if (!hasXcEnv('LANG')) setLocale(cfg.locale);
@@ -132,7 +146,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
 
   let lock;
   try {
-    lock = await acquireLock(ws.root, 'xcompiler_build', { force: !!opts.force });
+    lock = await acquireLock(container.state.root, 'xcompiler_build', { force: !!opts.force });
   } catch (err) {
     if (err instanceof LockError) {
       await runtimeLog(io, 'error', t().system.unhandledError(err.message));
@@ -147,7 +161,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   let scoreStore: ScoreStore | undefined;
   try {
   const M = t();
-  const audit = new AuditLogger({ root: ws.root, command: 'xcompiler_build' });
+  const audit = new AuditLogger({ root: ws.root, stateRoot: container.state.root, command: 'xcompiler_build' });
   await audit.start({
     workspace: ws.root,
     config: opts.configPath ?? '(default)',
@@ -205,7 +219,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   const baseline =
     isIncrementalIntent(intent)
-      ? await loadIncrementalBaseline(ws, { planPath: opts.baselinePlanFile })
+      ? await loadIncrementalBaseline(ws, container.state, { planPath: opts.baselinePlanFile })
       : { summary: '', sources: [] };
   if (isIncrementalIntent(intent) && !baseline.summary) {
     const msg = M.compile.baselineMissing(ws.root);
@@ -535,7 +549,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     throw new CompileExitError(3, M.compile.lintFail(issues.length));
   }
 
-  const repository = new DomainObjectRepository(ws);
+  const repository = new DomainObjectRepository(container.state);
   await repository.load();
   const graphPersistence = new ProjectGraphPersistenceService(repository);
   const previousProject = await repository.findProject();
@@ -605,7 +619,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   // 归档上一版本（如有），再写入新版本。topic.md 已在第 3.5 步落盘，这里只处理 plan.
   await archiveIfExists(ws, DOC_NAMES.plan, audit);
   await ws.writeFile(DOC_NAMES.plan, planMd);
-  await refreshProjectMemory(ws, {
+  await refreshProjectMemory(ws, container.state, {
     planPath,
     language: persistedPlan.language,
     intent: persistedPlan.intent,
@@ -662,7 +676,10 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       draft: persistedPlan,
       topic: finalTopicMd,
       topicSourceRef: DOC_NAMES.topic,
-      projectName: path.basename(ws.root) || 'project',
+      // The container directory is the fallback, never the working copy underneath it: that is
+      // always the canonical branch, so naming a Project after it would call every project "master".
+      projectName: opts.name ?? path.basename(container.root) ?? 'project',
+      roleTemplates: await loadRoleTemplates(defaultRoleTemplatePath(ws.root)),
     });
     await graphPersistence.persistGraph(compiled);
     if (previousProject) await repository.retireProject(previousProject.id);
@@ -670,7 +687,8 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   }
   await new ProjectPlanningGovernanceService(
     repository,
-    new FileProjectProjectionWriter(ws),
+    // Container state, not the working copy: see the note at the run-time writer.
+    new FileProjectProjectionWriter(new Workspace(container.state.root)),
   ).baseline({
     project: graph.project,
     plan: persistedPlan,
@@ -710,6 +728,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   });
   const projectFile = await updateProjectFile({
     workspace: ws.root,
+    container: container.root,
     planPath: phasePlanPath,
     configPath: cfgPath,
     projectFilePath: opts.projectFilePath,

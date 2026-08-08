@@ -1,6 +1,6 @@
 # XCompiler 0.3 Architecture Refactor Plan
 
-Status: review draft  
+Status: implemented — see §16 for per-item status, revised sections, and what remains  
 Target release: v0.3.0  
 Scope: architecture, execution governance, testing infrastructure, and release baseline  
 Compatibility policy: intentionally breaking; no backward-compatibility layer
@@ -471,14 +471,25 @@ Decision resolution order:
 
 An LLM recommendation can never override a domain invariant, denied capability, or failed required gate.
 
-### 6.9 Governance modes
+### 6.9 Governance modes — superseded
+
+These four modes were a staged-rollout device for the migration, not a target-state feature:
 
 - `disabled`: existing Runtime behavior without PM decisions.
 - `observe`: PM computes and records decisions but cannot change execution.
 - `advisory`: PM recommends; Runtime or user confirms actions.
 - `enforced`: PM may execute explicitly authorized low-risk actions.
 
-Implementation progresses through these modes in order. Enforced mode is not the initial 0.3 default.
+They are **not implemented, and deliberately so.** The modes assume a non-PM execution path still
+exists to fall back to and to compare against. 0.3 completed the migration and deleted that path:
+`DomainExecutionEngine`'s project-driving loop and `DomainScheduler`'s state advancement are gone,
+and `ProjectOrchestrator` is the only loop. Building `disabled` or `observe` now would mean
+re-creating the second execution path this refactor removed, which contradicts DoD item 5 and the
+"PM becomes a second workflow engine" risk control in §14.
+
+The safety properties the modes existed to provide are met structurally instead: Domain transitions
+reject illegal commands whatever PM requests, sensitive operations route through persistent
+interactions (§6.10), and every decision is recorded with authority, rationale, and confidence.
 
 ### 6.10 Persistent interaction
 
@@ -856,7 +867,11 @@ Gate:
 
 Work:
 
-- Add PM Advisor LLM role with structured recommendation output.
+- ~~Add PM Advisor LLM role with structured recommendation output.~~ **Deferred past 0.3.** The
+  decision model already carries the seat for it — `DecisionRecord.authority` includes `pm-advisor`
+  and every decision records a confidence — but no LLM advisor is wired in. Deterministic PM policy
+  drives the project end to end today, so the advisor is an additive capability rather than refactor
+  completion, and adding a new LLM role, prompts, and resolver would widen 0.3's scope.
 - Resolve recommendations by authority, confidence, risk, and capability.
 - Make PM the active driver for Project, Phase, V-model Step, Ticket routing, retry, wait, fallback, and
   interaction commands.
@@ -889,21 +904,38 @@ Gate:
 
 ## 12. Test Topology
 
-Tests are reorganized by architectural responsibility:
+**Revised during implementation.** The original plan split tests into five buckets by architectural
+responsibility (`unit/domain`, `unit/application`, `contract`, `integration`, `e2e`). Measured against
+the finished code that split does not hold up, and it was replaced with a capability-based one.
 
-- `tests/unit/domain`: objects, transitions, invariants, policies, fingerprints.
-- `tests/unit/application`: use cases, PM decisions, cache projection, ticket routing.
-- `tests/contract`: Repository, Runtime, ACP, events, record/replay channel contracts.
-- `tests/integration`: filesystem, Registry, UnitOfWork, sandbox, local HTTP, provider streams.
-- `tests/e2e`: CLI/ACP workflows and real Python/TypeScript generated projects.
+Two findings drove the change:
 
-CI profiles:
+1. The layer buckets are not cleanly derivable. Most suites exercise `core`, `agents`, `llm`, `tools`,
+   or `sandbox`, none of which map onto `unit/domain` versus `unit/application`; assigning them would
+   have been an arbitrary judgement encoded as a directory name.
+2. Capability, not layer, is what CI has to gate on. Of 67 suites only five need a real OS capability
+   — four bind a loopback socket or spawn a process, one drives the real CLI. That distinction is the
+   one that decides whether a suite can run in a restricted sandbox, and it was the original motive
+   for this section: a sandbox that forbids `127.0.0.1` must not report environment restrictions as
+   product regressions.
 
-- `core`: deterministic, no network, required for every change.
-- `integration`: loopback and process capabilities, required before merge.
-- `replay`: external integrations with network disabled, required before release.
-- `live`: explicitly authorized credentials and endpoints, scheduled or release-only.
-- `package`: npm/native package installation and executable smoke tests.
+The implemented layout keeps the deterministic majority at the top level and carves out only what
+needs more than a filesystem:
+
+- `tests/`: deterministic suites. No sockets, no spawned processes.
+- `tests/integration/`: loopback HTTP servers, provider streams, and real subprocess execution.
+- `tests/e2e/`: suites that spawn the real CLI/ACP process.
+
+Suites are selected through Vitest projects, so a profile is a first-class runner target:
+
+- `core` (`npm run test:core`): deterministic; required for every change and runnable in a restricted
+  sandbox.
+- `integration` (`npm run test:integration`): loopback and process capabilities; required before merge.
+- `e2e` (`npm run test:e2e`): real CLI/ACP process.
+- `replay`: expressed as a runtime mode rather than a suite — verification stages force `replay`, and
+  a replay miss fails with a typed result instead of silently reaching the network.
+- `live` and `package`: release-time activities driven by credentials and `npm run package`, not by
+  the unit runner.
 
 Skipped, blocked, and inconclusive results are visible and governed by the active gate. They are never
 silently converted to success.
@@ -975,3 +1007,109 @@ The refactor is complete only when all of the following are true:
 17. Runtime, ACP, package, architecture, and security documentation match the implemented 0.3 behavior.
 18. The final project report contains complete quality, ticket assignment/trace, PM, RAID, record/replay, and
     delivery evidence.
+
+## 16. Implementation Status
+
+Recorded after the R0-R8 implementation pass and re-verified after the worktree/MR/context
+workstream (P1-P9) and its final lifecycle review. `npm run typecheck`, `npm run lint`, and the full
+test matrix pass: 92 files and 821 tests.
+
+### Definition of Done
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Runtime is the only business entry | Done — enforced by `tests/architecture_dependencies.test.ts` |
+| 2 | Domain depends on nothing outward | Done — the planning DTO moved to `domain/planning/plan_draft.ts`, closing the last leak |
+| 3 | One canonical V-model vocabulary | Done — defined once in `domain/steps/step.ts`; the plan file re-exports it |
+| 4 | Transactionally consistent state and events | Done — atomic graph commits with a same-batch event outbox |
+| 5 | PM actively drives progress | Done — `ProjectOrchestrator` is the only project loop |
+| 6 | PM cache bounded, revision-safe, rebuildable | Done — keyed by object revisions and registry cursor; the delete-and-rebuild gate is covered by `tests/pm_projection_rebuild.test.ts` |
+| 7 | Ticket creation authority and assignment | Done — PM creates only Epic/Story; execution requires an accepted assignment |
+| 8 | PM requests progression, Domain validates | Done |
+| 9 | Immutable hash-linked Ticket trace | Done — append-only; Repository rejects trace updates |
+| 10 | Reproducible flow metrics | Done — rebuilt from the trace |
+| 11 | Distinct Bug/Enhancement/CR lifecycles | Done |
+| 12 | Structured test outcomes and failures | Done — typed failures with a bounded text fallback for stringified provider errors |
+| 13 | Generic record/replay across channels | Done — HTTP, LLM, subprocess, tool |
+| 14 | Verification cannot record or go live | Done — verification stages are forced to `replay` |
+| 15 | Python and TypeScript real-project gates | **Not run** — requires live LLM credentials; see below |
+| 16 | Earlier compatibility code removed | Done |
+| 17 | Documentation matches 0.3 behavior | Done — design-doc persistence paths corrected to the revision-immutable object layout and the PM cache location |
+| 18 | Final report carries complete evidence | Done — quality, tickets, PM/RAID, flow metrics, and external-interaction evidence |
+
+### Deliberately not implemented
+
+- **Governance modes (§6.9).** Superseded; the migration they staged is complete. See §6.9.
+- **PM Advisor LLM role (R7).** Deferred past 0.3; the decision model reserves its authority seat.
+- **Five-bucket test topology (§12).** Replaced by capability-based profiles. See §12.
+
+### Outstanding
+
+- **Second workstream in the same release.** The tag baseline is v0.2.4, and
+  [the worktree/MR/layered-context plan](./XCompiler_worktree_mr_context_plan.md) ships as part of
+  the same 0.3.0 tag rather than as a follow-on. Users take one breaking step, not two, and no
+  compatibility is owed to any intermediate layout.
+- **DoD 15 — real-project validation.** Generating a Python and a TypeScript project end to end needs
+  live model credentials and cannot run as part of the deterministic gate. It is the remaining
+  release blocker for tagging 0.3.0, and now covers both workstreams. See §15.1 for what running it
+  has found so far.
+
+#### 15.1 What live validation has been for
+
+Thirty-eight defects so far, plus one performance change, against `examples/news/news_ts.md` with two
+OpenRouter models. Every defect now has a deterministic test; the live run's job was to reach the
+state that exposed it, not to be the test.
+
+The merge gate has now run for real: a CODE Step delivered from its own worktree, the gate installed
+dependencies and ran the generated project's tests against the merge candidate, the run passed, and
+the Merge Request advanced `draft → ready → validating → approved → mergeable`. That path had never
+been reached before, and reaching it immediately produced two more defects — the last one being
+XCompiler's own PM projection, written into the generated project's working copy, refusing the squash
+because Git saw the working copy as dirty.
+
+Three findings are worth carrying forward beyond the individual fixes.
+
+**Defects are layered, and reasoning cannot converge on them.** Each of the sandbox defects was only
+reachable once the previous one was fixed: dependencies could not install (weak-network retry budget)
+→ the canonical copy installed but the manifest delivered as a file output never synced → the
+canonical copy synced but a CODE Step forks into a worktree where `node_modules`, being untracked,
+does not exist. No amount of reading found the second one before the first was fixed.
+
+**Two defects can cancel.** `MergeIntegrationService` wrote through a ChangeSet copy that was one
+revision stale, *and* composed two mutators that each advance a revision. Being one behind and asking
+for two forward lands on one, so every test passed. Fixing either alone makes the other visible.
+This is the strongest argument in the refactor for tests that exercise the real seam: the unit
+harness stubbed the repository as a static object that answered the same record for every id and
+dropped every write, and no amount of care in the assertions could have compensated.
+
+**A mechanism can be dead in production while its test is green.** The planner's repair loop keyed on
+the failure's message text, and the provider router wraps every failure in one aggregate error, so
+the loop never fired in a real run. Its test drives a bare client, where the error propagates
+unwrapped. The lesson is the same one `ToolFailureCode` encodes: branch on structure, never on prose
+— and check what the production path actually hands the predicate.
+
+**A rule stated in one place is decided in several.** The dependency flow was the clearest case: the
+tool refused every phase but HIGH_LEVEL_DESIGN, and the tool calibration handed HIGH_LEVEL_DESIGN a
+skill that did not contain the tool. Every dependency Change Request routed correctly to a Step that
+had no way to act on it. `skill:dep_resolver` existed and was wired to nobody. The same shape
+produced the four `manifest_missing` guards, three sandbox-sync sites, and two places that decide
+what a failed merge gate means.
+
+**Downgrading a failure to a note obliges someone to read the note.** Three sandbox syncs failed at
+once for a whole run — a tool writing the manifest, a Step delivering it, an isolated scope preparing
+itself — each recording a note and continuing, so no environment was ever updated after the manifest
+changed and nothing said why. The decision not to raise was right: a missing toolchain is reported by
+the next command in terms the Step can act on, and a stack trace would replace that. What was missing
+is that nothing consumed the notes. The same shape hid the merge: `awaiting-authorization` was neither
+an error nor observable, so a run completed looking healthy while every ChangeSet sat unmerged, and
+finding it meant reading Merge Request revisions by hand.
+
+**What blocks a run is rarely what the run is about.** A single-capacity role deadlocked the whole
+project: a Bug held the developer's one slot while the Step it belonged to was parked waiting for a
+dependency, and the answer arrived as a Change Request aimed at that same Step. The rule that
+prevents it — capacity models work being carried, not ownership — was already written down and
+already implemented; it simply was not applied on the path that parks a Step for a dependency.
+- **Repository read performance.** Reads are cached per object revision, which removed the dominant
+  cost (the PM orchestration suite went from ~52s to ~2.9s; its heaviest single V-model run from
+  ~18s to ~0.9s). `list()` still walks the registry per call; if
+  projects grow much larger, a registry-level index is the next step.

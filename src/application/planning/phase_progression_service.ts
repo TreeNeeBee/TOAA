@@ -20,6 +20,8 @@ export interface PhaseProgressionResult {
 export class PhaseProgressionService {
   constructor(
     private readonly workspace: Workspace,
+    /** The container state root. Derived project memory belongs here, never inside a worktree. */
+    private readonly state: Workspace,
     private readonly router: LLMRouter,
     private readonly audit: AuditLogger,
     private readonly terminalOutput: boolean,
@@ -58,7 +60,7 @@ export class PhaseProgressionService {
       : transition.phasePlan.requirementDigest;
     let baselineSummary = transition.phasePlan.baselineSummary;
     try {
-      const memory = await refreshProjectMemory(this.workspace, {
+      const memory = await refreshProjectMemory(this.workspace, this.state, {
         planPath: input.currentPlanPath,
         language: transition.phasePlan.language,
         intent: transition.phasePlan.intent,
@@ -111,7 +113,7 @@ export class PhaseProgressionService {
     await savePlan(nextPlanPath, nextPlan);
     await savePhasePlan(input.phasePlanPath, transition.phasePlan);
     await this.workspace.writeFile(DOC_NAMES.plan, renderPlanMarkdown(nextPlan));
-    await refreshProjectMemory(this.workspace, {
+    await refreshProjectMemory(this.workspace, this.state, {
       planPath: nextPlanPath,
       language: nextPlan.language,
       intent: nextPlan.intent,

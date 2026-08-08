@@ -6,7 +6,7 @@ import type {
 } from '../../application/project_management/project_projection.js';
 import type { Workspace } from '../../workspace/workspace.js';
 
-export const PROJECT_STATUS_PROJECTION_PATH = '.xcompiler/cache/pm/project-status.json';
+export const PROJECT_STATUS_PROJECTION_PATH = 'cache/pm/project-status.json';
 
 export class FileProjectProjectionWriter implements ProjectProjectionWriter {
   constructor(private readonly workspace: Workspace) {}

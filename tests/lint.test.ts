@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { lintPlan, topoSort } from '../src/core/lint.js';
-import { PlanSchema, type Plan } from '../src/core/plan.js';
+import { PLAN_VERSION, PlanSchema, type Plan } from '../src/core/plan.js';
 
 const baseDeliveryDocs = ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'];
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
   const base: Plan = {
-    version: '1',
+    version: PLAN_VERSION,
     language: 'python',
     intent: 'greenfield',
     projectType: 'application',

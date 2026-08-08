@@ -19,7 +19,7 @@ import {
   normalizeContextWindowTokens,
   resolveSkillOperationWindow,
 } from './window.js';
-import { LLMRequestError, isLLMRequestError } from './errors.js';
+import { LLMRequestError } from './errors.js';
 import type { RecordReplayController } from '../application/record_replay/controller.js';
 
 
@@ -92,8 +92,8 @@ export class LLMRouter {
    * 排序：按 ScoreStore 的评分降序；评分 = 0 的 provider 直接剔除。
    * 链中第一个调用成功即返回；失败 → 自动降评分并尝试下一个。
    */
-  for(role: Role): LLMClient {
-    const candidates = this.resolveChain(role);
+  for(role: Role, options: { providerPool?: readonly string[] } = {}): LLMClient {
+    const candidates = this.resolveChain(role, options.providerPool);
     if (candidates.length === 0) {
       throw new LLMRequestError(`LLM provider not configured for role: ${role}`, {
         code: 'provider_not_configured', mode: 'router', retryable: false, switchProvider: false,
@@ -173,11 +173,18 @@ export class LLMRouter {
     }
   }
 
-  private resolveChain(role: Role): string[] {
+  private resolveChain(role: Role, providerPool?: readonly string[]): string[] {
     const out: string[] = [];
     const push = (n: string | undefined) => {
       if (n && !out.includes(n)) out.push(n);
     };
+    // An actor bound to specific providers is authoritative and does not inherit the global
+    // fallback chain: binding a model to one of several parallel actors is meaningless if the run
+    // may silently substitute a different one.
+    if (providerPool && providerPool.length > 0) {
+      for (const n of providerPool) push(n);
+      return out;
+    }
     const explicit = this.cfg.llm.role_fallbacks?.[role];
     if (explicit && explicit.length > 0) {
       for (const n of explicit) push(n);

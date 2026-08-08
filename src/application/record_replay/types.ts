@@ -1,6 +1,7 @@
 export const RECORD_REPLAY_MODES = ['off', 'record', 'replay', 'auto', 'refresh'] as const;
 export type RecordReplayMode = (typeof RECORD_REPLAY_MODES)[number];
-export type RecordReplayChannel = 'http' | 'llm' | 'subprocess' | 'tool';
+export const RECORD_REPLAY_CHANNELS = ['http', 'llm', 'subprocess', 'tool'] as const;
+export type RecordReplayChannel = (typeof RECORD_REPLAY_CHANNELS)[number];
 
 export interface RecordReplayEntry {
   version: 2;

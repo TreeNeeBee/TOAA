@@ -106,6 +106,15 @@ const LocalSandboxSchema = z
     sandbox_dir: z.string().min(1).optional(),
     python_bin: z.string().min(1).optional(),
     inherit_env: z.boolean().default(false),
+    /**
+     * Package registry the sandbox resolves dependencies from. Unset means the tool's own default.
+     *
+     * Needed because the sandbox redirects HOME to keep host credentials away from generated
+     * projects, which also discards the host's registry configuration. Declared here rather than
+     * read from the host: which registry a generated project uses is a project decision, and an
+     * endpoint inherited silently is one nobody chose.
+     */
+    registry: z.string().url().optional(),
     limits: SandboxLimitsSchema,
   })
   .default(() => ({ inherit_env: false, limits: defaultSandboxLimits() }));
@@ -343,7 +352,9 @@ export async function loadConfigWithPath(explicitPath?: string): Promise<LoadedC
       const raw = await fs.readFile(abs, 'utf8');
       const expanded = expandEnv(raw);
       const data = YAML.parse(expanded.text);
-      return { config: ConfigSchema.parse(data), path: abs, missingEnv: expanded.missing };
+      const parsed = ConfigSchema.safeParse(data);
+      if (!parsed.success) throw new Error(describeConfigFailure(abs, parsed.error));
+      return { config: parsed.data, path: abs, missingEnv: expanded.missing };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw err;
@@ -355,6 +366,34 @@ export async function loadConfigWithPath(explicitPath?: string): Promise<LoadedC
       `or create a local config.yaml from config.example.yaml before running XCompiler. ` +
       `The npm package ships config.example.yaml as a template; config.yaml is your local runtime config.`,
   );
+}
+
+/**
+ * 0.3 intentionally drops backward compatibility, so a config written for 0.2 must fail — but it has
+ * to fail legibly. A raw schema dump leaves the user guessing; this names the offending keys, calls
+ * out the ones 0.3 removed on purpose, and points at the template to rebuild from.
+ */
+function describeConfigFailure(configPath: string, error: z.ZodError): string {
+  const lines = [`Config file is not valid for XCompiler 0.3: ${configPath}`, ''];
+  let hasUnknownKeys = false;
+  for (const issue of error.issues) {
+    const at = issue.path.length > 0 ? issue.path.join('.') : '(root)';
+    if (issue.code === 'unrecognized_keys') {
+      const keys = issue.keys.map((key) => (at === '(root)' ? key : `${at}.${key}`));
+      hasUnknownKeys = true;
+      lines.push(`  - unknown key(s): ${keys.join(', ')}`);
+      continue;
+    }
+    lines.push(`  - ${at}: ${issue.message}`);
+  }
+  if (hasUnknownKeys) {
+    lines.push(
+      '',
+      'Keys that no longer exist were most likely valid in 0.2. 0.3 does not migrate old config;',
+      'remove them, or rebuild this file from the shipped config.example.yaml template.',
+    );
+  }
+  return lines.join('\n');
 }
 
 function expandEnv(s: string): { text: string; missing: string[] } {

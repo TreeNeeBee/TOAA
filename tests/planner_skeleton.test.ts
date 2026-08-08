@@ -17,6 +17,35 @@ function fakeLLM(reply: string | string[]): LLMClient {
   };
 }
 
+/**
+ * Mimics the provider router: a validate failure is not raised as itself, it is aggregated into one
+ * `all LLM providers failed` error carrying the last underlying failure as `cause`. `fakeLLM` above
+ * raises the underlying error directly, which is why the repair loop looked covered while never
+ * firing in a real run.
+ */
+function routedLLM(reply: string[]): LLMClient {
+  const replies = reply;
+  let calls = 0;
+  return {
+    name: 'routed',
+    async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+      const current = replies[Math.min(calls, replies.length - 1)]!;
+      calls += 1;
+      if (options?.validate) {
+        try {
+          options.validate(current);
+        } catch (error) {
+          throw new Error(
+            `all LLM providers failed for role Planner: primary: ${(error as Error).message}`,
+            { cause: error },
+          );
+        }
+      }
+      return current;
+    },
+  };
+}
+
 const minimalStep = (id: string, phase: string, outputs: string[] = [], iterationId = 'P1') =>
   ({
     id,
@@ -668,6 +697,137 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain(moduleTestPath);
     expect(plan.architectureModules?.[0]?.testPaths).toEqual([moduleTestPath]);
+  });
+
+  // From a live run: the planner gave README.md to both CODE and FUNCTIONAL_TEST, and the plan rules
+  // only ran after decompose returned — so the build died with exit 3 after two model calls, and the
+  // one party able to repair the plan was never told. The rules now run inside the repair loop.
+  it('两个 Step 抢同一个 output 时会带反馈重试，而不是让 build 直接失败', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = {
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'one bounded CLI',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [
+        {
+          id: 'P1',
+          title: 'Core',
+          objective: 'Deliver the CLI.',
+          status: 'current' as const,
+          scope: ['CLI'],
+          deliverables: ['Runnable CLI'],
+          dependsOn: [],
+        },
+      ],
+    };
+    const moduleTestPath = 'tests/modules/cli-contract.test.ts';
+    const module = {
+      id: 'M001',
+      name: 'CLI',
+      responsibility: 'Own command parsing and dispatch.',
+      sourcePaths: ['src/main.ts'],
+      testPaths: [moduleTestPath],
+      dependencies: [],
+    };
+    // S008 FUNCTIONAL_TEST already owns README.md; CODE claiming it too is the live failure.
+    const contendedSteps = vModelSteps('P1', 1, 'src/main.ts', moduleTestPath);
+    contendedSteps[3] = {
+      ...contendedSteps[3]!,
+      outputs: [...contendedSteps[3]!.outputs, 'README.md'],
+    };
+    const contended = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [module],
+      steps: contendedSteps,
+    };
+    const repaired = { ...contended, steps: vModelSteps('P1', 1, 'src/main.ts', moduleTestPath) };
+    const planner = new Planner(
+      fakeLLM([JSON.stringify(contended), JSON.stringify(repaired)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      phasePlan,
+      'P1',
+    );
+
+    expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain('README.md');
+    expect(plan.steps.find((step) => step.phase === 'FUNCTIONAL_TEST')?.outputs).toContain('README.md');
+  });
+
+  // The repair loop keys on the failure being repairable. The router wraps every per-provider
+  // failure in one aggregate error, so reading only the outer message matched nothing and the loop
+  // rethrew immediately — a whole live build died at decompose with a plan the planner could have
+  // fixed.
+  it('修复轮次在 router 包装错误后仍然触发', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = {
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'one bounded CLI',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [
+        {
+          id: 'P1',
+          title: 'Core',
+          objective: 'Deliver the CLI.',
+          status: 'current' as const,
+          scope: ['CLI'],
+          deliverables: ['Runnable CLI'],
+          dependsOn: [],
+        },
+      ],
+    };
+    const moduleTestPath = 'tests/modules/cli-contract.test.ts';
+    const module = {
+      id: 'M001',
+      name: 'CLI',
+      responsibility: 'Own command parsing and dispatch.',
+      sourcePaths: ['src/main.ts'],
+      testPaths: [moduleTestPath],
+      dependencies: [],
+    };
+    const contendedSteps = vModelSteps('P1', 1, 'src/main.ts', moduleTestPath);
+    contendedSteps[3] = {
+      ...contendedSteps[3]!,
+      outputs: [...contendedSteps[3]!.outputs, 'README.md'],
+    };
+    const contended = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [module],
+      steps: contendedSteps,
+    };
+    const repaired = { ...contended, steps: vModelSteps('P1', 1, 'src/main.ts', moduleTestPath) };
+    const planner = new Planner(
+      routedLLM([JSON.stringify(contended), JSON.stringify(repaired)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      phasePlan,
+      'P1',
+    );
+
+    expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain('README.md');
   });
 
   it('当前 phase 的架构规模门禁不被后续 planned phase 的 surface 误伤', async () => {

@@ -69,11 +69,10 @@ export function resolveSkillOperationWindow(input: OperationWindowInput = {}): S
   );
   const feedbackCharBudget = feedbackTokens * ESTIMATED_CHARS_PER_TOKEN;
   const readChunkBytes = Math.max(1024, Math.floor(feedbackCharBudget * 0.7));
-  const automaticWriteChunkBytes = Math.max(
+  const writeChunkBytes = Math.max(
     1024,
     Math.floor(responseTokenBudget * ESTIMATED_CHARS_PER_TOKEN * 0.72),
   );
-  const writeChunkBytes = automaticWriteChunkBytes;
 
   return {
     contextWindowTokens,

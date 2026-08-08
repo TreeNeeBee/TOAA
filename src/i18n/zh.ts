@@ -53,7 +53,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
 12. implementationPhases 必须包含 P1 current 和后续 planned 可执行迭代；verificationGate 的 failurePolicy 必须说明把失败日志传给 Debugger，回退到对应 V 模型阶段并重新执行后续阶段。
 13. dependencies 是 Python pip 依赖列表；必须包含 \`pytest\`；只写裸包名；任何 Step 都不要输出 \`requirements.txt\`。
 14. application/mixed 项目需要可直接运行的 Python 入口（\`src/main.py\` 或包 \`__main__.py\`）并复用 CODE 模块；library/mixed 项目需要稳定公开 API 和 \`docs/api-guide.md\`。
-15. 复杂需求必须返回 \`architectureModules\`：每个模块包含 id、name、responsibility、sourcePaths、可选 assetPaths、testPaths、dependencies。HIGH_LEVEL_DESIGN 产出 testPaths，CODE 产出实现路径，MODULE_TEST 消费 testPaths；宏 Step 覆盖多个模块时必须在 subTasks 中列出模块级工作。
+15. 复杂需求必须返回 \`architectureModules\`：每个模块包含 id、name、responsibility、sourcePaths、可选 assetPaths、testPaths、dependencies。每个模块的 \`testPaths\` 至少一条，且 \`sourcePaths\` 与 \`assetPaths\` 不能同时为空——模块没有测试路径就无法被 MODULE_TEST 消费。HIGH_LEVEL_DESIGN 产出 testPaths，CODE 产出实现路径，MODULE_TEST 消费 testPaths；宏 Step 覆盖多个模块时必须在 subTasks 中列出模块级工作。
 16. 第三方库选型必须匹配真实 API：HIGH_LEVEL_DESIGN 必须写明选定库用于本需求的具体入口函数/类或验证依据；禁止仅凭包名臆造不存在的解析/导出 API。
 17. 每个 Step 可声明 qualityGate。S1-S4 使用 completionMin 和 upstreamAlignmentMin；S5-S8 声明对应阶段 metrics 与 tolerance（metricShortfall、maxFailedTests、maxSkippedTests、maxWarnings）。阈值应符合项目风险；省略时由 Runtime 注入工程默认值。
 
@@ -106,7 +106,9 @@ const PYTHON_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只能�
     "metrics": {},
     "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
     "evidence": ["产物路径、测试报告或命令结果"],
-    "gaps": []
+    "unavailableMetrics": [],
+    "gaps": [],
+    "blockedBy": []
   },
   "actions": [ { "tool": "<工具名>", "args": { ... } }, ... ],
   "done": true | false
@@ -143,10 +145,11 @@ const PYTHON_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只能�
 4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空，并提交有具体证据支撑的 qualityAssessment。
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE 必须报告 completion 和 upstreamAlignment。
    这四个开发阶段负责编写配对测试，但只有当前 Step 明确授权验证工具时才运行；测试按计划留到 UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 执行不属于当前阶段缺陷，禁止写入 qualityAssessment.gaps。
+   本 Step 自身工作的欠缺写入 qualityAssessment.gaps，它会判本 Step 不通过。本 Step 不拥有、也无法满足的前置条件（由别的 Step 产出的源码、由别的阶段声明的依赖、应由配对验证阶段执行的测试）写入 qualityAssessment.blockedBy，它只作为证据记录、不会判本 Step 不通过。两者不可互填，真实的阻塞也不可两边都不写。
    每个配对测试必须导入或执行 Plan 声明的真实产品模块与公开接口；禁止在测试文件内复制产品类型、类、算法、渲染器、解析器、调度器或其它业务行为来制造脱离产品代码的自测通过。
    当 Plan 声明至少两个产品源码时，每个 DETAILED_DESIGN 集成测试必须实际使用至少两个已声明产品源码；任一侧使用内联替身都不属于集成证据。
    UNIT_TEST 报告 lineCoverage、branchCoverage、testCasePassRate；INTEGRATION_TEST 报告 interfaceCoverage、integrationScenarioCoverage、testCasePassRate；MODULE_TEST 报告 moduleCoverage、contractCoverage、testCasePassRate；FUNCTIONAL_TEST 报告 functionalCoverage、requirementCoverage、endToEndPassRate。
-   所有比率使用 0..1；禁止编造测量结果，无法取得的证据必须写入 gaps，由 Runtime 建立 Enhance Ticket。
+   所有比率使用 0..1；禁止编造测量结果。具体探测仍无法取得必填指标时，把准确指标名写入 unavailableMetrics，并在 gaps 说明原因，由 Runtime 建立 Enhancement Ticket。
    UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 不得修复测试或产品代码；若检查发现测试执行未必能暴露的语义性测试缺陷，必须填写 validationDefect、设置 done=false，由 Runtime 建立 Bug Ticket 并路由到配对源阶段。
 5. 任何错误都通过下一轮的 actions 修正；不要尝试越权或捏造工具。
 6. 【大文件拆块写入】write_file / append_file 单次 content 必须低于工具文档展示的当前 Step 运行时 chunk limit。
@@ -211,7 +214,9 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只�
     "metrics": {},
     "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
     "evidence": ["产物路径、测试报告或命令结果"],
-    "gaps": []
+    "unavailableMetrics": [],
+    "gaps": [],
+    "blockedBy": []
   },
   "actions": [ { "tool": "<工具名>", "args": { ... } }, ... ],
   "done": true | false
@@ -230,10 +235,11 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只�
 4. 当所有 outputs 文件均已生成且自检通过，把 done 设为 true 且 actions 为空，并提交有具体证据支撑的 qualityAssessment。
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE 必须报告 completion 和 upstreamAlignment。
    这四个开发阶段负责编写配对测试，但只有当前 Step 明确授权验证工具时才运行；测试按计划留到 UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 执行不属于当前阶段缺陷，禁止写入 qualityAssessment.gaps。
+   本 Step 自身工作的欠缺写入 qualityAssessment.gaps，它会判本 Step 不通过。本 Step 不拥有、也无法满足的前置条件（由别的 Step 产出的源码、由别的阶段声明的依赖、应由配对验证阶段执行的测试）写入 qualityAssessment.blockedBy，它只作为证据记录、不会判本 Step 不通过。两者不可互填，真实的阻塞也不可两边都不写。
    每个配对测试必须导入或执行 Plan 声明的真实产品模块与公开接口；禁止在测试文件内复制产品类型、类、算法、渲染器、解析器、调度器或其它业务行为来制造脱离产品代码的自测通过。
    当 Plan 声明至少两个产品源码时，每个 DETAILED_DESIGN 集成测试必须实际使用至少两个已声明产品源码；任一侧使用内联替身都不属于集成证据。
    UNIT_TEST 报告 lineCoverage、branchCoverage、testCasePassRate；INTEGRATION_TEST 报告 interfaceCoverage、integrationScenarioCoverage、testCasePassRate；MODULE_TEST 报告 moduleCoverage、contractCoverage、testCasePassRate；FUNCTIONAL_TEST 报告 functionalCoverage、requirementCoverage、endToEndPassRate。
-   所有比率使用 0..1；禁止编造测量结果，无法取得的证据必须写入 gaps，由 Runtime 建立 Enhance Ticket。
+   所有比率使用 0..1；禁止编造测量结果。具体探测仍无法取得必填指标时，把准确指标名写入 unavailableMetrics，并在 gaps 说明原因，由 Runtime 建立 Enhancement Ticket。
    UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 不得修复测试或产品代码；若检查发现测试执行未必能暴露的语义性测试缺陷，必须填写 validationDefect、设置 done=false，由 Runtime 建立 Bug Ticket 并路由到配对源阶段。
 5. 任何错误都通过下一轮的 actions 修正；不要尝试越权或捏造工具。
 6. 【大文件拆块写入】write_file / append_file 单次 content 必须低于工具文档展示的当前 Step 运行时 chunk limit。
@@ -810,6 +816,11 @@ ${opts.phasePlan}
       '如果上一轮停滞在只读探测，不要重复定位；直接执行下一项有依据的修改或验证动作。' +
       (suggestions ? `\n\n${suggestions}` : ''),
     executorGlobalBlock: (globalPrompt: string) => `\n\n## 项目全局约束\n${globalPrompt}`,
+    executorContextBlock: (context: string) => `\n\n# 已装配上下文\n${context}`,
+    executorRoleBlock: (identity) => `\n\n## 你的角色\n${identity.rolePrompt}\n${identity.capabilityPrompt}`
+      + (identity.prohibitions.length > 0
+        ? `\n\n禁止事项：\n${identity.prohibitions.map((rule) => `- ${rule}`).join('\n')}`
+        : ''),
     executorStepBlock: (sp: string) =>
       `\n\n## 当前 Step 专属提示 (唯一使命，禁止跨 Step 发散)\n${sp}`,
     executorSkillBlock: (hints: string[]) =>

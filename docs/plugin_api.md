@@ -44,7 +44,7 @@ XCompiler 核心版本和 Plugin API 版本独立演进：核心使用 package S
 | `compile.afterPlan` | 计划校准后、Schema/Lint 之前 |
 | `compile.finish` | 计划和文档持久化后 |
 | `llm.before/after/error` | 每次完整 LLM 调用外围 |
-| `run.before/after/error` | DomainExecutionEngine 整体运行外围 |
+| `run.before/after/error` | ProjectOrchestrator（PM 推进循环）整体运行外围 |
 | `step.before/after/error` | 单个 V 模型 Step 外围 |
 | `step.attempt.before/after` | 正常执行或 DEBUG retry 的每次尝试外围 |
 | `tool.before/after/error` | Tool 调用外围（仍受 EditGuard 保护） |

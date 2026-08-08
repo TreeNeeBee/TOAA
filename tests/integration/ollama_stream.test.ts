@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { OllamaClient } from '../src/llm/ollama.js';
+import { OllamaClient } from '../../src/llm/ollama.js';
 
 describe('OllamaClient streaming', () => {
   it('forwards the configured thinking flag to Ollama', async () => {

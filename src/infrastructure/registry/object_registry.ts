@@ -8,7 +8,7 @@ import { ObjectTypeSchema, type ObjectType } from '../../domain/objects/object_t
 
 export const OBJECT_REGISTRY_KIND = 'xcompiler.object-registry';
 export const OBJECT_REGISTRY_VERSION = 2;
-export const OBJECT_REGISTRY_ROOT = '.xcompiler/registry';
+export const OBJECT_REGISTRY_ROOT = 'registry';
 export const OBJECT_REGISTRY_INDEX_PATH = `${OBJECT_REGISTRY_ROOT}/index.json`;
 export const OBJECT_REGISTRY_EVENTS_PATH = `${OBJECT_REGISTRY_ROOT}/events.jsonl`;
 
@@ -224,7 +224,9 @@ export class ObjectRegistry {
           }
           if (envelope.revision !== current.revision + 1) {
             throw new Error(
-              `Object ${envelope.id} revision must advance from ${current.revision} to ${current.revision + 1}`,
+              `${envelope.objectType} ${envelope.name} (${envelope.id}) revision must advance ` +
+              `from ${current.revision} to ${current.revision + 1}, not ${envelope.revision}: ` +
+              'the caller is holding a copy read before another write landed',
             );
           }
         }
@@ -241,7 +243,7 @@ export class ObjectRegistry {
         entries.push(entry);
       }
 
-      let sequence = this.eventSequence;
+      const sequence = this.eventSequence;
       let previousEventHash = this.lastEventHash;
       const events: ObjectRegistryEvent[] = entries.map((entry, index) => {
         const eventBase = {

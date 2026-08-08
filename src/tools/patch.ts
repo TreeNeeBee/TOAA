@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { isAllowedWrite, type Tool } from './types.js';
+import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import { suspiciousTextTruncationError } from './content_guard.js';
 
@@ -29,7 +29,7 @@ export const applyPatchTool: Tool<{ patch: string }, { changedFiles: string[] }>
       });
       if (!resolved.ok) return { ok: false, error: resolved.error };
       if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
-        return { ok: false, error: `write denied: ${resolved.rel} not in step writable allowlist` };
+        return deniedWrite('write', resolved.rel, ctx.allowedWrites);
       }
       const abs = resolved.abs;
       let original = '';

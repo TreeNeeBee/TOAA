@@ -7,6 +7,7 @@ import type { Project } from '../domain/projects/project.js';
 import type { Step, StepState } from '../domain/steps/step.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../workspace/workspace.js';
+import { ProjectContainer } from '../workspace/project_container.js';
 import type { PlanIntent } from './plan.js';
 
 export const XCOMPILER_PROJECT_FILE_EXTENSION = '.xc';
@@ -58,6 +59,15 @@ export const XCompilerProjectFileSchema = z.object({
   projectId: ObjectIdSchema,
   name: z.string().min(1),
   workspace: z.string().min(1),
+  /**
+   * The project container, relative to this manifest.
+   *
+   * Recorded separately from `workspace` because 0.3 keeps project state outside every worktree:
+   * the manifest sits with the code, but the registry it names lives in `<container>/.xcompiler`.
+   * Deriving one from the other would break for a Ticket or gate worktree, which sit at a different
+   * depth under the same container.
+   */
+  container: z.string().min(1),
   planPath: z.string().min(1),
   configPath: z.string().nullable().optional(),
   lastCommand: z.string().optional(),
@@ -71,6 +81,8 @@ export type XCompilerProjectProgress = z.infer<typeof ProjectProgressSchema>;
 
 export interface UpdateProjectFileOptions {
   workspace: string;
+  /** Container root. Domain state is read from `<container>/.xcompiler`, never from the worktree. */
+  container: string;
   planPath: string;
   configPath?: string;
   projectFilePath?: string;
@@ -86,6 +98,8 @@ export interface LoadedXCompilerProject {
   filePath: string;
   data: XCompilerProjectFile;
   workspace: string;
+  /** Container root; its `.xcompiler` holds the registry this project's objects live in. */
+  container: string;
   planPath: string;
   configPath?: string;
   project: Project;
@@ -121,7 +135,8 @@ export async function loadXCompilerProject(projectFilePath: string): Promise<Loa
   const base = path.dirname(filePath);
   const workspace = path.resolve(base, data.workspace);
   await assertSafeProjectWorkspace(filePath, workspace);
-  const repository = new DomainObjectRepository(new Workspace(workspace));
+  const container = path.resolve(base, data.container);
+  const repository = new DomainObjectRepository(new ProjectContainer(container).state);
   await repository.load();
   const object = await repository.read(data.projectId);
   if (object.objectType !== 'project') {
@@ -134,6 +149,7 @@ export async function loadXCompilerProject(projectFilePath: string): Promise<Loa
     filePath,
     data,
     workspace,
+    container,
     planPath: path.resolve(base, data.planPath),
     configPath: data.configPath ? path.resolve(base, data.configPath) : undefined,
     project: object,
@@ -142,16 +158,13 @@ export async function loadXCompilerProject(projectFilePath: string): Promise<Loa
 
 export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise<string> {
   const workspace = path.resolve(opts.workspace);
-  const filePath = path.resolve(
-    opts.projectFilePath ?? (await findProjectFile(workspace)) ?? defaultProjectFilePath(workspace),
-  );
-  assertProjectFileExtension(filePath);
-  const base = path.dirname(filePath);
-  if (base !== workspace && !base.startsWith(workspace + path.sep)) {
-    throw new Error(`XCompiler project file must be inside its workspace: ${filePath}`);
-  }
-  const existing = await readExistingProjectFile(filePath);
-  const repository = new DomainObjectRepository(new Workspace(workspace));
+  const known = opts.projectFilePath
+    ? path.resolve(opts.projectFilePath)
+    : await findProjectFile(workspace);
+  if (known) assertProjectFileExtension(known);
+  const existing = known ? await readExistingProjectFile(known) : undefined;
+  const container = path.resolve(opts.container);
+  const repository = new DomainObjectRepository(new ProjectContainer(container).state);
   await repository.load();
   const project = opts.projectId
     ? await requireProject(repository, opts.projectId)
@@ -163,6 +176,15 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
   }
   if (existing && existing.projectId !== project.id && !opts.projectId) {
     throw new Error(`Project manifest cannot switch from ${existing.projectId} to ${project.id}`);
+  }
+  // Named after the Project it describes, not after the directory it sits in. That directory is the
+  // canonical working copy, so deriving the filename from it produced `master.xc` for every project
+  // — and disagreed with the Project name recorded inside the same file.
+  const filePath = known ?? defaultProjectFilePath(workspace, project.name);
+  assertProjectFileExtension(filePath);
+  const base = path.dirname(filePath);
+  if (base !== workspace && !base.startsWith(workspace + path.sep)) {
+    throw new Error(`XCompiler project file must be inside its workspace: ${filePath}`);
   }
   const steps = (await repository.list({ objectType: 'step', projectId: project.id }))
     .filter((object): object is Step => object.objectType === 'step');
@@ -187,6 +209,7 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
     projectId: project.id,
     name: project.name,
     workspace,
+    container: relativeFrom(base, container),
     planPath: relativeFrom(base, planPath),
     configPath: opts.configPath !== undefined
       ? relativeFrom(base, path.resolve(opts.configPath))

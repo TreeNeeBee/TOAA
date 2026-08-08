@@ -92,7 +92,8 @@ describe('GitService', () => {
     expect(await ws.readFile('sample.xc')).toContain('FAILED');
 
     const tracked = await git.raw().raw(['ls-files']);
-    expect(tracked).toContain('.xcompiler/.gitkeep');
+    // Project state is never versioned, with no placeholder exception.
+    expect(tracked).not.toContain('.xcompiler/');
     expect(tracked).not.toContain('.xcompiler/audit.jsonl');
     expect(tracked).not.toContain('.xcompiler/objects/ticket/BUG-1.json');
     expect(tracked).not.toContain('logs/run.log');

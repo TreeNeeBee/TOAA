@@ -5,9 +5,10 @@ import {
   resolveAttemptRoundLimit,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  deliveredManifest,
 } from '../src/application/execution/attempt_runner.js';
 import type { DomainLog } from '../src/domain/observability/records.js';
-import { classifyAttemptFailure } from '../src/application/execution/failure_classification.js';
+import { classifyAttemptFailure, classifyFailure } from '../src/application/execution/failure_classification.js';
 import type { Plan, Step } from '../src/core/plan.js';
 import type { Ticket } from '../src/domain/tickets/ticket.js';
 
@@ -71,6 +72,15 @@ describe('attempt failure classification', () => {
       .toBe('infrastructure');
     expect(classifyAttemptFailure('run_tests failed: external news API returned HTTP 429'))
       .toBe('execution');
+  });
+
+  it('only reads provider phrasing out of text the runtime authored', () => {
+    // XCompiler can be asked to build an LLM application; its test output legitimately contains
+    // this phrasing. Trusting captured output would retry forever instead of opening a Bug, so
+    // provider-text matching is opt-in and every un-annotated string stays an execution failure.
+    const subjectOutput = 'FAIL tests/router.spec.ts\n  Error: all LLM providers failed for role Tester';
+    expect(classifyFailure(subjectOutput).kind).toBe('execution');
+    expect(classifyFailure(subjectOutput, { trustProviderText: true }).kind).toBe('infrastructure');
   });
 });
 
@@ -163,3 +173,48 @@ function bugTicket(ids: {
     failure: ids,
   } as unknown as Ticket;
 }
+
+describe('manifest delivery', () => {
+  it('recognises the manifest wherever it sits, and nothing merely named like it', () => {
+    // Writing package.json as a plain file output changes nothing about the sandbox on its own, so
+    // the runner rebuilds when it sees one delivered. A false positive would rebuild an environment
+    // nobody asked to change.
+    expect(deliveredManifest(['package.json'], 'package.json')).toBe(true);
+    expect(deliveredManifest(['packages/api/package.json'], 'package.json')).toBe(true);
+    expect(deliveredManifest(['requirements.txt'], 'requirements.txt')).toBe(true);
+
+    expect(deliveredManifest(['vendor-package.json'], 'package.json')).toBe(false);
+    expect(deliveredManifest(['package.json.bak'], 'package.json')).toBe(false);
+    expect(deliveredManifest(['src/main.ts', 'docs/02.md'], 'package.json')).toBe(false);
+    expect(deliveredManifest([], 'package.json')).toBe(false);
+  });
+});
+
+describe('quality gaps a Step does not own', () => {
+  const assessment = (gaps: string[]) => ({
+    completeness: 1, upstreamAlignment: 1, coverage: 1, metrics: {}, evidence: [], gaps,
+  }) as never;
+
+  // Both codes name a condition the Step does not own. REQUIREMENT_ANALYSIS runs before
+  // HIGH_LEVEL_DESIGN writes package.json; every design phase runs before CODE writes the sources
+  // its tsconfig points at. Reporting either accurately cost the Step an attempt, because the gate
+  // fails a Step for every gap it reports.
+  it.each([
+    ['manifest_missing', 'package.json does not exist; it is HIGH_LEVEL_DESIGN output'],
+    ['product_not_implemented', 'src/ does not exist; it is CODE output'],
+  ] as const)('drops gaps raised by a condition the Step cannot own (%s)', (code, gap) => {
+    const blocked = reconcileMeasuredQualityAssessment(
+      assessment([gap]),
+      [{ tool: 'run_tests', ok: false, code }],
+    );
+    expect(blocked?.gaps).toEqual([]);
+  });
+
+  it('keeps gaps when the Step could have acted on them', () => {
+    const real = reconcileMeasuredQualityAssessment(
+      assessment(['the renderer has no tests']),
+      [{ tool: 'run_tests', ok: false, error: '1 failing' }],
+    );
+    expect(real?.gaps).toEqual(['the renderer has no tests']);
+  });
+});

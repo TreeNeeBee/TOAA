@@ -12,6 +12,8 @@ import { ReportSchema } from '../domain/observability/records.js';
 import { ProjectSchema } from '../domain/projects/project.js';
 import { PhaseSchema } from '../domain/phases/phase.js';
 import { TicketFlowMetricsService } from '../application/project_management/ticket_flow_metrics.js';
+import type { RecordReplayEvidence } from '../application/record_replay/controller.js';
+import { RECORD_REPLAY_CHANNELS } from '../application/record_replay/types.js';
 
 export const PROJECT_DEVELOPMENT_REPORT_PATH = 'docs/project-development-report.md';
 
@@ -22,6 +24,8 @@ export async function generateProjectDevelopmentReport(input: {
   projectAudit?: ProjectAuditResult;
   finalDelivery: boolean;
   repository?: DomainObjectRepository;
+  /** External-interaction evidence: fixture mode and per-channel replay/live accounting. */
+  recordReplay?: RecordReplayEvidence;
 }): Promise<string> {
   const repository = input.repository ?? new DomainObjectRepository(input.workspace);
   if (!input.repository) await repository.load();
@@ -142,6 +146,10 @@ export async function generateProjectDevelopmentReport(input: {
     `- Handoffs / reopens / escalations: ${flow.totalHandoffs} / ${flow.totalReopens} / ${flow.totalEscalations}`,
     `- Stalled Tickets: ${flow.stalledTicketIds.length}`,
     '',
+    '## External Interactions',
+    '',
+    ...renderRecordReplayEvidence(input.recordReplay),
+    '',
     '## Project Audit',
     '',
     ...(input.projectAudit
@@ -210,6 +218,45 @@ function renderQualityRow(step: Step, assessment?: QualityAssessment): string {
   ).join('; ') || '-';
   return `| ${step.name} | ${step.type} | ${step.state} | ${formatRatio(assessment.score)} | ` +
     `${escapeTable(observations)} | ${escapeTable(assessment.gaps.join('; ') || '-')} |`;
+}
+
+/**
+ * Delivery evidence for DoD "record/replay use and live dependencies": which external channels this
+ * run replayed from fixtures and which it actually reached out to. A reader must be able to tell
+ * whether a green delivery was verified against recordings or against live services.
+ */
+function renderRecordReplayEvidence(evidence: RecordReplayEvidence | undefined): string[] {
+  if (!evidence) return ['- NOT RECORDED: this run did not report external-interaction evidence.'];
+  const lines = [`- Fixture mode: ${evidence.mode}`];
+  // A channel is only counted when it is under fixture control. Silence from an unmanaged channel
+  // means "not observed", never "did not happen", so the two must never be reported the same way.
+  if (evidence.managedChannels.length === 0) {
+    lines.push(
+      '- No channel was under fixture control; every external interaction in this run was live.',
+      '- Live dependencies: all external interactions (HTTP, LLM, subprocess, tool).',
+    );
+    return lines;
+  }
+  const managed = evidence.managedChannels
+    .map((channel) => [channel, evidence.usage[channel]] as const)
+    .filter(([, usage]) => usage.replayed + usage.recorded + usage.live > 0);
+  lines.push(...(managed.length === 0
+    ? ['- No external interaction was made on a fixture-controlled channel.']
+    : managed.map(([channel, usage]) =>
+        `- ${channel}: replayed ${usage.replayed}, recorded ${usage.recorded}, live ${usage.live}`,
+      )));
+  const liveManaged = managed
+    .filter(([, usage]) => usage.recorded + usage.live > 0)
+    .map(([channel]) => channel);
+  const unmanaged = RECORD_REPLAY_CHANNELS.filter(
+    (channel) => !evidence.managedChannels.includes(channel),
+  );
+  lines.push(
+    liveManaged.length === 0 && unmanaged.length === 0
+      ? '- Live dependencies: none; every external interaction was replayed from fixtures.'
+      : `- Live dependencies: ${[...liveManaged, ...unmanaged.map((c) => `${c} (not fixture-controlled)`)].join(', ')}`,
+  );
+  return lines;
 }
 
 function renderUnresolvedTickets(tickets: readonly Ticket[]): string[] {

@@ -17,6 +17,7 @@ import {
 } from '../../domain/project_management/index.js';
 import { RoleRegistry } from './role_registry.js';
 import { TicketTraceService } from './ticket_trace_service.js';
+import { TicketDistillationService } from '../context/ticket_distillation_service.js';
 import type { TicketTraceAppendInput } from './ticket_trace_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 
@@ -37,10 +38,12 @@ export interface PreparedTicketTransition {
 export class TicketLifecycleService {
   private readonly roles: RoleRegistry;
   private readonly traces: TicketTraceService;
+  private readonly distillation: TicketDistillationService;
 
   constructor(private readonly repository: DomainObjectRepositoryPort) {
     this.roles = new RoleRegistry(repository);
     this.traces = new TicketTraceService(repository);
+    this.distillation = new TicketDistillationService(repository);
   }
 
   async transition(
@@ -57,6 +60,10 @@ export class TicketLifecycleService {
     input: TicketTransitionInput = {},
   ): Promise<Ticket> {
     const prepared = await this.prepareTransitionPath(ticketOrId, path, input);
+    // Distilled before the closure commits, not after: if the Step Context write fails, nothing has
+    // moved and the caller can retry. Distilling afterwards would leave a closed Ticket whose
+    // knowledge was lost with no transition left to re-run.
+    if (prepared.ticket.state === 'closed') await this.distillation.distil(prepared.ticket);
     await this.repository.commit(prepared.objects);
     return prepared.ticket;
   }
@@ -84,12 +91,14 @@ export class TicketLifecycleService {
     const assignment = ticket.activeAssignmentId
       ? await this.requireAssignment(ticket.activeAssignmentId)
       : undefined;
-    if (!assignment || assignment.state !== 'accepted') {
-      throw new Error(`Ticket ${ticket.name} must have an accepted owner assignment before lifecycle processing`);
+    // Execution ownership is the invariant: no role may work a Ticket PM has not assigned to it.
+    // Administrative transitions PM itself performs — parking, closing, or cancelling work that was
+    // resolved through another Ticket — are not execution and must not require an assignee.
+    if (path.includes('in_progress') && (!assignment || assignment.state !== 'accepted')) {
+      throw new Error(`Ticket ${ticket.name} must have an accepted owner assignment before execution`);
     }
-    const initiator = input.initiatorActorId
-      ? await this.roles.require(input.initiatorActorId)
-      : await this.roles.require(assignment.assigneeActorId);
+    const initiatorId = input.initiatorActorId ?? assignment?.assigneeActorId ?? ticket.creatorActorId;
+    const initiator = await this.roles.require(initiatorId);
     const now = new Date().toISOString();
     const transitioned = transitionTicketPath(ticket, path, {
       pendingReason: input.pendingReason,
@@ -137,12 +146,11 @@ export class TicketLifecycleService {
     const objects: PersistedDomainObject[] = [...built.events];
     if (assignment && assignmentNext) {
       objects.push(transitionAssignment(assignment, assignmentNext, now));
-      if (assignment.capacityConsumed) {
-        const owner = await this.roles.require(assignment.assigneeActorId);
-        objects.push(reviseActor(owner, {
-          activeAssignmentIds: owner.activeAssignmentIds.filter((id) => id !== assignment.id),
-        }));
-      }
+    }
+    if (assignment?.capacityConsumed) {
+      const owner = await this.roles.require(assignment.assigneeActorId);
+      const reconciled = reconcileActorCapacity(owner, assignment.id, finalState);
+      if (reconciled) objects.push(reconciled);
     }
     objects.push(updatedTicket, createDomainEvent({
       projectId: ticket.projectId,
@@ -188,6 +196,60 @@ function traceEventForTransition(from: TicketState, to: TicketState): TicketTrac
   if (to === 'reopened') return 'reopened';
   if (to === 'cancelled') return 'cancelled';
   return 'correction';
+}
+
+/**
+ * Actor capacity models work the assignee is carrying, not lifetime ownership.
+ *
+ * Capacity is reserved when an assignment is accepted (see TicketRegistrationService) and released
+ * as soon as the work leaves `in_progress`. It is deliberately *not* held for `resolved`,
+ * `reopened`, or `pending`: a source-Step Story stays open until its paired verification closes it,
+ * and a Story blocked by a corrective Ticket waits in `reopened`/`pending` until that Ticket is
+ * repaired. Holding capacity there would let one V-model Phase exhaust a single-capacity role and
+ * deadlock the very Bug that unblocks it. Assignment ownership is unaffected: `activeAssignmentId`
+ * survives the release, so resumed work returns to the same actor.
+ *
+ * Routing reserves capacity at assignment time, while the Ticket is still `created`, so that a
+ * single-capacity actor cannot be double-booked before its work starts. Blocking such a Ticket
+ * records a blocker without a state transition, so `releaseCapacityFor` below is what reconciles
+ * the reservation in that case; a resumed Ticket re-reserves on its `in_progress` transition, and
+ * cannot overcommit because routing re-checked capacity excluding its own assignment.
+ */
+function holdsCapacity(state: TicketState): boolean {
+  return state === 'in_progress';
+}
+
+/**
+ * Releases the reservation of a Ticket parked without a state transition.
+ *
+ * Returns the revised actor, or undefined when there is nothing to release — no assignment, an
+ * inherited assignment that consumed no capacity, or a reservation already gone.
+ */
+export async function releaseCapacityFor(
+  repository: DomainObjectRepositoryPort,
+  ticket: Ticket,
+): Promise<ActorRegistration | undefined> {
+  if (!ticket.activeAssignmentId) return undefined;
+  const assignment = await repository.read(ticket.activeAssignmentId);
+  if (assignment.objectType !== 'ticket-assignment' || !assignment.capacityConsumed) return undefined;
+  const owner = await repository.read(assignment.assigneeActorId);
+  if (owner.objectType !== 'actor-registration') return undefined;
+  return reconcileActorCapacity(owner, assignment.id, ticket.state);
+}
+
+function reconcileActorCapacity(
+  owner: ActorRegistration,
+  assignmentId: ObjectId,
+  ticketState: TicketState,
+): ActorRegistration | undefined {
+  const held = owner.activeAssignmentIds.includes(assignmentId);
+  const shouldHold = holdsCapacity(ticketState);
+  if (held === shouldHold) return undefined;
+  return reviseActor(owner, {
+    activeAssignmentIds: shouldHold
+      ? [...owner.activeAssignmentIds, assignmentId]
+      : owner.activeAssignmentIds.filter((id) => id !== assignmentId),
+  });
 }
 
 function assignmentStateForTicket(

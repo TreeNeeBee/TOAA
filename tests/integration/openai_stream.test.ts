@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { OpenAIClient } from '../src/llm/openai.js';
+import { OpenAIClient } from '../../src/llm/openai.js';
 
 describe('OpenAI-compatible streaming', () => {
   it('streams SSE chunks and allows local endpoints without api_key', async () => {

@@ -47,7 +47,7 @@ XCompiler combines a phase iteration model with the V-model. The planner first c
 V-model behavior:
 
 - Each implementation Phase owns exactly eight canonical Steps: `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, `CODE`, `UNIT_TEST`, `INTEGRATION_TEST`, `MODULE_TEST`, and `FUNCTIONAL_TEST`.
-- Planner JSON is an immutable execution specification. Runtime compiles it into globally identified Project, Phase, Step, Ticket, KPI, Changelist, Checkpoint, Report, Log, and AuditEvent objects; only those objects own lifecycle state.
+- Planner JSON is an immutable execution specification. Runtime compiles it into globally identified domain objects; only those objects own lifecycle state. Every one of them carries the same envelope — a UUIDv7 `id`, `objectType`, `projectId`, `revision`, and timestamps — and is committed through the object registry: Project, ProjectPlan/PhasePlan, Phase, Step, Ticket, ActorRegistration, TicketAssignment, TicketTraceEvent, ProjectManagementPlan, Decision, Risk, InteractionRequest, KPI, QualityAssessment, Changelist, Checkpoint, Deliverable, Report, Log, AuditEvent, and DomainEvent.
 - `REQUIREMENT_ANALYSIS`, `HIGH_LEVEL_DESIGN`, `DETAILED_DESIGN`, and `CODE` each generate the paired functional, module, integration, and unit test plans and executable cases.
 - `HIGH_LEVEL_DESIGN` defines system-level interfaces, external APIs, third-party libraries, and dependencies.
 - `DETAILED_DESIGN` defines internal module structure and implementation details.
@@ -85,7 +85,7 @@ Layer responsibilities:
 - **Agents / Skills**: role-specific prompts plus allowed tools for each stage.
 - **Tools**: guarded file edits, program/test execution, API fetches, dependency edits, git snapshots.
 - **LLM Router**: role chains, provider scores, cluster fallbacks, OpenAI-compatible/Ollama clients, audit.
-- **Workspace**: `phasePlan.json` and `plan.P<N>.json` planning artifacts, `<name>.xc` manifest, `.xcompiler/registry/` identity index/events, `.xcompiler/objects/<type>/<uuid>.json` canonical objects, human audit logs, debug wiki, project memory, and delivery reports.
+- **Workspace**: `phasePlan.json` and `plan.P<N>.json` planning artifacts, `<name>.xc` manifest, `.xcompiler/registry/` identity index/events, `.xcompiler/objects/<type>/<uuid>/r<N>.json` canonical objects (immutable per revision), human audit logs, debug wiki, project memory, and delivery reports.
 
 The append-only object-registry event stream is the recovery source; its snapshot index and PM status cache are rebuildable. Each registry entry maps `id` to `objectType`, object path, parent, revision, content hash, and lifecycle state. Multi-object lifecycle changes commit through one repository unit of work with optimistic revision checks and a transactional event outbox. Adapters and agents cannot mutate these files directly.
 
@@ -235,6 +235,15 @@ npm run typecheck
 npm run lint
 npm test
 npm run build
+```
+
+Suites are split by the capabilities they need, so a restricted environment can still run a full
+deterministic gate instead of reporting environment limits as product failures:
+
+```bash
+npm run test:core          # deterministic only; no sockets, no spawned processes
+npm run test:integration   # loopback HTTP servers and real subprocesses
+npm run test:e2e           # spawns the real CLI/ACP process
 ```
 
 The release gate always runs the complete current suite; no fixed historical test count is used as an acceptance claim.

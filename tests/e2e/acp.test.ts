@@ -2,16 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { AcpServer, AcpMethod, type AcpTransport, type JsonRpcMessage } from '../src/acp/index.js';
-import type { AcpRuntimeFacade } from '../src/acp/types.js';
+import { AcpServer, AcpMethod, type AcpTransport, type JsonRpcMessage } from '../../src/acp/index.js';
+import type { AcpRuntimeFacade } from '../../src/acp/types.js';
 import type {
   RuntimeBuildCommandOptions,
   RuntimeBuildCommandResult,
   RuntimeRunCommandOptions,
-} from '../src/runtime/commands.js';
-import type { ExecuteResult } from '../src/runtime/run.js';
+} from '../../src/runtime/commands.js';
+import type { ExecuteResult } from '../../src/runtime/run.js';
 
-const root = path.resolve(__dirname, '..');
+const root = path.resolve(__dirname, '..', '..');
 
 class MemoryTransport implements AcpTransport {
   sent: JsonRpcMessage[] = [];
@@ -364,6 +364,9 @@ describe('ACP Code Agent adapter', () => {
     const source = await Promise.all(files.filter((f) => f.endsWith('.ts')).map((file) => fs.readFile(path.join(root, 'src/acp', file), 'utf8')));
     const combined = source.join('\n');
     expect(combined).not.toMatch(/\.\.\/agents\/|\.\.\/core\/|\.\.\/sandbox\/|\.\.\/workspace\/|\.\.\/tools\/index/u);
-    expect(combined).toContain('../runtime/commands.js');
+    // 0.3 contract: adapters reach the Runtime only through its public facade, never through a
+    // module inside src/runtime/.
+    expect(combined).not.toMatch(/from '\.\.\/runtime\//u);
+    expect(combined).toContain("from '../runtime.js'");
   });
 });

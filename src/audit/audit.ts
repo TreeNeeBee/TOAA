@@ -8,7 +8,7 @@ import { xcEnv } from '../config/env.js';
  * AuditLogger 把开发流水线中的所有交互/执行动作记录到两份产物：
  *
  *  - `docs/process_log.md` —— 人类可读的过程记录，用于交付时汇总。
- *  - `.xcompiler/audit.jsonl`   —— 机器可读的逐行 JSON，便于后续分析与回放。
+ *  - `<stateRoot>/audit.jsonl`  —— 机器可读的逐行 JSON，便于后续分析与回放。
  *
  * 设计原则：
  *  - 追加写入，永不删除。
@@ -58,13 +58,15 @@ export interface AuditEvent {
 }
 
 export interface AuditLoggerOptions {
-  /** workspace 根目录（绝对路径） */
+  /** 工作副本根目录（绝对路径）；人类可读过程日志属于版本化产物，写在这里。 */
   root: string;
+  /** 容器状态根（绝对路径）；结构化审计属于项目状态，不进 Git。默认退回 root 以兼容独立调用。 */
+  stateRoot?: string;
   /** 命令名，例如 `xcompiler_build` / `xcompiler_run` */
   command: string;
   /** markdown 文件相对路径，默认 docs/process_log.md */
   mdRelPath?: string;
-  /** jsonl 文件相对路径，默认 .xcompiler/audit.jsonl */
+  /** jsonl 相对 stateRoot 的路径，默认 audit.jsonl */
   jsonlRelPath?: string;
   /** full=完整内容；redacted=保留内容但遮蔽凭据（默认）；metadata=仅保留长度与摘要。 */
   contentMode?: AuditContentMode;
@@ -87,7 +89,7 @@ export class AuditLogger {
       opts.contentMode ?? xcEnv('AUDIT_CONTENT_MODE'),
     );
     this.mdAbs = path.resolve(opts.root, opts.mdRelPath ?? 'docs/process_log.md');
-    this.jsonlAbs = path.resolve(opts.root, opts.jsonlRelPath ?? '.xcompiler/audit.jsonl');
+    this.jsonlAbs = path.resolve(opts.stateRoot ?? opts.root, opts.jsonlRelPath ?? 'audit.jsonl');
   }
 
   async start(meta: Record<string, unknown> = {}): Promise<void> {

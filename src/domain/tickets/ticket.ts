@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { assertStateTransition, type StateTransitions } from '../../util/state_machine.js';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
-import { ObjectIdSchema } from '../identity/object_id.js';
+import { ObjectIdSchema, type ObjectId } from '../identity/object_id.js';
 import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import { STEP_TYPES } from '../steps/step.js';
@@ -36,6 +36,27 @@ const TICKET_TRANSITIONS: StateTransitions<TicketState> = {
   cancelled: ['reopened', 'closed'],
   closed: [],
 };
+
+/** A Git commit is an external artifact, referenced by its native id rather than registered. */
+const GitRevisionSchema = z.string().regex(/^[0-9a-f]{7,40}$/u, 'Git revision must be a commit sha');
+
+export const TICKET_COMMIT_KINDS = ['baseline', 'attempt', 'verified'] as const;
+export type TicketCommitKind = (typeof TICKET_COMMIT_KINDS)[number];
+
+export const TicketCommitSchema = z.object({
+  revision: GitRevisionSchema,
+  /**
+   * `baseline` marks where an attempt started, and is therefore the target that attempt rolls back
+   * to. `attempt` is work that was rolled back. `verified` survived its gate.
+   */
+  kind: z.enum(TICKET_COMMIT_KINDS),
+  attempt: z.number().int().nonnegative(),
+  stepId: ObjectIdSchema,
+  summary: z.string().min(1),
+  recordedAt: z.string().datetime({ offset: true }),
+}).strict();
+
+export type TicketCommit = z.infer<typeof TicketCommitSchema>;
 
 export const TICKET_PRIORITY_MIN = 0;
 export const TICKET_PRIORITY_MAX = 255;
@@ -91,6 +112,15 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   traceLastEventId: ObjectIdSchema.optional(),
   traceEventCount: z.number().int().nonnegative().default(0),
   traceChainHash: z.string().regex(/^sha256:[a-f0-9]{64}$/u).optional(),
+  /**
+   * Commit this Ticket's work started from, and the append-only record of every commit made under
+   * it. Rollback used to depend on a baseline held only in memory for the duration of one attempt,
+   * so a crash between snapshot and rollback left the working copy changed with nothing recording
+   * where to return. Persisting both makes rollback recoverable and auditable, and lets a Ticket be
+   * unwound as a whole rather than only one attempt at a time.
+   */
+  baselineRevision: GitRevisionSchema.optional(),
+  commits: z.array(TicketCommitSchema).default([]),
   attempts: z.number().int().nonnegative().default(0),
   maxAttempts: z.number().int().positive().default(3),
   state: z.enum(TICKET_STATES),
@@ -164,7 +194,15 @@ export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   parentChangeRequestId: ObjectIdSchema.optional(),
   triggerStepId: ObjectIdSchema,
   sourceStepId: ObjectIdSchema,
-  affectedStepIds: z.array(ObjectIdSchema).min(1),
+  /**
+   * The one Step this Change Request is applied to.
+   *
+   * A CR used to carry the whole downstream chain, decided when it was opened. That asserts an
+   * answer nobody has yet: a delta applied to a design may or may not require a code change. The
+   * chain is discovered instead — applying a CR that produced changes opens a child CR for the next
+   * Step, linked by `parentChangeRequestId`.
+   */
+  targetStepId: ObjectIdSchema,
   contractDelta: z.object({
     summary: z.string().min(1),
     before: z.array(z.string().min(1)).default([]),
@@ -242,4 +280,53 @@ export function transitionTicketPath(
 
 export function isActiveTicket(ticket: Ticket): boolean {
   return ticket.state !== 'closed' && ticket.state !== 'cancelled';
+}
+
+/**
+ * The Step where this Ticket's work is performed, which is what its `role` and
+ * `requiredCapabilities` describe.
+ *
+ * For corrective Tickets this is not `stepId`: a Bug found in UNIT_TEST is repaired in the paired
+ * CODE Step, so `stepId` records where the problem was observed while the target Step records where
+ * it is fixed. Routing and scheduling must both use this Step, otherwise a Bug is matched against
+ * the verifying role instead of the repairing one.
+ */
+/**
+ * Records a commit against a Ticket. The list is append-only: a rolled-back attempt keeps its
+ * entries so the history shows what was tried, not only what survived.
+ *
+ * The first commit recorded also fixes `baselineRevision`, which is where unwinding the whole
+ * Ticket returns to.
+ */
+export function appendTicketCommit<T extends Ticket>(ticket: T, commit: TicketCommit): T {
+  return TicketSchema.parse({
+    ...ticket,
+    baselineRevision: ticket.baselineRevision ?? (commit.kind === 'baseline' ? commit.revision : undefined),
+    commits: [...ticket.commits, commit],
+  }) as T;
+}
+
+/**
+ * Where the given attempt must roll back to: the baseline recorded when it started.
+ *
+ * Reading it from the Ticket rather than from a variable held across the attempt is what makes
+ * rollback survive a crash, and what keeps a shared Ticket worktree correct — a corrective Ticket
+ * reusing the worktree unwinds only its own attempt, never a predecessor's verified work.
+ */
+export function attemptBaselineRevision(ticket: Ticket, attempt: number): string | undefined {
+  return [...ticket.commits]
+    .reverse()
+    .find((commit) => commit.kind === 'baseline' && commit.attempt === attempt)
+    ?.revision;
+}
+
+/** The last commit that passed its gate, used when unwinding to the last known-good state. */
+export function lastVerifiedRevision(ticket: Ticket): string | undefined {
+  return [...ticket.commits].reverse().find((commit) => commit.kind === 'verified')?.revision;
+}
+
+export function workStepId(ticket: Ticket): ObjectId | undefined {
+  if (ticket.type === 'bug') return ticket.failure.targetStepId;
+  if (ticket.type === 'enhancement') return ticket.targetStepId;
+  return ticket.stepId;
 }

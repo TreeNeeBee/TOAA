@@ -5,7 +5,6 @@ import os from 'node:os';
 import { Workspace } from '../src/workspace/workspace.js';
 import { isAllowedWrite } from '../src/tools/types.js';
 import {
-  DEFAULT_WRITE_CHUNK_BYTES,
   appendFileTool,
   readFileTool,
   listDirTool,
@@ -13,6 +12,8 @@ import {
   writeFileTool,
 } from '../src/tools/fs.js';
 import { applyPatchTool, parseUnifiedDiff } from '../src/tools/patch.js';
+import { runTestsTool } from '../src/tools/sandbox.js';
+import { addDependencyTool } from '../src/tools/deps.js';
 import type { ToolContext } from '../src/tools/types.js';
 
 let tmp: string;
@@ -37,6 +38,47 @@ describe('isAllowedWrite', () => {
     expect(isAllowedWrite('src/a/b.py', ['src'])).toBe(true);
     expect(isAllowedWrite('docs/x.md', ['src/'])).toBe(false);
     expect(isAllowedWrite('./src/x.py', ['src/'])).toBe(true);
+  });
+
+  it('reports a denial by code, so callers never branch on its wording', async () => {
+    // The executor's loop-breaker keyed on the denial prose; improving that prose silently changed
+    // control flow. The code is what callers match, and it is checked here so the two cannot drift.
+    ctx.allowedWrites = ['src/'];
+    const denied = await writeFileTool.run({ path: 'outside/x.py', content: 'x\n' }, ctx);
+    expect(denied.ok).toBe(false);
+    expect(denied.code).toBe('write_denied');
+    // The message still names what is writable, which is what lets a model correct itself.
+    expect(denied.error).toContain('src/');
+  });
+
+  it('honours the glob outputs a Step actually declares', () => {
+    // A planner writes `tests/modules/*.ts` before any of those files exist, and the same list is
+    // shown to the model as its writable candidates. Matching it literally told the model a path was
+    // writable and then refused every file under it — unfixable from the model's side.
+    const step = ['docs/02-high-level-design.md', 'tests/modules/*.ts'];
+    expect(isAllowedWrite('tests/modules/index.ts', step)).toBe(true);
+    expect(isAllowedWrite('tests/modules/test_config.ts', step)).toBe(true);
+    // `*` does not cross a separator, so a glob cannot silently widen into subdirectories.
+    expect(isAllowedWrite('tests/modules/deep/nested.ts', step)).toBe(false);
+    expect(isAllowedWrite('tests/modules/notes.md', step)).toBe(false);
+    expect(isAllowedWrite('src/index.ts', step)).toBe(false);
+  });
+
+  it('crosses separators only for **, and matches the zero-directory case', () => {
+    expect(isAllowedWrite('src/a/b/c.ts', ['src/**/*.ts'])).toBe(true);
+    expect(isAllowedWrite('src/a.ts', ['src/**/*.ts'])).toBe(true);
+    expect(isAllowedWrite('src/a.py', ['src/**/*.ts'])).toBe(false);
+    expect(isAllowedWrite('other/a.ts', ['src/**/*.ts'])).toBe(false);
+  });
+
+  it('treats a pattern as a path, never as a regular expression', () => {
+    // Regex metacharacters in a declared output must match literally, or a Step could widen its own
+    // allowlist by declaring an output that happens to look like a pattern.
+    expect(isAllowedWrite('srcXa.ts', ['src.a.ts'])).toBe(false);
+    expect(isAllowedWrite('src.a.ts', ['src.a.ts'])).toBe(true);
+    expect(isAllowedWrite('anything', ['.*'])).toBe(false);
+    expect(isAllowedWrite('a+b.ts', ['a+b.ts'])).toBe(true);
+    expect(isAllowedWrite('aab.ts', ['a+b.ts'])).toBe(false);
   });
 
   it('allows tests/fixtures/<f> when tests/fixtures is in whitelist (engine test/DEBUG augmentation)', () => {
@@ -203,18 +245,20 @@ describe('write_file tool', () => {
 
   it('auto-scales write chunk budget by phase and step context', () => {
     expect(resolveWriteChunkBytes(1234, { phase: 'CODE' })).toBe(1234);
-    const dynamic = resolveWriteChunkBytes('auto', {
+    const dynamic = resolveWriteChunkBytes(undefined, {
       phase: 'CODE',
       tools: ['write_file', 'append_file'],
       outputs: ['src/a.ts', 'src/b.ts', 'tests/a.test.ts'],
       contextChars: 20_000,
     });
-    expect(dynamic).toBeGreaterThan(DEFAULT_WRITE_CHUNK_BYTES);
-    const smallerModel = resolveWriteChunkBytes('auto', {
+    // 0.3 has no fixed byte baseline to compare against: the automatic budget is derived purely
+    // from the active model context, so it must simply be a usable window.
+    expect(dynamic).toBeGreaterThan(1024);
+    const smallerModel = resolveWriteChunkBytes(undefined, {
       contextWindowTokens: 32 * 1024,
       contextChars: 20_000,
     });
-    const largerModel = resolveWriteChunkBytes('auto', {
+    const largerModel = resolveWriteChunkBytes(undefined, {
       contextWindowTokens: 256 * 1024,
       contextChars: 20_000,
     });
@@ -222,11 +266,11 @@ describe('write_file tool', () => {
   });
 
   it('reduces the automatic write window as the current prompt consumes context', () => {
-    const shortPrompt = resolveWriteChunkBytes('auto', {
+    const shortPrompt = resolveWriteChunkBytes(undefined, {
       contextWindowTokens: 128 * 1024,
       contextChars: 3_000,
     });
-    const longPrompt = resolveWriteChunkBytes('auto', {
+    const longPrompt = resolveWriteChunkBytes(undefined, {
       contextWindowTokens: 128 * 1024,
       contextChars: 340_000,
     });
@@ -728,5 +772,196 @@ describe('runTestsTool / runPythonTool summary', () => {
     const denied = await runTestsTool.run({ cwd: outsideDir }, fakeCtx);
     expect(denied.ok).toBe(false);
     expect(denied.error).toContain('outside the project directory');
+  });
+});
+
+describe('run_program missing-manifest diagnosis', () => {
+  it('gives a Step reaching for the runner directly the same diagnosis run_tests gets', async () => {
+    // From a live run: a Debugger at REQUIREMENT_ANALYSIS ran `npx vitest` through run_program, got
+    // an opaque exit code because the diagnosis was only wired into run_tests, and spent its round
+    // budget repairing a project whose manifest did not exist yet.
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-run-program-'));
+    const workspace = new Workspace(root);
+    const failing = {
+      ...ctx,
+      ws: workspace,
+      language: 'typescript' as const,
+      sandbox: { runProgram: async () => ({ exitCode: 254, stdout: '', stderr: '', timedOut: false }) },
+    } as unknown as typeof ctx;
+
+    const noManifest = await runProgramTool.run({ args: ['npx', 'vitest', 'run'] }, failing);
+    expect(noManifest.ok).toBe(false);
+    expect(noManifest.error).toContain('No package.json');
+    expect(noManifest.error).toContain('HIGH_LEVEL_DESIGN');
+    expect(noManifest.code).toBe('manifest_missing');
+
+    // An installed-but-empty toolchain stays the Step's own problem to fix.
+    await workspace.writeFile('package.json', '{"scripts":{"test":"vitest run"}}\n');
+    const missingRunner = await runProgramTool.run({ args: ['npx', 'vitest', 'run'] }, {
+      ...failing,
+      sandbox: { runProgram: async () => ({
+        exitCode: 127, stdout: '', stderr: 'sh: vitest: command not found', timedOut: false,
+      }) },
+    } as unknown as typeof ctx);
+    expect(missingRunner.error).toContain('install_deps');
+    expect(missingRunner.code).toBeUndefined();
+
+    // With the manifest present, an ordinary failure stays ordinary.
+    const ordinary = await runProgramTool.run({ args: ['npx', 'tsx', 'src/cli.ts'] }, failing);
+    expect(ordinary.ok).toBe(false);
+    expect(ordinary.code).toBeUndefined();
+  });
+});
+
+describe('design phases and a product that does not exist yet', () => {
+  // From a live run: REQUIREMENT_ANALYSIS, HIGH_LEVEL_DESIGN and DETAILED_DESIGN ran `tsc --noEmit`
+  // 43 times against a `src/` that CODE had not written, and converged on editing tsconfig.json to
+  // point `files` at package.json so the compiler would stop complaining — corrupting the config the
+  // next Step has to build with.
+  const design = (phase: string, stderr: string) => ({
+    ...ctx,
+    language: 'typescript' as const,
+    phase,
+    sandbox: { runProgram: async () => ({ exitCode: 2, stdout: '', stderr, timedOut: false }) },
+  } as unknown as typeof ctx);
+
+  it('tells a design Step the missing sources are CODE\'s output, not its defect', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    for (const phase of ['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN']) {
+      const r = await runProgramTool.run(
+        { args: ['npx', 'tsc', '--noEmit'] },
+        design(phase, "error TS18003: No inputs were found in config file 'tsconfig.json'."),
+      );
+      expect(r.ok, phase).toBe(false);
+      // The code is what stops it counting against the Step; the prose only explains it.
+      expect(r.code, phase).toBe('product_not_implemented');
+      expect(r.error, phase).toContain('CODE');
+      expect(r.error, phase).toContain('Do not edit tsconfig.json');
+    }
+  });
+
+  it('leaves it a real defect once CODE has run', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    for (const phase of ['CODE', 'UNIT_TEST', 'INTEGRATION_TEST']) {
+      const r = await runProgramTool.run(
+        { args: ['npx', 'tsc', '--noEmit'] },
+        design(phase, "error TS18003: No inputs were found in config file 'tsconfig.json'."),
+      );
+      expect(r.ok, phase).toBe(false);
+      expect(r.code, phase).not.toBe('product_not_implemented');
+    }
+  });
+
+  it('does not excuse an ordinary compile error in a design phase', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    const r = await runProgramTool.run(
+      { args: ['npx', 'tsc', '--noEmit'] },
+      design('HIGH_LEVEL_DESIGN', "tests/modules/a.test.ts(3,1): error TS2304: Cannot find name 'foo'."),
+    );
+    expect(r.code).not.toBe('product_not_implemented');
+  });
+});
+
+describe('run_tests missing-manifest diagnosis', () => {
+  it('names the missing manifest instead of reporting a failing suite', async () => {
+    // A TypeScript project's package.json is written by HIGH_LEVEL_DESIGN, so every earlier Step
+    // runs npm test against a workspace that has none. Reported as a plain failure, the Step burns
+    // its debug rounds repairing tests that were never collected.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-run-tests-'));
+    const workspace = new Workspace(root);
+    const workspaceForRunner = workspace;
+    const failing = {
+      ...ctx,
+      ws: workspace,
+      language: 'typescript' as const,
+      sandbox: { runTests: async () => ({ exitCode: 254, stdout: '', stderr: '', timedOut: false }) },
+    } as unknown as typeof ctx;
+
+    // An installed-but-empty toolchain is a different condition, and one the Step can act on.
+    await workspaceForRunner.writeFile('package.json', '{"scripts":{"test":"vitest run"}}\n');
+    const missingRunner = await runTestsTool.run({}, {
+      ...failing,
+      ws: workspaceForRunner,
+      sandbox: { runTests: async () => ({
+        exitCode: 127, stdout: '', stderr: 'sh: vitest: command not found', timedOut: false,
+      }) },
+    } as unknown as typeof ctx);
+    expect(missingRunner.error).toContain('install_deps');
+    expect(missingRunner.code).toBeUndefined();
+    await workspaceForRunner.remove('package.json');
+
+    const noManifest = await runTestsTool.run({}, failing);
+    expect(noManifest.ok).toBe(false);
+    expect(noManifest.error).toContain('No package.json');
+    expect(noManifest.error).toContain('HIGH_LEVEL_DESIGN');
+    // The code is what stops this counting against the Step; the prose only explains it.
+    expect(noManifest.code).toBe('manifest_missing');
+
+    // Once the manifest exists, a failure is an ordinary test failure again.
+    await workspace.writeFile('package.json', '{"scripts":{"test":"vitest run"}}\n');
+    const withManifest = await runTestsTool.run({}, failing);
+    expect(withManifest.ok).toBe(false);
+    expect(withManifest.error).not.toContain('No package.json');
+    expect(withManifest.code).toBeUndefined();
+  });
+});
+
+describe('dependency manifest ownership', () => {
+  const withPhase = (phase: string) => ({
+    ...ctx, language: 'typescript' as const, phase,
+    sandbox: { build: async () => ({ rebuilt: true, reason: 'ok' }) },
+  } as unknown as typeof ctx);
+
+  it('lets HIGH_LEVEL_DESIGN author the manifest', async () => {
+    await ws.writeFile('package.json', '{"name":"a","version":"0.0.0"}\n');
+    const r = await addDependencyTool.run({ packages: ['zod@3.22.0'] }, withPhase('HIGH_LEVEL_DESIGN'));
+    expect(r.ok).toBe(true);
+    expect(JSON.parse(await ws.readFile('package.json')).dependencies.zod).toBe('3.22.0');
+  });
+
+  // From a live run: HIGH_LEVEL_DESIGN's sandbox had no toolchain, so it called add_dependency for
+  // packages already in its own manifest. It was told `+0 (none new; sandbox rebuild skipped)` and
+  // left exactly as it was. "The manifest did not change" and "the environment needs nothing" are
+  // different facts, and nothing a Step can do from the first one fixes the second.
+  it('still prepares the environment when every package was already declared', async () => {
+    const builds: string[] = [];
+    const withBuildLog = {
+      ...ctx, language: 'typescript' as const, phase: 'HIGH_LEVEL_DESIGN',
+      sandbox: { build: async (manifest: string) => { builds.push(manifest); } },
+    } as unknown as typeof ctx;
+    await ws.writeFile('package.json', '{"name":"a","version":"0.0.0","dependencies":{"zod":"3.22.0"}}\n');
+
+    const r = await addDependencyTool.run({ packages: ['zod@3.22.0'] }, withBuildLog);
+
+    expect(r.ok).toBe(true);
+    expect(builds).toEqual(['package.json']);
+    expect(r.summary).toContain('environment matches the manifest');
+  });
+
+  it('says so when an unchanged manifest cannot be prepared, rather than reporting a skip', async () => {
+    const failing = {
+      ...ctx, language: 'typescript' as const, phase: 'HIGH_LEVEL_DESIGN',
+      sandbox: { build: async () => { throw new Error('npm install timed out'); } },
+    } as unknown as typeof ctx;
+    await ws.writeFile('package.json', '{"name":"a","version":"0.0.0","dependencies":{"zod":"3.22.0"}}\n');
+
+    const r = await addDependencyTool.run({ packages: ['zod@3.22.0'] }, failing);
+
+    expect(r.ok).toBe(true);
+    expect(r.summary).toContain('does not match the manifest');
+    expect(r.summary).toContain('npm install timed out');
+  });
+
+  it('sends every other phase back through a change request', async () => {
+    // One design decides the whole set. A Step editing the manifest under HIGH_LEVEL_DESIGN changes
+    // what every other Step already resolved against, with nobody checking the result is consistent.
+    for (const phase of ['REQUIREMENT_ANALYSIS', 'DETAILED_DESIGN', 'CODE', 'UNIT_TEST'] as const) {
+      const r = await addDependencyTool.run({ packages: ['left-pad'] }, withPhase(phase));
+      expect(r.ok, phase).toBe(false);
+      expect(r.code, phase).toBe('dependency_not_owned');
+      expect(r.error, phase).toContain('HIGH_LEVEL_DESIGN');
+      expect(r.error, phase).toContain('left-pad');
+    }
   });
 });

@@ -47,6 +47,36 @@ describe('calibrateStepShape', () => {
     expect(tools).toEqual(expect.arrayContaining(['write_file', 'skill:tester']));
   });
 
+  // From a live run: CODE needed a package, `add_dependency` refused because HIGH_LEVEL_DESIGN owns
+  // the manifest, the Change Request routed there and the flow rolled back — and HIGH_LEVEL_DESIGN
+  // had `skill:author`, which carries no `add_dependency`. Every dependency Change Request ended at
+  // a Step told to do something it had no tool to do. `skill:dep_resolver` existed, wired to nobody.
+  it('hands the manifest owner the tool it owns', async () => {
+    const tools = ensureEssentialToolRefs({
+      phase: 'HIGH_LEVEL_DESIGN',
+      tools: ['write_file', 'append_file'],
+      outputs: ['docs/02-high-level-design.md', 'package.json'],
+    });
+    expect(tools).toEqual(expect.arrayContaining(['skill:dep_resolver']));
+
+    // What matters is the tool the Step can actually call once skills are expanded.
+    const { buildDefaultSkills } = await import('../src/skills/skill.js');
+    expect(buildDefaultSkills().resolve(tools).resolvedToolNames)
+      .toEqual(expect.arrayContaining(['add_dependency']));
+  });
+
+  it('gives it to no other design phase, because the ownership is exclusive', async () => {
+    const { buildDefaultSkills } = await import('../src/skills/skill.js');
+    for (const phase of ['REQUIREMENT_ANALYSIS', 'DETAILED_DESIGN'] as const) {
+      const tools = ensureEssentialToolRefs({
+        phase,
+        tools: ['write_file', 'append_file'],
+        outputs: ['docs/01-requirement-analysis.md'],
+      });
+      expect(buildDefaultSkills().resolve(tools).resolvedToolNames, phase).not.toContain('add_dependency');
+    }
+  });
+
   it('pairs explicit write_file and append_file so chunked authoring is available in old plans', () => {
     expect(ensureEssentialToolRefs({
       phase: 'CODE',

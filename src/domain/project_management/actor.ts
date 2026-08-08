@@ -2,8 +2,6 @@ import { z } from 'zod';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { ObjectIdSchema } from '../identity/object_id.js';
 import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
-import { STEP_TYPES } from '../steps/step.js';
-import { TICKET_TYPES } from '../tickets/ticket.js';
 
 export const ACTOR_STATES = ['active', 'paused', 'unavailable', 'retired'] as const;
 export type ActorState = (typeof ACTOR_STATES)[number];
@@ -12,10 +10,27 @@ export const ActorRegistrationSchema = ObjectEnvelopeSchema.extend({
   objectType: z.literal('actor-registration'),
   actorKind: z.enum(['human', 'llm-agent', 'runtime-service']),
   role: DomainRoleSchema,
+  /**
+   * The definition this actor instantiates, and the sole source of what it can do: capabilities,
+   * supported Ticket types, and supported Step types are read through this reference rather than
+   * copied here, so an actor cannot drift from the role it claims to be.
+   *
+   * One definition, many actors: that split is what lets two actors of the same role carry
+   * different model bindings and run concurrently.
+   */
+  roleDefinitionId: ObjectIdSchema,
   agent: ExecutionAgentSchema.optional(),
-  capabilities: z.array(z.string().min(1)).min(1),
-  supportedTicketTypes: z.array(z.enum(TICKET_TYPES)).default([]),
-  supportedStepTypes: z.array(z.enum(STEP_TYPES)).default([]),
+  /**
+   * Which models this actor may use, in order.
+   *
+   * Bound to the actor rather than looked up from a global agent-keyed pool, so two actors of the
+   * same role can differ — the precondition for assigning a stronger model to one of several
+   * parallel developers.
+   */
+  llmBinding: z.object({
+    providerPool: z.array(z.string().min(1)).min(1),
+    temperature: z.number().min(0).max(2).optional(),
+  }).strict().optional(),
   state: z.enum(ACTOR_STATES),
   capacity: z.number().int().positive().max(255).default(1),
   activeAssignmentIds: z.array(ObjectIdSchema).default([]),

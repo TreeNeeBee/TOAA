@@ -7,8 +7,8 @@ import {
   execRaw,
   formatExecFailure,
   resolveExecutableOnPath,
-} from '../src/sandbox/subprocess.js';
-import { Workspace } from '../src/workspace/workspace.js';
+} from '../../src/sandbox/subprocess.js';
+import { Workspace } from '../../src/workspace/workspace.js';
 
 async function tempDir(name: string): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), `xcompiler-${name}-`));
@@ -96,6 +96,7 @@ describe('SubprocessSandbox environment isolation', () => {
     try {
       const isolated = new SubprocessSandbox({
         ws: new Workspace(dir),
+        environmentRoot: path.join(dir, '..', 'env-isolated'),
         language: 'typescript',
         limits: { cpu: 1, memory_mb: 128, wall_seconds: 5, network: 'download-only' },
       });
@@ -104,6 +105,7 @@ describe('SubprocessSandbox environment isolation', () => {
 
       const inherited = new SubprocessSandbox({
         ws: new Workspace(dir),
+        environmentRoot: path.join(dir, '..', 'env-inherited'),
         language: 'typescript',
         inheritEnv: true,
         limits: { cpu: 1, memory_mb: 128, wall_seconds: 5, network: 'download-only' },
@@ -133,6 +135,7 @@ describe('SubprocessSandbox TypeScript dependency cache', () => {
     }, null, 2) + '\n');
     const sandbox = new SubprocessSandbox({
       ws,
+      environmentRoot: path.join(ws.root, '..', 'env-signature'),
       language: 'typescript',
       limits: { cpu: 1, memory_mb: 128, wall_seconds: 10, network: 'download-only' },
     });

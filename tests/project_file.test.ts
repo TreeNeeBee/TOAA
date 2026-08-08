@@ -17,12 +17,14 @@ import { reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
 import { Workspace } from '../src/workspace/workspace.js';
+import { ProjectContainer } from '../src/workspace/project_container.js';
 
 describe('XCompiler project file', () => {
   it('creates a workspace-local manifest that points to the canonical Project', async () => {
-    const { workspace, graph } = await canonicalWorkspace();
+    const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
+      container,
       projectId: graph.project.id,
       planPath: path.join(workspace, 'phasePlan.json'),
       configPath: path.join(workspace, 'config.yaml'),
@@ -32,7 +34,9 @@ describe('XCompiler project file', () => {
       recordHistory: true,
     });
 
-    expect(projectFile).toBe(defaultProjectFilePath(workspace));
+    // Named after the Project, not the directory: the directory is always the canonical branch.
+    expect(projectFile).toBe(defaultProjectFilePath(workspace, graph.project.name));
+    expect(path.basename(projectFile)).toBe('sample.xc');
     const loaded = await loadXCompilerProject(projectFile);
     expect(loaded.data.kind).toBe(XCOMPILER_PROJECT_MANIFEST_KIND);
     expect(loaded.data.projectId).toBe(graph.project.id);
@@ -43,6 +47,34 @@ describe('XCompiler project file', () => {
     expect(loaded.data.progress?.status).toBe('planned');
     expect(loaded.data.progress?.steps[0]?.name).toBe('P1-S001');
     expect(loaded.data.history[0]?.command).toBe('build');
+  });
+
+  it('resolves domain state from the container, never from the worktree it lives in', async () => {
+    const { workspace, container, graph } = await canonicalWorkspace();
+    const projectFile = await updateProjectFile({
+      workspace,
+      container,
+      projectId: graph.project.id,
+      planPath: path.join(workspace, 'phasePlan.json'),
+      recordHistory: true,
+    });
+
+    // Nothing under the worktree holds a registry: project state is shared across every worktree,
+    // so a manifest that read it from beside itself would find nothing here and would diverge per
+    // worktree if it ever did.
+    const inWorktree = await fs.readdir(workspace);
+    expect(inWorktree, inWorktree.join(',')).not.toContain('registry');
+    expect(inWorktree).not.toContain('objects');
+    expect(await new Workspace(path.join(container, '.xcompiler')).exists('registry/index.json'))
+      .toBe(true);
+
+    const loaded = await loadXCompilerProject(projectFile);
+    expect(loaded.project.id).toBe(graph.project.id);
+    expect(loaded.container).toBe(path.resolve(container));
+    // Absolute, like `workspace`: the container is always above the manifest, and `relativeFrom`
+    // refuses to write a `..` escape into the file. A moved container fails loudly on load rather
+    // than resolving to some other directory.
+    expect(loaded.data.container).toBe(path.resolve(container));
   });
 
   it('does not auto-discover legacy .toaa project files', async () => {
@@ -80,9 +112,10 @@ describe('XCompiler project file', () => {
   });
 
   it('stores the workspace as an absolute path', async () => {
-    const { workspace, graph } = await canonicalWorkspace();
+    const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
+      container,
       projectId: graph.project.id,
       planPath: path.join(workspace, 'phasePlan.json'),
       command: 'build',
@@ -92,9 +125,10 @@ describe('XCompiler project file', () => {
   });
 
   it('rejects a manifest pointing to an unknown Project', async () => {
-    const { workspace, graph } = await canonicalWorkspace();
+    const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
+      container,
       projectId: graph.project.id,
       planPath: path.join(workspace, 'phasePlan.json'),
     });
@@ -105,9 +139,10 @@ describe('XCompiler project file', () => {
   });
 
   it('rejects a stale workspace path before loading domain state', async () => {
-    const { workspace, graph } = await canonicalWorkspace();
+    const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
+      container,
       projectId: graph.project.id,
       planPath: path.join(workspace, 'phasePlan.json'),
     });
@@ -118,9 +153,10 @@ describe('XCompiler project file', () => {
   });
 
   it('rejects a workspace that does not contain the manifest', async () => {
-    const { workspace, graph } = await canonicalWorkspace();
+    const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
+      container,
       projectId: graph.project.id,
       planPath: path.join(workspace, 'phasePlan.json'),
     });
@@ -132,9 +168,10 @@ describe('XCompiler project file', () => {
   });
 
   it('rejects a workspace without write permission', async () => {
-    const { workspace, graph } = await canonicalWorkspace();
+    const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
+      container,
       projectId: graph.project.id,
       planPath: path.join(workspace, 'phasePlan.json'),
     });
@@ -148,8 +185,14 @@ describe('XCompiler project file', () => {
 });
 
 async function canonicalWorkspace() {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
-  const repository = new DomainObjectRepository(new Workspace(workspace));
+  // A real 0.3 container: state at <container>/.xcompiler, code at worktrees/master. The manifest
+  // sits with the code, so a fixture that puts both in one directory cannot tell whether the
+  // manifest resolves domain state from the container or from the worktree it lives in.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-'));
+  const container = new ProjectContainer(root);
+  const workspace = container.canonical().workspace.root;
+  await fs.mkdir(workspace, { recursive: true });
+  const repository = new DomainObjectRepository(container.state);
   await repository.load();
   const graph = compileProjectGraph({
     draft: samplePlan(),
@@ -157,7 +200,7 @@ async function canonicalWorkspace() {
     projectName: 'sample',
   });
   await new ProjectGraphPersistenceService(repository).persistGraph(graph);
-  return { workspace, repository, graph };
+  return { root, workspace, container: root, repository, graph };
 }
 
 function samplePlan(): Plan {

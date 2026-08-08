@@ -12,6 +12,7 @@ import {
   type PlanIntent,
   type ProjectType,
 } from '../core/plan.js';
+import { lintPlan } from '../core/lint.js';
 import { getLanguageProfile } from '../core/language.js';
 import { withDefaultQualityGate } from '../core/quality_gate.js';
 import {
@@ -37,13 +38,10 @@ import {
   calibrateArchitectureModulePaths,
 } from './calibration.js';
 import {
-  CLARIFICATION_CATEGORIES,
-  CLARIFICATION_OPTION_LABELS,
   hasExternalApiOrUrlRequirement,
   parseClarifyJson,
   validateClarifyJson,
   type ClarificationCategory,
-  type ClarificationOptionLabel,
   type ClarifyOption,
   type ClarifyQuestion,
 } from './planning/clarification.js';
@@ -278,7 +276,10 @@ export class Planner {
         },
         { role: 'user', content: prompt + feedback },
       ],
-      validate: (t) => parsePhaseStepPlanJson(t, parseContext, phasePlan, currentPhase),
+      validate: (t) => {
+        const candidate = parsePhaseStepPlanJson(t, parseContext, phasePlan, currentPhase);
+        assertPlanRulesSatisfied(candidate, parseContext);
+      },
     });
     await this.audit?.plannerThought('decompose', text, {
       qaCount: input.clarifications.length,
@@ -355,6 +356,48 @@ function plannerStructuredRepairAttemptLimit(context: DraftParseContext): number
   return demand.nonTrivial || context.intent !== 'greenfield' ? 3 : 2;
 }
 
+/**
+ * A generated plan that breaks a rule the planner could have satisfied.
+ *
+ * Recognised by a field rather than by its prose: the retry predicate below still matches message
+ * text for the older validation errors, and prose is exactly what stops describing the failure the
+ * moment someone improves the wording.
+ */
+class PlannerContractViolation extends Error {
+  readonly plannerContractViolation = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'PlannerContractViolation';
+  }
+}
+
+/**
+ * Runs the plan's own rules while the planner can still fix them.
+ *
+ * These rules were only checked after decompose returned, so a plan that broke one killed the build
+ * outright — two model calls and several minutes spent, and the one party able to repair it never
+ * heard about it. The planner already retries structured failures with feedback; a lint error is the
+ * same kind of failure and now takes the same path.
+ *
+ * The check stays in `runtime/build.ts` too. This is the repairable attempt; that one is the
+ * guarantee, and it must not depend on the planner having been asked nicely.
+ */
+function assertPlanRulesSatisfied(draft: DraftPlan, context: DraftParseContext): void {
+  const issues = lintPlan(buildPlan(draft, {
+    userAddenda: context.userAddenda,
+    language: context.language,
+    intent: context.intent,
+    baselineSummary: context.baselineSummary,
+  })).filter((issue) => issue.level === 'error');
+  if (issues.length === 0) return;
+  throw new PlannerContractViolation(
+    `Planner draft violates plan rules: ${
+      issues.map((issue) => `[${issue.stepId ?? '*'}] ${issue.message}`).join('; ')
+    }`,
+  );
+}
+
 function formatPlannerValidationFeedback(err: unknown): string {
   if (!err) return '';
   const message = errorMessage(err).slice(0, 1800);
@@ -368,14 +411,39 @@ function formatPlannerValidationFeedback(err: unknown): string {
     '- architectureModules 必须满足 sourcePaths/testPaths 和 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 可追踪性；不要为凑数量拆散内聚模块。',
     '- architectureModules.testPaths 是 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 消费的模块契约测试，不能同时出现在 CODE 的单元测试输出中。',
     '- 若一个 CODE 宏 Step 覆盖多个模块，必须在该 CODE Step 的 subTasks 中逐一列出对应模块。',
+    '- 每个 output 文件在一次 V 流程中只能由一个 Step 产出；其它 Step 需要它就写进 inputs，不要重复声明为 outputs。',
     '- 不要删除标准 V 模型 8 个宏 Step。',
   ].join('\n');
 }
 
+const PLANNER_CONTRACT_MESSAGE =
+  /^Planner (?:architecture|phase|PhasePlan|JSON|draft|complexityAssessment|implementationPhases|iteration)/u;
+
+/**
+ * Whether the planner's last failure is one it could fix if told what was wrong.
+ *
+ * Walks the `cause` chain because the provider router wraps every per-provider failure in one
+ * `all LLM providers failed for role Planner: ...` error. Reading only the outer message, this
+ * matched nothing, so the repair round never fired in a real run — the test that covers it drives a
+ * bare client, where the underlying error propagates unwrapped, and passed throughout.
+ */
 function isPlannerStructuredValidationError(err: unknown): boolean {
-  const message = errorMessage(err);
-  if (isPlannerTransportFailure(message)) return false;
-  return /^Planner (?:architecture|phase|PhasePlan|JSON|draft|complexityAssessment|implementationPhases|iteration)/u.test(message);
+  // Checked on the outer error only: the router names the transport failure there, and a chain that
+  // died on the network is not repairable by rewriting the prompt.
+  if (isPlannerTransportFailure(errorMessage(err))) return false;
+  let current: unknown = err;
+  for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
+    if (isPlannerContractViolation(current)) return true;
+    if (PLANNER_CONTRACT_MESSAGE.test(errorMessage(current))) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Identified by a field, so the check survives the router copying a message but not a class. */
+function isPlannerContractViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null &&
+    (err as { plannerContractViolation?: unknown }).plannerContractViolation === true;
 }
 
 function isPlannerTransportFailure(message: string): boolean {
@@ -737,7 +805,14 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
   }
   const architectureResult = ArchitectureModuleSchema.array().safeParse(obj.architectureModules ?? []);
   if (!architectureResult.success) {
-    throw new Error(`Planner architectureModules invalid: ${architectureResult.error.issues.map((i) => i.message).join('; ')}`);
+    // Name the field, not just the rule. "Too small: expected array to have >=1 items" told the
+    // model nothing about which of seven module fields was empty, so both providers retried and
+    // failed identically — a schema error that cannot be acted on is a schema error that repeats.
+    throw new Error(
+      `Planner architectureModules invalid: ${architectureResult.error.issues
+        .map((issue) => `architectureModules.${issue.path.join('.')}: ${issue.message}`)
+        .join('; ')}`,
+    );
   }
   const architectureDependencyCalibration = calibrateArchitectureModuleDependencies(
     calibrateArchitectureModulePaths(architectureResult.data, context?.language ?? 'python'),

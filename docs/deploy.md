@@ -69,9 +69,12 @@ xcompiler --version
 ### 1.4 烟测
 
 ```bash
-# 1) 单测（不依赖 LLM/网络）
+# 1) 单测（不依赖 LLM）
 npm run typecheck
-npm test                           # 完整 Vitest 回归（含本机回环网络测试）
+npm test                           # 全部套件
+npm run test:core                  # 仅确定性套件；受限沙箱（禁止监听 127.0.0.1）中也能跑
+npm run test:integration           # 需要本机回环端口与真实子进程
+npm run test:e2e                   # 拉起真实 CLI/ACP 进程
 
 # 2) OpenRouter endpoint 烟测（需 .env 中 OPENROUTER_API_KEY 可用）
 set -a

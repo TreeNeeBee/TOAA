@@ -9,7 +9,7 @@ import { runLs, runShow } from './inspect.js';
 import { runDoctorCli } from './doctor.js';
 import { setLocale, t } from '../i18n/index.js';
 import { xcEnv } from '../config/env.js';
-import { createCliRuntimeIO } from './runtime_adapter.js';
+import { createCliRuntimeIO, createNonInteractiveCliRuntimeIO } from './runtime_adapter.js';
 import { runAcpStdioServer } from '../acp/index.js';
 import {
   localeFromArgv,
@@ -135,6 +135,8 @@ program
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (projectArg, opts) => {
     const result = await runtime.loadCommand({
+      // Execution asks nothing: the human gates all live in `build`.
+      io: createNonInteractiveCliRuntimeIO(),
       projectFile: projectArg,
       configPath: opts.config,
       dryRun: !!opts.dryRun,
@@ -219,6 +221,8 @@ program
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (planArg, opts) => {
     const result = await runtime.runCommand({
+      // Execution asks nothing: the human gates all live in `build`.
+      io: createNonInteractiveCliRuntimeIO(),
       planArg,
       output: opts.output,
       workspace: opts.workspace,

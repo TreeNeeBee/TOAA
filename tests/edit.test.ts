@@ -278,20 +278,27 @@ describe('add_dependency', () => {
     });
   });
 
-  it('skips sandbox rebuild when every requested dependency already exists', async () => {
+  // This asserted that no build ran when every package was already declared. A live run showed why
+  // that is wrong: a Step whose sandbox had no toolchain called add_dependency for packages already
+  // in its manifest and was told the rebuild was skipped, leaving it exactly as it was. The intent
+  // — adding nothing should not do expensive work — is kept by the build's own signature cache,
+  // which makes an in-sync environment a stat and a hash.
+  it('leaves the manifest alone when every requested dependency already exists', async () => {
     await ws.writeFile('requirements.txt', 'pytest\n');
     let buildCalls = 0;
     ctx.sandbox = {
       build: async () => {
         buildCalls++;
-        return { rebuilt: false, reason: 'not expected' };
+        return { rebuilt: false, reason: 'cache hit' };
       },
     } as never;
 
     const r = await addDependencyTool.run({ packages: ['pytest'] }, ctx);
 
     expect(r.ok).toBe(true);
-    expect(r.summary).toContain('rebuild skipped');
-    expect(buildCalls).toBe(0);
+    expect(await ws.readFile('requirements.txt')).toBe('pytest\n');
+    expect(r.summary).toContain('+0 (none new');
+    // Asked for, not skipped: only the build itself can tell whether the environment matches.
+    expect(buildCalls).toBe(1);
   });
 });

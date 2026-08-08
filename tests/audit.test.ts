@@ -14,7 +14,7 @@ describe('AuditLogger jsonl flush', () => {
   it('flushes each event synchronously to disk before the await resolves', async () => {
     const audit = new AuditLogger({ root: tmp, command: 'xcompiler_test' });
     await audit.start({ workspace: tmp });
-    const jsonlPath = path.join(tmp, '.xcompiler/audit.jsonl');
+    const jsonlPath = path.join(tmp, 'audit.jsonl');
     // 多次 await：每次 await 返回后，对应的 jsonl 行必须已在磁盘上（appendFileSync 同步写入）。
     await audit.event('phase.start', 'S007 TEST 测试', { role: 'Tester' });
     let lines = readFileSync(jsonlPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -32,7 +32,7 @@ describe('AuditLogger jsonl flush', () => {
     for (let i = 0; i < 50; i++) {
       await audit.event('tool.call', `op-${i}`, { i });
     }
-    const lines = readFileSync(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8')
+    const lines = readFileSync(path.join(tmp, 'audit.jsonl'), 'utf8')
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l))
@@ -48,7 +48,7 @@ describe('AuditLogger jsonl flush', () => {
       messageId: 'test.localized_message',
       detail: 1,
     });
-    const lines = readFileSync(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8')
+    const lines = readFileSync(path.join(tmp, 'audit.jsonl'), 'utf8')
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
@@ -61,7 +61,7 @@ describe('AuditLogger jsonl flush', () => {
     const redacted = new AuditLogger({ root: tmp, command: 'xcompiler_test' });
     await redacted.start();
     await redacted.userInput('requirement', 'api_key=super-secret-value');
-    const redactedLog = readFileSync(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const redactedLog = readFileSync(path.join(tmp, 'audit.jsonl'), 'utf8');
     expect(redactedLog).not.toContain('super-secret-value');
     expect(redactedLog).toContain('[REDACTED]');
 
@@ -69,7 +69,7 @@ describe('AuditLogger jsonl flush', () => {
     const metadata = new AuditLogger({ root: metadataRoot, command: 'xcompiler_test', contentMode: 'metadata' });
     await metadata.start();
     await metadata.llmResponse('Coder', 'model', 'private response');
-    const metadataLog = readFileSync(path.join(metadataRoot, '.xcompiler/audit.jsonl'), 'utf8');
+    const metadataLog = readFileSync(path.join(metadataRoot, 'audit.jsonl'), 'utf8');
     expect(metadataLog).not.toContain('private response');
     expect(metadataLog).toContain('sha256');
   });

@@ -4,9 +4,9 @@ import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
 import { AddressInfo } from 'node:net';
-import { Workspace } from '../src/workspace/workspace.js';
-import { httpFetchTool } from '../src/tools/net.js';
-import type { ToolContext } from '../src/tools/types.js';
+import { Workspace } from '../../src/workspace/workspace.js';
+import { httpFetchTool } from '../../src/tools/net.js';
+import type { ToolContext } from '../../src/tools/types.js';
 
 let tmp: string;
 let ws: Workspace;

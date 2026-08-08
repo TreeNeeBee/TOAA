@@ -1,8 +1,12 @@
+import type { PendingReason } from '../../domain/workflow/pending_reason.js';
 import { createHash } from 'node:crypto';
 import { CheckpointSchema, type Checkpoint } from '../../domain/evidence/evidence.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import { createObjectEnvelope, reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
-import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
+import {
+  objectRevisionRef,
+  type DomainObjectRepositoryPort,
+} from '../../domain/ports/repository.js';
 import { transitionPhase, type Phase } from '../../domain/phases/phase.js';
 import { ProjectPlanSchema } from '../../domain/planning/plan.js';
 import {
@@ -86,7 +90,7 @@ export class ProjectStateService {
   async checkpoint(step: Step, reason: string): Promise<Checkpoint> {
     const current = await this.requireStep(step.id);
     const entry = this.repository.registry.require(current.id, 'step');
-    const snapshotRefs = [entry.objectRef];
+    const snapshotRefs = [objectRevisionRef(entry)];
     const checkpoint = CheckpointSchema.parse({
       ...createObjectEnvelope({
         name: `${current.name}-CP${String(current.checkpointIds.length + 1).padStart(3, '0')}`,
@@ -106,7 +110,7 @@ export class ProjectStateService {
     return checkpoint;
   }
 
-  async moveStepPending(step: Step, reason: 'defect' | 'quality-gap'): Promise<Step> {
+  async moveStepPending(step: Step, reason: 'defect' | 'quality-gap' | 'dependency'): Promise<Step> {
     let current = step;
     if (current.state === 'delivered' || current.state === 'closed') {
       current = await this.transitionStep(current, 'reopened');
@@ -123,7 +127,7 @@ export class ProjectStateService {
   async transitionStep(
     step: Step,
     next: Parameters<typeof transitionStep>[1],
-    pendingReason?: 'defect' | 'quality-gap',
+    pendingReason?: PendingReason,
   ): Promise<Step> {
     if (step.state === next) return step;
     const updated = transitionStep(step, next, { pendingReason });

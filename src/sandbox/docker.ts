@@ -6,9 +6,10 @@ import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
 import type { Language } from '../core/plan.js';
 import type { Sandbox, SandboxBuildOptions, SandboxLimits, ExecResult, ExecExtra } from './types.js';
+import { SANDBOX_GUEST_ENVIRONMENT_DIR } from './environment.js';
 import { normalizeTypeScriptTestArgs } from './test_args.js';
 import { resolveTypeScriptProgramCommand } from './program_args.js';
-import { createInstallProgressWatch, execRaw, formatExecFailure, sanitizeVenvName } from './subprocess.js';
+import { createInstallProgressWatch, execRaw, formatExecFailure } from './subprocess.js';
 
 export interface DockerSandboxOptions {
   ws: Workspace;
@@ -20,8 +21,11 @@ export interface DockerSandboxOptions {
   image?: string;
   /** 容器内挂载点，默认 /workspace */
   workdir?: string;
-  /** 沙盒目录相对 workspace，venv 等放这里；默认 .sandbox */
-  sandboxDir?: string;
+  /**
+   * 环境根目录（宿主绝对路径），单独 bind-mount 进容器。
+   * 不能再放在工作副本挂载内：那样每个 worktree 都会各自重建一份环境。
+   */
+  environmentRoot: string;
   /** docker 可执行路径，默认 PATH 中的 docker */
   dockerBin?: string;
   /** 是否在 build 时强制 docker pull（拉取最新镜像） */
@@ -53,7 +57,6 @@ export class DockerSandbox implements Sandbox {
   private readonly language: Language;
   private readonly image: string;
   private readonly workdir: string;
-  private readonly sandboxRel: string;
   private readonly cacheRel: string;
   private readonly dockerBin: string;
   private readonly extraRunArgs: string[];
@@ -64,18 +67,17 @@ export class DockerSandbox implements Sandbox {
     this.language = opts.language ?? 'python';
     this.image = opts.image ?? (this.language === 'typescript' ? 'node:24-slim' : 'python:3.11-slim');
     this.workdir = opts.workdir ?? '/workspace';
-    this.sandboxRel = (opts.sandboxDir ?? '.sandbox').replaceAll('\\', '/');
-    this.cacheRel = `${this.sandboxRel}/${this.language === 'typescript' ? 'package.sha256' : 'requirements.sha256'}`;
+    this.cacheRel = this.language === 'typescript' ? 'package.sha256' : 'requirements.sha256';
     this.dockerBin = opts.dockerBin ?? 'docker';
     this.extraRunArgs = opts.extraRunArgs ?? [];
     this.pull = !!opts.pull;
-    // venv 目录名 = 项目名（与 SubprocessSandbox 保持一致）
-    this.venvName = sanitizeVenvName(path.basename(opts.ws.root));
+    // 与 SubprocessSandbox 一致：环境根已标识归属，venv 名固定。
+    this.venvName = 'venv';
   }
 
   /** 容器内 venv 路径 */
   private get venvInContainer(): string {
-    return `${this.workdir}/${this.sandboxRel}/${this.venvName}`;
+    return `${SANDBOX_GUEST_ENVIRONMENT_DIR}/${this.venvName}`;
   }
 
   private get pythonInContainer(): string {
@@ -108,7 +110,7 @@ export class DockerSandbox implements Sandbox {
     options?: SandboxBuildOptions,
   ): Promise<{ rebuilt: boolean; reason: string }> {
     await this.assertDocker();
-    const sandboxAbs = this.opts.ws.abs(this.sandboxRel);
+    const sandboxAbs = this.opts.environmentRoot;
     await fs.mkdir(sandboxAbs, { recursive: true });
     if (this.language === 'typescript') {
       return this.buildNode(manifestFile ?? 'package.json', options);
@@ -117,11 +119,11 @@ export class DockerSandbox implements Sandbox {
   }
 
   private async buildPython(requirementsTxt: string): Promise<{ rebuilt: boolean; reason: string }> {
-    const sandboxAbs = this.opts.ws.abs(this.sandboxRel);
+    const sandboxAbs = this.opts.environmentRoot;
     const reqAbs = this.opts.ws.abs(requirementsTxt);
     const reqContent = await fs.readFile(reqAbs, 'utf8').catch(() => '');
     const sig = crypto.createHash('sha256').update(this.image + '\n' + reqContent).digest('hex');
-    const cacheAbs = this.opts.ws.abs(this.cacheRel);
+    const cacheAbs = path.join(this.opts.environmentRoot, this.cacheRel);
     const cached = await fs.readFile(cacheAbs, 'utf8').catch(() => '');
     const venvExists = await fs
       .stat(path.join(sandboxAbs, this.venvName, 'bin', 'python'))
@@ -157,6 +159,8 @@ export class DockerSandbox implements Sandbox {
         '--rm',
         '-v',
         `${this.opts.ws.root}:${this.workdir}`,
+        '-v',
+        `${this.opts.environmentRoot}:${SANDBOX_GUEST_ENVIRONMENT_DIR}`,
         '-w',
         this.workdir,
         ...this.extraRunArgs,
@@ -189,7 +193,7 @@ export class DockerSandbox implements Sandbox {
     }
     const lockContent = await fs.readFile(this.opts.ws.abs('package-lock.json'), 'utf8').catch(() => '');
     const sig = dockerNodeDependencySignature(this.image, pkgContent, lockContent);
-    const cacheAbs = this.opts.ws.abs(this.cacheRel);
+    const cacheAbs = path.join(this.opts.environmentRoot, this.cacheRel);
     const cached = await fs.readFile(cacheAbs, 'utf8').catch(() => '');
     const modulesExist = await fs
       .stat(this.opts.ws.abs('node_modules'))
@@ -221,6 +225,8 @@ export class DockerSandbox implements Sandbox {
         '--rm',
         '-v',
         `${this.opts.ws.root}:${this.workdir}`,
+        '-v',
+        `${this.opts.environmentRoot}:${SANDBOX_GUEST_ENVIRONMENT_DIR}`,
         '-w',
         this.workdir,
         ...this.extraRunArgs,
@@ -248,6 +254,8 @@ export class DockerSandbox implements Sandbox {
           '--rm',
           '-v',
           `${this.opts.ws.root}:${this.workdir}`,
+          '-v',
+          `${this.opts.environmentRoot}:${SANDBOX_GUEST_ENVIRONMENT_DIR}`,
           '-w',
           this.workdir,
           ...this.extraRunArgs,
@@ -283,6 +291,8 @@ export class DockerSandbox implements Sandbox {
       '--rm',
       '-v',
       `${this.opts.ws.root}:${this.workdir}`,
+      '-v',
+      `${this.opts.environmentRoot}:${SANDBOX_GUEST_ENVIRONMENT_DIR}`,
       '-w',
       containerCwd,
       `--cpus=${this.opts.limits.cpu}`,
@@ -347,7 +357,7 @@ export class DockerSandbox implements Sandbox {
       [
         this.language === 'typescript'
           ? this.opts.ws.abs('node_modules')
-          : this.opts.ws.abs(`${this.sandboxRel}/${this.venvName}`),
+          : path.join(this.opts.environmentRoot, this.venvName),
       ],
       this.opts.limits,
       this.language === 'typescript' ? 'docker npm install' : 'docker pip install',

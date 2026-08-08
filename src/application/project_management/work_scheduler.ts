@@ -2,7 +2,7 @@ import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { Phase } from '../../domain/phases/phase.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
-import { isActiveTicket, type Ticket, type WorkTicket } from '../../domain/tickets/ticket.js';
+import { isActiveTicket, workStepId, type Ticket, type WorkTicket } from '../../domain/tickets/ticket.js';
 import { TicketWorkflow } from './ticket_workflow.js';
 
 export type WorkMode = 'normal' | 'debug' | 'enhancement' | 'change-request';
@@ -103,14 +103,14 @@ function activeCorrectiveTicket(step: Step, tickets: readonly Ticket[]): Ticket 
     .filter((ticket) => isActiveTicket(ticket))
     .filter((ticket) => ticket.blockedByTicketIds.length === 0)
     .filter((ticket) =>
-      (ticket.type === 'bug' &&
-        ticket.failure.targetStepId === step.id &&
-        ticket.changeRequestTicketIds.length === 0) ||
-      (ticket.type === 'enhancement' &&
-        ticket.targetStepId === step.id &&
+      // Bugs and Enhancements are repaired at the Step `workStepId` designates, which is the same
+      // rule PM routes them by. A Change Request is the exception: it spans several Steps, so it is
+      // matched against whichever of them still lacks an application.
+      ((ticket.type === 'bug' || ticket.type === 'enhancement') &&
+        workStepId(ticket) === step.id &&
         ticket.changeRequestTicketIds.length === 0) ||
       (ticket.type === 'change-request' &&
-        ticket.affectedStepIds.includes(step.id) &&
+        ticket.targetStepId === step.id &&
         !ticket.applications.some((application) => application.stepId === step.id)))
     .sort((left, right) =>
       correctionRank(right) - correctionRank(left) || right.priority - left.priority)[0];

@@ -1,4 +1,5 @@
-import type { Tool, ToolContext } from './types.js';
+import type { Tool, ToolContext, ToolFailureCode } from './types.js';
+import type { StepType } from '../domain/steps/step.js';
 import { detectNetworkApiFailureInExec } from '../core/network_api_gate.js';
 import { normalizeTypeScriptTestArgs } from '../sandbox/test_args.js';
 import { resolveTypeScriptProgramCommand } from '../sandbox/program_args.js';
@@ -97,6 +98,7 @@ export const runProgramTool: Tool<
       summary: ok
         ? base
         : buildRunSummary(networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base, r),
+      ...(ok ? {} : await diagnoseSandboxFailure(ctx, base, r, 'program')),
     };
   },
 };
@@ -152,9 +154,80 @@ export const runTestsTool: Tool<
       summary: passed
         ? [base, ...successEvidence].join('\n')
         : buildRunSummary(networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base, r),
+      ...(passed ? await Promise.resolve({}) : await diagnoseSandboxFailure(ctx, base, r, 'tests')),
     };
   },
 };
+
+/**
+ * Says why a run could not happen at all, rather than reporting it as a failing suite.
+ *
+ * A TypeScript project's `package.json` is authored by HIGH_LEVEL_DESIGN, so every earlier Step runs
+ * `npm test` against a workspace that has no manifest yet. npm exits with an opaque code, the
+ * executor reads it as a test failure, and the Step burns its debug rounds trying to repair tests
+ * that were never collected — a repair no role can make, because the manifest is another Step's
+ * declared output.
+ */
+/**
+ * Explains a failed sandbox command in terms of what the caller can do about it.
+ *
+ * Shared by `run_tests` and `run_program` because they hit the identical wall: the toolchain is not
+ * there. It was only wired into `run_tests`, so a Step that reached for the runner directly —
+ * `run_program npx vitest`, which is what a Debugger does — got an opaque exit code, none of the
+ * `manifest_missing` guards fired, and it spent its whole round budget repairing a project that had
+ * no way to run anything yet.
+ */
+async function diagnoseSandboxFailure(
+  ctx: ToolContext,
+  base: string,
+  result: { exitCode: number; stderr: string },
+  intent: 'tests' | 'program',
+): Promise<{ error: string; code?: ToolFailureCode }> {
+  if (ctx.language !== 'typescript' || result.exitCode === 0) return { error: base };
+  // Distinct from a missing manifest and, unlike it, repairable here: the manifest names the command
+  // but nothing has installed it. Reported as an opaque exit code, no Step reaches for the tool that
+  // fixes it — a whole live run went by without `install_deps` being called once.
+  if (/\bcommand not found\b|\bENOENT\b.*\bvitest\b/iu.test(result.stderr)) {
+    return {
+      error: `${base}\nThe command is named in package.json but is not installed in this sandbox. ` +
+        'Run install_deps for the devDependencies it declares, then run it again.',
+    };
+  }
+  // `tsc` found no inputs because the sources it is configured to compile do not exist yet. Before
+  // CODE runs, that is the V-model working as intended, not a defect in the design Step that ran it
+  // — and left as a plain exit code it is one the Step tries to repair. Three design Steps in a live
+  // run spent 43 rounds on it, and the repair they converged on was editing `tsconfig.json` to point
+  // at a file that is not source, which corrupts the project the next Step has to build.
+  if (isProductAuthoringPending(ctx.phase) && /\bTS18003\b/u.test(result.stderr)) {
+    return {
+      code: 'product_not_implemented',
+      error: `${base}\nThe configured source files do not exist yet; they are the CODE Step's output. ` +
+        'This is expected before CODE runs and is not this Step\'s to repair. Do not edit tsconfig.json ' +
+        'to make the compiler quiet — leave the configuration describing the source layout it will have.',
+    };
+  }
+  if (await ctx.ws.exists('package.json')) return { error: base };
+  return {
+    code: 'manifest_missing',
+    error: `${base}\nNo package.json in ${ctx.ws.root}, so nothing declares ${
+      intent === 'tests' ? 'a test script' : 'this command'
+    } or the packages it needs. ` +
+      'This project\'s manifest is written by the HIGH_LEVEL_DESIGN Step; a Step running before it ' +
+      'cannot execute anything here and must not try to repair it.',
+  };
+}
+
+/**
+ * Whether the product source is still someone else's future output.
+ *
+ * True for the development-side design phases, which by construction run before CODE. After CODE has
+ * run, the same failure is a real defect and must stay one.
+ */
+function isProductAuthoringPending(phase: StepType | undefined): boolean {
+  return phase === 'REQUIREMENT_ANALYSIS' ||
+    phase === 'HIGH_LEVEL_DESIGN' ||
+    phase === 'DETAILED_DESIGN';
+}
 
 function isCoverageArgument(arg: string): boolean {
   return arg === '--coverage' || arg.startsWith('--coverage.');

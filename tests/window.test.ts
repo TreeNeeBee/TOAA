@@ -32,19 +32,28 @@ describe('model operation window', () => {
     expect(veryLarge.writeChunkBytes).toBeGreaterThan(large.writeChunkBytes);
   });
 
-  it('keeps an explicit write chunk override while updating the other windows', () => {
-    const target: Record<string, number | undefined> = {};
+  it('derives every window from the active context and rewrites them on a provider switch', () => {
+    const target: Record<string, number | undefined> = { writeChunkBytes: 7777 };
     const window = updateOperationWindow(target, {
       contextWindowTokens: 64 * 1024,
       promptChars: 20_000,
-      configuredWriteChunkBytes: 7777,
     });
-    expect(window.writeChunkBytes).toBe(7777);
+    // 0.3 removed the standalone byte-limit configuration: no stale override survives, every
+    // budget comes from the context window of the provider now in use.
+    expect(window.writeChunkBytes).not.toBe(7777);
+    expect(window.writeChunkBytes).toBeGreaterThan(1024);
     expect(target).toMatchObject({
       contextWindowTokens: 64 * 1024,
-      writeChunkBytes: 7777,
+      writeChunkBytes: window.writeChunkBytes,
       readChunkBytes: window.readChunkBytes,
       feedbackCharBudget: window.feedbackCharBudget,
     });
+
+    const switched = updateOperationWindow(target, {
+      contextWindowTokens: 200 * 1024,
+      promptChars: 20_000,
+    });
+    expect(switched.writeChunkBytes).toBeGreaterThan(window.writeChunkBytes);
+    expect(target.writeChunkBytes).toBe(switched.writeChunkBytes);
   });
 });

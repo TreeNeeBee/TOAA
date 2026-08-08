@@ -9,6 +9,8 @@ import { DockerSandbox } from '../sandbox/docker.js';
 import type { ExecResult } from '../sandbox/types.js';
 import { Workspace } from '../workspace/workspace.js';
 import { t } from '../i18n/index.js';
+import { GitRepositoryService } from '../infrastructure/git/git_repository_service.js';
+import { CONTAINER_WORKTREES_DIR } from '../workspace/project_container.js';
 import { runtimeLog, silentRuntimeIO, type RuntimeIO } from './io.js';
 
 export interface BootstrapOptions {
@@ -216,25 +218,27 @@ export async function prepareBootstrapWorkspace(
   requestedWorktree?: string,
 ): Promise<BootstrapWorkspace> {
   const requested = path.resolve(repository);
-  const requestedGit = simpleGit({ baseDir: requested });
-  if (!(await requestedGit.checkIsRepo().catch(() => false))) {
+  const requestedService = new GitRepositoryService(requested);
+  if (!(await requestedService.isRepository())) {
     throw new Error(t().bootstrap.notGitRepository(requested));
   }
-  const root = (await requestedGit.revparse(['--show-toplevel'])).trim();
-  const git = simpleGit({ baseDir: root });
-  const status = await git.status();
-  if (!status.isClean()) {
+  const root = await requestedService.root();
+  const service = new GitRepositoryService(root);
+  if (!await service.isClean()) {
+    const status = await service.raw().status();
     throw new Error(t().bootstrap.dirtyRepository(status.files.map((file) => file.path).join(', ')));
   }
 
   const runId = createRunId();
   const branch = `xcompiler/bootstrap/${runId}`;
-  const baseCommit = (await git.revparse(['HEAD'])).trim();
+  const baseCommit = await service.head();
+  // Worktrees live beside the container state, never inside it: state is shared by every worktree,
+  // so nesting one within the other makes the two lifetimes impossible to reason about.
   const worktree = requestedWorktree
     ? path.resolve(requestedWorktree)
-    : path.join(root, '.xcompiler', 'bootstrap', 'worktrees', runId);
+    : path.join(root, CONTAINER_WORKTREES_DIR, 'bootstrap', runId);
   await fs.mkdir(path.dirname(worktree), { recursive: true });
-  await git.raw(['worktree', 'add', '-b', branch, worktree, baseCommit]);
+  await service.addWorktree({ path: worktree, branch, startPoint: baseCommit });
   return { repository: root, worktree, branch, baseCommit, runId };
 }
 
@@ -327,7 +331,7 @@ async function createQualificationExecutor(
     const sandbox = new SubprocessSandbox({
       ws: workspace,
       language: 'typescript',
-      sandboxDir: '.sandbox/bootstrap-qualification',
+      environmentRoot: path.join(worktree, '.sandbox', 'bootstrap-qualification'),
       inheritEnv: false,
       limits: {
         cpu: 2,
@@ -347,6 +351,7 @@ async function createQualificationExecutor(
   const sandbox = new DockerSandbox({
     ws: workspace,
     language: 'typescript',
+    environmentRoot: path.join(worktree, '.sandbox', 'bootstrap-qualification'),
     image: options.dockerImage ?? 'node:24-slim',
     dockerBin: options.dockerBin,
     limits: {

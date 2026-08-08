@@ -27,6 +27,30 @@ function renderLog(level: RuntimeLogLevel, message: string): void {
   }
 }
 
+/**
+ * The IO an execution stage runs under: identical to the interactive adapter except that it never
+ * stops to ask.
+ *
+ * Every clarification and approval belongs to `build`, which owns the human gates and the plan the
+ * user confirmed. Asking again at execution time stalls an unattended run on a question that was
+ * already answered, and there is no new information at that point to answer it with.
+ *
+ * The request is still recorded: the permission service writes an InteractionRequest and a
+ * DecisionRecord either way, so the audit shows what was authorized and on what basis.
+ */
+export function createNonInteractiveCliRuntimeIO(): RuntimeIO {
+  const io = createCliRuntimeIO();
+  return {
+    ...io,
+    requestPermission: async (request) => ({
+      approved: true,
+      reason:
+        `Authorized by the build-stage gate: ${request.operationType} carries no separate ` +
+        'execution-time prompt.',
+    }),
+  };
+}
+
 export function createCliRuntimeIO(): RuntimeIO {
   return {
     terminalOutput: true,

@@ -9,8 +9,6 @@ import {
 } from '../core/plan.js';
 import {
   normalizeQualityAssessment,
-  reconcileDevelopmentQualityAssessment,
-  resolveQualityGate,
   type StageQualityAssessment,
 } from '../core/quality_gate.js';
 import type {
@@ -19,6 +17,8 @@ import type {
   Ticket,
 } from '../domain/tickets/ticket.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
+import { isPathPattern, isUnownedStepFailure, matchesPathPattern } from '../tools/types.js';
+import type { ToolFailureCode } from '../tools/types.js';
 import type {
   Tool,
   ToolContext,
@@ -120,6 +120,20 @@ export interface ExecutorRunInput {
       testArgs: string[];
     };
   };
+  /**
+   * Who is executing, taken from the assignee's Role Definition. Identity only — the Role holds no
+   * project, ticket, or workspace state, all of which reach the model through the blocks below.
+   */
+  roleIdentity?: {
+    rolePrompt: string;
+    capabilityPrompt: string;
+    prohibitions: readonly string[];
+  };
+  /**
+   * The layered Project → Phase → Step → Ticket-chain context assembled for this execution. Already
+   * budgeted by the assembler, so it is injected as-is.
+   */
+  layeredContext?: string;
   /** Plan 级别的全局 system prompt（xcompiler build 沉淀）。 */
   globalPrompt?: string;
   /** 目标语言 profile（决定 executor system prompt 的语言专属覆盖块）。默认 python。 */
@@ -149,6 +163,8 @@ export interface ToolCallRecord {
   ok: boolean;
   summary?: string;
   error?: string;
+  /** Why it failed, when a caller has to act on the reason rather than report it. */
+  code?: ToolFailureCode;
   data?: unknown;
 }
 
@@ -200,10 +216,17 @@ export class StepExecutor {
       inp.globalPrompt && inp.globalPrompt.trim()
         ? t().prompts.executorGlobalBlock(inp.globalPrompt.trim())
         : '';
+    const roleBlock = inp.roleIdentity ? t().prompts.executorRoleBlock(inp.roleIdentity) : '';
+    const contextBlock = inp.layeredContext?.trim()
+      ? t().prompts.executorContextBlock(inp.layeredContext.trim())
+      : '';
     const stepBlock = t().prompts.executorStepBlock(inp.step.systemPrompt.trim());
     const policyBlock = renderExecutionPromptPolicy({
       debug: !!inp.debugContext,
       changeRequest: !!inp.changeRequest,
+      // Not in Debug: a Bug routed to a design Step was opened deliberately by its paired
+      // verification, and repairing it is exactly the job. Rule 9 governs ownership there.
+      declarative: isDeclarativeOutputPhase(inp.step.phase) && !inp.debugContext,
     });
     const userPrompt = renderExecutionUserPrompt(inp, toolDocs, initialMissingOutputs);
     const profile = inp.languageProfile ?? getLanguageProfile('python');
@@ -213,8 +236,10 @@ export class StepExecutor {
         role: 'system',
         content:
           t().prompts.executorSystem(profile) +
+          roleBlock +
           policyBlock +
           globalBlock +
+          contextBlock +
           stepBlock +
           skillBlock +
           debugBlock,
@@ -304,7 +329,10 @@ export class StepExecutor {
         const chatOptions: ChatOptions = {
           responseFormat: 'json',
           temperature: 0.1,
+          // `onProviderStart` recomputes this from the newly selected provider's context window, so
+          // the object handed to the client must be this one, not a snapshot taken before the call.
           maxTokens: inp.ctx.responseTokenBudget,
+          signal: this.opts.signal,
           scoreSuccess: false,
           validate:
             role === 'Debugger' && (
@@ -349,7 +377,7 @@ export class StepExecutor {
             rep.onToken(chunk);
           },
         };
-        text = await this.opts.llm.chat(chatMessages, { ...chatOptions, signal: this.opts.signal });
+        text = await this.opts.llm.chat(chatMessages, chatOptions);
         providers.add(provider ?? this.opts.llm.name);
       } catch (err) {
         rep.done('failed');
@@ -721,6 +749,7 @@ export class StepExecutor {
         );
         const r = await safeRunTool(selectedTool, a.args, inp.ctx);
         toolReporter.done(r.ok ? 'done' : 'failed');
+        await syncSandboxIfManifestWritten(a, r, inp.ctx);
         updateUnresolvedToolFailures(unresolvedToolFailures, a, r, advisoryFailureTools, advisoryFailureRules);
         const successfulMutation = didPerformSuccessfulMutation(a, r);
         if (successfulMutation) {
@@ -746,6 +775,11 @@ export class StepExecutor {
           if (r.ok) {
             failedVerificationAttempts.delete(verificationKey);
             verifiedMutationGeneration = mutationGeneration;
+          } else if (isUnownedStepFailure(r.code)) {
+            // Nothing the Step can do makes this command succeed: the manifest is another Step's
+            // declared output. Counting the repeat as no-progress fails the attempt for a condition
+            // it does not own — the third guard to have needed telling.
+            failedVerificationAttempts.delete(verificationKey);
           } else {
             const count = (failedVerificationAttempts.get(verificationKey) ?? 0) + 1;
             failedVerificationAttempts.set(verificationKey, count);
@@ -787,6 +821,7 @@ export class StepExecutor {
           ok: r.ok,
           summary: r.summary,
           error: r.error,
+          code: r.code,
           data: r.data,
         });
         turnResults.push({ ...r, tool: a.tool });
@@ -795,11 +830,6 @@ export class StepExecutor {
         lastToolActionRound = round;
       }
       const verify = await verifyOutputs(inp);
-      qualityAssessment = reconcileDevelopmentQualityAssessment(
-        inp.step,
-        qualityAssessment,
-        verify.missing,
-      );
       const mutationSucceededThisRound = actions.some((action, index) =>
         didPerformSuccessfulMutation(action, turnResults[normalizedActions.invalid.length + index]!)
       );
@@ -897,7 +927,6 @@ export class StepExecutor {
         inp.step,
         qualityAssessment,
         qualityAssessmentRound > lastToolActionRound,
-        unresolvedToolFailures.size > 0,
       );
       const supersededContractFailures =
         repairEvidence &&
@@ -1584,8 +1613,12 @@ function didPerformSuccessfulMutation(action: LLMAction, result: ToolResult): bo
     (Array.isArray(result.data.updated) && result.data.updated.length > 0);
 }
 
+/**
+ * An allowlist denial is excluded: it aborts the attempt, and a Step that legitimately needs a path
+ * it was not granted should surface as a scope problem rather than burn one of its few attempts.
+ */
 function shouldTrackRepeatedMutationFailure(result: ToolResult): boolean {
-  return !/not in step writable allowlist/i.test(result.error ?? '');
+  return result.code !== 'write_denied';
 }
 
 function isDeclarativeOutputPhase(phase: Step['phase']): boolean {
@@ -1700,6 +1733,10 @@ function updateUnresolvedToolFailures(
   if (advisoryFailureTools.has(action.tool)) return;
   if (matchesAdvisoryFailureRule(action, result, advisoryFailureRules)) return;
   if (isIgnorableReadOnlyToolFailure(action, result)) return;
+  // A missing manifest is another Step's declared output. Holding it against this Step blocks a
+  // completion no role here can earn, which is how REQUIREMENT_ANALYSIS spent its debug rounds
+  // repairing tests that were never collected.
+  if (isUnownedStepFailure(result.code)) return;
   const detail = truncate(
     `${action.tool} FAIL ${result.error ?? result.summary ?? 'unknown error'}`,
     1500,
@@ -1921,6 +1958,42 @@ function redactLargeArgs(args: unknown): Record<string, unknown> {
   return out;
 }
 
+/**
+ * Rebuilds the environment as soon as a tool writes the dependency manifest.
+ *
+ * `add_dependency` rebuilds, and delivering the manifest as a Step output rebuilds. Writing the file
+ * directly did not — and that is the path a design Step actually takes, because it authors the whole
+ * manifest rather than appending one package. So HIGH_LEVEL_DESIGN wrote `package.json`, ran its
+ * module tests, and got `vitest: command not found` for a toolchain it had just declared.
+ *
+ * The diagnosis that failure carries is a fallback, not the answer: it asks the Step to install what
+ * it declared, and a Debugger answered by inventing `npx tsx install`. A Step should not have to ask
+ * for an environment that matches the manifest it just wrote.
+ *
+ * Failures are left to the next command to report. The build is cached by manifest signature, so a
+ * write that changes nothing costs nothing.
+ */
+export async function syncSandboxIfManifestWritten(
+  action: { tool: string; args?: unknown },
+  result: ToolResult,
+  ctx: ToolContext,
+): Promise<void> {
+  if (!result.ok || action.tool === 'add_dependency') return;
+  const manifest = getLanguageProfile(ctx.language ?? 'python').manifestFile;
+  const changed = changedFilesForAction(action.tool, action.args, result);
+  if (!changed.some((file) => file.replace(/^\.\//, '') === manifest)) return;
+  try {
+    await ctx.sandbox.build(manifest);
+    await ctx.audit?.event('note', `sandbox synced after ${action.tool} wrote ${manifest}`, {
+      messageId: 'execute.sandbox_synced_after_manifest_write',
+    });
+  } catch (error) {
+    await ctx.audit?.event('note', `sandbox sync failed after ${action.tool} wrote ${manifest}: ${(error as Error).message}`, {
+      messageId: 'execute.sandbox_sync_after_manifest_write_failed',
+    });
+  }
+}
+
 function changedFilesForAction(tool: string, args: unknown, result: ToolResult): string[] {
   if (tool === 'apply_patch' && result.data && typeof result.data === 'object') {
     const changed = (result.data as { changedFiles?: unknown }).changedFiles;
@@ -1974,10 +2047,37 @@ export async function verifyOutputs(inp: ExecutorRunInput): Promise<{ ok: boolea
   const missing: string[] = [];
   for (const out of inp.step.outputs) {
     if (out.endsWith('/')) continue; // 目录约束跳过显式文件检查
+    // A Step routinely declares `tests/unit/*.test.ts` before any of those files exist. Checking a
+    // pattern as a literal filename can never succeed, so the Step could not report completion no
+    // matter what it wrote — the same mismatch the write allowlist had.
+    if (isPathPattern(out)) {
+      if (!(await hasOutputMatching(inp, out))) missing.push(out);
+      continue;
+    }
     const exists = await inp.ctx.ws.exists(out);
     if (!exists || !(await hasSubstantiveOutputContent(inp, out))) missing.push(out);
   }
   return { ok: missing.length === 0, missing };
+}
+
+/** A pattern is satisfied by one substantive file matching it. */
+async function hasOutputMatching(inp: ExecutorRunInput, pattern: string): Promise<boolean> {
+  // Walk only the fixed prefix of the pattern; walking the workspace root would descend into
+  // node_modules on every check.
+  const prefix = pattern.split('/').slice(0, -1)
+    .reduce<string[]>((kept, part) => (
+      kept.length === pattern.split('/').length - 1 || /[*?]/u.test(part) ? kept : [...kept, part]
+    ), []).join('/');
+  const root = inp.ctx.ws.abs(prefix);
+  const entries = await fs.readdir(root, { recursive: true, withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const absolute = path.join(entry.parentPath ?? root, entry.name);
+    const rel = path.relative(inp.ctx.ws.root, absolute).split(path.sep).join('/');
+    if (!matchesPathPattern(rel, pattern)) continue;
+    if (await hasSubstantiveOutputContent(inp, rel)) return true;
+  }
+  return false;
 }
 
 async function hasSubstantiveOutputContent(inp: ExecutorRunInput, output: string): Promise<boolean> {

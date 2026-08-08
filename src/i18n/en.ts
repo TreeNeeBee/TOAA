@@ -53,7 +53,7 @@ Mandatory rules:
 12. implementationPhases must include P1 current and any planned executable phases. Each phase has a verificationGate whose failurePolicy says to feed the failure log to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.
 13. dependencies is a Python pip dependency list. Include \`pytest\`; use bare package names only; never list \`requirements.txt\` in Step outputs.
 14. Application/mixed projects need a directly executable Python entry point (\`src/main.py\` or package \`__main__.py\`) that reuses CODE modules. Library/mixed projects need a stable public API and \`docs/api-guide.md\`.
-15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, optional assetPaths, testPaths, and dependencies. HIGH_LEVEL_DESIGN authors testPaths, CODE authors implementation paths, and MODULE_TEST consumes testPaths. Macro Steps may cover multiple modules but must list module-level work in subTasks.
+15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, optional assetPaths, testPaths, and dependencies. HIGH_LEVEL_DESIGN authors testPaths, CODE authors implementation paths, and MODULE_TEST consumes testPaths. Every module needs at least one \`testPaths\` entry, and \`sourcePaths\` and \`assetPaths\` cannot both be empty — a module with no test path cannot be consumed by MODULE_TEST. Macro Steps may cover multiple modules but must list module-level work in subTasks.
 16. Third-party library choices must match real APIs: HIGH_LEVEL_DESIGN must name the concrete entry point function/class or verification basis for the selected library in this requirement; do not invent parser/export APIs from package names alone.
 17. Every Step may declare a qualityGate. S1-S4 use completionMin and upstreamAlignmentMin. S5-S8 declare their stage metrics and tolerance (metricShortfall, maxFailedTests, maxSkippedTests, maxWarnings). Keep thresholds realistic for the project; Runtime supplies engineering defaults when omitted.
 
@@ -106,7 +106,9 @@ Every round you must return strict JSON:
     "metrics": {},
     "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
     "evidence": ["artifact path, test report, or command result"],
-    "gaps": []
+    "unavailableMetrics": [],
+    "gaps": [],
+    "blockedBy": []
   },
   "actions": [ { "tool": "<tool name>", "args": { ... } }, ... ],
   "done": true | false
@@ -144,10 +146,11 @@ Rules:
 4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
    These four development phases author their paired tests but do not run them unless the current Step explicitly authorises a verification tool. Their scheduled execution in UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST is not a current-phase gap and must not be listed in qualityAssessment.gaps.
+   A shortfall in this Step's own work goes in qualityAssessment.gaps and fails this Step. A precondition this Step does not own and cannot satisfy — product source another Step writes, a dependency another phase declares, a test whose scheduled execution belongs to the paired verification phase — goes in qualityAssessment.blockedBy, which is recorded as evidence and does not fail this Step. Never put one in the other's field, and never leave a true blocker out of both.
    Every paired test must import or execute the real product modules/public APIs declared by the Plan. Never duplicate product types, classes, algorithms, renderers, parsers, schedulers, or other business behavior inside a test to make it pass without product code.
    Every DETAILED_DESIGN integration test must exercise at least two declared product source modules when the Plan declares two or more; an inline stand-in for either side is not integration evidence.
    UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
-   Ratios use 0..1. Never invent measurements: record unavailable evidence as a gap so Runtime can create an Enhance Ticket.
+   Ratios use 0..1. Never invent measurements: after a concrete probe fails to produce a required metric, put its exact identifier in unavailableMetrics and explain the cause in gaps so Runtime can create an Enhancement Ticket.
    In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
 5. Correct any error in the next round's actions; never overstep authority or invent tools.
 6. [Large-file chunked writes] write_file / append_file content must stay under the current Step's runtime chunk limit shown in the tool docs.
@@ -212,7 +215,9 @@ Every round you must return strict JSON:
     "metrics": {},
     "tolerance": { "failedTests": 0, "skippedTests": 0, "warnings": 0 },
     "evidence": ["artifact path, test report, or command result"],
-    "gaps": []
+    "unavailableMetrics": [],
+    "gaps": [],
+    "blockedBy": []
   },
   "actions": [ { "tool": "<tool name>", "args": { ... } }, ... ],
   "done": true | false
@@ -231,10 +236,11 @@ Rules:
 4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
    These four development phases author their paired tests but do not run them unless the current Step explicitly authorises a verification tool. Their scheduled execution in UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST is not a current-phase gap and must not be listed in qualityAssessment.gaps.
+   A shortfall in this Step's own work goes in qualityAssessment.gaps and fails this Step. A precondition this Step does not own and cannot satisfy — product source another Step writes, a dependency another phase declares, a test whose scheduled execution belongs to the paired verification phase — goes in qualityAssessment.blockedBy, which is recorded as evidence and does not fail this Step. Never put one in the other's field, and never leave a true blocker out of both.
    Every paired test must import or execute the real product modules/public APIs declared by the Plan. Never duplicate product types, classes, algorithms, renderers, parsers, schedulers, or other business behavior inside a test to make it pass without product code.
    Every DETAILED_DESIGN integration test must exercise at least two declared product source modules when the Plan declares two or more; an inline stand-in for either side is not integration evidence.
    UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
-   Ratios use 0..1. Never invent measurements: record unavailable evidence as a gap so Runtime can create an Enhance Ticket.
+   Ratios use 0..1. Never invent measurements: after a concrete probe fails to produce a required metric, put its exact identifier in unavailableMetrics and explain the cause in gaps so Runtime can create an Enhancement Ticket.
    In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
 5. Correct any error in the next round's actions; never overstep authority or invent tools.
 6. [Large-file chunked writes] write_file / append_file content must stay under the current Step's runtime chunk limit shown in the tool docs.
@@ -813,6 +819,11 @@ Return strict JSON StepPlan for the current phase only.`,
       'If the previous attempt stalled on read-only probes, do not repeat discovery: perform the next justified mutation or verification action.' +
       (suggestions ? `\n\n${suggestions}` : ''),
     executorGlobalBlock: (globalPrompt: string) => `\n\n## Project-wide constraints\n${globalPrompt}`,
+    executorContextBlock: (context: string) => `\n\n# Assembled context\n${context}`,
+    executorRoleBlock: (identity) => `\n\n## Your role\n${identity.rolePrompt}\n${identity.capabilityPrompt}`
+      + (identity.prohibitions.length > 0
+        ? `\n\nYou must not:\n${identity.prohibitions.map((rule) => `- ${rule}`).join('\n')}`
+        : ''),
     executorStepBlock: (sp: string) =>
       `\n\n## Current Step prompt (sole mission — do not drift across steps)\n${sp}`,
     executorSkillBlock: (hints: string[]) =>

@@ -155,7 +155,6 @@ export function missingQualityAssessmentFields(
   step: Step,
   assessment: StageQualityAssessment | undefined,
   freshAfterTools = true,
-  allowMetricGaps = false,
 ): string[] {
   if (!step.qualityGate) return [];
   if (!assessment) return ['qualityAssessment'];
@@ -170,19 +169,13 @@ export function missingQualityAssessmentFields(
   for (const metric of Object.keys(resolveQualityGate(step).metrics)) {
     if (
       typeof assessment.metrics[metric] !== 'number' &&
-      !(allowMetricGaps && assessment.gaps.some((gap) => qualityGapNamesMetric(gap, metric)))
+      !assessment.unavailableMetrics.includes(metric)
     ) {
       missing.push(`qualityAssessment.metrics.${metric}`);
     }
   }
   if (assessment.evidence.length === 0) missing.push('qualityAssessment.evidence');
   return missing;
-}
-
-function qualityGapNamesMetric(gap: string, metric: string): boolean {
-  const normalizedGap = gap.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
-  const normalizedMetric = metric.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
-  return normalizedMetric.length > 0 && normalizedGap.includes(normalizedMetric);
 }
 
 function renderToolResultDetail(

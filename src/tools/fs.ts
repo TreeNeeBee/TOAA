@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { isAllowedWrite, type Tool } from './types.js';
+import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -154,7 +154,7 @@ export const writeFileTool: Tool<{ path: string; content: string }, WriteFileDat
       };
     }
     if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
-      return { ok: false, error: `write denied: ${resolved.rel} not in step writable allowlist` };
+      return deniedWrite('write', resolved.rel, ctx.allowedWrites);
     }
     const size = Buffer.byteLength(args.content);
     const limit = resolveWriteChunkBytes(ctx.writeChunkBytes);
@@ -250,7 +250,7 @@ export const appendFileTool: Tool<{ path: string; content: string }, { bytes: nu
       return { ok: false, error: 'append denied: requirements.txt 由 add_dependency 维护。' };
     }
     if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
-      return { ok: false, error: `append denied: ${resolved.rel} not in step writable allowlist` };
+      return deniedWrite('append', resolved.rel, ctx.allowedWrites);
     }
     const size = Buffer.byteLength(args.content);
     const limit = resolveWriteChunkBytes(ctx.writeChunkBytes);

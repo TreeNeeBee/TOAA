@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
-import type { Tool } from './types.js';
+import type { Tool, ToolContext } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
+import { DEPENDENCY_MANIFEST_OWNER } from '../domain/steps/step.js';
 
 /**
  * add_dependency：把一组依赖追加到语言对应的依赖清单并重建沙盒。
@@ -24,6 +25,20 @@ export const addDependencyTool: Tool<
     const normalized = [...new Set(args.packages.map((p) => p.trim()).filter(Boolean))];
     if (normalized.length === 0) {
       return { ok: false, error: 'invalid add_dependency args: packages must include at least one package name' };
+    }
+    // One design decides the whole dependency set. A Step that edits the manifest under
+    // HIGH_LEVEL_DESIGN changes what every other Step already resolved against, and nobody checked
+    // the result is consistent — so a need discovered elsewhere travels back as a Change Request
+    // and returns as a dependency the design accepted.
+    if (ctx.phase !== undefined && ctx.phase !== DEPENDENCY_MANIFEST_OWNER) {
+      return {
+        ok: false,
+        code: 'dependency_not_owned',
+        error:
+          `add_dependency is owned by ${DEPENDENCY_MANIFEST_OWNER}; ${ctx.phase} cannot change the manifest. ` +
+          `Report the packages this Step needs (${normalized.join(', ')}) as a dependency change ` +
+          `request so ${DEPENDENCY_MANIFEST_OWNER} can check them against the accepted set and update it.`,
+      };
     }
     const manifestPath = ctx.language === 'typescript' ? 'package.json' : 'requirements.txt';
     const resolved = await resolveWorkspacePath(ctx.ws, manifestPath, 'add_dependency', {
@@ -75,7 +90,7 @@ export const addDependencyTool: Tool<
       }
       final = [...new Set([...Object.keys(dependencies), ...Object.keys(devDependencies)])].sort();
       if (added.length === 0 && updated.length === 0) {
-        return unchangedDependencyResult(manifestPath, final);
+        return unchangedDependencyResult(ctx, manifestPath, final);
       }
       pkg.dependencies = sortedDependencySection(dependencies);
       if (Object.keys(devDependencies).length > 0) {
@@ -101,7 +116,7 @@ export const addDependencyTool: Tool<
       }
       final = [...set].sort();
       if (added.length === 0) {
-        return unchangedDependencyResult(manifestPath, final);
+        return unchangedDependencyResult(ctx, manifestPath, final);
       }
       await fs.writeFile(abs, final.join('\n') + '\n', 'utf8');
     }
@@ -166,14 +181,37 @@ async function restoreWorkspaceFiles(
   return errors;
 }
 
-function unchangedDependencyResult(
+/**
+ * Every requested package was already declared — so the manifest does not change, but the
+ * environment may still not match it.
+ *
+ * Those are different facts, and reading the first as the second is why a Step that called this
+ * *because* its toolchain was missing was told the rebuild had been skipped and left exactly as it
+ * was. Nothing a Step can do from there fixes it.
+ *
+ * The build is cached by manifest signature, so when the environment really is in sync this costs a
+ * stat and a hash.
+ */
+async function unchangedDependencyResult(
+  ctx: ToolContext,
   manifestPath: string,
   finalLines: string[],
 ) {
+  let synced = true;
+  let reason = '';
+  try {
+    await ctx.sandbox.build(manifestPath);
+  } catch (error) {
+    synced = false;
+    reason = (error as Error).message;
+  }
   return {
     ok: true as const,
     data: { added: [], updated: [], finalLines },
-    summary: `add_dependency ${manifestPath} +0 (none new; sandbox rebuild skipped)`,
+    summary: synced
+      ? `add_dependency ${manifestPath} +0 (none new; environment matches the manifest)`
+      : `add_dependency ${manifestPath} +0 (none new; the environment does not match the manifest ` +
+        `and could not be prepared: ${reason})`,
   };
 }
 
