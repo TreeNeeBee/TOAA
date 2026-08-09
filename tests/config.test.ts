@@ -74,6 +74,18 @@ describe('config locale', () => {
     expect(failure).not.toContain('unrecognized_keys');
   });
 
+  it('rejects sandbox modes that have no runtime implementation', async () => {
+    const config = baseConfig();
+    const agent = config.agent as Record<string, unknown>;
+    agent.sandboxes = {
+      python: { mode: 'firejail' },
+      typescript: { mode: 'subprocess' },
+    };
+    await expect(loadConfigWithPath(await writeConfig(config))).rejects.toThrow(
+      /agent\.sandboxes\.python\.mode.*subprocess.*docker/su,
+    );
+  });
+
   it('parses the optional Ollama think flag', async () => {
     const cfg = baseConfig();
     const llm = cfg.llm as Record<string, unknown>;

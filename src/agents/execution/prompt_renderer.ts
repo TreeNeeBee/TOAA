@@ -1,4 +1,5 @@
 import type { Step } from '../../core/plan.js';
+import { VALIDATION_CONTRACT_DEFECT_CODE } from '../../domain/tickets/ticket.js';
 import { t } from '../../i18n/index.js';
 import type { ExecutorRunInput } from '../executor.js';
 
@@ -44,6 +45,7 @@ export function renderExecutionUserPrompt(
         '## debug repair packet',
         'The source, test, manifest, and config snippets below were loaded from the current workspace for this attempt.',
         'Use any complete snippet directly for patch/write actions; do not spend another turn rereading it.',
+        'Direct local imports of failure-related code are included when available. Reconcile test calls against those implementation exports before editing; a symbol absent from current snippets must not be invented.',
         'Only read a file again when its snippet explicitly ends with a truncation marker and the missing section is required for the repair.',
         '',
       ].join('\n')
@@ -69,6 +71,40 @@ export function renderExecutionUserPrompt(
         '',
       ].join('\n')
     : '';
+  const deferredVerificationScope = input.debugContext?.deferredVerificationScope
+    ? [
+        '## paired verification deferred to change-request propagation',
+        `verification step: ${input.debugContext.deferredVerificationScope.stepId}`,
+        `verification phase: ${input.debugContext.deferredVerificationScope.phase}`,
+        'This Bug was routed to an upstream source phase. Repair only the contract, design, and paired test artifacts owned by the current writable scope.',
+        'Do not modify downstream product implementation from this phase and do not weaken or replace behavioral tests to make the old implementation pass.',
+        'Do not repeatedly run the deferred paired gate after an unchanged downstream implementation has already produced conclusive failure evidence.',
+        'If the current upstream repair is complete and the remaining failure belongs to downstream implementation, record that dependency in qualityAssessment.blockedBy and finish the current repair. Do not report a second validationDefect for the same downstream gap.',
+        'If every current-phase output is already aligned, do not invent a file edit. A no-op handoff still requires the structured bugResolutionDisposition described below, including inspected downstream artifact paths; blockedBy text alone is insufficient.',
+        'Record an explicit resolution plan and structured accepted delta. PM will propagate those exact affected artifacts through downstream Change Requests, then rerun the original verification gate.',
+        '',
+      ].join('\n')
+    : '';
+  const validationContractDefect =
+    input.ticket?.type === 'bug' && input.ticket.failure.code === VALIDATION_CONTRACT_DEFECT_CODE
+      ? [
+          '## validation-contract defect ownership',
+          'The discovering role proved that the failed validation contract, paired test, or source-stage specification is defective; this is not an unchanged downstream implementation blocker.',
+          'The current paired source Step owns the correction. Patch or rewrite only its affected declared output(s), preserve valid product behavior and assertions, and record a real incremental changelist.',
+          'A read-only review with actions=[] cannot resolve this Bug or hand the unchanged validation defect downstream.',
+          '',
+        ].join('\n')
+      : '';
+  const bugNoopHandoffContract = input.ticket?.type === 'bug'
+    ? [
+        '## Bug no-op handoff contract',
+        'A Bug may leave this source Step without a mutation only when concrete current-workspace evidence proves that every remaining affected artifact belongs downstream.',
+        'Such a completion must return this exact top-level object: bugResolutionDisposition={outcome:"deferred",reasonCategory:"downstream-owned"|"external-dependency",rationale:"...",affectedArtifacts:["path"],evidence:["fact"]}.',
+        'Every affectedArtifacts path must be outside this Step outputs and must have been loaded from the current workspace. A blockedBy sentence or free-form bugResolutionPlan alone cannot transfer ownership.',
+        'If the defective artifact is a paired test, plan, contract, or other output owned by this Step, repair it here and do not return a deferred disposition.',
+        '',
+      ].join('\n')
+    : '';
   const missingOutputPriority = initialMissingOutputs.length > 0
     ? [
         '## highest-priority required-output gate',
@@ -88,9 +124,27 @@ export function renderExecutionUserPrompt(
         `source ticket: ${input.changeRequest.sourceTicketId}`,
         `objective: ${input.changeRequest.description}`,
         `contract delta: ${input.changeRequest.contractDelta.summary}`,
+        input.changeRequest.originFailure
+          ? `original failed gate: ${input.changeRequest.originFailure.failedStepType} — ${input.changeRequest.originFailure.message}`
+          : 'original failed gate: not recorded (dependency or quality CR)',
+        'failing baseline / before:',
+        truncate(input.changeRequest.contractDelta.before.join('\n'), 2600),
+        'accepted outcome / after:',
+        input.changeRequest.contractDelta.after.map((item) => `- ${item}`).join('\n'),
+        'affected artifacts:',
+        ...input.changeRequest.contractDelta.affectedArtifacts.map((path) => `- ${path}`),
         'This CR carries an accepted upstream contract change. It is not an enhancement finding.',
         'This is incremental CR execution against the existing project baseline.',
         'Apply only the affected contract and artifacts for this Step. Preserve unrelated files and accepted behavior.',
+        'If an affected artifact is owned by this Step, file or symbol existence alone is not completion. Compare the failing invocation and expected behavior with the actual artifact behavior, then either apply the minimal semantic delta or submit an explicit not-applicable decision.',
+        'Classify the CR result structurally. Use reasonCategory="contract-applied" only with outcome="applied". For outcome="not-applicable", use exactly one of: "already-aligned", "outside-step-scope", "downstream-owned", or "diagnosis-contradicted".',
+        'Ownership constrains that classification: if this Step owns every declared affected artifact, "downstream-owned" is invalid; if it owns any affected artifact, "outside-step-scope" is invalid. For a CR with an immutable original failed gate, "already-aligned" cannot close owned work without a successful executable verification of that failure.',
+        'Use "diagnosis-contradicted" when current files or executable evidence disprove the CR diagnosis or reveal that the original test/contract is defective. Runtime will make the discovering role create a Bug and PM will route it using the immutable original failed-gate snapshot. Never hide a disproved CR premise in blockedBy.',
+        'Every CR completion must include this exact top-level shape: changeRequestDisposition={outcome:"applied"|"not-applicable",reasonCategory:"contract-applied"|"already-aligned"|"outside-step-scope"|"downstream-owned"|"diagnosis-contradicted",rationale:"...",inspectedArtifacts:["path"],evidence:["fact"]}. All five fields are required; inspectedArtifacts and evidence must be JSON string arrays, never a single string. A normal not-applicable decision must inspect every affected artifact owned by this Step, explain why the failure belongs elsewhere, and name that downstream work in qualityAssessment.blockedBy.',
+        'If this Step owns none of the listed affected artifacts, inspect at least one declared affected artifact, then return an explicit not-applicable disposition with actions=[] and done=true. ' +
+          `Use this concrete path first when available: ${input.changeRequest.contractDelta.affectedArtifacts[0] ?? '(no affected artifact was declared)'}. ` +
+          'Do not substitute this Step\'s report or plan for that inspection. Do not rewrite this Step outputs or call unavailable verification tools merely to manufacture progress; PM will carry the CR to its next owning stage.',
+        'Never add comments, whitespace, formatting, renames, or unrelated edits merely to manufacture mutation evidence. Such changes do not implement a CR.',
         'Do not regenerate the whole phase, project, design, or test suite.',
         '',
       ].join('\n')
@@ -106,6 +160,9 @@ export function renderExecutionUserPrompt(
         'Preserve accepted baseline behavior and artifacts. Do not regenerate the whole phase or project.',
         'For coverage gaps, use measured coverage evidence to add focused tests around uncovered production behavior. ' +
           'Do not rewrite accepted production code merely to inflate a metric.',
+        'When this Enhancement is routed from a downstream verification Step, the current source Step only authors the focused test delta. ' +
+          'After a real mutation, return completion/upstreamAlignment evidence with qualityAssessment.gaps=[]; put the coverage rerun in blockedBy. ' +
+          'Do not report downstream coverage metrics in unavailableMetrics or gaps, and do not keep adding tests because run_tests is intentionally unavailable here.',
         '',
       ].join('\n')
     : '';
@@ -161,6 +218,9 @@ export function renderExecutionUserPrompt(
       : '',
     debugRepairPacket,
     verificationScope,
+    deferredVerificationScope,
+    validationContractDefect,
+    bugNoopHandoffContract,
     contextBlock
       ? `## context\nTreat these existing files as the current project truth. Extend or refactor them in place; do not replace the project with a tiny parallel implementation.\n\n${contextBlock}\n`
       : '',

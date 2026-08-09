@@ -24,13 +24,20 @@ import {
   type DomainEventPublisher,
 } from '../observability/outbox_dispatcher.js';
 import { AttemptResultProcessor } from './attempt_result_processor.js';
+import { ProjectProgressGuard } from './progress_guard.js';
+import { isCancellationError } from '../../core/cancellation.js';
+
+interface MergeIntegrationResult {
+  status: 'merged' | 'nothing-to-merge' | 'failed' | 'blocked' | 'awaiting-authorization';
+  reason?: string;
+  failureLog?: string;
+}
 
 export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, 'repository' | 'plugins'> {
   repository: DomainObjectRepositoryPort;
   plugins: PluginHost;
   projectionWriter?: ProjectProjectionWriter;
   eventPublisher?: DomainEventPublisher;
-  maxTransitions?: number;
   attemptRunner?: {
     initialize(): Promise<void>;
     run(input: AttemptInput): Promise<AttemptResult>;
@@ -50,12 +57,9 @@ export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, '
    * Called as each Step delivers, because the next Step reads its output: a change still on its own
    * branch is invisible to everything that follows it in the V-model.
    */
-  integrateTicket?: (rootTicketId: ObjectId) => Promise<{ status: string; reason?: string; failureLog?: string }>;
-  integratePhase?: (phaseId: ObjectId) => Promise<{
-    status: 'merged' | 'nothing-to-merge' | 'failed' | 'blocked' | 'awaiting-authorization';
-    reason?: string;
-    failureLog?: string;
-  }>;
+  integrateTicket?: (rootTicketId: ObjectId) => Promise<MergeIntegrationResult>;
+  integratePhase?: (phaseId: ObjectId) => Promise<MergeIntegrationResult>;
+  integratePendingAuthorization?: (phaseId: ObjectId) => Promise<MergeIntegrationResult>;
   onTransition?: (event: {
     event: 'phase_started' | 'step_started' | 'ticket_started' | 'ticket_routed' | 'step_delivered' | 'phase_delivered' | 'project_delivered';
     projectId: ObjectId;
@@ -63,7 +67,13 @@ export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, '
     stepId?: ObjectId;
     stepName?: string;
     ticketId?: ObjectId;
+    ticketName?: string;
     ticketType?: string;
+    creatorActorId?: ObjectId;
+    creatorRole?: string;
+    assigneeActorId?: ObjectId;
+    assigneeRole?: string;
+    assigneeAgent?: string;
     correlationId: ObjectId;
     causationId?: ObjectId;
     message?: string;
@@ -136,6 +146,18 @@ export class ProjectOrchestrator {
       denyBehavior: 'Stop because failed attempts cannot be rolled back safely.',
     });
     await this.options.git.ensureRepo();
+    if (this.options.integratePendingAuthorization) {
+      const pending = await this.options.integratePendingAuthorization(phase.id);
+      if (pending.status !== 'merged' && pending.status !== 'nothing-to-merge') {
+        return this.failure(
+          phase.id,
+          steps.length,
+          0,
+          undefined,
+          pending.reason ?? `pending merge integration ${pending.status}`,
+        );
+      }
+    }
     const profileManifest = this.draft.language === 'python' ? 'requirements.txt' : 'package.json';
     if (await this.options.workspace.exists(profileManifest)) {
       await this.requirePermission({
@@ -155,9 +177,19 @@ export class ProjectOrchestrator {
     }
 
     let executed = 0;
-    const transitionLimit = this.options.maxTransitions ?? Math.max(32, steps.length * 8);
-    for (let transition = 0; transition < transitionLimit; transition += 1) {
+    const progress = new ProjectProgressGuard(this.options.repository);
+    for (;;) {
       this.throwIfAborted();
+      const observation = await progress.observe(phase.projectId, phase.id);
+      if (observation.stalled) {
+        return this.failure(
+          phase.id,
+          steps.length,
+          executed,
+          undefined,
+          `Domain scheduler made no semantic progress for ${observation.unchangedObservations} observations`,
+        );
+      }
       let work: ScheduledWork | undefined;
       try {
         work = await this.scheduler.resume(phase.id);
@@ -260,9 +292,32 @@ export class ProjectOrchestrator {
         return this.failure(phase.id, steps.length, executed, work.step, `Execution specification missing for ${work.step.name}`);
       }
       try {
+        const firstAssignment = !work.ticket.activeAssignmentId;
         const routed = await this.tickets.routeAndAssign(work.ticket.id, { forStepId: work.step.id });
         assignee = await this.tickets.routingActorById(routed.assignment.assigneeActorId);
         work = { ...work, ticket: routed.ticket };
+        if (firstAssignment) {
+          const creator = await this.tickets.actorById(routed.ticket.creatorActorId);
+          const assigned = await this.tickets.actorById(routed.assignment.assigneeActorId);
+          await this.transition({
+            event: 'ticket_routed',
+            projectId: phase.projectId,
+            phaseId: phase.id,
+            stepId: work.step.id,
+            stepName: work.step.name,
+            ticketId: routed.ticket.id,
+            ticketName: routed.ticket.name,
+            ticketType: routed.ticket.type,
+            creatorActorId: creator.id,
+            creatorRole: creator.role,
+            assigneeActorId: assigned.id,
+            assigneeRole: assigned.role,
+            assigneeAgent: routed.ticket.agent,
+            correlationId: routed.ticket.source.correlationId,
+            causationId: routed.ticket.source.causationId,
+            message: `${creator.role} created ${routed.ticket.name}; PM routed it to ${assigned.role}/${routed.ticket.agent}`,
+          });
+        }
         work = await this.scheduler.start(work);
       } catch (error) {
         return this.failure(phase.id, steps.length, executed, work.step, (error as Error).message);
@@ -292,14 +347,25 @@ export class ProjectOrchestrator {
         message: `${work.mode} execution started`,
       });
       await this.options.plugins.emit('step.before', { plan: projection.plan, step: executionStep });
-      const result = await this.runner.run({
-        plan: projection.plan,
-        executionStep,
-        domainStep: work.step,
-        ticket: work.ticket,
-        mode: work.mode,
-        assignee,
-      });
+      let result: AttemptResult;
+      try {
+        result = await this.runner.run({
+          plan: projection.plan,
+          executionStep,
+          domainStep: work.step,
+          ticket: work.ticket,
+          mode: work.mode,
+          assignee,
+        });
+      } catch (error) {
+        if (isCancellationError(error, this.options.abortSignal)) {
+          await this.scheduler.deferCancelledAttempt(
+            work,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        throw error;
+      }
       executed += 1;
       await this.options.plugins.emit('step.after', { plan: projection.plan, step: executionStep, ok: result.ok });
 
@@ -327,9 +393,6 @@ export class ProjectOrchestrator {
             return this.failure(phase.id, steps.length, executed, work.step, gate.reason);
           }
         } else if (landed.status === 'awaiting-authorization') {
-          // Not an error, but it must not be silent: the run completes having merged nothing, and a
-          // live run spent a whole pass looking successful while every ChangeSet sat unmerged. The
-          // gate had passed; only the authorization was missing.
           await this.options.audit.event('note', `${work.step.name} passed its gate but was not merged`, {
             messageId: 'domain.merge_awaiting_authorization',
             projectId: work.step.projectId,
@@ -339,6 +402,13 @@ export class ProjectOrchestrator {
             ticketId: work.ticket.id,
             reason: landed.reason,
           });
+          return this.failure(
+            phase.id,
+            steps.length,
+            executed,
+            work.step,
+            landed.reason ?? 'merge authorization is required before downstream execution',
+          );
         } else if (landed.status === 'blocked') {
           return this.failure(
             phase.id, steps.length, executed, work.step,
@@ -346,15 +416,7 @@ export class ProjectOrchestrator {
           );
         }
       }
-
     }
-    return this.failure(
-      phase.id,
-      steps.length,
-      executed,
-      undefined,
-      `Domain scheduler exceeded ${transitionLimit} transitions; active Ticket graph did not converge`,
-    );
   }
 
   private throwIfAborted(): void {
@@ -384,7 +446,7 @@ export class ProjectOrchestrator {
   private async requirePermission(request: ToolPermissionRequest): Promise<void> {
     const decision = this.options.requestPermission
       ? await this.options.requestPermission(request)
-      : { approved: true };
+      : { approved: false, reason: 'No Runtime permission policy is configured.' };
     if (!decision.approved) throw new Error(`permission denied for ${request.operationType}: ${request.target}`);
   }
 

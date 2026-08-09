@@ -190,12 +190,17 @@ export const writeFileTool: Tool<{ path: string; content: string }, WriteFileDat
           summary: `unchanged ${resolved.rel} (${size}B; content identical)`,
         };
       }
-      if (previous && ctx.preserveExistingFiles) {
+      if (
+        previous &&
+        ctx.preserveExistingFiles &&
+        !ctx.rewriteExistingFiles?.includes(resolved.rel)
+      ) {
         return {
           ok: false,
           error:
             `incremental write denied: ${resolved.rel} is an accepted existing file. ` +
-            'Use replace_in_file or apply_patch for the smallest required delta; write_file may still create a missing file.',
+            'Use replace_in_file or apply_patch for the smallest required delta. write_file may create a missing file, ' +
+            'or rewrite an existing path only when Runtime lists it as a direct failure-evidence rewrite target.',
         };
       }
       const truncationError = previous

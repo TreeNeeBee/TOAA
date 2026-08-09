@@ -31,9 +31,9 @@ export function evaluateAttemptExtension(
     };
   }
   return {
-    extend: true,
+    extend: signatures.length > 0,
     reason: signatures.length === 0
-      ? 'legacy attempts have no failure fingerprint; grant one adaptive retry'
+      ? 'attempt extension requires structured failure fingerprints'
       : 'failure evidence is still changing and the corrective work is converging',
   };
 }

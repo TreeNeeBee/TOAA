@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   reconcileMeasuredQualityAssessment,
+  reconcileDeferredSourceQualityAssessment,
+  prioritizeAttemptFailureEvidence,
   renderAttemptRetryFeedback,
+  renderExecutorFailure,
   resolveAttemptRoundLimit,
+  selectActionableAttemptFailure,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  shouldPreserveExistingFiles,
   deliveredManifest,
+  isAttemptCancellation,
 } from '../src/application/execution/attempt_runner.js';
 import type { DomainLog } from '../src/domain/observability/records.js';
 import { classifyAttemptFailure, classifyFailure } from '../src/application/execution/failure_classification.js';
@@ -13,7 +19,7 @@ import type { Plan, Step } from '../src/core/plan.js';
 import type { Ticket } from '../src/domain/tickets/ticket.js';
 
 describe('attempt verification scope', () => {
-  it('inherits only the paired test gate when a verification Bug returns to its source Step', () => {
+  it('defers the paired test gate when a verification Bug returns to an upstream source Step', () => {
     const plan = fixturePlan();
     const code = plan.steps[0]!;
     const ticket = bugTicket({
@@ -24,7 +30,8 @@ describe('attempt verification scope', () => {
 
     expect(resolveAttemptVerificationScope(plan, code, ticket)).toEqual({
       testArgs: ['tests/unit/core.test.ts'],
-      inheritedFromTicket: true,
+      inheritedFromTicket: false,
+      deferredToChangeRequest: true,
       verificationStepId: 'unit-id',
       verificationPhase: 'UNIT_TEST',
     });
@@ -82,9 +89,61 @@ describe('attempt failure classification', () => {
     expect(classifyFailure(subjectOutput).kind).toBe('execution');
     expect(classifyFailure(subjectOutput, { trustProviderText: true }).kind).toBe('infrastructure');
   });
+
+  it('classifies model no-progress loops as agent stalls rather than project defects', () => {
+    expect(classifyFailure(
+      'repeated read-only/probe actions without progress for 3 rounds',
+    )).toMatchObject({
+      kind: 'execution',
+      category: 'internal',
+      code: 'agent_execution_stalled',
+      retryable: true,
+      switchProvider: true,
+    });
+  });
+});
+
+describe('attempt cancellation detection', () => {
+  it('separates terminal SIGINT and Runtime aborts from project defects', () => {
+    const promptExit = new Error('User force closed the prompt with SIGINT');
+    promptExit.name = 'ExitPromptError';
+    expect(isAttemptCancellation(promptExit)).toBe(true);
+
+    const controller = new AbortController();
+    controller.abort(new Error('ACP task cancelled by client'));
+    expect(isAttemptCancellation(new Error('provider stopped'), controller.signal)).toBe(true);
+    expect(isAttemptCancellation(new Error('generated project test failed'))).toBe(false);
+  });
 });
 
 describe('attempt retry feedback', () => {
+  it('persists bounded test output instead of replacing it with the short tool error', () => {
+    const failure = renderExecutorFailure({
+      success: false,
+      rounds: 1,
+      finalThought: 'module verification failed',
+      error: 'validation defect reported: module contract failed',
+      metrics: {
+        rounds: 1,
+        parseFailures: 0,
+        repeatedTurns: 0,
+        toolFailRatio: 1,
+        progressRatio: 1,
+        healthScore: 0,
+        providers: [],
+      },
+      toolCalls: [{
+        tool: 'run_tests',
+        ok: false,
+        error: 'npm test exit=1',
+        summary: 'npm test exit=1\nFAIL tests/modules/scrapers.test.ts\nAssertionError: invalid matcher',
+      }],
+    });
+
+    expect(failure).toContain('FAIL tests/modules/scrapers.test.ts');
+    expect(failure).toContain('AssertionError: invalid matcher');
+  });
+
   it('passes a compact actionable failure from a rolled-back Ticket attempt', () => {
     const feedback = renderAttemptRetryFeedback({
       message: 'Step executor reached max rounds',
@@ -102,6 +161,51 @@ describe('attempt retry feedback', () => {
     expect(feedback).toContain('tests/unit/rss.spec.ts');
     expect(feedback).toContain("Cannot read properties of undefined");
   });
+
+  it('places the latest rolled-back failure before the original Bug context', () => {
+    const evidence = prioritizeAttemptFailureEvidence(
+      'Original failure: runPipeline is not a function',
+      'Latest failure: expected zhihu to be baidu after the interface repair',
+    );
+
+    expect(evidence.indexOf('Latest failure')).toBeLessThan(evidence.indexOf('Original failure'));
+    expect(evidence).toContain('## original bug context');
+  });
+
+  it('uses the persisted failure category instead of reclassifying provider wording', () => {
+    const feedback = renderAttemptRetryFeedback({
+      message: 'all LLM providers failed after a low-quality response',
+      data: {
+        structuredFailure: {
+          kind: 'execution',
+          category: 'test',
+          code: 'test_command_failed',
+        },
+        failureLog: [
+          'run_tests: npm test exit=1 args=tests/integration/pipeline.test.ts',
+          "AssertionError: expected 'zhihu' to be 'baidu'",
+        ].join('\n'),
+      },
+    } as unknown as DomainLog, 'DETAILED_DESIGN');
+
+    expect(feedback).toContain('category: test_failure');
+    expect(feedback).toContain("expected 'zhihu' to be 'baidu'");
+    expect(feedback).not.toContain('This is LLM provider/context infrastructure');
+  });
+
+  it('prefers the latest project failure over a newer provider-only retry failure', () => {
+    const projectFailure = {
+      id: 'project-failure',
+      data: { structuredFailure: { kind: 'execution', category: 'test' } },
+    } as unknown as DomainLog;
+    const providerFailure = {
+      id: 'provider-failure',
+      data: { structuredFailure: { kind: 'infrastructure', category: 'llm-provider' } },
+    } as unknown as DomainLog;
+
+    expect(selectActionableAttemptFailure([projectFailure, providerFailure]))
+      .toBe(projectFailure);
+  });
 });
 
 describe('attempt round limits', () => {
@@ -110,6 +214,15 @@ describe('attempt round limits', () => {
     expect(resolveAttemptRoundLimit('debug', 6)).toBe(9);
     expect(resolveAttemptRoundLimit('enhancement', 8)).toBe(12);
     expect(resolveAttemptRoundLimit('change-request', 6, 14)).toBe(14);
+  });
+});
+
+describe('attempt mutation policy', () => {
+  it('preserves accepted files for every corrective Ticket mode', () => {
+    expect(shouldPreserveExistingFiles('normal')).toBe(false);
+    expect(shouldPreserveExistingFiles('debug')).toBe(true);
+    expect(shouldPreserveExistingFiles('enhancement')).toBe(true);
+    expect(shouldPreserveExistingFiles('change-request')).toBe(true);
   });
 });
 
@@ -134,6 +247,54 @@ describe('measured test quality evidence', () => {
     expect(result?.metrics.branchCoverage).toBeCloseTo(0.8666);
     expect(result?.metrics.testCasePassRate).toBe(1);
     expect(result?.evidence.at(-1)).toContain('src/cli.ts=0%');
+  });
+});
+
+describe('deferred source quality evidence', () => {
+  it('hands a measured coverage gap back to the paired unit-test gate after a real source delta', () => {
+    const result = reconcileDeferredSourceQualityAssessment({
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['focused unit tests added'],
+      unavailableMetrics: ['lineCoverage', 'branchCoverage'],
+      gaps: ['CODE cannot execute the coverage command'],
+      blockedBy: ['UNIT_TEST must measure the new tests'],
+    }, {
+      currentPhase: 'CODE',
+      deferredToChangeRequest: true,
+      verificationPhase: 'UNIT_TEST',
+      changedFiles: ['tests/unit/core.test.ts'],
+    });
+
+    expect(result?.gaps).toEqual([]);
+    expect(result?.blockedBy).toContain('deferred to UNIT_TEST: CODE cannot execute the coverage command');
+  });
+
+  it('keeps gaps when no source delta was produced or the metric does not belong downstream', () => {
+    const assessment = {
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['inspection only'],
+      unavailableMetrics: ['unrelatedMetric'],
+      gaps: ['implementation is incomplete'],
+      blockedBy: ['UNIT_TEST is pending'],
+    };
+    expect(reconcileDeferredSourceQualityAssessment(assessment, {
+      currentPhase: 'CODE',
+      deferredToChangeRequest: true,
+      verificationPhase: 'UNIT_TEST',
+      changedFiles: [],
+    })?.gaps).toEqual(['implementation is incomplete']);
+    expect(reconcileDeferredSourceQualityAssessment(assessment, {
+      currentPhase: 'CODE',
+      deferredToChangeRequest: true,
+      verificationPhase: 'UNIT_TEST',
+      changedFiles: ['tests/unit/core.test.ts'],
+    })?.gaps).toEqual(['implementation is incomplete']);
   });
 });
 

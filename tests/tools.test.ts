@@ -174,6 +174,27 @@ describe('write_file tool', () => {
     expect(created).toMatchObject({ ok: true });
   });
 
+  it('allows a full rewrite only for an exact failure-evidence target', async () => {
+    await ws.writeFile('src/failing.ts', 'export const value = 1;\n');
+    await ws.writeFile('src/unrelated.ts', 'export const value = 1;\n');
+    ctx.preserveExistingFiles = true;
+    ctx.rewriteExistingFiles = ['src/failing.ts'];
+
+    const rewritten = await writeFileTool.run(
+      { path: 'src/failing.ts', content: 'export const value = 2;\n' },
+      ctx,
+    );
+    const unrelated = await writeFileTool.run(
+      { path: 'src/unrelated.ts', content: 'export const value = 2;\n' },
+      ctx,
+    );
+
+    expect(rewritten).toMatchObject({ ok: true, data: { changed: true } });
+    expect(unrelated).toMatchObject({ ok: false });
+    expect(await ws.readFile('src/failing.ts')).toContain('value = 2');
+    expect(await ws.readFile('src/unrelated.ts')).toContain('value = 1');
+  });
+
   it('uses explicit per-step chunk limits for write_file and append_file', async () => {
     ctx.writeChunkBytes = 16;
     const tooLarge = await writeFileTool.run({ path: 'src/big.py', content: 'x'.repeat(17) }, ctx);
@@ -628,7 +649,7 @@ describe('runTestsTool / runPythonTool summary', () => {
       allowedWrites: [],
       stepId: 'S005',
       language: 'typescript',
-      defaultTestArgs: ['tests/unit/parser.test.ts'],
+      testGateArgs: ['tests/unit/parser.test.ts'],
     };
     const r = await runTestsTool.run({ args: ['run'] }, fakeCtx);
     expect(r.ok).toBe(true);
@@ -636,7 +657,7 @@ describe('runTestsTool / runPythonTool summary', () => {
     expect(r.summary).toBe('npm test exit=0 args=tests/unit/parser.test.ts');
   });
 
-  it('preserves explicit TypeScript test filters instead of replacing them with defaults', async () => {
+  it('does not let explicit TypeScript selectors replace the Runtime-owned gate', async () => {
     const { runTestsTool } = await import('../src/tools/sandbox.js');
     let seenArgs: string[] = [];
     const fakeCtx: ToolContext = {
@@ -652,12 +673,12 @@ describe('runTestsTool / runPythonTool summary', () => {
       allowedWrites: [],
       stepId: 'S007',
       language: 'typescript',
-      defaultTestArgs: ['tests/module/parser.test.ts'],
+      testGateArgs: ['tests/module/parser.test.ts', '--coverage'],
     };
     const r = await runTestsTool.run({ args: ['run', 'tests/unit'] }, fakeCtx);
     expect(r.ok).toBe(true);
-    expect(seenArgs).toEqual(['tests/unit']);
-    expect(r.summary).toBe('npm test exit=0 args=tests/unit');
+    expect(seenArgs).toEqual(['tests/module/parser.test.ts', '--coverage']);
+    expect(r.summary).toBe('npm test exit=0 args=tests/module/parser.test.ts --coverage');
   });
 
   it('combines TypeScript runner flags with scoped default test args', async () => {
@@ -676,7 +697,7 @@ describe('runTestsTool / runPythonTool summary', () => {
       allowedWrites: [],
       stepId: 'S005',
       language: 'typescript',
-      defaultTestArgs: ['tests/unit/parser.test.ts'],
+      testGateArgs: ['tests/unit/parser.test.ts'],
     };
     const r = await runTestsTool.run({ args: ['--reporter=verbose'] }, fakeCtx);
     expect(r.ok).toBe(true);
@@ -713,7 +734,7 @@ describe('runTestsTool / runPythonTool summary', () => {
       allowedWrites: [],
       stepId: 'S005',
       language: 'typescript',
-      defaultTestArgs: ['tests/unit/parser.test.ts', '--coverage'],
+      testGateArgs: ['tests/unit/parser.test.ts', '--coverage'],
     };
     const r = await runTestsTool.run({}, fakeCtx);
     expect(r.ok).toBe(true);
@@ -738,7 +759,7 @@ describe('runTestsTool / runPythonTool summary', () => {
       allowedWrites: [],
       stepId: 'S005',
       language: 'typescript',
-      defaultTestArgs: ['tests/unit/parser.test.ts', '--coverage'],
+      testGateArgs: ['tests/unit/parser.test.ts', '--coverage'],
     };
     const r = await runTestsTool.run({ args: ['--coverage'] }, fakeCtx);
     expect(r.ok).toBe(true);

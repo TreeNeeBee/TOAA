@@ -16,6 +16,10 @@ import {
   stepContextChars,
 } from './execution_context.js';
 import { TestPhaseValidator } from './test_phase_validator.js';
+import {
+  inspectPairedSourceTests,
+  mergePairedSourceTestQuality,
+} from '../../core/paired_test_contract.js';
 import { isTestFilePath, normalizeGitPath } from './v_model_policy.js';
 import { getLanguageProfile, type LanguageProfile } from '../../core/language.js';
 import type { Plan, Step as ExecutionStep } from '../../core/plan.js';
@@ -44,6 +48,7 @@ import {
   buildDefaultRegistry,
   EditGuard,
   resolveWriteChunkBytes,
+  isAllowedWrite,
   type ToolContext,
   type ToolExecutionReporter,
   type ToolPermissionRequester,
@@ -52,7 +57,7 @@ import {
 import type { Workspace } from '../../workspace/workspace.js';
 import type { GitService } from '../../workspace/git.js';
 import { createHash } from 'node:crypto';
-import { executionPhaseFor } from './execution_adapter.js';
+import { isCancellationError } from '../../core/cancellation.js';
 import {
   classifyFailure,
   type AttemptFailure,
@@ -62,19 +67,32 @@ import { collectTestOutcomes, type TestOutcome } from './test_outcome.js';
 import type { RecordReplayController } from '../record_replay/controller.js';
 import {
   reconcileMeasuredQualityAssessment,
+  reconcileDeferredSourceQualityAssessment,
   renderAttemptRetryFeedback,
+  prioritizeAttemptFailureEvidence,
+  selectActionableAttemptFailure,
   resolveAttemptRoundLimit,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  shouldPreserveExistingFiles,
   type AttemptMode,
 } from './attempt_policy.js';
+import { VerifiedBugKnowledgeService } from './verified_bug_knowledge_service.js';
+import {
+  discoverDebugContextPaths,
+  extractWorkspacePaths,
+} from './debug_context_snippets.js';
 
 export {
+  prioritizeAttemptFailureEvidence,
+  reconcileDeferredSourceQualityAssessment,
   reconcileMeasuredQualityAssessment,
   renderAttemptRetryFeedback,
+  selectActionableAttemptFailure,
   resolveAttemptRoundLimit,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  shouldPreserveExistingFiles,
 } from './attempt_policy.js';
 
 /**
@@ -152,6 +170,8 @@ export interface AttemptResult {
   changes?: Changelist['entries'];
   commit?: string;
   solutionPlan?: string;
+  bugResolutionDisposition?: ExecutorRunResult['bugResolutionDisposition'];
+  changeRequestDisposition?: ExecutorRunResult['changeRequestDisposition'];
   wikiEntryIds: string[];
   executor?: ExecutorRunResult;
   testOutcomes: TestOutcome[];
@@ -165,6 +185,7 @@ export class DomainAttemptRunner {
   private readonly context: ContextAssembler;
   private readonly profile: LanguageProfile;
   private readonly traces: DomainAuditTrail;
+  private readonly knowledge: VerifiedBugKnowledgeService;
 
   constructor(private readonly options: AttemptRunnerOptions, language: Plan['language']) {
     this.registry = options.registry ?? buildDefaultRegistry();
@@ -177,6 +198,7 @@ export class DomainAttemptRunner {
       { projectPath: options.projectDebugWikiPath },
     );
     this.profile = getLanguageProfile(language);
+    this.knowledge = new VerifiedBugKnowledgeService(options.repository, this.wiki, this.profile.id);
     this.context = new ContextAssembler(options.repository, {
       wiki: this.wiki,
       language: this.profile.id,
@@ -189,66 +211,11 @@ export class DomainAttemptRunner {
   }
 
   async synchronizeVerifiedBugResolutions(projectId: Step['projectId']): Promise<void> {
-    const tickets = await this.options.repository.list({ objectType: 'ticket', projectId });
-    for (const ticket of tickets) {
-      if (
-        ticket.objectType === 'ticket' &&
-        ticket.type === 'bug' &&
-        ticket.state === 'closed' &&
-        ticket.solution?.status === 'verified' &&
-        ticket.debugWikiResolutionEntryIds.length === 0
-      ) {
-        await this.recordVerifiedBugResolution(ticket.id);
-      }
-    }
+    await this.knowledge.synchronize(projectId);
   }
 
   async recordVerifiedBugResolution(ticketId: BugTicket['id']): Promise<void> {
-    const object = await this.options.repository.read(ticketId);
-    if (object.objectType !== 'ticket' || object.type !== 'bug') {
-      throw new Error(`Ticket ${ticketId} is not a Bug`);
-    }
-    if (object.state !== 'closed' || object.solution?.status !== 'verified') {
-      throw new Error(`Bug ${object.name} must be closed with a verified solution before debug-wiki persistence`);
-    }
-    if (object.debugWikiResolutionEntryIds.length > 0) return;
-    const target = await this.options.repository.read(object.failure.targetStepId);
-    if (target.objectType !== 'step') {
-      throw new Error(`Bug ${object.name} target ${object.failure.targetStepId} is not a Step`);
-    }
-    const assessment = target.qualityAssessmentId
-      ? await this.options.repository.read(target.qualityAssessmentId)
-      : undefined;
-    const phase = executionPhaseFor(target.type);
-    const brief = buildDebugBrief({
-      reason: object.failure.summary,
-      failureLog: object.failure.message,
-      phase,
-      targetPhase: phase,
-    });
-    const persisted = await this.wiki.recordResolution({
-      brief,
-      ticketId: object.id,
-      stepId: target.id,
-      phase,
-      targetPhase: phase,
-      language: this.profile.id,
-      resolutionPlan: object.solution.approach,
-      solution: object.solution.approach,
-      evidence: [
-        ...object.solution.verification,
-        ...(assessment?.objectType === 'quality-assessment' ? assessment.evidence : []),
-      ],
-      repairFiles: object.solution.changes.filter((item) => !item.startsWith('commit:')),
-      usedEntryIds: object.debugWikiCandidateEntryIds,
-    });
-    const entryIds = persisted.created ? [persisted.created] : persisted.updated;
-    const updated = TicketSchema.parse({
-      ...object,
-      ...reviseObjectEnvelope(object),
-      debugWikiResolutionEntryIds: entryIds,
-    });
-    await this.options.repository.update(updated, updated.state);
+    await this.knowledge.record(ticketId);
   }
 
   async run(input: AttemptInput): Promise<AttemptResult> {
@@ -302,6 +269,9 @@ export class DomainAttemptRunner {
       const debugContext = input.ticket.type === 'bug'
         ? debugContextFrom(input.ticket, input.executionStep, assembled.debugWikiMatches)
         : undefined;
+      const retryFeedback = input.ticket.type === 'bug'
+        ? await this.latestAttemptFailure(input)
+        : undefined;
       wikiMatches = assembled.debugWikiMatches;
       if (wikiMatches.length > 0 && input.ticket.type === 'bug') {
         await this.wiki.recordUse(wikiMatches.map((match) => match.entry.id), {
@@ -329,9 +299,21 @@ export class DomainAttemptRunner {
         skillHints: environment.hints,
         debugContext: input.ticket.type === 'bug' ? {
           bugTicketId: input.ticket.id,
-          reason: input.ticket.failure.summary,
-          failureLog: input.ticket.failure.message,
-          debugBrief: debugContext?.brief.summary,
+          reason: retryFeedback
+            ? 'The previous repair attempt made partial progress and was rolled back. Continue from the latest failed-attempt evidence; do not restart the original repair.'
+            : input.ticket.failure.summary,
+          failureLog: prioritizeAttemptFailureEvidence(
+            input.ticket.failure.message,
+            retryFeedback,
+          ),
+          debugBrief: retryFeedback
+            ? buildDebugBrief({
+                reason: 'The latest attempt for this Bug failed after partial progress.',
+                failureLog: retryFeedback,
+                phase: input.executionStep.phase,
+                targetPhase: input.executionStep.phase,
+              }).summary
+            : debugContext?.brief.summary,
           suggestions: debugContext?.suggestions,
           repairRequired: true,
           verificationScope: environment.verificationScope.inheritedFromTicket
@@ -339,6 +321,14 @@ export class DomainAttemptRunner {
                 stepId: environment.verificationScope.verificationStepId!,
                 phase: environment.verificationScope.verificationPhase!,
                 testArgs: environment.verificationScope.testArgs,
+              }
+            : undefined,
+          deferredVerificationScope: environment.verificationScope.deferredToChangeRequest &&
+            environment.verificationScope.verificationStepId &&
+            environment.verificationScope.verificationPhase
+            ? {
+                stepId: environment.verificationScope.verificationStepId,
+                phase: environment.verificationScope.verificationPhase,
               }
             : undefined,
         } : undefined,
@@ -390,9 +380,47 @@ export class DomainAttemptRunner {
         });
       }
 
+      const pairedTestInspection = await inspectPairedSourceTests(
+        scope.workspace,
+        input.plan,
+        input.executionStep,
+      );
+      const status = await scope.git.raw().status();
+      const changedFiles = status.files.map((file) => normalizeGitPath(file.path));
+      const changes = status.files.map((file) => ({
+        path: normalizeGitPath(file.path),
+        operation: gitChangeOperation(file.index, file.working_dir),
+      }));
+      const measuredAssessment = reconcileMeasuredQualityAssessment(
+        result.qualityAssessment,
+        result.toolCalls,
+      );
+      const scopedAssessment = reconcileDeferredSourceQualityAssessment(measuredAssessment, {
+        currentPhase: input.executionStep.phase,
+        deferredToChangeRequest: environment.verificationScope.deferredToChangeRequest,
+        verificationPhase: environment.verificationScope.verificationPhase,
+        changedFiles,
+      });
+      if (measuredAssessment && scopedAssessment && measuredAssessment.gaps.length > scopedAssessment.gaps.length) {
+        await this.options.audit.event(
+          'note',
+          `Deferred ${input.executionStep.phase} verification gaps to ${environment.verificationScope.verificationPhase}`,
+          {
+            messageId: 'audit.source_quality_verification_deferred',
+            stepId: input.domainStep.id,
+            ticketId: input.ticket.id,
+            verificationStepId: environment.verificationScope.verificationStepId,
+            verificationPhase: environment.verificationScope.verificationPhase,
+            deferredGaps: measuredAssessment.gaps,
+            changedFiles,
+          },
+        );
+      }
       const assessment = await this.recordAssessment(
         input.domainStep,
-        reconcileMeasuredQualityAssessment(result.qualityAssessment, result.toolCalls),
+        scopedAssessment
+          ? mergePairedSourceTestQuality(scopedAssessment, pairedTestInspection)
+          : scopedAssessment,
       );
       if (!assessment.passed) {
         return await this.failAndRollback(scope, baseline, input, {
@@ -411,12 +439,6 @@ export class DomainAttemptRunner {
           wikiEntryIds: wikiMatches.map((match) => match.entry.id),
         });
       }
-      const status = await scope.git.raw().status();
-      const changedFiles = status.files.map((file) => normalizeGitPath(file.path));
-      const changes = status.files.map((file) => ({
-        path: normalizeGitPath(file.path),
-        operation: gitChangeOperation(file.index, file.working_dir),
-      }));
       // The manifest can be delivered as a plain file output, not only through add_dependency, and
       // writing it changes nothing about the sandbox on its own. A design that declared its
       // dependencies and left the environment without them hands every later Step a project whose
@@ -429,12 +451,20 @@ export class DomainAttemptRunner {
         changedFiles,
         changes,
         commit,
-        solutionPlan: result.bugResolutionPlan ?? result.finalThought,
+        solutionPlan: result.changeRequestDisposition?.outcome === 'not-applicable'
+          ? result.changeRequestDisposition.rationale
+          : result.bugResolutionPlan ?? result.finalThought,
+        bugResolutionDisposition: result.bugResolutionDisposition,
+        changeRequestDisposition: result.changeRequestDisposition,
         wikiEntryIds: wikiMatches.map((match) => match.entry.id),
         executor: result,
         testOutcomes: collectTestOutcomes(result.toolCalls, input.domainStep.type),
       };
     } catch (error) {
+      if (isAttemptCancellation(error, this.options.abortSignal)) {
+        await scope.git.revertTo(baseline);
+        throw error;
+      }
       // A thrown error on our own execution path carries a message this runtime authored.
       const failure = classifyFailure(error, { trustProviderText: true });
       return this.failAndRollback(scope, baseline, input, {
@@ -485,6 +515,10 @@ export class DomainAttemptRunner {
       : [];
     const allowedWrites = [...new Set([...baseWrites, ...affected])]
       .filter((candidate) => !isVerification(input.domainStep) || !isTestFilePath(candidate));
+    const retryFeedback = await this.latestAttemptFailure(input);
+    const rewriteExistingFiles = input.mode === 'debug'
+      ? await this.failureEvidenceRewriteTargets(scope, input, allowedWrites, retryFeedback)
+      : [];
     const budgetContext = {
       phase: input.executionStep.phase,
       role: input.mode === 'debug' ? 'Debugger' as const : input.domainStep.agent,
@@ -524,13 +558,14 @@ export class DomainAttemptRunner {
       feedbackCharBudget: window.feedbackCharBudget,
       readChunkBytes: window.readChunkBytes,
       writeChunkBytes: resolveWriteChunkBytes(window.writeChunkBytes, budgetContext),
-      defaultTestArgs: resolveAttemptTestArgs(verificationScope, input.plan.language),
-      preserveExistingFiles: input.mode === 'enhancement' || input.mode === 'change-request',
+      testGateArgs: resolveAttemptTestArgs(verificationScope, input.plan.language),
+      preserveExistingFiles: shouldPreserveExistingFiles(input.mode),
+      rewriteExistingFiles,
       requestPermission: this.options.requestPermission,
       onToolEvent: this.options.onToolEvent,
       recordReplay: this.options.recordReplay,
     };
-    const snippets = await this.contextSnippets(scope, input);
+    const snippets = await this.contextSnippets(scope, input, retryFeedback);
     const rounds = resolveAttemptRoundLimit(
       input.mode,
       this.options.maxRoundsPerStep ?? 6,
@@ -554,7 +589,11 @@ export class DomainAttemptRunner {
     };
   }
 
-  private async contextSnippets(scope: ExecutionScope, input: AttemptInput): Promise<Array<{ path: string; content: string }>> {
+  private async contextSnippets(
+    scope: ExecutionScope,
+    input: AttemptInput,
+    retryFeedback?: string,
+  ): Promise<Array<{ path: string; content: string }>> {
     const candidates = new Set([
       ...input.executionStep.inputs,
       ...(input.mode === 'normal' ? [] : input.executionStep.outputs),
@@ -567,12 +606,35 @@ export class DomainAttemptRunner {
       path: `.xcompiler/objects/ticket/${input.ticket.id}.json`,
       content: JSON.stringify(input.ticket, null, 2),
     }];
-    const retryFeedback = await this.latestAttemptFailure(input);
     if (retryFeedback) {
       snippets.push({
         path: `.xcompiler/retry/${input.ticket.name}.md`,
         content: retryFeedback,
       });
+    }
+    if (input.mode === 'debug' || input.mode === 'change-request') {
+      const failureEvidence = input.ticket.type === 'bug'
+        ? [input.ticket.failure.summary, input.ticket.failure.message, retryFeedback ?? ''].join('\n')
+        : input.ticket.type === 'change-request'
+          ? [
+              input.ticket.contractDelta.summary,
+              ...input.ticket.contractDelta.before,
+              ...input.ticket.contractDelta.affectedArtifacts,
+              retryFeedback ?? '',
+            ].join('\n')
+          : retryFeedback;
+      const debugPaths = await discoverDebugContextPaths({
+        workspace: scope.workspace,
+        seedPaths: [
+          ...input.executionStep.outputs,
+          ...(input.ticket.type === 'change-request'
+            ? input.ticket.contractDelta.affectedArtifacts
+            : []),
+        ],
+        failureEvidence,
+        language: input.plan.language,
+      });
+      for (const debugPath of debugPaths) candidates.add(debugPath);
     }
     if ((input.plan.architectureModules?.length ?? 0) > 0) {
       snippets.push({
@@ -589,14 +651,34 @@ export class DomainAttemptRunner {
     return snippets;
   }
 
+  private async failureEvidenceRewriteTargets(
+    scope: ExecutionScope,
+    input: AttemptInput,
+    allowedWrites: string[],
+    retryFeedback?: string,
+  ): Promise<string[]> {
+    const evidence = input.ticket.type === 'bug'
+      ? [input.ticket.failure.summary, input.ticket.failure.message, retryFeedback ?? ''].join('\n')
+      : retryFeedback ?? '';
+    const targets: string[] = [];
+    for (const candidate of extractWorkspacePaths(evidence)) {
+      if (!isAllowedWrite(candidate, allowedWrites)) continue;
+      if (!(await scope.workspace.exists(candidate))) continue;
+      targets.push(candidate);
+    }
+    return [...new Set(targets)];
+  }
+
   private async latestAttemptFailure(input: AttemptInput): Promise<string | undefined> {
-    for (const logId of [...input.ticket.logIds].reverse()) {
+    const failures = [];
+    for (const logId of input.ticket.logIds) {
       const object = await this.options.repository.read(logId);
       if (object.objectType !== 'log' || object.level !== 'error') continue;
       if (object.data.stepId !== input.domainStep.id) continue;
-      return renderAttemptRetryFeedback(object, input.executionStep.phase);
+      failures.push(object);
     }
-    return undefined;
+    const selected = selectActionableAttemptFailure(failures);
+    return selected ? renderAttemptRetryFeedback(selected, input.executionStep.phase) : undefined;
   }
 
   private async recordAssessment(step: Step, value?: StageQualityAssessment): Promise<QualityAssessment> {
@@ -748,6 +830,7 @@ export class DomainAttemptRunner {
       failureLog: failure.failureLog,
       phase: input.executionStep.phase,
       targetPhase: input.executionStep.phase,
+      typedFailure: classified,
     });
     const failureSignature = createHash('sha256').update(JSON.stringify({
       category: brief.category,
@@ -803,14 +886,22 @@ export class DomainAttemptRunner {
   }
 }
 
+export function isAttemptCancellation(error: unknown, signal?: AbortSignal): boolean {
+  return isCancellationError(error, signal);
+}
+
 function isVerification(step: Step): boolean {
   return ['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST'].includes(step.type);
 }
 
-function renderExecutorFailure(result: ExecutorRunResult): string {
+export function renderExecutorFailure(result: ExecutorRunResult): string {
   return [
     result.error ?? 'Executor failed.',
-    ...result.toolCalls.filter((call) => !call.ok).map((call) => `${call.tool}: ${call.error ?? call.summary ?? 'failed'}`),
+    // Tool errors name the category (for example `npm test exit=1`); their summaries carry the
+    // bounded stderr/stdout evidence. Persisting the shorter error first discarded failed test names,
+    // assertions, and stacks before the Bug Ticket was created.
+    ...result.toolCalls.filter((call) => !call.ok).map((call) =>
+      `${call.tool}: ${call.summary ?? call.error ?? 'failed'}`),
   ].join('\n');
 }
 
@@ -864,6 +955,7 @@ function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {
     failureLog: ticket.failure.message,
     phase: step.phase,
     targetPhase: step.phase,
+    typedFailure: ticket.failure,
   });
 }
 
@@ -873,7 +965,11 @@ function debugContextFrom(ticket: BugTicket, step: ExecutionStep, matches: Debug
     matches,
     suggestions: matches.length === 0 ? undefined : [
       'Relevant debug-wiki entries (validate before applying):',
-      ...matches.map((match) => `- ${match.entry.id}: ${match.entry.solution}`),
+      'These are hypotheses. Discard any entry contradicted by current files or executable failure evidence.',
+      ...matches.map((match) =>
+        match.entry.status === 'needs_review'
+          ? `- ${match.entry.id} status=needs_review: prior solution intentionally hidden; derive a fresh solution from current evidence`
+          : `- ${match.entry.id} status=${match.entry.status} confidence=${match.confidence?.toFixed(2) ?? 'unknown'}: ${match.entry.solution}`),
     ].join('\n'),
   };
 }

@@ -141,18 +141,7 @@ export const WorkTicketSchema = TicketBaseSchema.extend({
   pairedSourceTicketId: ObjectIdSchema.optional(),
 }).strict();
 
-export const BugTicketSchema = TicketBaseSchema.extend({
-  type: z.literal('bug'),
-  bugKind: z.enum([
-    'stage-execution',
-    'test-failure',
-    'quality-gate',
-    'delivery-gate',
-    'infrastructure',
-    'exception',
-  ]),
-  severity: z.enum(['low', 'medium', 'high', 'critical']),
-  failure: z.object({
+export const BugFailureSchema = z.object({
     category: z.enum(['llm-provider', 'tool', 'test', 'quality', 'contract', 'internal']),
     code: z.string().min(1),
     message: z.string().min(1),
@@ -170,7 +159,23 @@ export const BugTicketSchema = TicketBaseSchema.extend({
     tool: z.string().min(1).optional(),
     exitCode: z.number().int().optional(),
     statusCode: z.number().int().optional(),
-  }).strict(),
+  }).strict();
+
+/** A discovering role proved that the failed verification contract, not the reported product gap, is defective. */
+export const VALIDATION_CONTRACT_DEFECT_CODE = 'validation_contract_defect' as const;
+
+export const BugTicketSchema = TicketBaseSchema.extend({
+  type: z.literal('bug'),
+  bugKind: z.enum([
+    'stage-execution',
+    'test-failure',
+    'quality-gate',
+    'delivery-gate',
+    'infrastructure',
+    'exception',
+  ]),
+  severity: z.enum(['low', 'medium', 'high', 'critical']),
+  failure: BugFailureSchema,
   enhancementTicketId: ObjectIdSchema.optional(),
   changeRequestTicketIds: z.array(ObjectIdSchema).default([]),
   debugWikiCandidateEntryIds: z.array(z.string().min(1)).default([]),
@@ -188,6 +193,20 @@ export const EnhancementTicketSchema = TicketBaseSchema.extend({
   changeRequestTicketIds: z.array(ObjectIdSchema).default([]),
 }).strict();
 
+export const ChangeRequestApplicationDecisionSchema = z.object({
+  outcome: z.enum(['applied', 'not-applicable']).default('applied'),
+  reasonCategory: z.enum([
+    'contract-applied',
+    'already-aligned',
+    'outside-step-scope',
+    'downstream-owned',
+    'diagnosis-contradicted',
+  ]).optional(),
+  rationale: z.string().min(1).optional(),
+  inspectedArtifacts: z.array(z.string().min(1)).default([]),
+  evidence: z.array(z.string().min(1)).default([]),
+}).strict();
+
 export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   type: z.literal('change-request'),
   sourceTicketId: ObjectIdSchema,
@@ -197,12 +216,13 @@ export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   /**
    * The one Step this Change Request is applied to.
    *
-   * A CR used to carry the whole downstream chain, decided when it was opened. That asserts an
-   * answer nobody has yet: a delta applied to a design may or may not require a code change. The
-   * chain is discovered instead — applying a CR that produced changes opens a child CR for the next
-   * Step, linked by `parentChangeRequestId`.
+   * Each downstream Step receives its own CR, linked by `parentChangeRequestId`, and records either
+   * an incremental change or an explicit no-op verification. One Step cannot decide that later
+   * owners and verification gates are unaffected merely because it did not edit a file.
    */
   targetStepId: ObjectIdSchema,
+  /** Immutable failure evidence that caused a corrective CR chain. */
+  originFailure: BugFailureSchema.optional(),
   contractDelta: z.object({
     summary: z.string().min(1),
     before: z.array(z.string().min(1)).default([]),
@@ -211,7 +231,7 @@ export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   }).strict(),
   implementationPlan: z.array(z.string().min(1)).min(1),
   verificationGate: z.array(z.string().min(1)).min(1),
-  applications: z.array(z.object({
+  applications: z.array(ChangeRequestApplicationDecisionSchema.extend({
     stepId: ObjectIdSchema,
     changelistId: ObjectIdSchema,
     verificationAssessmentId: ObjectIdSchema.optional(),
@@ -231,6 +251,7 @@ export type WorkTicket = z.infer<typeof WorkTicketSchema>;
 export type BugTicket = z.infer<typeof BugTicketSchema>;
 export type EnhancementTicket = z.infer<typeof EnhancementTicketSchema>;
 export type ChangeRequestTicket = z.infer<typeof ChangeRequestTicketSchema>;
+export type ChangeRequestApplicationDecision = z.infer<typeof ChangeRequestApplicationDecisionSchema>;
 
 export function transitionTicket(
   ticket: Ticket,

@@ -9,7 +9,7 @@ import { runLs, runShow } from './inspect.js';
 import { runDoctorCli } from './doctor.js';
 import { setLocale, t } from '../i18n/index.js';
 import { xcEnv } from '../config/env.js';
-import { createCliRuntimeIO, createNonInteractiveCliRuntimeIO } from './runtime_adapter.js';
+import { createCliRuntimeIO, isCliCancellation, runCliAbortable } from './runtime_adapter.js';
 import { runAcpStdioServer } from '../acp/index.js';
 import {
   localeFromArgv,
@@ -135,8 +135,7 @@ program
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (projectArg, opts) => {
     const result = await runtime.loadCommand({
-      // Execution asks nothing: the human gates all live in `build`.
-      io: createNonInteractiveCliRuntimeIO(),
+      io: createCliRuntimeIO(),
       projectFile: projectArg,
       configPath: opts.config,
       dryRun: !!opts.dryRun,
@@ -220,9 +219,8 @@ program
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (planArg, opts) => {
-    const result = await runtime.runCommand({
-      // Execution asks nothing: the human gates all live in `build`.
-      io: createNonInteractiveCliRuntimeIO(),
+    const result = await runCliAbortable((abortSignal) => runtime.runCommand({
+      io: createCliRuntimeIO(),
       planArg,
       output: opts.output,
       workspace: opts.workspace,
@@ -233,8 +231,9 @@ program
       debugWikiPath: opts.debugWikiPath,
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      abortSignal,
       cwd: process.cwd(),
-    });
+    }));
     applyExecuteExitCode(result);
   });
 
@@ -308,6 +307,10 @@ program
   });
 
 program.parseAsync(process.argv).catch((err) => {
+  if (isCliCancellation(err)) {
+    process.exitCode = 130;
+    return;
+  }
   if (err instanceof CompileExitError) {
     process.exitCode = err.exitCode;
     return;

@@ -47,6 +47,7 @@ import {
   runtimeLog,
   runtimeResult,
   silentRuntimeIO,
+  runtimePermissionAuthorizer,
   type RuntimeIO,
 } from './io.js';
 import { createRuntimeRecordReplay } from './record_replay.js';
@@ -55,6 +56,7 @@ import { ProjectPermissionService } from '../application/project_management/perm
 import { PhaseMaterializationService } from '../application/project_management/phase_materialization_service.js';
 import { PhaseProgressionService } from '../application/planning/phase_progression_service.js';
 import type { RecordReplayMode } from '../application/record_replay/types.js';
+import { isCancellationError } from '../core/cancellation.js';
 
 export interface ExecuteOptions {
   planPath: string;
@@ -86,7 +88,7 @@ export interface ExecuteOptions {
 }
 
 export interface ExecuteResult {
-  status: 'ok' | 'failed' | 'error' | 'dry-run';
+  status: 'ok' | 'failed' | 'error' | 'dry-run' | 'cancelled';
   engine?: ProjectOrchestratorResult;
   audit?: ProjectAuditResult;
   message?: string;
@@ -414,13 +416,12 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     },
   );
   const permissionService = new ProjectPermissionService(domainRepository, domainProject);
-  const requestPermission = io.requestPermission
-    ? (request: ToolPermissionRequest) => permissionService.request(
-        request,
-        io.requestPermission!,
-        (status) => emitRuntimeEvent(io, { type: 'permission', status, request }),
-      )
-    : undefined;
+  const permissionAuthorizer = runtimePermissionAuthorizer(io);
+  const requestPermission = (request: ToolPermissionRequest) => permissionService.request(
+    request,
+    permissionAuthorizer,
+    (status) => emitRuntimeEvent(io, { type: 'permission', status, request }),
+  );
   const mergeGates = new MergeGateService(
     domainRepository,
     container,
@@ -435,8 +436,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     // A repository that already existed belongs to whoever created it, so a validated change waits
     // for explicit authorization rather than being written onto their mainline.
     mayMerge: repositoryInfo.ownership === 'xcompiler-created',
-    authorizeMerge: requestPermission
-      ? (changeSet) => requestPermission({
+    authorizeMerge: (changeSet) => requestPermission({
           operationType: 'git_operation',
           target: `merge ${changeSet.sourceBranch} into ${container.canonicalBranch}`,
           reason: 'Land the validated CODE ChangeSet so downstream V-model Steps test the new code.',
@@ -449,12 +449,11 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
             rootTicketId: changeSet.rootTicketId,
             generation: changeSet.generation,
           },
-        })
-      : undefined,
+        }),
     releaseChangeSet: async (changeSetId) => {
       await changeSets.release(changeSetId);
     },
-    runChecks: async (root) => {
+    runChecks: async (root, scope) => {
       const candidate = new Workspace(root);
       const gateSandbox = withRecordReplaySandbox(
         createSandbox(
@@ -471,7 +470,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         ),
         recordReplay,
       );
-      return runMergeGateChecks(gateSandbox, plan.language, recordReplay);
+      return runMergeGateChecks(gateSandbox, plan.language, recordReplay, scope);
     },
   });
   let finalProjectAudit: ProjectAuditResult | undefined;
@@ -498,6 +497,8 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     resolveScope,
     integrateTicket: (rootTicketId) => mergeIntegration.integrateTicket(domainProject.id, rootTicketId),
     integratePhase: (phaseId) => mergeIntegration.integratePhase(domainProject.id, phaseId),
+    integratePendingAuthorization: (phaseId) =>
+      mergeIntegration.integratePendingAuthorization(domainProject.id, phaseId),
     abortSignal: opts.abortSignal,
     onToolEvent: async (event: ToolExecutionEvent) => {
       await emitRuntimeEvent(io, {
@@ -553,7 +554,13 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           stepId: event.stepId,
           stepName: event.stepName,
           ticketId: event.ticketId,
+          ticketName: event.ticketName,
           ticketType: event.ticketType,
+          creatorActorId: event.creatorActorId,
+          creatorRole: event.creatorRole,
+          assigneeActorId: event.assigneeActorId,
+          assigneeRole: event.assigneeRole,
+          assigneeAgent: event.assigneeAgent,
           message: event.message,
         },
       });
@@ -639,7 +646,6 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       ? await generateProjectDevelopmentReport({
           workspace: ws,
           plan,
-          phasePlan: phaseAdvance?.phasePlan ?? target.phasePlan,
           projectAudit: finalProjectAudit,
           finalDelivery: !phaseAdvance?.nextPlan,
           repository: domainRepository,
@@ -686,8 +692,22 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
     return { status: 'ok', engine: r, audit: finalProjectAudit, reportPath };
   } catch (err) {
-    const msg = (err as Error).message;
-    const stack = (err as Error).stack;
+    const msg = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    if (isCancellationError(err, opts.abortSignal)) {
+      await audit.end({ status: 'cancelled', message: msg });
+      await updateProjectFile({
+        workspace: ws.root,
+        container: container.root,
+        planPath: publicPlanPath,
+        configPath: cfgPath,
+        projectFilePath,
+        command: projectCommand,
+        intent: plan.intent,
+      });
+      await runtimeResult(io, 'run', 'cancelled', { message: msg, exitCode: 130 });
+      return { status: 'cancelled', message: msg, exitCode: 130 };
+    }
     await runtimeLog(io, 'error', t().system.unhandledError(msg));
     if (stack && stack !== msg) {
       await runtimeLog(io, 'dim', stack);

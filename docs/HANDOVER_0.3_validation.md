@@ -1,13 +1,18 @@
 # Handover — XCompiler 0.3 live validation
 
-Branch: `refactor/0.3-architecture`
+Branch: `master`
 Pre-review gates: `npm run lint`, `npx tsc --noEmit`, `npm test` → **92 files / 814 tests, all green**
 Post-review gates: `npm run lint`, `npm run typecheck`, `npm test` → **92 files / 821 tests, all green**
+Refactor-hardening gates: `npm run lint`, `npm run typecheck`, `npm run build`, `npm test` →
+**93 files / 826 tests, all green**
+Release-artifact gates: full `npm audit` → **0 vulnerabilities**; `npm pack --dry-run` →
+**41 files**; cached `npm run package:native` → **signed macOS arm64 v0.3.0 smoke passed**
 
 This session ran `examples/news/news_ts.md` end to end against two OpenRouter models
 (`qwen/qwen3.7-plus`, `deepseek/deepseek-v4-flash`) and fixed what the runs exposed:
-**38 defects and one performance change**, in 24 fix commits plus 3 test-only and 5 docs commits.
-Range: `fd9125b..8fc61ce`.
+**38 defects and one performance change**. The development commits were intentionally squashed into
+the 0.3 architecture commit before merging to `master`; the historical hashes below are diagnostic
+labels from the validation session, not stable repository references.
 
 ## 1. How to resume
 
@@ -36,19 +41,18 @@ merge has never landed and Steps S005–S008 cannot see the code CODE wrote.
 
 - **DoD 15 is not met.** It is the only release blocker for tagging `v0.3.0`
   (`docs/XCompiler_refactor_plan.md` §15). Every other DoD item is done.
-- **The last unverified link:** squash merge landing on the mainline. The gate itself has now run
+- **The last live-model link:** squash merge landing on the mainline. The gate itself has now run
   and passed against a real generated project (`GATE[passed] MR[approved]`), and every known
   blocker on the path to the merge has been fixed — but no single run has yet gone all the way
-  through. The three fixes on that path (`f7ef854`, `e8919a4`, `275cf4d`) have deterministic tests
-  but no live confirmation.
-- **Remaining typed-error work:** `src/core/debug_brief.ts` still classifies some external legacy
-  evidence by message text. `src/agents/executor.ts` and the quality gate no longer infer ownership
-  or unavailable metrics from prose; they use typed failure codes, `blockedBy`, and
-  `unavailableMetrics`.
-- **Historical context:** `src/agents/executor.ts` and `src/core/debug_brief.ts` generated
-  human-readable reason strings in one place and regex-match them in others. Two defects fixed this
-  session had exactly that shape. Converting them to typed codes was scoped out to avoid changing
-  the most intricate debug machinery mid-validation.
+  through. Deterministic tests cover repository ownership, merge failure reporting, merge intent
+  recovery, and downstream visibility; a fresh live run still has to confirm the complete path.
+- **Typed-error hardening completed in the review follow-up:** `DebugBrief` now consumes the Ticket's
+  structured failure category and status code before consulting bounded text fallbacks. Executor
+  and quality gates use typed failure codes, `blockedBy`, and `unavailableMetrics`; prose remains
+  presentation and legacy external-provider evidence, not the primary control channel.
+- **Debug feedback was modularized:** verified Bug knowledge synchronization now lives in a dedicated
+  application service, while prompt validation/retry policy, executor action policy, output
+  verification, Ticket lookup, and blocker routing have independent modules and tests.
 - **Resolved in the review follow-up:** the fallback that dropped quality gaps based on model prose
   was removed. Misowned prerequisites use `blockedBy`; failed metric probes use exact identifiers in
   `unavailableMetrics`; true `gaps` are never silently discarded.

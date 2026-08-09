@@ -84,10 +84,29 @@ describe('TicketWorkflow', () => {
         ticketId: request.id,
         stepId: step.id,
         summary: `Applied CR to ${step.name}.`,
-        entries: [{ path: step.outputs[0]!, operation: 'update' }],
+        entries: step.id === detailed.id
+          ? []
+          : [{ path: step.outputs[0]!, operation: 'update' }],
+        application: step.id === detailed.id
+          ? {
+            outcome: 'not-applicable',
+            reasonCategory: 'already-aligned',
+            rationale: 'The detailed-design contract already contains the required result source.',
+              inspectedArtifacts: [step.outputs[0]!],
+              evidence: ['The existing output contract explicitly requires source.'],
+            }
+          : undefined,
         verificationAssessmentId: await passingAssessment(repository, step),
       });
     }
+
+    const appliedRequest = await repository.read(request.id);
+    expect(appliedRequest.objectType === 'ticket' && appliedRequest.type === 'change-request'
+      ? appliedRequest.applications.find((application) => application.stepId === detailed.id)
+      : undefined).toMatchObject({
+      outcome: 'not-applicable',
+      inspectedArtifacts: [detailed.outputs[0]!],
+    });
 
     const bugBeforeClose = await repository.read(bug.id);
     expect(bugBeforeClose.objectType === 'ticket' && bugBeforeClose.state).not.toBe('closed');
@@ -371,6 +390,115 @@ describe('TicketWorkflow', () => {
     const after = await registration.actorById(routed.assignment.assigneeActorId);
     expect(after.activeAssignmentIds).not.toContain(routed.assignment.id);
   });
+
+  it('does not reopen resolved Story work when a corrective Ticket owns the repair', async () => {
+    const { graph, repository, workflow, registration } = await setup();
+    const detailed = graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
+    const integration = graph.steps.find((step) => step.type === 'INTEGRATION_TEST')!;
+    const story = await workflow.storyForStep(detailed.id);
+    await registration.routeAndAssign(story.id, { forStepId: detailed.id });
+    await new ProjectStateService(repository).transitionTicketPath(story, ['in_progress', 'resolved']);
+
+    const bug = await workflow.openBug({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      failedStep: integration,
+      targetStep: detailed,
+      verificationStep: integration,
+      kind: 'test-failure',
+      severity: 'high',
+      message: 'integration contract failed',
+      summary: 'integration contract failed',
+      category: 'test',
+      code: 'integration_contract_failure',
+      retryable: true,
+      switchProvider: false,
+      correlationId: createObjectId(),
+    });
+
+    const blocked = await repository.read(story.id);
+    expect(blocked.objectType === 'ticket' && blocked.state).toBe('resolved');
+    expect(blocked.objectType === 'ticket' && blocked.blockedByTicketIds).toEqual([bug.id]);
+  });
+
+  it('parks the active parent CR instead of blocking a closed Story for a quality gap', async () => {
+    const { graph, repository, workflow, registration } = await setup();
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
+    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
+    const story = await workflow.storyForStep(coding.id);
+    const state = new ProjectStateService(repository);
+    const routedStory = await registration.routeAndAssign(story.id, { forStepId: coding.id });
+    await state.transitionTicketPath(routedStory.ticket, ['in_progress', 'resolved', 'closed']);
+    const tester = graph.actors.find((actor) => actor.role === 'tester')!;
+    const parent = await openChangeRequestFor(repository, graph, [unit.id], tester.id);
+    await registration.register(parent.id);
+    const routedParent = await registration.routeAndAssign(parent.id, { forStepId: unit.id });
+    await state.transitionTicketPath(routedParent.ticket, ['in_progress']);
+
+    const enhancement = await workflow.openEnhancement({
+      creatorActorId: tester.id,
+      sourceStep: unit,
+      targetStep: coding,
+      verificationStep: unit,
+      kind: 'quality-shortfall',
+      finding: 'Line coverage is below the approved KPI.',
+      parentChangeRequestId: parent.id,
+      correlationId: createObjectId(),
+    });
+
+    const unchangedStory = await repository.read(story.id);
+    const blockedParent = await repository.read(parent.id);
+    expect(unchangedStory.objectType === 'ticket' && unchangedStory.state).toBe('closed');
+    expect(unchangedStory.objectType === 'ticket' && unchangedStory.blockedByTicketIds).toEqual([]);
+    expect(blockedParent.objectType === 'ticket' && blockedParent.state).toBe('pending');
+    expect(blockedParent.objectType === 'ticket' && blockedParent.blockedByTicketIds).toEqual([
+      enhancement.id,
+    ]);
+    expect(enhancement.creatorActorId).toBe(tester.id);
+  });
+
+  it('parks the active parent CR while preserving closed Stories for a discovered Bug', async () => {
+    const { graph, repository, workflow, registration } = await setup();
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
+    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
+    const state = new ProjectStateService(repository);
+    const codingStory = await workflow.storyForStep(coding.id);
+    const unitStory = await workflow.storyForStep(unit.id);
+    const routedCoding = await registration.routeAndAssign(codingStory.id, { forStepId: coding.id });
+    await state.transitionTicketPath(routedCoding.ticket, ['in_progress', 'resolved', 'closed']);
+    const routedUnit = await registration.routeAndAssign(unitStory.id, { forStepId: unit.id });
+    await state.transitionTicketPath(routedUnit.ticket, ['in_progress', 'resolved', 'closed']);
+    const tester = graph.actors.find((actor) => actor.role === 'tester')!;
+    const parent = await openChangeRequestFor(repository, graph, [unit.id], tester.id);
+    await registration.register(parent.id);
+    const routedParent = await registration.routeAndAssign(parent.id, { forStepId: unit.id });
+    await state.transitionTicketPath(routedParent.ticket, ['in_progress']);
+
+    const bug = await workflow.openBug({
+      creatorActorId: tester.id,
+      failedStep: unit,
+      targetStep: coding,
+      verificationStep: unit,
+      kind: 'test-failure',
+      severity: 'high',
+      message: 'A unit assertion failed while verifying the change.',
+      summary: 'The changed behavior violates its unit contract.',
+      category: 'test',
+      code: 'unit_assertion_failed',
+      retryable: true,
+      switchProvider: false,
+      parentChangeRequestId: parent.id,
+      correlationId: createObjectId(),
+    });
+
+    const unchangedCodingStory = await repository.read(codingStory.id);
+    const unchangedUnitStory = await repository.read(unitStory.id);
+    const blockedParent = await repository.read(parent.id);
+    expect(unchangedCodingStory.objectType === 'ticket' && unchangedCodingStory.state).toBe('closed');
+    expect(unchangedUnitStory.objectType === 'ticket' && unchangedUnitStory.state).toBe('closed');
+    expect(blockedParent.objectType === 'ticket' && blockedParent.state).toBe('pending');
+    expect(blockedParent.objectType === 'ticket' && blockedParent.blockedByTicketIds).toEqual([bug.id]);
+    expect(bug.creatorActorId).toBe(tester.id);
+  });
 });
 
 async function activeAssignments(
@@ -444,6 +572,7 @@ async function openChangeRequestFor(
   repository: DomainObjectRepository,
   graph: Awaited<ReturnType<typeof setup>>['graph'],
   affectedStepIds: string[],
+  creatorActorId?: string,
 ): Promise<Ticket> {
   const source = graph.tickets.find((ticket) => ticket.stepId === affectedStepIds[0])!;
   const { workKind: _w, verificationTicketId: _v, pairedSourceTicketId: _p, ...base } =
@@ -458,6 +587,7 @@ async function openChangeRequestFor(
     }),
     type: 'change-request',
     parentTicketId: source.id,
+    creatorActorId: creatorActorId ?? source.creatorActorId,
     state: 'created',
     assignmentIds: [],
     activeAssignmentId: undefined,

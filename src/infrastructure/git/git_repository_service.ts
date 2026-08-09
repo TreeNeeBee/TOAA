@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { simpleGit, type SimpleGit } from 'simple-git';
 import { MergeConflictError } from '../../application/workspace/git_port.js';
+import type { GitCommitRecord } from '../../application/workspace/git_port.js';
 
 /**
  * Whether XCompiler created this repository, which decides how much branch policy it may impose.
@@ -200,6 +201,16 @@ export class GitRepositoryService {
 
   async revision(ref: string): Promise<string> {
     return (await this.git.revparse([ref])).trim();
+  }
+
+  async readCommit(ref: string): Promise<GitCommitRecord> {
+    const raw = await this.git.raw(['show', '-s', '--format=%H%n%P%n%B', ref]);
+    const [revision = '', parents = '', ...message] = raw.replace(/\r\n/gu, '\n').split('\n');
+    return {
+      revision: revision.trim(),
+      parents: parents.trim() ? parents.trim().split(/\s+/u) : [],
+      message: message.join('\n').trim(),
+    };
   }
 
   /** Merges `source` into the working copy at `root`, producing the candidate a gate judges. */

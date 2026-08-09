@@ -12,6 +12,7 @@ import {
   isActiveTicket,
   TicketSchema,
   type BugTicket,
+  type ChangeRequestApplicationDecision,
   type ChangeRequestTicket,
   type EnhancementTicket,
   type Ticket,
@@ -160,10 +161,30 @@ export class ProjectController {
   }
 
   async deferInfrastructureFailure(work: ScheduledWork, reason: string): Promise<void> {
+    await this.deferNonProjectAttempt(work, `Infrastructure failure deferred without V-model routing: ${reason}`);
+  }
+
+  async deferCancelledAttempt(work: ScheduledWork, reason: string): Promise<void> {
+    await this.deferNonProjectAttempt(work, `Cancelled attempt returned to PM without V-model routing: ${reason}`);
+  }
+
+  async retainAgentExecutionFailure(work: ScheduledWork, reason: string): Promise<void> {
     const step = await this.requireStep(work.step.id);
     const ticket = await this.requireTicket(work.ticket.id);
     if (step.state !== 'in_progress' || ticket.state !== 'in_progress') {
-      throw new Error(`Infrastructure failure can only defer active work: ${step.name}/${ticket.name}`);
+      throw new Error(`Only active work can retain an agent execution failure: ${step.name}/${ticket.name}`);
+    }
+    await this.checkpoint(
+      step,
+      `Agent execution stalled; retained ${ticket.name} for an explicit resume without V-model defect routing: ${reason}`,
+    );
+  }
+
+  private async deferNonProjectAttempt(work: ScheduledWork, checkpoint: string): Promise<void> {
+    const step = await this.requireStep(work.step.id);
+    const ticket = await this.requireTicket(work.ticket.id);
+    if (step.state !== 'in_progress' || ticket.state !== 'in_progress') {
+      throw new Error(`Only active work can return an attempt to PM: ${step.name}/${ticket.name}`);
     }
     const revisedStep = StepSchemaWithRevision(step, {
       attempts: Math.max(0, step.attempts - 1),
@@ -172,7 +193,7 @@ export class ProjectController {
       attempts: Math.max(0, ticket.attempts - 1),
     });
     await this.repository.commit([revisedStep, revisedTicket]);
-    await this.checkpoint(revisedStep, `Infrastructure failure deferred without V-model routing: ${reason}`);
+    await this.checkpoint(revisedStep, checkpoint);
   }
 
   async deliverNormal(work: ScheduledWork, qualityAssessmentId: ObjectId): Promise<void> {
@@ -217,6 +238,7 @@ export class ProjectController {
     correlationId: ObjectId;
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
+    discoveringStepId?: ObjectId;
     creatorActorId: ObjectId;
   }): Promise<BugTicket> {
     return this.corrective.routeFailure(input);
@@ -268,6 +290,7 @@ export class ProjectController {
     entries: Changelist['entries'];
     commit?: string;
     verification?: string[];
+    application?: ChangeRequestApplicationDecision;
   }): Promise<{ closed: boolean; sourceTicketId?: ObjectId; sourceTicketType?: 'bug' | 'enhancement' }> {
     return this.corrective.completeChangeRequestStep(input);
   }
@@ -278,6 +301,28 @@ export class ProjectController {
 
   async reconcileClosedCorrectiveTickets(projectId: ObjectId): Promise<void> {
     await this.tickets.reconcileClosedCorrectiveTickets(projectId);
+    const tickets = await this.tickets.list();
+    for (const ticket of tickets) {
+      if (ticket.projectId === projectId && ticket.type === 'change-request' && isActiveTicket(ticket)) {
+        await this.corrective.activateChangeRequest(ticket.id);
+      }
+    }
+    const objects = await this.repository.list({ objectType: 'step', projectId });
+    const closedSteps = objects.filter((object): object is Step =>
+      object.objectType === 'step' && object.state === 'closed');
+    for (const step of closedSteps) {
+      let story = await this.tickets.storyForStep(step.id);
+      if (story.state === 'closed' || story.blockedByTicketIds.length > 0) continue;
+      await this.completeTasks(story);
+      const path = ticketClosurePath(story);
+      if (path.includes('in_progress')) {
+        story = (await this.registration.routeAndAssign(story.id, {
+          forStepId: step.id,
+          administrative: true,
+        })).ticket as WorkTicket;
+      }
+      if (path.length > 0) await this.saveTicketTransitionPath(story, path);
+    }
   }
 
   async completePhase(phaseId: ObjectId): Promise<{ nextPhaseId?: ObjectId; projectDelivered: boolean }> {
@@ -353,8 +398,14 @@ export class ProjectController {
 
   private async completeTasks(story: Ticket): Promise<void> {
     const descendants = (await this.ticketDescendants(story.id)).reverse();
-    for (const task of descendants) {
+    for (let task of descendants) {
       const path = ticketClosurePath(task);
+      if (path.includes('in_progress')) {
+        task = (await this.registration.routeAndAssign(task.id, {
+          forStepId: task.stepId,
+          administrative: true,
+        })).ticket;
+      }
       if (path.length > 0) await this.saveTicketTransitionPath(task, path);
     }
   }

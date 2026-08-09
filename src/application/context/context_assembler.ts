@@ -255,7 +255,11 @@ function renderContext(
   if (parts.debugWikiMatches.length > 0) {
     sections.push([
       '## Debug Wiki (validate before applying)',
-      ...parts.debugWikiMatches.map((match) => `- ${match.entry.id}: ${match.entry.solution}`),
+      'These are hypotheses. Current files and executable failure evidence always take precedence.',
+      ...parts.debugWikiMatches.map((match) =>
+        match.entry.status === 'needs_review'
+          ? `- ${match.entry.id} status=needs_review: prior solution intentionally hidden; derive a fresh solution from current evidence`
+          : `- ${match.entry.id} status=${match.entry.status} confidence=${match.confidence?.toFixed(2) ?? 'unknown'}: ${match.entry.solution}`),
     ].join('\n'));
   }
   const text = sections.join('\n\n');

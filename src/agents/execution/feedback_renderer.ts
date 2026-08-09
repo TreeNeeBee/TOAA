@@ -14,6 +14,7 @@ export interface TurnFeedbackContext {
   actionCount: number;
   unresolvedFailures?: string[];
   readOnlyLoopWarning?: { rounds: number; targets: string };
+  changeRequestContradictionRecovery?: boolean;
   missingOutputStallWarning?: { rounds: number; missing: string };
   readOnlyRecoveryWarning?: boolean;
   diagnosticProbeAllowance?: {
@@ -22,9 +23,26 @@ export interface TurnFeedbackContext {
   };
   noProgressWarning?: { rounds: number };
   repairEvidenceMissing?: boolean;
+  validationContractRepairRequired?: boolean;
+  bugDeferredDispositionProblem?: {
+    reason: 'missing' | 'owned-artifact' | 'uninspected-artifact';
+    artifacts: string[];
+  };
+  ownedChangeRequestArtifacts?: string[];
   bugResolutionPlanMissing?: boolean;
+  changeRequestDispositionMissing?: boolean;
+  invalidChangeRequestDisposition?: {
+    reasonCategory: string;
+    reason: 'all-artifacts-owned' | 'owned-artifact-in-scope' | 'verification-required';
+    artifacts: string[];
+  };
   postMutationVerificationRequired?: boolean;
   qualityAssessmentMissing?: string[];
+  deferredVerification?: {
+    stepId: string;
+    phase: Step['phase'];
+  };
+  unsupportedValidationDefect?: string;
 }
 
 export function renderExecutionFeedback(
@@ -54,6 +72,16 @@ export function renderExecutionFeedback(
   if (verify.ok) {
     lines.push(messages.executorFeedbackVerifyOk);
     if (turn.repairEvidenceMissing) lines.push(messages.executorFeedbackRepairEvidenceMissing);
+    if (turn.repairEvidenceMissing && turn.ownedChangeRequestArtifacts?.length) {
+      lines.push(
+        'Invalid CR completion: this Step owns affected artifacts ' +
+        `${turn.ownedChangeRequestArtifacts.join(', ')}. ` +
+        'Their existence, exported symbol names, and read-only inspection do not prove that the reported behavior was repaired. ' +
+        'Compare the CR before/after contract and failing invocation with the current implementation. Then either use an authorized mutation tool ' +
+        'for a minimal semantic delta, or return changeRequestDisposition.outcome="not-applicable" with every owned affected artifact in inspectedArtifacts, concrete evidence, and the true downstream owner in qualityAssessment.blockedBy. ' +
+        'Comments, whitespace, formatting, or unrelated edits are invalid mutation evidence.',
+      );
+    }
   } else {
     lines.push(messages.executorFeedbackVerifyMissing(verify.missing.join(', ')));
     if (turn.declaredDone && turn.actionCount === 0) {
@@ -69,6 +97,16 @@ export function renderExecutionFeedback(
       turn.readOnlyLoopWarning.rounds,
       turn.readOnlyLoopWarning.targets,
     ));
+    if (turn.changeRequestContradictionRecovery) {
+      lines.push(
+        'Change Request convergence: if the inspected evidence disproves the original failure diagnosis, ' +
+        'stop probing and do not mutate unrelated files. Return actions=[], done=true and ' +
+        'changeRequestDisposition={outcome:"not-applicable",reasonCategory:"diagnosis-contradicted",' +
+        'rationale,inspectedArtifacts,evidence}. Runtime will turn that evidence into a Bug owned by the ' +
+        'discovering role and PM will route it. Otherwise apply the actual contract delta or report a ' +
+        'different evidence-backed not-applicable category.',
+      );
+    }
   }
   if (turn.missingOutputStallWarning) {
     lines.push(
@@ -101,6 +139,57 @@ export function renderExecutionFeedback(
     );
   }
   if (turn.bugResolutionPlanMissing) lines.push(messages.executorFeedbackBugResolutionPlanMissing);
+  if (turn.validationContractRepairRequired) {
+    lines.push(
+      'Validation-contract Bug completion is invalid without a real correction. The discovering role proved that the failed validation contract, paired test, or its source-stage specification is defective. ' +
+      'This paired source Step must patch or rewrite the affected output it owns and record the incremental change; actions=[] cannot delegate the unchanged defect downstream. ' +
+      'Preserve product behavior and assertions that remain valid, then let PM propagate the corrected contract through Change Requests.',
+    );
+  }
+  if (turn.bugDeferredDispositionProblem) {
+    const problem = turn.bugDeferredDispositionProblem;
+    const detail = problem.reason === 'missing'
+      ? 'No valid structured deferred disposition was supplied.'
+      : problem.reason === 'owned-artifact'
+        ? `The proposed downstream artifacts are owned by this Step: ${problem.artifacts.join(', ')}.`
+        : `The proposed downstream artifacts were not inspected from the current workspace: ${problem.artifacts.join(', ')}.`;
+    lines.push(
+      `Invalid Bug no-op handoff: ${detail} ` +
+      'If the root cause truly belongs downstream, return bugResolutionDisposition={outcome:"deferred",reasonCategory:"downstream-owned"|"external-dependency",rationale,affectedArtifacts:["path"],evidence:["fact"]}; ' +
+      'every affected artifact must be outside this Step ownership and backed by a successful context/read inspection. Otherwise patch the current Step output that owns the defect.',
+    );
+  }
+  if (turn.invalidChangeRequestDisposition) {
+    const invalid = turn.invalidChangeRequestDisposition;
+    if (invalid.reason === 'all-artifacts-owned') {
+      lines.push(
+        `Invalid Change Request classification: reasonCategory="${invalid.reasonCategory}" cannot be used because ` +
+        `this Step owns every declared affected artifact (${invalid.artifacts.join(', ')}). ` +
+        'Apply and verify the contract delta in this Step, or use reasonCategory="diagnosis-contradicted" when the evidence disproves the immutable origin-failure diagnosis.',
+      );
+    } else if (invalid.reason === 'owned-artifact-in-scope') {
+      lines.push(
+        `Invalid Change Request classification: reasonCategory="${invalid.reasonCategory}" cannot be used because ` +
+        `this Step owns affected artifact(s) ${invalid.artifacts.join(', ')}. ` +
+        'Handle the owned delta here; only the remaining artifacts may be delegated. Use reasonCategory="diagnosis-contradicted" if the origin diagnosis itself is false.',
+      );
+    } else {
+      lines.push(
+        `Invalid Change Request classification: reasonCategory="${invalid.reasonCategory}" cannot close an immutable origin failure ` +
+        `for owned artifact(s) ${invalid.artifacts.join(', ')} without successful executable verification. ` +
+        'Run the relevant verification, apply the contract delta, or use reasonCategory="diagnosis-contradicted" if current evidence disproves the original diagnosis.',
+      );
+    }
+  }
+  if (turn.changeRequestDispositionMissing) {
+    lines.push(
+      'Change Request completion is incomplete. Return a top-level changeRequestDisposition with outcome, reasonCategory, rationale, inspectedArtifacts, and evidence. ' +
+      'Use outcome="applied" only with real mutation or successful executable verification evidence. ' +
+      'Use outcome="not-applicable" only after inspecting the declared affected artifact(s), with ' +
+      'actions=[], done=true, concrete evidence, and the true downstream owner in qualityAssessment.blockedBy. ' +
+      'Do not rewrite unrelated phase outputs to manufacture an application.',
+    );
+  }
   if (turn.postMutationVerificationRequired) {
     lines.push(messages.executorFeedbackPostMutationVerificationRequired);
   }
@@ -110,6 +199,13 @@ export function renderExecutionFeedback(
       `${turn.qualityAssessmentMissing.join(', ')}. ` +
       'Do not rewrite verified outputs. Return actions=[] and done=true with a complete qualityAssessment ' +
       'backed by the existing artifact, test-report, or command evidence.',
+    );
+  }
+  if (turn.unsupportedValidationDefect) {
+    lines.push(
+      'Validation defect rejected: a Bug requires failed executable test evidence from run_tests. ' +
+      'The current executable gate did not fail. Complete the Step from the successful test evidence, ' +
+      'or report measurable completeness/coverage shortcomings in qualityAssessment.gaps so Runtime can create an Enhancement.',
     );
   }
   if (failureDetails.some((failure) => /path must be a non-empty string/i.test(failure))) {
@@ -122,11 +218,14 @@ export function renderExecutionFeedback(
     lines.push(
       `Unresolved tool failures remain: ${turn.unresolvedFailures.map((failure) => truncate(failure, 1200)).join('; ')}`,
     );
-    if (turn.unresolvedFailures.some((failure) => /replace_in_file FAIL .*expected 1 occurrences of find, found 0/i.test(failure))) {
+    if (turn.unresolvedFailures.some((failure) =>
+      /replace_in_file FAIL .*expected \d+ occurrences of find, found \d+/i.test(failure)
+    )) {
       lines.push(
-        'Replace miss recovery: the find string does not match the current file. ' +
-        'Do not retry the same find text. Next response must use the exact current file bytes shown by read_file/tool hints, ' +
-        'or switch to apply_patch/write_file on the same target with a minimal repair, then run verification.',
+        'Replace count recovery: expectedCount or find does not match the current file. ' +
+        'Do not guess a new count or retry the same find text. Next response must use the exact current file bytes shown by snippets/read_file/tool hints, ' +
+        'or switch to apply_patch on the same existing target with a minimal repair, then run verification. ' +
+        'Use write_file only when the target file is genuinely missing.',
       );
     }
     if (turn.unresolvedFailures.some((failure) => /content must be a string/i.test(failure))) {
@@ -141,11 +240,23 @@ export function renderExecutionFeedback(
         'for example {"packages":["cheerio@1.0.0"]}; set dev=true for test/build tooling.',
       );
     }
-    if (turn.declaredDone) {
+    if (turn.unresolvedFailures.some((failure) =>
+      /tool not allowed for this step: (?:execute_command|run_command|run_shell)/i.test(failure)
+    )) {
       lines.push(
-        'Invalid completion: do not return done=true until each failed tool call is corrected ' +
-        'or superseded by a successful tool call on the same target.',
+        'Tool name correction: execute_command/run_command/run_shell are not Runtime tools. ' +
+        'Use read_file/list_dir/code_search for inspection, run_tests for the declared test gate, ' +
+        'or run_program for an authorized build/program check. A successful canonical tool call ' +
+        'with the same capability supersedes the denied alias.',
       );
+    }
+    if (turn.declaredDone) {
+      lines.push(turn.deferredVerification
+        ? 'Deferred verification completion requires a fresh, complete qualityAssessment whose blockedBy evidence ' +
+          `attributes the remaining failure to downstream ${turn.deferredVerification.phase} Step ${turn.deferredVerification.stepId}. ` +
+          'Do not rerun the unchanged gate or create a duplicate Bug.'
+        : 'Invalid completion: do not return done=true until each failed tool call is corrected ' +
+          'or superseded by a successful tool call on the same target.');
     }
   }
   return lines.join('\n');

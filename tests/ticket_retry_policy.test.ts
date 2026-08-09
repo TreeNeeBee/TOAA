@@ -21,7 +21,7 @@ describe('adaptive Ticket attempt policy', () => {
     ])).toMatchObject({ extend: false });
   });
 
-  it('grants legacy Tickets one adaptive retry when fingerprints are absent', () => {
-    expect(evaluateAttemptExtension([{}, {}, {}])).toMatchObject({ extend: true });
+  it('rejects attempt extensions without structured failure fingerprints', () => {
+    expect(evaluateAttemptExtension([{}, {}, {}])).toMatchObject({ extend: false });
   });
 });

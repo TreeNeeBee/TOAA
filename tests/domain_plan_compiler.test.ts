@@ -18,8 +18,10 @@ import { ProjectGraphPersistenceService } from '../src/application/planning/proj
 import { DomainAuditTrail } from '../src/application/observability/domain_audit_trail.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { generateProjectDevelopmentReport } from '../src/core/project_report.js';
-import { reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
+import { createObjectEnvelope, reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
 import { PhaseSchema } from '../src/domain/phases/phase.js';
+import { StepSchema } from '../src/domain/steps/step.js';
+import { QualityAssessmentSchema } from '../src/domain/quality/quality.js';
 import { TicketSchema, type WorkTicket } from '../src/domain/tickets/ticket.js';
 
 describe('domain plan compiler', () => {
@@ -205,6 +207,66 @@ describe('domain plan compiler', () => {
     expect(reports).toHaveLength(1);
     const phaseWithReport = await repository.read(graph.phases[0]!.id);
     expect(phaseWithReport.objectType === 'phase' && phaseWithReport.reportIds).toEqual([reports[0]!.id]);
+  });
+
+  it('does not declare final delivery while a later Phase is incomplete', async () => {
+    const draft = samplePlan();
+    const graph = compileProjectGraph({ draft, topic: 'Build news.', projectName: 'news' });
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-report-'));
+    const workspace = new Workspace(root);
+    const repository = new DomainObjectRepository(workspace);
+    await repository.load();
+    await new ProjectGraphPersistenceService(repository).persistGraph(graph);
+    const p1 = graph.phases.find((phase) => phase.name === 'P1')!;
+
+    for (const step of graph.steps.filter((candidate) => candidate.phaseId === p1.id)) {
+      const assessment = QualityAssessmentSchema.parse({
+        ...createObjectEnvelope({
+          name: `${step.name}-quality`,
+          objectType: 'quality-assessment',
+          projectId: graph.project.id,
+        }),
+        subject: { id: step.id, objectType: 'step' },
+        observations: [], score: 1, passed: true, gaps: [], evidence: ['verified'],
+      });
+      await repository.commit([
+        assessment,
+        StepSchema.parse({
+          ...step,
+          ...reviseObjectEnvelope(step),
+          state: 'closed',
+          qualityAssessmentId: assessment.id,
+        }),
+      ]);
+    }
+    for (const ticket of graph.tickets.filter((candidate) => candidate.phaseId === p1.id)) {
+      await repository.update(TicketSchema.parse({
+        ...ticket,
+        ...reviseObjectEnvelope(ticket),
+        state: 'closed',
+      }), 'closed');
+    }
+    await repository.update(PhaseSchema.parse({
+      ...p1,
+      ...reviseObjectEnvelope(p1),
+      state: 'closed',
+    }), 'closed');
+    await repository.update(ProjectSchema.parse({
+      ...graph.project,
+      ...reviseObjectEnvelope(graph.project),
+      state: 'closed',
+    }), 'closed');
+
+    const report = await generateProjectDevelopmentReport({
+      workspace,
+      plan: draft,
+      finalDelivery: true,
+      repository,
+      projectAudit: { ok: true, warnings: 0, errors: 0, checks: [] },
+    });
+    const content = await workspace.readFile(report);
+    expect(content).toContain('Report scope: all phases');
+    expect(content).toContain('Verdict: **NOT READY**');
   });
 
   it('appends rebased Phases without replacing the canonical Project identity', async () => {

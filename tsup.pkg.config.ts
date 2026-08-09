@@ -16,7 +16,11 @@ export default defineConfig({
   dts: false,
   minify: false,
   shims: true, // 让 __dirname / import.meta 在 cjs 下可用
-  // 把所有 deps 内联（pkg 之后只会看到这一个 .cjs 文件）
-  noExternal: [/.*/],
+  // The embedded runtime is Node 24; preserving `node:` avoids turning newer builtins such as
+  // `node:sqlite` into nonexistent bare npm packages.
+  removeNodeProtocol: false,
+  // 把所有 npm deps 内联（pkg 之后只会看到这一个 .cjs 文件）。Node 24 的 SQLite builtin
+  // 必须保持 external；把它归一化成 bare `sqlite` 会产生一个不存在的 npm 模块。
+  noExternal: [/^(?!node:sqlite$).*/],
   banner: { js: '#!/usr/bin/env node' },
 });

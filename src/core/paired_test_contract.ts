@@ -92,7 +92,10 @@ export async function inspectPairedSourceTests(
     const requiredReferences = sourceStep.phase === 'DETAILED_DESIGN'
       ? Math.min(2, expectedSources.length)
       : 1;
-    if (matched.length >= requiredReferences) {
+    const behaviorRisks = sourceStep.phase === 'DETAILED_DESIGN'
+      ? duplicatedIntegrationBehavior(content, plan.language)
+      : [];
+    if (matched.length >= requiredReferences && behaviorRisks.length === 0) {
       valid.push(testPath);
       continue;
     }
@@ -100,10 +103,13 @@ export async function inspectPairedSourceTests(
     const ownerLabel = owners.length > 0
       ? owners.map((owner) => owner.id).join(', ')
       : sourceStep.id;
-    invalid.push(
-      `${testPath}: exercises ${matched.length}/${requiredReferences} required declared product sources for ${ownerLabel}` +
-      ` (expected one of: ${expectedSources.join(', ')})`,
-    );
+    if (matched.length < requiredReferences) {
+      invalid.push(
+        `${testPath}: exercises ${matched.length}/${requiredReferences} required declared product sources for ${ownerLabel}` +
+        ` (expected one of: ${expectedSources.join(', ')})`,
+      );
+    }
+    invalid.push(...behaviorRisks.map((risk) => `${testPath}: ${risk}`));
   }
 
   return {
@@ -113,6 +119,21 @@ export async function inspectPairedSourceTests(
     invalid,
     references,
   };
+}
+
+function duplicatedIntegrationBehavior(content: string, language: Plan['language']): string[] {
+  const code = stripCommentsAndStrings(content);
+  const hasLoop = language === 'typescript'
+    ? /\b(?:for\s*(?:await\s*)?\(|while\s*\()/u.test(code)
+    : /^\s*(?:async\s+)?(?:for|while)\b/mu.test(code);
+  const hasFailurePolicy = language === 'typescript'
+    ? /\btry\s*\{|\bcatch\s*(?:\([^)]*\))?\s*\{/u.test(code)
+    : /^\s*(?:try|except)\s*(?::|\b)/mu.test(code);
+  if (!hasLoop || !hasFailurePolicy) return [];
+  return [
+    'duplicates orchestration/failure-handling control flow inside the integration test; ' +
+      'invoke the real product orchestration or entry boundary and mock only its external collaborators',
+  ];
 }
 
 function ownersForTest(

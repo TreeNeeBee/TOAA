@@ -75,7 +75,7 @@ const ProviderSchema = z.object({
 });
 
 const LocaleSchema = z.enum(['en', 'zh']);
-const SandboxModeSchema = z.enum(['subprocess', 'docker', 'firejail']);
+const SandboxModeSchema = z.enum(['subprocess', 'docker']);
 
 const SandboxLimitsSchema = z
   .object({
@@ -263,7 +263,7 @@ function defaultSandboxLimits(): NormalizedSandboxLimits {
 
 function defaultLanguageSandbox(
   language: 'python' | 'typescript',
-  mode: 'subprocess' | 'docker' | 'firejail',
+  mode: 'subprocess' | 'docker',
   limits: NormalizedSandboxLimits,
 ): NormalizedLanguageSandbox {
   return {

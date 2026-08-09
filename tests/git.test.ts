@@ -25,9 +25,11 @@ describe('GitService', () => {
     await ws.writeFile('a.txt', 'v2');
     await git.snapshot('S001', 1, 'after v2');
     expect(await ws.readFile('a.txt')).toBe('v2');
+    await ws.writeFile('created-by-failed-attempt.txt', 'temporary');
 
     await git.revertTo(sha1);
     expect(await ws.readFile('a.txt')).toBe('v1');
+    expect(await ws.exists('created-by-failed-attempt.txt')).toBe(false);
   });
 
   it('ensureRepo is idempotent', async () => {

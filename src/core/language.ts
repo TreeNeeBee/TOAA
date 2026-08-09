@@ -19,7 +19,7 @@ import { t } from '../i18n/index.js';
  * 让 sandbox / engine / lint / render / planner / executor 等都通过 profile 取用，
  * 而不是在各处硬编码 Python 的 venv / pip / pytest / requirements.txt 假设。
  *
- * 默认语言仍是 Python（完全向后兼容）；TypeScript 作为新 profile 接入。
+ * 无法从需求确定语言时使用 Python；TypeScript 通过独立 profile 接入。
  */
 export interface LanguageProfile {
   readonly id: Language;

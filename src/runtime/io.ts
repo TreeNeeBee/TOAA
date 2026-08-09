@@ -93,7 +93,13 @@ export interface RuntimeWorkflowEvent extends RuntimeEventEnvelope {
   stepId?: string;
   stepName?: string;
   ticketId?: string;
+  ticketName?: string;
   ticketType?: string;
+  creatorActorId?: string;
+  creatorRole?: string;
+  assigneeActorId?: string;
+  assigneeRole?: string;
+  assigneeAgent?: string;
   correlationId: string;
   causationId?: string;
   message?: string;
@@ -135,12 +141,16 @@ export interface RuntimeInteraction {
   pauseStdin?(): void;
 }
 
+export type RuntimePermissionPolicy = 'request' | 'allow' | 'deny';
+
 export interface RuntimeIO {
   /** Enables human-oriented lower-level stream rendering. Runtime adapters default to false. */
   terminalOutput?: boolean;
   emit(event: RuntimeEvent): void | Promise<void>;
   progress(message: string, opts?: { animate?: boolean }): RuntimeProgress;
   interaction?: RuntimeInteraction;
+  /** Sensitive-operation policy. Headless callers fail closed unless they explicitly opt in. */
+  permissionPolicy?: RuntimePermissionPolicy;
   requestPermission?: ToolPermissionRequester;
 }
 
@@ -152,9 +162,33 @@ const noopProgress: RuntimeProgress = {
 
 export const silentRuntimeIO: RuntimeIO = {
   terminalOutput: false,
+  permissionPolicy: 'deny',
   emit: () => undefined,
   progress: () => noopProgress,
 };
+
+export function runtimePermissionAuthorizer(io: RuntimeIO): ToolPermissionRequester {
+  const policy = io.permissionPolicy ?? 'request';
+  return async (request) => {
+    if (policy === 'allow') {
+      return {
+        approved: true,
+        reason: `Explicit Runtime permission policy allowed ${request.operationType}.`,
+      };
+    }
+    if (policy === 'deny') {
+      return {
+        approved: false,
+        reason: `Runtime permission policy denied ${request.operationType}.`,
+      };
+    }
+    if (io.requestPermission) return io.requestPermission(request);
+    return {
+      approved: false,
+      reason: `No permission requester is configured for ${request.operationType}.`,
+    };
+  };
+}
 
 export function runtimeLog(io: RuntimeIO, level: RuntimeLogLevel, message: string): Promise<void> {
   return emitRuntimeEvent(io, { type: 'log', level, message });

@@ -87,10 +87,17 @@ export interface ToolContext {
   feedbackCharBudget?: number;
   /** read_file 单次读取并回传的动态字节预算。 */
   readChunkBytes?: number;
-  /** run_tests 未提供有效过滤参数时使用的当前阶段默认测试范围。 */
-  defaultTestArgs?: string[];
+  /** Runtime-owned executable gate. Model-provided selectors cannot replace or widen this scope. */
+  testGateArgs?: string[];
   /** Incremental Tickets may create files but must patch, rather than overwrite, accepted files. */
   preserveExistingFiles?: boolean;
+  /**
+   * Existing files named directly by failure evidence that a Debug attempt may rewrite in full.
+   *
+   * This is intentionally an exact-path list rather than another allowlist: broad output globs are
+   * suitable for containment, but would let one failing artifact authorize unrelated rewrites.
+   */
+  rewriteExistingFiles?: string[];
   /** Optional protocol/UI permission hook for sensitive tool operations. */
   requestPermission?: ToolPermissionRequester;
   /** Optional protocol/UI event hook for tool calls and file changes. */

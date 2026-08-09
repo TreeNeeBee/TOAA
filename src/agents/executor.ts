@@ -16,13 +16,13 @@ import type {
   EnhancementTicket,
   Ticket,
 } from '../domain/tickets/ticket.js';
+import { VALIDATION_CONTRACT_DEFECT_CODE } from '../domain/tickets/ticket.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
-import { isPathPattern, isUnownedStepFailure, matchesPathPattern } from '../tools/types.js';
+import { isUnownedStepFailure } from '../tools/types.js';
 import type { ToolFailureCode } from '../tools/types.js';
 import type {
   Tool,
   ToolContext,
-  ToolPermissionRequest,
   ToolResult,
 } from '../tools/types.js';
 import { makeStreamReporter } from '../llm/stream.js';
@@ -30,10 +30,15 @@ import { t } from '../i18n/index.js';
 import { updateOperationWindow } from '../llm/window.js';
 import { renderExecutionPromptPolicy } from './prompt_policy.js';
 import {
+  extractChangeRequestDisposition,
   extractBugResolutionPlan,
+  extractBugResolutionDisposition,
   extractValidationDefect,
   isCompleteTurnJson,
+  rejectedExecutionTurnEnvelopeKey,
   parseTurn,
+  type ChangeRequestDisposition,
+  type BugResolutionDisposition,
   type LLMAction,
   type LLMTurn,
 } from './execution/turn_parser.js';
@@ -50,10 +55,19 @@ import {
   normalizeActions,
   safeRunTool,
 } from './execution/tool_action_normalizer.js';
+import {
+  actionTargetPaths,
+  buildPermissionRequest,
+  normalizeRelPath,
+} from './execution/action_policy.js';
+import { verifyOutputs } from './execution/output_verifier.js';
 
 export { isCompleteTurnJson } from './execution/turn_parser.js';
+export { verifyOutputs } from './execution/output_verifier.js';
 
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
+const INVALID_COMPLETION_ROUND_LIMIT = 2;
+const CONSECUTIVE_PERMISSION_DENIAL_LIMIT = 2;
 const RECOVERY_PROBE_ACTIONS_PER_ROUND = 4;
 const MAX_DIRECT_REPAIR_PROBE_ROUNDS = 4;
 
@@ -119,6 +133,10 @@ export interface ExecutorRunInput {
       phase: Step['phase'];
       testArgs: string[];
     };
+    deferredVerificationScope?: {
+      stepId: string;
+      phase: Step['phase'];
+    };
   };
   /**
    * Who is executing, taken from the assignee's Role Definition. Identity only — the Role holds no
@@ -147,7 +165,11 @@ export interface ExecutorRunResult {
   finalThought?: string;
   /** Debugger 处理 Bug Ticket 时输出的可复用方案，成功后写回 Ticket/debug-wiki。 */
   bugResolutionPlan?: string;
-  /** Right-side validation found a semantic test/contract defect that must route to the paired source phase. */
+  /** Structured evidence for the exceptional case where a Bug has no source-Step mutation. */
+  bugResolutionDisposition?: BugResolutionDisposition;
+  /** Auditable CR decision; not-applicable records a verified empty changelist. */
+  changeRequestDisposition?: ChangeRequestDisposition;
+  /** A role found a semantic test/contract defect backed by current or inherited executable evidence. */
   validationDefect?: string;
   /** Structured completion/alignment/coverage evidence evaluated by the Runtime quality gate. */
   qualityAssessment?: StageQualityAssessment;
@@ -249,6 +271,8 @@ export class StepExecutor {
     const calls: ExecutorRunResult['toolCalls'] = [];
     let finalThought: string | undefined;
     let bugResolutionPlan: string | undefined;
+    let bugResolutionDisposition: BugResolutionDisposition | undefined;
+    let changeRequestDisposition: ChangeRequestDisposition | undefined;
     let qualityAssessment: StageQualityAssessment | undefined;
     let qualityAssessmentRound = 0;
     let lastToolActionRound = 0;
@@ -267,15 +291,21 @@ export class StepExecutor {
     const actionFingerprints = new Map<string, number>();
     const unresolvedToolFailures = new Map<string, string>();
     const failedVerificationAttempts = new Map<string, number>();
+    const failedExactVerificationAttempts = new Map<string, string>();
     const failedMutationAttempts = new Map<string, number>();
     let mutationGeneration = 0;
     let verifiedMutationGeneration = 0;
     let actualRounds = 0;
     let consecutiveReadOnlyRounds = 0;
     let consecutiveNoProgressRounds = 0;
+    let consecutiveInvalidCompletionRounds = 0;
+    let consecutiveMissingCrMutationRounds = 0;
     let failedTestRunRounds = 0;
+    let consecutivePermissionDenialRounds = 0;
     let repairEvidence = false;
-    const repairRequired = inp.debugContext?.repairRequired === true;
+    const ownedChangeRequestArtifacts = currentStepAffectedArtifacts(inp);
+    const changeRequestMutationRequired = ownedChangeRequestArtifacts.length > 0;
+    const repairRequired = inp.debugContext?.repairRequired === true || changeRequestMutationRequired;
     const readOnlyRecoveryMode = isReadOnlyLoopFailure(inp.debugContext?.reason ?? '');
     const strictReadOnlyRecoveryMode = isRejectedReadOnlyRecovery(inp.debugContext?.reason ?? '');
     const directRepairMode =
@@ -294,6 +324,13 @@ export class StepExecutor {
 
     const stepLabel = inp.stepName?.trim() || inp.step.id;
     for (let round = 1; round <= roundLimit; round++) {
+      const testPhaseGatePendingAtRoundStart =
+        (V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) &&
+        toolMap.has('run_tests') &&
+        !calls.some((call) => call.tool === 'run_tests');
+      const qualityAssessmentBeforeRound = qualityAssessment;
+      const qualityAssessmentRoundBeforeRound = qualityAssessmentRound;
+      const changeRequestDispositionBeforeRound = changeRequestDisposition;
       const rep = makeStreamReporter(
         `${stepLabel} ${role} round ${round}`,
         this.opts.llm.name,
@@ -326,6 +363,12 @@ export class StepExecutor {
               )
             )
           );
+        const validateCompletionQuality = !!inp.step.qualityGate && lastMissingCount === 0;
+        const validateDebuggerRecovery =
+          role === 'Debugger' && (
+            enforceRecoveryContract ||
+            (bugResolutionPlanRequired && !bugResolutionPlan?.trim())
+          );
         const chatOptions: ChatOptions = {
           responseFormat: 'json',
           temperature: 0.1,
@@ -334,12 +377,13 @@ export class StepExecutor {
           maxTokens: inp.ctx.responseTokenBudget,
           signal: this.opts.signal,
           scoreSuccess: false,
-          validate:
-            role === 'Debugger' && (
-              enforceRecoveryContract ||
-              (bugResolutionPlanRequired && !bugResolutionPlan?.trim())
-            )
-              ? (text) => validateDebuggerRecoveryTurn(text, toolMap, {
+          validate: validateCompletionQuality || validateDebuggerRecovery
+            ? (text) => {
+              if (validateCompletionQuality) {
+                validateExecutionTurnContract(text, inp.step, toolMap);
+              }
+              if (validateDebuggerRecovery) {
+                validateDebuggerRecoveryTurn(text, toolMap, {
                   enforceRecoveryContract,
                   requireBugResolutionPlanBeforeAction:
                     bugResolutionPlanRequired && !bugResolutionPlan?.trim(),
@@ -347,8 +391,10 @@ export class StepExecutor {
                     (readOnlyRecoveryMode && !directRepairMode) ||
                     allowNovelDirectRepairProbe,
                   seenProbeFingerprints: recoveryProbeFingerprints,
-                })
-              : undefined,
+                });
+              }
+            }
+            : undefined,
           onProvider: (name) => { provider = name; },
           onProviderStart: (name, model, providerWindow) => {
             provider = name;
@@ -373,6 +419,12 @@ export class StepExecutor {
           onToken: (chunk) => {
             if (rawAggregate.length < RAW_CAP) {
               rawAggregate = (rawAggregate + chunk).slice(0, RAW_CAP);
+            }
+            const rejectedEnvelopeKey = rejectedExecutionTurnEnvelopeKey(rawAggregate);
+            if (rejectedEnvelopeKey) {
+              throw new Error(
+                `invalid Executor response envelope: unexpected top-level key "${rejectedEnvelopeKey}"`,
+              );
             }
             rep.onToken(chunk);
           },
@@ -482,6 +534,9 @@ export class StepExecutor {
       const turn = parseTurn(text);
       finalThought = turn.thoughts;
       bugResolutionPlan = extractBugResolutionPlan(turn) ?? bugResolutionPlan;
+      bugResolutionDisposition =
+        extractBugResolutionDisposition(turn) ?? bugResolutionDisposition;
+      changeRequestDisposition = extractChangeRequestDisposition(turn) ?? changeRequestDisposition;
       const turnQualityAssessment = normalizeQualityAssessment(
         turn.qualityAssessment ?? turn.quality_assessment,
       );
@@ -603,6 +658,74 @@ export class StepExecutor {
           },
         );
       }
+      const automaticTestPhaseVerifications = automaticTestPhaseVerificationActions({
+        actions,
+        phase: inp.step.phase,
+        toolMap,
+        calls,
+      });
+      if (automaticTestPhaseVerifications.length > 0) {
+        actions = [...actions, ...automaticTestPhaseVerifications];
+        await inp.ctx.audit?.event(
+          'note',
+          `${inp.step.id} appended the mandatory executable verification gate`,
+          {
+            messageId: 'audit.executor_automatic_test_phase_verification',
+            stepId: inp.step.id,
+            role,
+            round,
+            phase: inp.step.phase,
+            actions: automaticTestPhaseVerifications,
+          },
+        );
+      }
+      let deferredPreVerificationActions: LLMAction[] = [];
+      if (testPhaseGatePendingAtRoundStart) {
+        const gate = actions.find((action) => action.tool === 'run_tests');
+        const inspections = actions.filter((action) =>
+          isPreVerificationInspectionAction(action) ||
+          (action.tool !== 'run_tests' && !toolMap.has(action.tool)));
+        deferredPreVerificationActions = actions.filter((action) =>
+          action.tool !== 'run_tests' &&
+          toolMap.has(action.tool) &&
+          !isPreVerificationInspectionAction(action));
+        actions = gate ? [...inspections, gate] : inspections;
+
+        // A report, diagnosis, or CR disposition produced before this Step's executable gate is
+        // speculative. Preserve only evidence from earlier verified rounds and make the model
+        // consume this run_tests result before it can close the Step or write derived artifacts.
+        qualityAssessment = qualityAssessmentBeforeRound;
+        qualityAssessmentRound = qualityAssessmentRoundBeforeRound;
+        changeRequestDisposition = changeRequestDispositionBeforeRound;
+        turn.qualityAssessment = undefined;
+        turn.quality_assessment = undefined;
+        turn.changeRequestDisposition = undefined;
+        turn.change_request_disposition = undefined;
+        turn.validationDefect = null;
+        turn.validation_defect = null;
+        turn.validationFailure = null;
+        turn.validation_failure = null;
+        turn.done = false;
+        turn.actions = actions;
+
+        if (deferredPreVerificationActions.length > 0) {
+          await inp.ctx.audit?.event(
+            'note',
+            `${inp.step.id} deferred actions until the executable verification result is available`,
+            {
+              messageId: 'audit.executor_pre_verification_actions_deferred',
+              stepId: inp.step.id,
+              role,
+              round,
+              phase: inp.step.phase,
+              deferredActions: deferredPreVerificationActions.map((action) => ({
+                tool: action.tool,
+                targets: actionTargetPaths(action.tool, action.args),
+              })),
+            },
+          );
+        }
+      }
       actualRounds = round;
       // 解析失败 / 空响应：关键的"不健康"信号。
       if (!turn || (turn.thoughts === undefined && actions.length === 0 && turn.done === undefined)) {
@@ -680,10 +803,55 @@ export class StepExecutor {
       }));
       let repeatedVerificationFailure: string | undefined;
       let repeatedMutationFailure: string | undefined;
+      let testGateFailure: ToolResult & { tool: string } | undefined;
       for (const item of normalizedActions.invalid) {
         calls.push({ tool: item.result.tool, ok: false, error: item.result.error });
       }
       for (const a of actions) {
+        if (
+          a.tool === 'run_tests' &&
+          mutationGeneration === verifiedMutationGeneration &&
+          calls.some((call) => call.tool === 'run_tests' && call.ok)
+        ) {
+          const summary =
+            'run_tests reused: the current mutation generation already passed the mandatory executable gate';
+          turnResults.push({ tool: a.tool, ok: true, summary });
+          await inp.ctx.audit?.event('note', summary, {
+            messageId: 'audit.executor_redundant_test_gate_reused',
+            stepId: inp.step.id,
+            phase: inp.step.phase,
+            round,
+            mutationGeneration,
+            requestedArgs: a.args,
+          });
+          continue;
+        }
+        const exactVerificationKey = COMPLETION_VERIFICATION_TOOLS.has(a.tool)
+          ? `${mutationGeneration}:${a.tool}:${stableActionValue(a.args)}`
+          : undefined;
+        const previousExactVerificationFailure = exactVerificationKey
+          ? failedExactVerificationAttempts.get(exactVerificationKey)
+          : undefined;
+        if (previousExactVerificationFailure) {
+          repeatedVerificationFailure =
+            `verification command repeated without a successful mutation: ${verificationActionLabel(a)}; ` +
+            `latest failure: ${truncate(previousExactVerificationFailure, 1000)}; ` +
+            'the duplicate command was not executed again; next attempt must patch/write before rerunning this command.';
+          turnResults.push({
+            tool: a.tool,
+            ok: false,
+            error: repeatedVerificationFailure,
+          });
+          await inp.ctx.audit?.event('note', repeatedVerificationFailure, {
+            messageId: 'audit.executor_duplicate_verification_blocked',
+            stepId: inp.step.id,
+            phase: inp.step.phase,
+            round,
+            mutationGeneration,
+            action: a,
+          });
+          continue;
+        }
         const selectedTool = toolMap.get(a.tool);
         if (!selectedTool) {
           const r = { ok: false, error: `tool not allowed for this step: ${a.tool}` };
@@ -753,7 +921,11 @@ export class StepExecutor {
         updateUnresolvedToolFailures(unresolvedToolFailures, a, r, advisoryFailureTools, advisoryFailureRules);
         const successfulMutation = didPerformSuccessfulMutation(a, r);
         if (successfulMutation) {
+          const hadPendingVerification = mutationGeneration > verifiedMutationGeneration;
           mutationGeneration++;
+          if (!hadPendingVerification && !mutationRequiresExecutionVerification(a, r)) {
+            verifiedMutationGeneration = mutationGeneration;
+          }
         }
         if (isOutputMutationTool(a.tool)) {
           const mutationKey = `${mutationGeneration}:${JSON.stringify({ tool: a.tool, args: a.args })}`;
@@ -774,6 +946,7 @@ export class StepExecutor {
           const verificationKey = `${mutationGeneration}:${verificationActionKey(a)}`;
           if (r.ok) {
             failedVerificationAttempts.delete(verificationKey);
+            if (exactVerificationKey) failedExactVerificationAttempts.delete(exactVerificationKey);
             verifiedMutationGeneration = mutationGeneration;
           } else if (isUnownedStepFailure(r.code)) {
             // Nothing the Step can do makes this command succeed: the manifest is another Step's
@@ -781,6 +954,12 @@ export class StepExecutor {
             // it does not own — the third guard to have needed telling.
             failedVerificationAttempts.delete(verificationKey);
           } else {
+            if (exactVerificationKey) {
+              failedExactVerificationAttempts.set(
+                exactVerificationKey,
+                r.error ?? r.summary ?? 'unknown error',
+              );
+            }
             const count = (failedVerificationAttempts.get(verificationKey) ?? 0) + 1;
             failedVerificationAttempts.set(verificationKey, count);
             if (count >= 2 && !advisoryFailureTools.has(a.tool)) {
@@ -825,9 +1004,63 @@ export class StepExecutor {
           data: r.data,
         });
         turnResults.push({ ...r, tool: a.tool });
+        if (
+          a.tool === 'run_tests' &&
+          !r.ok &&
+          r.code !== 'manifest_missing' &&
+          (V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) &&
+          !advisoryFailureTools.has('run_tests')
+        ) {
+          testGateFailure = { ...r, tool: a.tool };
+          break;
+        }
+      }
+      if (deferredPreVerificationActions.length > 0 && !testGateFailure) {
+        turnResults.push({
+          tool: 'verification_order',
+          ok: true,
+          summary:
+            `deferred ${deferredPreVerificationActions.length} action(s): consume the current ` +
+            'run_tests result first, then derive diagnostics, reports, or changes in the next round',
+        });
       }
       if (actions.length > 0 || normalizedActions.invalid.length > 0) {
         lastToolActionRound = round;
+      }
+      if (testGateFailure) {
+        const verify = await verifyOutputs(inp);
+        const validationDefect = extractValidationDefect(turn) ??
+          validationDefectFromTestFailure(inp.step.phase, testGateFailure);
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        await inp.ctx.audit?.event(
+          'note',
+          `${inp.step.id} stopped after its executable test gate failed`,
+          {
+            messageId: 'audit.executor_test_failure_ticket_handoff',
+            stepId: inp.step.id,
+            phase: inp.step.phase,
+            round,
+            validationDefect,
+          },
+        );
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          validationDefect,
+          error: `validation defect reported: ${validationDefect}`,
+          metrics,
+        };
       }
       const verify = await verifyOutputs(inp);
       const mutationSucceededThisRound = actions.some((action, index) =>
@@ -848,6 +1081,11 @@ export class StepExecutor {
       if (turnResults.some((r) => r.tool === 'run_tests' && !r.ok) && !advisoryFailureTools.has('run_tests')) {
         failedTestRunRounds++;
       }
+      const permissionDeniedThisRound = turnResults.some((result) =>
+        !result.ok && /permission denied for /iu.test(result.error ?? ''));
+      consecutivePermissionDenialRounds = permissionDeniedThisRound
+        ? consecutivePermissionDenialRounds + 1
+        : 0;
       if (repeatedMutationFailure) {
         const metrics = computeMetrics({
           rounds: actualRounds,
@@ -876,11 +1114,17 @@ export class StepExecutor {
           metrics,
         };
       }
-      const validationDefect = extractValidationDefect(turn);
-      if (
-        validationDefect &&
-        (V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase)
-      ) {
+      const validationDefect = extractValidationDefect(turn) ??
+        validationDefectFromChangeRequestDisposition(inp, changeRequestDisposition);
+      const currentExecutableFailure = calls.some((call) => call.tool === 'run_tests' && !call.ok);
+      const supportedValidationDefect = validationDefect && (
+        ((V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) && currentExecutableFailure) ||
+        inp.changeRequest?.originFailure !== undefined
+      );
+      const unsupportedValidationDefect = validationDefect && !supportedValidationDefect
+        ? validationDefect
+        : undefined;
+      if (supportedValidationDefect) {
         const metrics = computeMetrics({
           rounds: actualRounds,
           parseFailures,
@@ -892,7 +1136,7 @@ export class StepExecutor {
         });
         await inp.ctx.audit?.event(
           'note',
-          `${inp.step.id} reported a validation defect that requires paired-source repair`,
+          `${inp.step.id} reported an evidence-backed defect that requires PM routing`,
           {
             messageId: 'audit.executor_validation_defect',
             stepId: inp.step.id,
@@ -912,7 +1156,20 @@ export class StepExecutor {
           metrics,
         };
       }
-      const repairGateOk = !repairRequired ||
+      if (unsupportedValidationDefect) {
+        await inp.ctx.audit?.event(
+          'note',
+          `${inp.step.id} rejected a validation defect without failed executable evidence`,
+          {
+            messageId: 'audit.executor_validation_defect_evidence_required',
+            stepId: inp.step.id,
+            phase: inp.step.phase,
+            round,
+            validationDefect: unsupportedValidationDefect,
+          },
+        );
+      }
+      let repairGateOk = !repairRequired ||
         repairEvidence ||
         canAcceptOutputCompletionRecovery(inp, initialMissing);
       const bugResolutionPlanOk = !bugResolutionPlanRequired || !!bugResolutionPlan?.trim();
@@ -928,6 +1185,16 @@ export class StepExecutor {
         qualityAssessment,
         qualityAssessmentRound > lastToolActionRound,
       );
+      const invalidCompletionRound =
+        turn.done === true &&
+        actions.length === 0 &&
+        verify.ok &&
+        qualityAssessmentMissing.length > 0;
+      if (invalidCompletionRound) {
+        consecutiveInvalidCompletionRounds++;
+      } else {
+        consecutiveInvalidCompletionRounds = 0;
+      }
       const supersededContractFailures =
         repairEvidence &&
         hasSuccessfulCompletionVerification(calls) &&
@@ -946,12 +1213,74 @@ export class StepExecutor {
         qualityAssessment.gaps.length > 0 &&
         unresolvedToolFailures.size > 0 &&
         qualityAssessmentMissing.length === 0;
+      const deferredVerificationCompletion =
+        turn.done === true &&
+        verify.ok &&
+        repairEvidence &&
+        qualityAssessmentMissing.length === 0 &&
+        canAcceptDeferredVerificationFailure(
+          inp,
+          unresolvedToolFailures,
+          calls,
+          qualityAssessment,
+        );
+      const deferredNoopHandoff =
+        turn.done === true &&
+        actions.length === 0 &&
+        verify.ok &&
+        qualityAssessmentMissing.length === 0 &&
+        unresolvedToolFailures.size === 0 &&
+        canAcceptDeferredNoopHandoff(
+          inp,
+          initialMissing,
+          calls,
+          qualityAssessment,
+          bugResolutionDisposition,
+        );
+      const invalidChangeRequestDisposition = classifyInvalidChangeRequestDisposition(
+        inp,
+        ownedChangeRequestArtifacts,
+        calls,
+        changeRequestDisposition,
+      );
+      const explicitChangeRequestNoop =
+        turn.done === true &&
+        actions.length === 0 &&
+        verify.ok &&
+        qualityAssessmentMissing.length === 0 &&
+        !invalidChangeRequestDisposition &&
+        canAcceptExplicitChangeRequestNoop(
+          inp,
+          ownedChangeRequestArtifacts,
+          calls,
+          qualityAssessment,
+          changeRequestDisposition,
+        );
+      const appliedChangeRequestDisposition =
+        changeRequestDisposition?.outcome === 'applied' &&
+        (repairEvidence || hasSuccessfulCompletionVerification(calls));
+      const changeRequestDispositionOk =
+        !inp.changeRequest || explicitChangeRequestNoop || appliedChangeRequestDisposition;
+      repairGateOk = repairGateOk || deferredNoopHandoff || explicitChangeRequestNoop;
+      const missingOwnedCrMutation =
+        changeRequestMutationRequired &&
+        turn.done === true &&
+        actions.length === 0 &&
+        verify.ok &&
+        !repairEvidence &&
+        !explicitChangeRequestNoop;
+      consecutiveMissingCrMutationRounds = missingOwnedCrMutation
+        ? consecutiveMissingCrMutationRounds + 1
+        : 0;
       const unresolvedFailuresOk =
         unresolvedToolFailures.size === 0 ||
         (outputCompletionRecovery && hasOnlyUntargetedToolContractFailures(unresolvedToolFailures)) ||
         supersededContractFailures ||
         nonBlockingPhaseVerificationFailures ||
-        reportedQualityGateFailure;
+        reportedQualityGateFailure ||
+        deferredVerificationCompletion ||
+        (explicitChangeRequestNoop &&
+          hasOnlyExplicitNoopSupersededFailures(unresolvedToolFailures));
       const completionSignal =
         turn.done ||
         verifiedCompletion ||
@@ -964,8 +1293,60 @@ export class StepExecutor {
         unresolvedFailuresOk &&
         repairGateOk &&
         bugResolutionPlanOk &&
+        changeRequestDispositionOk &&
         qualityAssessmentMissing.length === 0
       ) {
+        const acceptedQualityAssessment = deferredVerificationCompletion || deferredNoopHandoff
+          ? normalizeDeferredVerificationAssessment(
+              qualityAssessment!,
+              inp.debugContext!.deferredVerificationScope!,
+            )
+          : qualityAssessment;
+        if (deferredVerificationCompletion) {
+          await inp.ctx.audit?.event(
+            'note',
+            `accepted ${inp.step.id} with paired verification deferred to downstream Change Requests`,
+            {
+              messageId: 'audit.executor_deferred_verification_completion',
+              stepId: inp.step.id,
+              phase: inp.step.phase,
+              verificationStepId: inp.debugContext!.deferredVerificationScope!.stepId,
+              verificationPhase: inp.debugContext!.deferredVerificationScope!.phase,
+              blockedBy: acceptedQualityAssessment?.blockedBy,
+            },
+          );
+        }
+        if (deferredNoopHandoff) {
+          await inp.ctx.audit?.event(
+            'note',
+            `accepted ${inp.step.id} as an aligned upstream no-op and handed the correction downstream`,
+            {
+              messageId: 'audit.executor_deferred_noop_handoff',
+              stepId: inp.step.id,
+              phase: inp.step.phase,
+              verificationStepId: inp.debugContext!.deferredVerificationScope!.stepId,
+              verificationPhase: inp.debugContext!.deferredVerificationScope!.phase,
+              blockedBy: acceptedQualityAssessment?.blockedBy,
+            },
+          );
+        }
+        if (explicitChangeRequestNoop) {
+          await inp.ctx.audit?.event(
+            'note',
+            `accepted ${inp.step.id} as an explicit not-applicable Change Request application`,
+            {
+              messageId: 'audit.executor_change_request_not_applicable',
+              stepId: inp.step.id,
+              phase: inp.step.phase,
+              ticketId: inp.changeRequest?.id,
+              affectedArtifacts: inp.changeRequest?.contractDelta.affectedArtifacts,
+              ownedAffectedArtifacts: ownedChangeRequestArtifacts,
+              rationale: changeRequestDisposition?.rationale,
+              reasonCategory: changeRequestDisposition?.reasonCategory,
+              evidence: changeRequestDisposition?.evidence,
+            },
+          );
+        }
         if (declarativeOutputCompletion) {
           await inp.ctx.audit?.event(
             'note',
@@ -994,7 +1375,74 @@ export class StepExecutor {
           toolCalls: calls,
           finalThought,
           bugResolutionPlan,
+          bugResolutionDisposition,
+          changeRequestDisposition,
+          qualityAssessment: acceptedQualityAssessment,
+          metrics,
+        };
+      }
+      if (consecutiveMissingCrMutationRounds >= 2) {
+        const error =
+          `change-request completion rejected for ${inp.step.id}: the Step owns affected artifacts ` +
+          `${ownedChangeRequestArtifacts.join(', ')}, but two completion rounds supplied only existence/read evidence ` +
+          'and no incremental mutation; the accepted contract delta remains unapplied.';
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns: repeatedTurns + 1,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        await inp.ctx.audit?.event('note', error, {
+          messageId: 'audit.executor_change_request_mutation_missing',
+          stepId: inp.step.id,
+          phase: inp.step.phase,
+          ticketId: inp.changeRequest?.id,
+          affectedArtifacts: ownedChangeRequestArtifacts,
+        });
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
           qualityAssessment,
+          error,
+          metrics,
+        };
+      }
+      if (consecutiveInvalidCompletionRounds >= INVALID_COMPLETION_ROUND_LIMIT) {
+        repeatedTurns++;
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        const error =
+          `model returned done=true with actions=[] but an incomplete qualityAssessment for ` +
+          `${consecutiveInvalidCompletionRounds} consecutive rounds; ` +
+          'this is an invalid completion loop, so the attempt is stopping before it consumes more tokens. ' +
+          `Missing: ${qualityAssessmentMissing.join(', ')}.`;
+        await inp.ctx.audit?.event('note', error, {
+          messageId: 'audit.executor_invalid_completion_guard',
+          stepId: inp.step.id,
+          round,
+          consecutiveInvalidCompletionRounds,
+          qualityAssessmentMissing,
+        });
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          qualityAssessment,
+          error,
           metrics,
         };
       }
@@ -1017,6 +1465,28 @@ export class StepExecutor {
           round,
           failedTestRunRounds,
           maxFailedTestRuns: this.opts.maxFailedTestRuns,
+        });
+        return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
+      }
+      if (consecutivePermissionDenialRounds >= CONSECUTIVE_PERMISSION_DENIAL_LIMIT) {
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        const error =
+          `sensitive operations were denied for ${consecutivePermissionDenialRounds} consecutive rounds; ` +
+          'stopping this attempt instead of repeatedly proposing unauthorized variants. ' +
+          'Resume with a materially different plan or explicit user guidance.';
+        await inp.ctx.audit?.event('note', error, {
+          messageId: 'audit.executor_permission_denial_guard',
+          stepId: inp.step.id,
+          round,
+          consecutivePermissionDenialRounds,
         });
         return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
@@ -1086,12 +1556,18 @@ export class StepExecutor {
           providers: [...providers],
         });
         const targets = actions.flatMap((action) => actionTargetPaths(action.tool, action.args)).join(', ');
+        const changeRequestRecovery = inp.changeRequest?.originFailure
+          ? ' If inspection disproves the original CR diagnosis, stop with actions=[], done=true and ' +
+            'changeRequestDisposition reasonCategory="diagnosis-contradicted" so Runtime can route the ' +
+            'discovering role\'s Bug through PM.'
+          : '';
         const error =
           (readOnlyRecoveryViolation
             ? `read-only recovery mode repeated probe actions for ${readOnlyRecoveryRounds} rounds`
             : `repeated read-only/probe actions without progress for ${consecutiveReadOnlyRounds} rounds`) +
           (targets ? ` (last target: ${targets})` : '') +
-          '; next attempt must patch/write an allowed file, run verification, or stop with a concrete blocker.';
+          '; next attempt must patch/write an allowed file, run verification, or stop with a concrete blocker.' +
+          changeRequestRecovery;
         await inp.ctx.audit?.event('note', error, {
           messageId: 'audit.executor_loop_guard',
           stepId: inp.step.id,
@@ -1138,7 +1614,9 @@ export class StepExecutor {
         completionSignal &&
         verify.ok &&
         qualityAssessmentMissing.length > 0;
-      const postMutationVerificationRequired = mutationGeneration > verifiedMutationGeneration;
+      const postMutationVerificationRequired =
+        mutationGeneration > verifiedMutationGeneration &&
+        !deferredVerificationCompletion;
       const successfulVerificationThisRound = turnResults.some(
         (result) => result.ok && COMPLETION_VERIFICATION_TOOLS.has(result.tool),
       );
@@ -1155,6 +1633,7 @@ export class StepExecutor {
         !mutationSucceededThisRound;
       if (
         round >= roundLimit &&
+        roundLimit < hardRoundLimit &&
         (
           productiveExtensionAtLimit ||
           (
@@ -1175,9 +1654,7 @@ export class StepExecutor {
           )
         )
       ) {
-        const nextLimit = productiveExtensionAtLimit
-          ? roundLimit + 2
-          : Math.min(hardRoundLimit, roundLimit + 2);
+        const nextLimit = Math.min(hardRoundLimit, roundLimit + 2);
         await inp.ctx.audit?.event('note', mutationSucceededThisRound
           ? `successful mutation needs verification; extending round budget ${roundLimit}→${nextLimit}`
           : productiveHandshakeAtLimit
@@ -1213,6 +1690,8 @@ export class StepExecutor {
                 targets: actions.flatMap((action) => actionTargetPaths(action.tool, action.args)).join(', '),
               }
             : undefined,
+          changeRequestContradictionRecovery:
+            !!inp.changeRequest?.originFailure && consecutiveReadOnlyRounds >= 2,
           missingOutputStallWarning: missingOutputStallRounds >= 1 && !verify.ok
             ? {
                 rounds: missingOutputStallRounds,
@@ -1244,17 +1723,40 @@ export class StepExecutor {
             verify.ok &&
             unresolvedToolFailures.size === 0 &&
             !repairEvidence,
+          validationContractRepairRequired:
+            isValidationContractDefect(inp) &&
+            turn.done === true &&
+            verify.ok &&
+            !repairEvidence,
+          bugDeferredDispositionProblem:
+            inp.ticket?.type === 'bug' &&
+            !isValidationContractDefect(inp) &&
+            turn.done === true &&
+            actions.length === 0 &&
+            verify.ok &&
+            !repairEvidence
+              ? classifyDeferredBugNoopProblem(inp, calls, bugResolutionDisposition)
+              : undefined,
+          ownedChangeRequestArtifacts,
           bugResolutionPlanMissing:
             bugResolutionPlanRequired &&
             turn.done === true &&
             verify.ok &&
             unresolvedToolFailures.size === 0 &&
             !bugResolutionPlanOk,
+          changeRequestDispositionMissing:
+            !!inp.changeRequest &&
+            turn.done === true &&
+            verify.ok &&
+            !changeRequestDispositionOk,
+          invalidChangeRequestDisposition,
           postMutationVerificationRequired,
           qualityAssessmentMissing:
             completionSignal && verify.ok && qualityAssessmentMissing.length > 0
               ? qualityAssessmentMissing
               : undefined,
+          deferredVerification: inp.debugContext?.deferredVerificationScope,
+          unsupportedValidationDefect,
         }, {
           feedbackCharBudget: inp.ctx.feedbackCharBudget,
           readChunkBytes: inp.ctx.readChunkBytes,
@@ -1319,6 +1821,13 @@ function isReadOnlyOrProbeAction(action: LLMAction): boolean {
   if (action.tool === 'read_file' || action.tool === 'list_dir' || action.tool === 'code_search') return true;
   if (action.tool === 'analyze_error') return true;
   return action.tool === 'http_fetch' && typeof action.args.saveAs !== 'string';
+}
+
+function isPreVerificationInspectionAction(action: LLMAction): boolean {
+  return action.tool === 'read_file' ||
+    action.tool === 'list_dir' ||
+    action.tool === 'code_search' ||
+    action.tool === 'analyze_error';
 }
 
 function boundRecoveryProbeActions(
@@ -1426,6 +1935,101 @@ function canAcceptOutputCompletionRecovery(inp: ExecutorRunInput, initialMissing
   return isOutputCompletionFailure(inp.debugContext.reason, inp.debugContext.failureLog);
 }
 
+function currentStepAffectedArtifacts(input: ExecutorRunInput): string[] {
+  if (!input.changeRequest) return [];
+  const outputs = input.step.outputs.map(normalizeRelPath);
+  return input.changeRequest.contractDelta.affectedArtifacts.filter((artifact) => {
+    const affected = normalizeRelPath(artifact);
+    return outputs.some((output) =>
+      output === affected || output.startsWith(`${affected}/`) || affected.startsWith(`${output}/`),
+    );
+  });
+}
+
+function classifyInvalidChangeRequestDisposition(
+  input: ExecutorRunInput,
+  ownedArtifacts: readonly string[],
+  calls: readonly ToolCallRecord[],
+  disposition: ChangeRequestDisposition | undefined,
+): {
+  reasonCategory: string;
+  reason: 'all-artifacts-owned' | 'owned-artifact-in-scope' | 'verification-required';
+  artifacts: string[];
+} | undefined {
+  if (!input.changeRequest || disposition?.outcome !== 'not-applicable') return undefined;
+  const affectedArtifacts = [...new Set(
+    input.changeRequest.contractDelta.affectedArtifacts.map(normalizeComparablePath),
+  )];
+  const owned = new Set(ownedArtifacts.map(normalizeComparablePath));
+  const ownedAffectedArtifacts = affectedArtifacts.filter((artifact) => owned.has(artifact));
+  const allArtifactsOwned =
+    affectedArtifacts.length > 0 && ownedAffectedArtifacts.length === affectedArtifacts.length;
+
+  if (disposition.reasonCategory === 'downstream-owned' && allArtifactsOwned) {
+    return {
+      reasonCategory: disposition.reasonCategory,
+      reason: 'all-artifacts-owned',
+      artifacts: ownedAffectedArtifacts,
+    };
+  }
+  if (disposition.reasonCategory === 'outside-step-scope' && ownedAffectedArtifacts.length > 0) {
+    return {
+      reasonCategory: disposition.reasonCategory,
+      reason: 'owned-artifact-in-scope',
+      artifacts: ownedAffectedArtifacts,
+    };
+  }
+  if (
+    disposition.reasonCategory === 'already-aligned' &&
+    input.changeRequest.originFailure &&
+    allArtifactsOwned &&
+    !hasSuccessfulCompletionVerification(calls)
+  ) {
+    return {
+      reasonCategory: disposition.reasonCategory,
+      reason: 'verification-required',
+      artifacts: ownedAffectedArtifacts,
+    };
+  }
+  return undefined;
+}
+
+function canAcceptExplicitChangeRequestNoop(
+  input: ExecutorRunInput,
+  ownedArtifacts: readonly string[],
+  calls: readonly ToolCallRecord[],
+  assessment: StageQualityAssessment | undefined,
+  disposition: ChangeRequestDisposition | undefined,
+): boolean {
+  if (!input.changeRequest) return false;
+  if (disposition?.outcome !== 'not-applicable') return false;
+  if (!assessment || assessment.gaps.length > 0 || assessment.blockedBy.length === 0) return false;
+  const inspected = new Set(disposition.inspectedArtifacts.map(normalizeComparablePath));
+  const successfullyRead = new Set([
+    ...(input.contextSnippets ?? []).map((snippet) => normalizeComparablePath(snippet.path)),
+    ...calls
+      .filter((call) => call.ok && call.tool === 'read_file' && typeof call.args?.path === 'string')
+      .map((call) => normalizeComparablePath(String(call.args!.path))),
+  ]);
+  if (ownedArtifacts.length > 0) {
+    return ownedArtifacts.every((artifact) => {
+      const normalized = normalizeComparablePath(artifact);
+      return inspected.has(normalized) && successfullyRead.has(normalized);
+    });
+  }
+
+  // A CR still traverses stages that do not own its concrete affected files. Those stages must be
+  // able to record an auditable pass-through instead of manufacturing a phase rewrite. Require at
+  // least one declared affected artifact to have been inspected through a successful workspace read.
+  const affected = input.changeRequest.contractDelta.affectedArtifacts
+    .map(normalizeComparablePath);
+  return affected.some((artifact) => inspected.has(artifact) && successfullyRead.has(artifact));
+}
+
+function normalizeComparablePath(value: string): string {
+  return value.replaceAll('\\', '/').replace(/^\.\//u, '');
+}
+
 function hasOnlyUntargetedToolContractFailures(unresolved: Map<string, string>): boolean {
   if (unresolved.size === 0) return true;
   return [...unresolved.entries()].every(([key, detail]) =>
@@ -1453,6 +2057,139 @@ function hasOnlyUnauthorizedVerificationFailures(unresolved: Map<string, string>
   );
 }
 
+function hasOnlyExplicitNoopSupersededFailures(unresolved: Map<string, string>): boolean {
+  if (unresolved.size === 0) return true;
+  return [...unresolved.entries()].every(([key, detail]) =>
+    ((key.startsWith('verification:run_tests:') || key.startsWith('verification:run_program:')) &&
+      /tool not allowed for this step: (?:run_tests|run_program)/iu.test(detail)) ||
+    (key.startsWith('path:') && /permission denied for file_write:/iu.test(detail)),
+  );
+}
+
+function canAcceptDeferredVerificationFailure(
+  input: ExecutorRunInput,
+  unresolved: Map<string, string>,
+  calls: ExecutorRunResult['toolCalls'],
+  assessment: StageQualityAssessment | undefined,
+): boolean {
+  if (!input.debugContext?.deferredVerificationScope || unresolved.size === 0) return false;
+  if (!assessment || assessment.blockedBy.length === 0) return false;
+  const hasExecutedFailure = calls.some((call) =>
+    call.tool === 'run_tests' &&
+    !call.ok &&
+    !/permission denied/iu.test(call.error ?? call.summary ?? '')
+  );
+  if (!hasExecutedFailure) return false;
+  return [...unresolved.entries()].every(([key, detail]) =>
+    key.startsWith('verification:run_tests:') &&
+    /run_tests FAIL/iu.test(detail),
+  );
+}
+
+function canAcceptDeferredNoopHandoff(
+  input: ExecutorRunInput,
+  initialMissing: number,
+  calls: ExecutorRunResult['toolCalls'],
+  assessment: StageQualityAssessment | undefined,
+  disposition: BugResolutionDisposition | undefined,
+): boolean {
+  if (!input.debugContext?.deferredVerificationScope || initialMissing !== 0) return false;
+  if (isValidationContractDefect(input)) return false;
+  if (!assessment || assessment.gaps.length > 0 || assessment.blockedBy.length === 0) return false;
+  if (classifyDeferredBugNoopProblem(input, calls, disposition)) return false;
+  if (input.step.outputs.length === 0) return false;
+  const available = new Set([
+    ...(input.contextSnippets ?? []).map((snippet) => normalizeRelPath(snippet.path)),
+    ...calls
+      .filter((call) => call.tool === 'read_file' && call.ok && typeof call.args?.path === 'string')
+      .map((call) => normalizeRelPath(call.args!.path as string)),
+  ]);
+  return input.step.outputs.every((output) => available.has(normalizeRelPath(output)));
+}
+
+function classifyDeferredBugNoopProblem(
+  input: ExecutorRunInput,
+  calls: readonly ToolCallRecord[],
+  disposition: BugResolutionDisposition | undefined,
+): {
+  reason: 'missing' | 'owned-artifact' | 'uninspected-artifact';
+  artifacts: string[];
+} | undefined {
+  if (input.ticket?.type !== 'bug' || !disposition) {
+    return { reason: 'missing', artifacts: [] };
+  }
+  const affectedArtifacts = [...new Set(disposition.affectedArtifacts.map(normalizeComparablePath))];
+  const ownedArtifacts = affectedArtifacts.filter((artifact) =>
+    input.step.outputs.some((output) => pathsOverlap(output, artifact)),
+  );
+  if (ownedArtifacts.length > 0) {
+    return { reason: 'owned-artifact', artifacts: ownedArtifacts };
+  }
+  const available = new Set([
+    ...(input.contextSnippets ?? []).map((snippet) => normalizeComparablePath(snippet.path)),
+    ...calls
+      .filter((call) => call.ok && call.tool === 'read_file' && typeof call.args?.path === 'string')
+      .map((call) => normalizeComparablePath(String(call.args!.path))),
+  ]);
+  const uninspected = affectedArtifacts.filter((artifact) => !available.has(artifact));
+  return uninspected.length > 0
+    ? { reason: 'uninspected-artifact', artifacts: uninspected }
+    : undefined;
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const a = normalizeComparablePath(left);
+  const b = normalizeComparablePath(right);
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function isValidationContractDefect(input: ExecutorRunInput): boolean {
+  return input.ticket?.type === 'bug' &&
+    input.ticket.failure.code === VALIDATION_CONTRACT_DEFECT_CODE;
+}
+
+function validationDefectFromTestFailure(
+  phase: Step['phase'],
+  failure: ToolResult & { tool: string },
+): string {
+  const evidence = [failure.summary, failure.error].filter((value): value is string => !!value?.trim()).join('\n');
+  return `${phase} executable test gate failed:\n${truncate(evidence || 'run_tests failed without details', 4000)}`;
+}
+
+function validationDefectFromChangeRequestDisposition(
+  input: ExecutorRunInput,
+  disposition: ChangeRequestDisposition | undefined,
+): string | undefined {
+  if (
+    !input.changeRequest?.originFailure ||
+    disposition?.outcome !== 'not-applicable' ||
+    disposition.reasonCategory !== 'diagnosis-contradicted'
+  ) return undefined;
+  return [
+    `Change Request ${input.changeRequest.name} diagnosis was contradicted at ${input.step.id}.`,
+    disposition.rationale,
+    ...disposition.evidence.map((item) => `Evidence: ${item}`),
+  ].join('\n');
+}
+
+function normalizeDeferredVerificationAssessment(
+  assessment: StageQualityAssessment,
+  scope: NonNullable<NonNullable<ExecutorRunInput['debugContext']>['deferredVerificationScope']>,
+): StageQualityAssessment {
+  const note =
+    `Paired ${scope.phase} Step ${scope.stepId} remains deferred; its failed tests are recorded in ` +
+    'tool evidence and blockedBy, not counted as failures of the current upstream Step.';
+  return {
+    ...assessment,
+    tolerance: {
+      ...assessment.tolerance,
+      failedTests: 0,
+      skippedTests: 0,
+    },
+    evidence: [...new Set([...assessment.evidence, note])],
+  };
+}
+
 function isOutputCompletionFailure(reason = '', failureLog = ''): boolean {
   const text = `${reason}\n${failureLog}`;
   return /max rounds exceeded without satisfying outputs/i.test(text) ||
@@ -1460,6 +2197,29 @@ function isOutputCompletionFailure(reason = '', failureLog = ''): boolean {
     /missing\s+(?:required\s+)?outputs?/i.test(text) ||
     /outputs?\s*仍缺失/u.test(text) ||
     /仍缺失[:：]/u.test(text);
+}
+
+function validateExecutionTurnContract(
+  text: string,
+  step: Step,
+  toolMap: Map<string, Tool>,
+): void {
+  if (!isCompleteTurnJson(text)) {
+    throw new Error('low-quality Executor response: incomplete or invalid JSON turn');
+  }
+  const turn = parseTurn(text);
+  const actions = normalizeActions(turn.actions, toolMap).actions;
+  if (turn.done !== true || actions.length > 0 || !step.qualityGate) return;
+
+  const assessment = normalizeQualityAssessment(
+    turn.qualityAssessment ?? turn.quality_assessment,
+  );
+  const missing = missingQualityAssessmentFields(step, assessment, true);
+  if (missing.length === 0) return;
+  throw new Error(
+    'low-quality Executor response: done=true with actions=[] requires a complete qualityAssessment; ' +
+    `missing: ${missing.join(', ')}; return the existing artifact or command evidence without rewriting outputs`,
+  );
 }
 
 function validateDebuggerRecoveryTurn(
@@ -1572,7 +2332,7 @@ async function automaticCodeDebugVerificationActions(input: {
   if (!input.actions.some((action) => isOutputMutationTool(action.tool))) return [];
   const automatic: LLMAction[] = [];
   const requestedTools = new Set(input.actions.map((action) => action.tool));
-  const hasInheritedTestGate = (input.ctx.defaultTestArgs?.length ?? 0) > 0;
+  const hasInheritedTestGate = (input.ctx.testGateArgs?.length ?? 0) > 0;
   const hasStaticPrerequisites =
     input.language === 'typescript' || await input.ctx.ws.exists('src');
   if (
@@ -1589,13 +2349,26 @@ async function automaticCodeDebugVerificationActions(input: {
     });
   }
   if (
-    (input.ctx.defaultTestArgs?.length ?? 0) > 0 &&
+    (input.ctx.testGateArgs?.length ?? 0) > 0 &&
     input.toolMap.has('run_tests') &&
     !requestedTools.has('run_tests')
   ) {
     automatic.push({ tool: 'run_tests', args: {} });
   }
   return automatic;
+}
+
+function automaticTestPhaseVerificationActions(input: {
+  actions: LLMAction[];
+  phase: Step['phase'];
+  toolMap: Map<string, Tool>;
+  calls: ToolCallRecord[];
+}): LLMAction[] {
+  if (!(V_MODEL_TEST_PHASES as readonly string[]).includes(input.phase)) return [];
+  if (!input.toolMap.has('run_tests')) return [];
+  if (input.actions.some((action) => action.tool === 'run_tests')) return [];
+  if (input.calls.some((call) => call.tool === 'run_tests')) return [];
+  return [{ tool: 'run_tests', args: {} }];
 }
 
 function didPerformSuccessfulMutation(action: LLMAction, result: ToolResult): boolean {
@@ -1632,7 +2405,7 @@ const COMPLETION_VERIFICATION_TOOLS = new Set([
   'run_tests',
 ]);
 
-function hasSuccessfulCompletionVerification(calls: ExecutorRunResult['toolCalls']): boolean {
+function hasSuccessfulCompletionVerification(calls: readonly ToolCallRecord[]): boolean {
   return calls.some((call) => call.ok && COMPLETION_VERIFICATION_TOOLS.has(call.tool));
 }
 
@@ -1674,6 +2447,7 @@ function compactTurnForHistory(turn: LLMTurn, toolMap?: Map<string, Tool>): stri
   return JSON.stringify({
     thoughts: truncate(`${turn.thoughts ?? ''}${omittedSummary}`, 900),
     bugResolutionPlan: truncate(extractBugResolutionPlan(turn) ?? '', 900),
+    bugResolutionDisposition: extractBugResolutionDisposition(turn),
     actions: safeActions.map((action) => ({
       tool: action.tool,
       args: compactActionArgs(action.tool, action.args),
@@ -1725,6 +2499,13 @@ function updateUnresolvedToolFailures(
   const keys = actionResolutionKeys(action);
   if (result.ok) {
     for (const key of keys) unresolved.delete(key);
+    const capability = canonicalToolCapability(action.tool);
+    if (capability) {
+      const aliasPrefix = `alias-capability:${capability}:`;
+      for (const key of unresolved.keys()) {
+        if (key.startsWith(aliasPrefix)) unresolved.delete(key);
+      }
+    }
     if (!COMPLETION_VERIFICATION_TOOLS.has(action.tool)) {
       unresolved.delete(`tool:${action.tool}`);
     }
@@ -1771,6 +2552,10 @@ function isIgnorableReadOnlyToolFailure(action: LLMAction, result: ToolResult): 
 }
 
 function actionResolutionKeys(action: LLMAction): string[] {
+  const aliasCapability = aliasedCommandCapability(action);
+  if (aliasCapability) {
+    return [`alias-capability:${aliasCapability}:${action.tool}`];
+  }
   if (COMPLETION_VERIFICATION_TOOLS.has(action.tool)) {
     return [`verification:${verificationActionKey(action)}`];
   }
@@ -1779,8 +2564,42 @@ function actionResolutionKeys(action: LLMAction): string[] {
   return [`tool:${action.tool}`];
 }
 
+type ToolCapability = 'inspection' | 'program' | 'test';
+
+function canonicalToolCapability(tool: string): ToolCapability | undefined {
+  if (tool === 'read_file' || tool === 'list_dir' || tool === 'code_search') return 'inspection';
+  if (tool === 'run_tests') return 'test';
+  if (tool === 'run_program') return 'program';
+  return undefined;
+}
+
+function aliasedCommandCapability(action: LLMAction): ToolCapability | undefined {
+  if (!['execute_command', 'run_command', 'run_shell'].includes(action.tool)) return undefined;
+  if (!isPlainRecord(action.args) || typeof action.args.command !== 'string') return undefined;
+  const command = action.args.command.trim().toLowerCase();
+  if (/^(?:npm\s+(?:run\s+)?test|npx\s+(?:vitest|jest)|pytest|python\s+-m\s+pytest)\b/u.test(command)) {
+    return 'test';
+  }
+  if (/^(?:cat|find|grep|head|ls|rg|sed|tail|wc)\b/u.test(command)) return 'inspection';
+  if (/^(?:node|npm\s+run\s+(?:build|start)|npx\s+(?:tsc|tsx)|python(?:3)?\b)/u.test(command)) {
+    return 'program';
+  }
+  return undefined;
+}
+
 function verificationActionKey(action: LLMAction): string {
-  return `${action.tool}:${stableActionValue(action.args)}`;
+  return `${action.tool}:${stableActionValue(verificationIdentityArgs(action.args))}`;
+}
+
+function verificationIdentityArgs(args: unknown): unknown {
+  if (!isPlainRecord(args)) return args;
+  const { timeoutMs: _timeoutMs, ...identity } = args;
+  return {
+    ...identity,
+    cwd: typeof identity.cwd === 'string' && identity.cwd.trim()
+      ? identity.cwd
+      : '.',
+  };
 }
 
 function verificationActionLabel(action: LLMAction): string {
@@ -1807,157 +2626,6 @@ function stableActionValue(value: unknown): string {
   return JSON.stringify(value) ?? String(value);
 }
 
-function actionTargetPaths(tool: string, args: unknown): string[] {
-  if (!isPlainRecord(args)) return [];
-  if (tool === 'read_file') {
-    return typeof args.path === 'string' ? [normalizeRelPath(args.path)] : [];
-  }
-  if (tool === 'list_dir') {
-    return typeof args.path === 'string' ? [normalizeRelPath(args.path)] : ['.'];
-  }
-  if (tool === 'code_search') {
-    return typeof args.root === 'string' ? [normalizeRelPath(args.root)] : ['.'];
-  }
-  if (tool === 'write_file' || tool === 'append_file' || tool === 'replace_in_file') {
-    return typeof args.path === 'string' ? [normalizeRelPath(args.path)] : [];
-  }
-  if (tool === 'apply_patch' && typeof args.patch === 'string') {
-    return extractPatchTargets(args.patch).map(normalizeRelPath);
-  }
-  if (tool === 'add_dependency') return ['requirements.txt'];
-  if (tool === 'http_fetch' && typeof args.saveAs === 'string') {
-    return [normalizeRelPath(args.saveAs)];
-  }
-  return [];
-}
-
-function extractPatchTargets(patch: string): string[] {
-  const out = new Set<string>();
-  for (const line of patch.split('\n')) {
-    const m =
-      line.match(/^\*\*\* (?:Update File|Add File|Delete File):\s+(.+)$/) ??
-      line.match(/^\+\+\+\s+b\/(.+)$/) ??
-      line.match(/^---\s+a\/(.+)$/);
-    if (m?.[1] && m[1] !== '/dev/null') out.add(m[1].trim());
-  }
-  return [...out];
-}
-
-function normalizeRelPath(p: string): string {
-  return p.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
-}
-
-function buildPermissionRequest(
-  tool: string,
-  args: unknown,
-  stepId: string,
-  language: ToolContext['language'],
-  stepName?: string,
-): ToolPermissionRequest | undefined {
-  const argRecord = isPlainRecord(args) ? args : {};
-  const target = actionTargetPaths(tool, args).join(', ');
-  const runtime = language === 'typescript' ? 'npm' : 'python';
-  const stepLabel = stepName?.trim() || stepId;
-  if (tool === 'write_file' || tool === 'append_file' || tool === 'replace_in_file' || tool === 'apply_patch') {
-    return {
-      operationType: 'file_write',
-      target: target || '(workspace file)',
-      reason: `Step ${stepLabel} requested ${tool} to update project files.`,
-      risk: 'This operation modifies files in the current workspace.',
-      scope: 'current workspace',
-      skippable: true,
-      denyBehavior: 'The tool call is skipped and the agent must continue with an alternative or fail the step.',
-      stepId,
-      tool,
-      metadata: { stepName: stepLabel, args: redactLargeArgs(args) },
-    };
-  }
-  if (tool === 'add_dependency') {
-    return {
-      operationType: 'config_change',
-      target: language === 'typescript' ? 'package.json' : 'requirements.txt',
-      reason: `Step ${stepLabel} requested dependency manifest changes.`,
-      risk: 'This can alter project dependencies and may trigger sandbox rebuilds.',
-      scope: 'current workspace dependency manifest',
-      skippable: true,
-      denyBehavior: 'The dependency change is skipped; later build or test steps may fail and report the missing dependency.',
-      stepId,
-      tool,
-      metadata: { stepName: stepLabel, args },
-    };
-  }
-  if (tool === 'install_deps') {
-    return {
-      operationType: 'install_dependency',
-      target: Array.isArray(argRecord.packages) ? argRecord.packages.join(', ') : '(packages)',
-      reason: `Step ${stepLabel} requested dependency installation.`,
-      risk: 'This may execute package manager scripts and download code from registries.',
-      scope: 'current workspace sandbox',
-      skippable: true,
-      denyBehavior: 'Dependency installation is skipped and the task continues with the missing dependency reported.',
-      stepId,
-      tool,
-      metadata: { stepName: stepLabel, args },
-    };
-  }
-  if (tool === 'run_tests') {
-    return {
-      operationType: 'test_command',
-      target: runtime === 'npm' ? 'npm test' : 'pytest',
-      reason: `Step ${stepLabel} requested test execution to validate changes.`,
-      risk: 'Project test scripts may execute arbitrary local project code.',
-      scope: 'current workspace sandbox',
-      skippable: true,
-      denyBehavior: 'Tests are skipped and the final result must mark verification as incomplete.',
-      stepId,
-      tool,
-      metadata: { stepName: stepLabel, args },
-    };
-  }
-  if (tool === 'run_program') {
-    return {
-      operationType: 'shell_command',
-      target: `${runtime} ${Array.isArray(argRecord.args) ? argRecord.args.join(' ') : ''}`.trim(),
-      reason: `Step ${stepLabel} requested program execution.`,
-      risk: 'This executes project code in the configured sandbox.',
-      scope: 'current workspace sandbox',
-      skippable: true,
-      denyBehavior: 'The command is skipped and the agent must use another validation strategy or fail the step.',
-      stepId,
-      tool,
-      metadata: { stepName: stepLabel, args },
-    };
-  }
-  if (tool === 'http_fetch') {
-    return {
-      operationType: 'network_access',
-      target: typeof argRecord.url === 'string' ? argRecord.url : '(url)',
-      reason: `Step ${stepLabel} requested network access.`,
-      risk: 'This contacts an external HTTP endpoint from the host process.',
-      scope: 'network',
-      skippable: true,
-      denyBehavior: 'The network call is skipped; the agent must use local context or report the missing data.',
-      stepId,
-      tool,
-      metadata: { stepName: stepLabel, args: redactLargeArgs(args) },
-    };
-  }
-  return undefined;
-}
-
-function redactLargeArgs(args: unknown): Record<string, unknown> {
-  if (!isPlainRecord(args)) return { value: args ?? null };
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
-    if (typeof value === 'string' && value.length > 500) {
-      out[key] = `${value.slice(0, 500)}... [truncated ${value.length - 500} chars]`;
-    } else {
-      out[key] = value;
-    }
-  }
-  return out;
-}
-
 /**
  * Rebuilds the environment as soon as a tool writes the dependency manifest.
  *
@@ -1982,6 +2650,29 @@ export async function syncSandboxIfManifestWritten(
   const manifest = getLanguageProfile(ctx.language ?? 'python').manifestFile;
   const changed = changedFilesForAction(action.tool, action.args, result);
   if (!changed.some((file) => file.replace(/^\.\//, '') === manifest)) return;
+  if (ctx.requestPermission) {
+    const decision = await ctx.requestPermission({
+      id: randomUUID(),
+      operationType: 'install_dependency',
+      target: manifest,
+      reason: `${action.tool} changed ${manifest}; the sandbox must install the declared dependencies before later build and test commands.`,
+      risk: 'The package manager may download code and execute dependency installation scripts.',
+      scope: 'current workspace sandbox',
+      skippable: true,
+      denyBehavior: 'Keep the manifest change but skip sandbox synchronization; later build or test commands will report missing dependencies.',
+      stepId: ctx.stepId,
+      tool: 'sandbox_sync',
+      metadata: { triggerTool: action.tool, manifest },
+    });
+    if (!decision.approved) {
+      await ctx.audit?.event('note', `sandbox sync skipped after ${action.tool} wrote ${manifest}`, {
+        messageId: 'execute.sandbox_sync_after_manifest_write_denied',
+        manifest,
+        reason: decision.reason,
+      });
+      return;
+    }
+  }
   try {
     await ctx.sandbox.build(manifest);
     await ctx.audit?.event('note', `sandbox synced after ${action.tool} wrote ${manifest}`, {
@@ -2009,6 +2700,19 @@ function changedFilesForAction(tool: string, args: unknown, result: ToolResult):
     return [];
   }
   return actionTargetPaths(tool, args);
+}
+
+function mutationRequiresExecutionVerification(action: LLMAction, result: ToolResult): boolean {
+  if (action.tool === 'add_dependency') return true;
+  const changedFiles = changedFilesForAction(action.tool, action.args, result);
+  if (changedFiles.length === 0) return true;
+  return changedFiles.some((file) => {
+    const normalized = normalizeRelPath(file).toLowerCase();
+    return !(
+      normalized.startsWith('docs/') &&
+      /\.(?:adoc|md|mdx|rst|txt)$/u.test(normalized)
+    );
+  });
 }
 
 function computeMetrics(p: {
@@ -2041,57 +2745,6 @@ function computeMetrics(p: {
     healthScore: score,
     providers: [...new Set(p.providers)],
   };
-}
-
-export async function verifyOutputs(inp: ExecutorRunInput): Promise<{ ok: boolean; missing: string[] }> {
-  const missing: string[] = [];
-  for (const out of inp.step.outputs) {
-    if (out.endsWith('/')) continue; // 目录约束跳过显式文件检查
-    // A Step routinely declares `tests/unit/*.test.ts` before any of those files exist. Checking a
-    // pattern as a literal filename can never succeed, so the Step could not report completion no
-    // matter what it wrote — the same mismatch the write allowlist had.
-    if (isPathPattern(out)) {
-      if (!(await hasOutputMatching(inp, out))) missing.push(out);
-      continue;
-    }
-    const exists = await inp.ctx.ws.exists(out);
-    if (!exists || !(await hasSubstantiveOutputContent(inp, out))) missing.push(out);
-  }
-  return { ok: missing.length === 0, missing };
-}
-
-/** A pattern is satisfied by one substantive file matching it. */
-async function hasOutputMatching(inp: ExecutorRunInput, pattern: string): Promise<boolean> {
-  // Walk only the fixed prefix of the pattern; walking the workspace root would descend into
-  // node_modules on every check.
-  const prefix = pattern.split('/').slice(0, -1)
-    .reduce<string[]>((kept, part) => (
-      kept.length === pattern.split('/').length - 1 || /[*?]/u.test(part) ? kept : [...kept, part]
-    ), []).join('/');
-  const root = inp.ctx.ws.abs(prefix);
-  const entries = await fs.readdir(root, { recursive: true, withFileTypes: true }).catch(() => []);
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const absolute = path.join(entry.parentPath ?? root, entry.name);
-    const rel = path.relative(inp.ctx.ws.root, absolute).split(path.sep).join('/');
-    if (!matchesPathPattern(rel, pattern)) continue;
-    if (await hasSubstantiveOutputContent(inp, rel)) return true;
-  }
-  return false;
-}
-
-async function hasSubstantiveOutputContent(inp: ExecutorRunInput, output: string): Promise<boolean> {
-  if (output.endsWith('/__init__.py') || output.endsWith('/.gitkeep')) return true;
-  const stat = await fs.stat(inp.ctx.ws.abs(output)).catch(() => undefined);
-  if (!stat?.isFile() || stat.size === 0) return false;
-  if (!isTextOutput(output)) return true;
-  const content = await fs.readFile(inp.ctx.ws.abs(output), 'utf8').catch(() => '');
-  return content.trim().length > 0;
-}
-
-function isTextOutput(output: string): boolean {
-  return /(?:^|\/)(?:README|LICENSE)(?:\.[A-Za-z0-9]+)?$/iu.test(output) ||
-    /\.(?:cjs|css|csv|hbs|html?|ini|json|jsx?|md|mjs|py|toml|tsx?|txt|xml|ya?ml)$/iu.test(output);
 }
 
 function truncate(s: string, n: number): string {

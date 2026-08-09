@@ -25,6 +25,8 @@ export class WorkScheduler {
     const phase = await this.requirePhase(phaseId);
     const steps = await this.phaseSteps(phase);
     const tickets = await this.tickets.list();
+    const resumed = await this.inProgressWork(phase, steps, tickets);
+    if (resumed) return resumed;
     for (const step of steps) {
       if (step.state === 'closed' || !(await this.stepDependenciesReady(step))) continue;
       const corrective = activeCorrectiveTicket(step, tickets);
@@ -51,20 +53,67 @@ export class WorkScheduler {
 
   async resume(phaseId: ObjectId): Promise<ScheduledWork | undefined> {
     const phase = await this.requirePhase(phaseId);
-    const inProgress = (await this.phaseSteps(phase)).filter((step) => step.state === 'in_progress');
+    const steps = await this.phaseSteps(phase);
+    const inProgress = steps.filter((step) => step.state === 'in_progress');
     if (inProgress.length > 1) {
       throw new Error(
         `Phase ${phase.name} has multiple in-progress Steps: ${inProgress.map((step) => step.name).join(', ')}`,
       );
     }
-    if (inProgress.length === 0) return this.next(phaseId);
     const tickets = await this.tickets.list();
+    const resumed = await this.inProgressWork(phase, steps, tickets);
+    if (resumed) return resumed;
+    if (inProgress.length === 0) return this.next(phaseId);
     const step = inProgress[0]!;
     const active = activeCorrectiveTicket(step, tickets) ?? tickets.find(
       (ticket) => ticket.type === 'story' && ticket.stepId === step.id && ticket.state === 'in_progress',
     );
     if (!active) throw new Error(`In-progress Step ${step.name} has no active Ticket`);
     return { phase, step, ticket: active, mode: modeFor(active) };
+  }
+
+  /**
+   * Resume owned work before dispatching anything new.
+   *
+   * A corrective child parks its parent Ticket and Step. Closing the child restores the parent
+   * Ticket to `in_progress`; the Step intentionally remains `pending` until `ProjectController`
+   * starts that Ticket again. Looking only at Step state loses this hand-off and lets an earlier
+   * created Ticket compete with the parent's already-reserved actor capacity.
+   */
+  private async inProgressWork(
+    phase: Phase,
+    steps: readonly Step[],
+    tickets: readonly Ticket[],
+  ): Promise<ScheduledWork | undefined> {
+    const stepById = new Map(steps.map((step) => [step.id, step]));
+    const candidates = tickets
+      .filter((ticket) => ticket.state === 'in_progress')
+      .filter((ticket) => ticket.blockedByTicketIds.length === 0)
+      .map((ticket) => {
+        const stepId = scheduledStepId(ticket);
+        return { ticket, step: stepId ? stepById.get(stepId) : undefined };
+      })
+      .filter((entry): entry is { ticket: Ticket; step: Step } =>
+        !!entry.step && entry.step.state !== 'closed')
+      .sort((left, right) =>
+        STEP_TYPE_ORDER[left.step.type] - STEP_TYPE_ORDER[right.step.type] ||
+        correctionRank(right.ticket) - correctionRank(left.ticket) ||
+        right.ticket.priority - left.ticket.priority ||
+        left.ticket.id.localeCompare(right.ticket.id));
+    for (const candidate of candidates) {
+      if (
+        await this.stepDependenciesReady(candidate.step) &&
+        await this.ticketDependenciesReady(candidate.ticket, tickets)
+      ) {
+        return {
+          phase,
+          step: candidate.step,
+          ticket: candidate.ticket,
+          mode: modeFor(candidate.ticket),
+        };
+      }
+    }
+    return undefined;
   }
 
   async phaseSteps(phase: Phase): Promise<Step[]> {
@@ -121,6 +170,13 @@ function correctionRank(ticket: Ticket): number {
   if (ticket.type === 'bug') return 2;
   if (ticket.type === 'enhancement') return 1;
   return 0;
+}
+
+function scheduledStepId(ticket: Ticket): ObjectId | undefined {
+  if (ticket.type === 'change-request') return ticket.targetStepId;
+  if (ticket.type === 'story' && ticket.workKind !== 'v-model-step') return undefined;
+  if (ticket.type === 'epic' || ticket.type === 'task') return undefined;
+  return workStepId(ticket);
 }
 
 function modeFor(ticket: Ticket): WorkMode {

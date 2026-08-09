@@ -3,6 +3,7 @@ import type { Sandbox } from '../../sandbox/types.js';
 import type { GateCheckResult } from '../../domain/workspace/merge_request.js';
 import { classifyFailure } from '../execution/failure_classification.js';
 import type { RecordReplayController } from '../record_replay/controller.js';
+import type { MergeGateScope } from './merge_integration_service.js';
 
 /**
  * Runs the generated project's own build and tests against a merge candidate.
@@ -18,6 +19,7 @@ export async function runMergeGateChecks(
   sandbox: Sandbox,
   language: Language,
   recordReplay?: RecordReplayController,
+  scope: MergeGateScope = 'phase',
 ): Promise<GateCheckResult[]> {
   const execute = async (): Promise<GateCheckResult[]> => {
     const checks: GateCheckResult[] = [];
@@ -29,7 +31,16 @@ export async function runMergeGateChecks(
     // would be worse than reporting only that the environment could not be prepared.
     if (!build.ok) return checks;
 
-    checks.push(await attempt('tests', () => sandbox.runTests()));
+    if (scope === 'ticket') {
+      checks.push(await attempt(
+        language === 'typescript' ? 'typecheck' : 'compile',
+        () => language === 'typescript'
+          ? sandbox.runProgram(['tsc', '--noEmit'])
+          : sandbox.runProgram(['-m', 'compileall', '-q', 'src']),
+      ));
+    } else {
+      checks.push(await attempt('tests', () => sandbox.runTests()));
+    }
     return checks;
   };
   return recordReplay && recordReplay.mode !== 'off'

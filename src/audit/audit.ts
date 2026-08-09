@@ -60,7 +60,7 @@ export interface AuditEvent {
 export interface AuditLoggerOptions {
   /** 工作副本根目录（绝对路径）；人类可读过程日志属于版本化产物，写在这里。 */
   root: string;
-  /** 容器状态根（绝对路径）；结构化审计属于项目状态，不进 Git。默认退回 root 以兼容独立调用。 */
+  /** 容器状态根（绝对路径）；结构化审计属于项目状态，不进 Git；独立调用默认使用 root。 */
   stateRoot?: string;
   /** 命令名，例如 `xcompiler_build` / `xcompiler_run` */
   command: string;

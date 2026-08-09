@@ -76,6 +76,16 @@ export function classifyFailure(
       statusCode: parseStatusCode(message),
     };
   }
+  if (AGENT_EXECUTION_STALL_TEXT.test(message)) {
+    return {
+      kind: 'execution',
+      category: 'internal',
+      code: 'agent_execution_stalled',
+      message,
+      retryable: true,
+      switchProvider: true,
+    };
+  }
   return {
     kind: 'execution',
     category: 'internal',
@@ -97,6 +107,9 @@ export function classifyFailure(
  */
 const PROVIDER_FAILURE_TEXT =
   /\ball LLM providers failed\b|\bOpenAI-compatible provider request failed\b|\bstream idle before first token\b|\bprovider_call_failed\b/iu;
+
+const AGENT_EXECUTION_STALL_TEXT =
+  /repeated read-only\/probe actions|read-only recovery mode repeated probe actions|model returned actions=\[\] and done=false|invalid completion loop|max rounds exceeded|low-quality (?:debugger )?response/iu;
 
 function parseStatusCode(message: string): number | undefined {
   const match = /\bstatus=(\d{3})\b/u.exec(message);

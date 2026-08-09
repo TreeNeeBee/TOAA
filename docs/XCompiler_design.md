@@ -176,6 +176,9 @@ Application 层的 PM Orchestrator 是唯一项目推进者；它通过 `WorkSch
 4. CR 已记录 application 的 Step 不得重复调度。
 5. Step 尝试前递增 `attempts`；达到 `maxAttempts` 时明确失败。
 6. 没有可运行项时，只有所有 Step、Story、纠正 Ticket 和最终审计通过才允许关闭 Phase。
+7. 调度不使用固定的全局跳转次数。`ProjectProgressGuard` 比较 Phase、Step、Ticket、
+   ChangeSet、Merge Request 和 Gate 的语义快照；只有连续三次调度后状态完全没有推进才停止，
+   因而复杂项目不会因规模大被误杀，真实循环也不会无限消耗模型额度。
 
 数组顺序不构成依赖，显示名不构成身份，Planner 状态不参与裁决。
 
@@ -253,6 +256,12 @@ docs/project-development-report.md     delivery projection
 
 注册表每次更新校验对象类型、父关系、Project 归属、revision 和内容哈希。事件流可重放并重建 index；对象损坏、孤儿引用或跨 Project 父关系必须明确报错。
 
+Git 合并使用可恢复的领域事务：门禁通过后先把 Merge Request 持久化为 `mergeable`，再执行带
+`[xcompiler:<changeSetId>]` 标记的 squash commit，最后提交 ChangeSet/Merge Request 的
+`merged` 状态。若进程在 Git 提交和领域提交之间中断，下次 Run 会核对目标提交的父提交、消息
+标记和最近一次通过的 Gate；证据一致时补交领域状态并清理 worktree，证据不一致时明确阻塞，
+不会重复合并或伪造完成。
+
 ## 13. Record/Replay
 
 HTTP、LLM 和 subprocess 外部交互通过统一端口记录；测试逻辑不内嵌特定 API 的 fixture 规则。`record`/`refresh` 只能由显式 fixture 准备命令触发，验证阶段强制 `replay`，缺失、歧义、哈希链损坏、未脱敏或过期 fixture 都明确失败。`refresh` 追加 supersession 关系，不覆盖历史证据。
@@ -263,9 +272,21 @@ Runtime 通过事件暴露 `project_planned`、`phase_started`、`ticket_started
 
 Run 中 shell、文件修改、删除、依赖安装、配置修改、Git、网络、测试、构建和工作区外访问都必须通过权限接口。拒绝不能静默：Runtime 要么采用明确替代路径，要么返回失败并写入最终报告。
 
+RuntimeIO 明确声明 `request`、`allow` 或 `deny` 权限策略。CLI 和 ACP Run 使用 `request` 并把
+每个敏感操作交给用户；只有嵌入方显式选择 `allow` 才可无交互批准。静默 Runtime 和缺失授权
+回调默认 `deny`。任何拒绝会终止当前推进并保持可恢复状态，不能继续执行下游 Step。
+
 ACP 取消把同一 AbortSignal 传入 Build、Run、Planner、Executor 和 OpenAI-compatible 网络请求。权限等待立即取消；无法中断的本地操作以 best-effort 完成后停止，不会静默报告成功。
 
-## 15. 不变量
+## 15. 项目交付报告
+
+迭代报告只评估当前 Phase；最终项目报告必须扫描 Project 下的全部 Phase、八阶段 Step、
+QualityAssessment、Epic、Delivery、纠正 Ticket 和 PM 状态。只有每个 Phase 都完成完整 V 模型、
+所有质量证据通过、全部交付与纠正 Ticket 关闭且 Project 已关闭时，报告才标记 `READY`。
+报告中的质量表包含 Iteration 列，关联对象覆盖所有纳入判定的 Phase、Step 和 Ticket，避免后续
+Phase 未完成时因当前 Phase 通过而误报项目已交付。
+
+## 16. 不变量
 
 - Runtime 是唯一业务入口。
 - 一个 workspace 只能有一个未 tombstone 的 Project。

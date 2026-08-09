@@ -104,6 +104,11 @@ export class GitService {
   /** 硬重置到指定 ref；用于 DEBUG 失败回滚。 */
   async revertTo(ref: string): Promise<void> {
     await this.git.reset(['--hard', ref]);
+    // The baseline snapshot committed every project file that existed before the attempt. Any
+    // remaining untracked, non-ignored path was therefore created by the failed attempt and must be
+    // removed as part of the same rollback. Runtime state, sandboxes, dependency caches, and other
+    // excluded paths remain untouched because `git clean` respects Git ignore/exclude rules here.
+    await this.git.raw(['clean', '-fd']);
   }
 
   /** 返回最近 N 条 [xcompiler] 提交。 */

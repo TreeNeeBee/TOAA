@@ -20,6 +20,7 @@ export {
 } from './runtime/commands.js';
 export {
   silentRuntimeIO,
+  runtimePermissionAuthorizer,
   type RuntimeEvent,
   type RuntimeEventEnvelope,
   type RuntimeEventInput,
@@ -30,6 +31,7 @@ export {
   type RuntimeFileChangedEvent,
   type RuntimePatchProposedEvent,
   type RuntimePermissionEvent,
+  type RuntimePermissionPolicy,
   type RuntimeProgress,
   type RuntimeProgressEvent,
   type RuntimeResultEvent,

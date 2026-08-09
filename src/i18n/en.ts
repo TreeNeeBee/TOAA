@@ -99,6 +99,7 @@ Every round you must return strict JSON:
 {
   "thoughts": "<one sentence describing this round's intent>",
   "bugResolutionPlan": "<required only for a DEBUG Bug Ticket: concise root cause, repair target, and validation plan>",
+  "changeRequestDisposition": null,
   "validationDefect": null,
   "qualityAssessment": {
     "completion": 1,
@@ -208,6 +209,7 @@ Every round you must return strict JSON:
 {
   "thoughts": "<one sentence describing this round's intent>",
   "bugResolutionPlan": "<required only for a DEBUG Bug Ticket: concise root cause, repair target, and validation plan>",
+  "changeRequestDisposition": null,
   "validationDefect": null,
   "qualityAssessment": {
     "completion": 1,
@@ -293,6 +295,12 @@ Target language: ${profile.displayName}.
 
 You will receive a frozen PhasePlan and a phaseId. Generate Steps only for that phaseId. Planned phases must not be expanded into this StepPlan.
 
+The target phase's objective, scope, deliverables, and verification gate are the authoritative
+specification for this StepPlan. Every planned phase is explicitly out of scope: do not copy its
+features, packages, artifacts, or acceptance criteria into the current phase. Rewrite
+requirementDigest and globalPrompt for the target phase only, and exclude dependencies used solely
+by a future planned phase.
+
 Every current phase must use the canonical V-model:
 REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TEST -> INTEGRATION_TEST -> MODULE_TEST -> FUNCTIONAL_TEST.
 
@@ -343,9 +351,12 @@ const messages: Messages = {
     invalidBaseUrl: (raw, fallback) => `[xcompiler] invalid base_url (${raw}); configure a valid HTTP(S) URL (default: ${fallback})`,
     providerValidationFailed: (role, model) => `[${role}] provider ${model} failed output contract validation`,
     providerValidationRetry: (role, model) => `[${role}] retrying provider ${model} with contract feedback before fallback`,
-    providerValidationRepairPrompt: (error) =>
-      `Your previous output failed the caller contract: ${error.slice(0, 1800)}\n` +
-      'Correct the complete response using the original system and user requirements. Return only the requested format without explanation or Markdown.',
+    providerValidationRepairPrompt: (error, rejectedOutput) =>
+      `Your previous candidate failed the caller contract before any action was parsed, authorized, executed, or persisted: ${error.slice(0, 1800)}\n` +
+      'Nothing claimed by that candidate changed the workspace. Treat only explicit tool results in the original conversation as executed state. ' +
+      'Return a complete corrected response using the original system and user requirements. If the rejected candidate intended a mutation, submit that mutation again; do not jump to verification until a caller tool result confirms it succeeded. ' +
+      'Return only the requested format without explanation or Markdown.\n\n' +
+      `<rejected-output never-executed="true">\n${rejectedOutput}\n</rejected-output>`,
     providerCallFailed: (role, model) => `[${role}] provider ${model} failed; trying next`,
     scoreReadFailed: (p, message) => `failed to read ${p}: ${message}`,
     scoreChanged: (provider, score, previous) => `score(${provider}) = ${score} (was ${previous})`,
@@ -363,7 +374,6 @@ const messages: Messages = {
       'sandbox network=off cannot be enforced in subprocess mode; use mode=docker or choose download-only/full explicitly.',
     dockerInsideContainerUnsupported:
       'XCompiler is running inside a container, so sandbox mode docker is unsupported because Docker-outside-of-Docker can mis-map bind mounts and docker.sock permissions. Use agent.sandboxes.<language>.mode=subprocess, run XCompiler on the host, or set XC_IN_CONTAINER=0 only in a controlled environment.',
-    firejailUnsupported: 'sandbox=firejail is not implemented; use subprocess or docker.',
     smokeHeader: (baseUrl) => `Smoke test against ${baseUrl} (streaming)`,
     smokeOk: (model, totalMs, firstTokenMs, chunks, preview) =>
       `[OK total=${totalMs}ms first-token=${firstTokenMs}ms chunks=${chunks}] ${model} -> ${preview}`,
@@ -805,6 +815,9 @@ Phase to expand now: ${opts.phaseId}
 Return a full V-model StepPlan only for ${opts.phaseId}:
 - Every Step.iterationId must equal "${opts.phaseId}".
 - Do not output Steps for any other planned phase; P2/P3 detailed plans are generated only when they become the current phase.
+- Treat every other planned phase as explicit excluded scope. Do not include its features, packages,
+  artifacts, or acceptance criteria in requirementDigest, globalPrompt, dependencies,
+  architectureModules, or steps.
 - If ${opts.phaseId} spans multiple concerns (domain logic, CLI/API, file I/O, external integration, orchestration, tests), declare architectureModules for this phase and map module-level work under HIGH_LEVEL_DESIGN/CODE/MODULE_TEST subTasks.
 - architectureModules.sourcePaths may only contain product source files under src/. Put product runtime non-code files in assetPaths. Do not register tests/fixtures, tests/utils, sample inputs, temporary outputs, directories, or docs as architecture modules.
 - architectureModules.testPaths must be module-contract tests authored by HIGH_LEVEL_DESIGN and executed by MODULE_TEST (normally tests/modules/*). CODE must author separate unit tests and must not repeat these testPaths.

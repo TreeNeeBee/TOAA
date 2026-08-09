@@ -7,6 +7,8 @@ import {
 import {
   advanceMergeRequest,
   type GateCheckResult,
+  type MergeGateRun,
+  type MergeRequest,
 } from '../../domain/workspace/merge_request.js';
 import type { MergeGateService } from './merge_gate_service.js';
 import { MergeConflictError, type GitMergePort } from './git_port.js';
@@ -26,7 +28,11 @@ export interface IntegrationOutcome {
 }
 
 /** Runs the project's own gates against a merge candidate checked out at `root`. */
-export type GateCheckRunner = (root: string) => Promise<GateCheckResult[]>;
+export type MergeGateScope = 'ticket' | 'phase';
+export type GateCheckRunner = (
+  root: string,
+  scope: MergeGateScope,
+) => Promise<GateCheckResult[]>;
 export type MergeAuthorizer = (changeSet: TicketChangeSet) => Promise<{
   approved: boolean;
   reason?: string;
@@ -85,7 +91,7 @@ export class MergeIntegrationService {
       return { status: 'nothing-to-merge', mergedRevisions: [] };
     }
     const mergedRevisions: string[] = [];
-    const outcome = await this.integrate(changeSet, mergedRevisions);
+    const outcome = await this.integrate(changeSet, mergedRevisions, 'ticket');
     return outcome ?? { status: 'merged', mergedRevisions };
   }
 
@@ -95,7 +101,45 @@ export class MergeIntegrationService {
 
     const mergedRevisions: string[] = [];
     for (const changeSet of pending) {
-      const outcome = await this.integrate(changeSet, mergedRevisions);
+      const outcome = await this.integrate(changeSet, mergedRevisions, 'phase');
+      if (outcome) return outcome;
+    }
+    return { status: 'merged', mergedRevisions };
+  }
+
+  /** Resumes only work that already passed its gate and stopped at the authorization boundary. */
+  async integratePendingAuthorization(
+    projectId: ObjectId,
+    phaseId: ObjectId,
+  ): Promise<IntegrationOutcome> {
+    const pending = (await this.pendingChangeSets(projectId, phaseId))
+      .filter((changeSet) => changeSet.state === 'gate-passed');
+    if (pending.length === 0) return { status: 'nothing-to-merge', mergedRevisions: [] };
+
+    const mergedRevisions: string[] = [];
+    for (const changeSet of pending) {
+      if (!changeSet.mergeRequestId) {
+        return {
+          status: 'blocked',
+          reason: `gate-passed ChangeSet ${changeSet.name} has no merge request`,
+          mergedRevisions,
+        };
+      }
+      const request = await this.repositoryRead(changeSet.mergeRequestId);
+      const reconciled = await this.reconcileMergeIntent(changeSet, request, mergedRevisions);
+      if (reconciled) {
+        if (reconciled.status !== 'merged') return reconciled;
+        continue;
+      }
+      const verdict = await this.options.gates.currentVerdict(request.id);
+      if (!verdict.ok || !verdict.run) {
+        return {
+          status: 'failed',
+          reason: verdict.reason ?? 'the previous merge gate is no longer current',
+          mergedRevisions,
+        };
+      }
+      const outcome = await this.mergeGatePassed(changeSet, request, verdict.run, mergedRevisions);
       if (outcome) return outcome;
     }
     return { status: 'merged', mergedRevisions };
@@ -104,6 +148,7 @@ export class MergeIntegrationService {
   private async integrate(
     changeSet: TicketChangeSet,
     mergedRevisions: string[],
+    scope: MergeGateScope,
   ): Promise<IntegrationOutcome | undefined> {
     let request;
     try {
@@ -136,7 +181,7 @@ export class MergeIntegrationService {
     }
     let checks: GateCheckResult[];
     try {
-      checks = await this.options.runChecks(candidate.root);
+      checks = await this.options.runChecks(candidate.root, scope);
     } catch (error) {
       checks = [{
         name: 'gate-execution',
@@ -178,6 +223,24 @@ export class MergeIntegrationService {
       await this.options.repository.update(tracked, tracked.state);
     }
 
+    const verdict = await this.options.gates.currentVerdict(request.id);
+    if (!verdict.ok || !verdict.run) {
+      return { status: 'failed', reason: verdict.reason, mergedRevisions };
+    }
+    return this.mergeGatePassed(
+      await this.freshChangeSet(changeSet.id),
+      request,
+      verdict.run,
+      mergedRevisions,
+    );
+  }
+
+  private async mergeGatePassed(
+    changeSet: TicketChangeSet,
+    request: MergeRequest,
+    run: MergeGateRun,
+    mergedRevisions: string[],
+  ): Promise<IntegrationOutcome | undefined> {
     if (!this.options.mayMerge) {
       if (!this.options.authorizeMerge) {
         return {
@@ -203,18 +266,15 @@ export class MergeIntegrationService {
       }
     }
 
-    const verdict = await this.options.gates.currentVerdict(request.id);
-    if (!verdict.ok) {
-      // The mainline moved between the gate passing and this merge, so the verdict no longer
-      // describes what would land.
-      return { status: 'failed', reason: verdict.reason, mergedRevisions };
-    }
-
     // `mergeable` is not a formality: it is the recorded fact that a passing gate was confirmed
     // still current, which is the only condition under which the squash below is authorized.
     const approvedRequest = await this.repositoryRead(request.id);
-    const mergeable = advanceMergeRequest(approvedRequest, ['mergeable']);
-    await this.options.repository.update(mergeable, mergeable.state);
+    const mergeable = approvedRequest.state === 'mergeable'
+      ? approvedRequest
+      : advanceMergeRequest(approvedRequest, ['mergeable']);
+    if (approvedRequest.state !== 'mergeable') {
+      await this.options.repository.update(mergeable, mergeable.state);
+    }
 
     // A merge that cannot run is reported, not thrown. Every other verdict here returns an outcome
     // the orchestrator handles; letting this one escape killed the process instead, after the gate
@@ -226,7 +286,7 @@ export class MergeIntegrationService {
         targetBranch: this.options.targetBranch,
         sourceBranch: changeSet.sourceBranch,
         expectedTargetRevision: run.targetRevision,
-        message: `[xcompiler] ${changeSet.name}`,
+        message: `${mergeCommitMarker(changeSet.id)} ${changeSet.name}`,
       });
     } catch (error) {
       return {
@@ -237,12 +297,17 @@ export class MergeIntegrationService {
     }
     mergedRevisions.push(merged);
 
-    await this.options.repository.commit([
-      advanceMergeRequest(mergeable, ['merged'], { mergedRevision: merged }),
-      transitionChangeSet(await this.freshChangeSet(changeSet.id), 'merged', {
-        mergedRevision: merged,
-      }),
-    ]);
+    try {
+      await this.persistMergedState(changeSet.id, mergeable, merged);
+    } catch (error) {
+      return {
+        status: 'blocked',
+        reason:
+          `merge ${merged} landed but its domain state could not be persisted: ${errorMessage(error)}; ` +
+          'the next run will reconcile the durable merge intent',
+        mergedRevisions,
+      };
+    }
     try {
       await this.options.releaseChangeSet(changeSet.id);
     } catch (error) {
@@ -253,6 +318,69 @@ export class MergeIntegrationService {
       };
     }
     return undefined;
+  }
+
+  /** Completes the domain half of a squash that landed before the process could persist it. */
+  private async reconcileMergeIntent(
+    changeSet: TicketChangeSet,
+    request: MergeRequest,
+    mergedRevisions: string[],
+  ): Promise<IntegrationOutcome | undefined> {
+    if (request.state !== 'mergeable') return undefined;
+    const latestGateId = request.gateRunIds.at(-1);
+    if (!latestGateId) {
+      return {
+        status: 'blocked',
+        reason: `mergeable request ${request.name} has no gate evidence`,
+        mergedRevisions,
+      };
+    }
+    const gateObject = await this.options.repository.read(latestGateId);
+    if (gateObject.objectType !== 'merge-gate-run' || gateObject.status !== 'passed') {
+      return {
+        status: 'blocked',
+        reason: `mergeable request ${request.name} has no passing gate evidence`,
+        mergedRevisions,
+      };
+    }
+    const head = await this.options.git.readCommit(this.options.targetBranch);
+    if (head.revision === gateObject.targetRevision) return undefined;
+    if (
+      head.parents.length !== 1 ||
+      head.parents[0] !== gateObject.targetRevision ||
+      !head.message.includes(mergeCommitMarker(changeSet.id))
+    ) {
+      return {
+        status: 'blocked',
+        reason:
+          `cannot reconcile ${changeSet.name}: ${this.options.targetBranch} moved to ${head.revision} ` +
+          'without the expected XCompiler merge marker',
+        mergedRevisions,
+      };
+    }
+    await this.persistMergedState(changeSet.id, request, head.revision);
+    mergedRevisions.push(head.revision);
+    try {
+      await this.options.releaseChangeSet(changeSet.id);
+    } catch (error) {
+      return {
+        status: 'merged',
+        reason: `reconciled merge but worktree cleanup failed: ${errorMessage(error)}`,
+        mergedRevisions,
+      };
+    }
+    return { status: 'merged', mergedRevisions };
+  }
+
+  private async persistMergedState(
+    changeSetId: ObjectId,
+    request: MergeRequest,
+    mergedRevision: string,
+  ): Promise<void> {
+    await this.options.repository.commit([
+      advanceMergeRequest(request, ['merged'], { mergedRevision }),
+      transitionChangeSet(await this.freshChangeSet(changeSetId), 'merged', { mergedRevision }),
+    ]);
   }
 
   /** ChangeSets whose work belongs to this Phase and has not landed yet. */
@@ -309,4 +437,8 @@ function failedSummary(checks: readonly GateCheckResult[]): string {
   const failed = checks.filter((check) => !check.ok);
   if (failed.length === 0) return 'no check reported a reason';
   return failed.map((check) => `${check.name}: ${check.summary}`).join('\n');
+}
+
+function mergeCommitMarker(changeSetId: ObjectId): string {
+  return `[xcompiler:${changeSetId}]`;
 }

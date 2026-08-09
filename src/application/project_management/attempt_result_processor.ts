@@ -1,7 +1,10 @@
 import { createObjectId, type ObjectId } from '../../domain/identity/object_id.js';
 import type { Phase } from '../../domain/phases/phase.js';
 import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
-import type { TicketSolution } from '../../domain/tickets/ticket.js';
+import {
+  VALIDATION_CONTRACT_DEFECT_CODE,
+  type TicketSolution,
+} from '../../domain/tickets/ticket.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import type { AuditLogger } from '../../audit/audit.js';
 import { changelistEntries, type AttemptResult } from '../execution/attempt_runner.js';
@@ -24,7 +27,13 @@ export interface AttemptTransitionEvent {
   stepId: ObjectId;
   stepName: string;
   ticketId: ObjectId;
+  ticketName?: string;
   ticketType: string;
+  creatorActorId?: ObjectId;
+  creatorRole?: string;
+  assigneeActorId?: ObjectId;
+  assigneeRole?: string;
+  assigneeAgent?: string;
   correlationId: ObjectId;
   causationId?: ObjectId;
   message: string;
@@ -60,6 +69,7 @@ export class AttemptResultProcessor {
         };
       }
       const solution = correctiveSolution(work, result.solutionPlan, result.changedFiles, result.commit);
+      const affectedArtifacts = correctiveAffectedArtifacts(steps, work.step, result);
       const parentTicket = work.ticket.parentTicketId
         ? await this.options.repository.read(work.ticket.parentTicketId)
         : undefined;
@@ -72,7 +82,7 @@ export class AttemptResultProcessor {
           summary: result.solutionPlan ?? `Apply verified correction from ${work.step.name}.`,
           before: [work.ticket.description],
           after: work.ticket.acceptance,
-          affectedArtifacts: result.changedFiles.length > 0 ? result.changedFiles : work.step.outputs,
+          affectedArtifacts,
         },
         implementationPlan: [
           `Apply the accepted delta from ${work.step.name} incrementally.`,
@@ -105,6 +115,7 @@ export class AttemptResultProcessor {
         entries: result.changes ?? changelistEntries(result.changedFiles),
         commit: result.commit,
         verification: result.assessment.evidence,
+        application: result.changeRequestDisposition,
       });
       if (completion.closed && completion.sourceTicketId && completion.sourceTicketType === 'bug') {
         await this.options.recordVerifiedBugResolution?.(completion.sourceTicketId);
@@ -190,6 +201,24 @@ export class AttemptResultProcessor {
         reason: `LLM infrastructure failure; ${work.ticket.name} remains active for retry: ${result.failureLog ?? reason}`,
       };
     }
+    if (isAgentExecutionStall(result)) {
+      const reason = result.reason ?? 'Agent execution stalled without project defect evidence.';
+      await this.options.controller.retainAgentExecutionFailure(work, reason);
+      await this.options.audit.event('note', `${work.step.name} agent execution stall retained`, {
+        messageId: 'domain.agent_execution_stall_retained',
+        projectId: work.step.projectId,
+        phaseId: phase.id,
+        stepId: work.step.id,
+        stepName: work.step.name,
+        ticketId: work.ticket.id,
+        workMode: work.mode,
+        reason,
+      });
+      return {
+        action: 'stop',
+        reason: `Agent execution stalled; ${work.ticket.name} remains active and no Bug was created: ${result.failureLog ?? reason}`,
+      };
+    }
     if (
       result.assessment &&
       !result.assessment.passed &&
@@ -219,6 +248,44 @@ export class AttemptResultProcessor {
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+      });
+      await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+      return { action: 'continue' };
+    }
+    if (
+      work.mode === 'change-request' &&
+      work.ticket.type === 'change-request' &&
+      result.executor?.validationDefect &&
+      work.ticket.originFailure
+    ) {
+      const routed = await this.options.controller.routeFailure({
+        creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
+        failedStepId: work.ticket.originFailure.failedStepId,
+        message: result.failureLog ?? result.executor.validationDefect,
+        summary: result.executor.validationDefect,
+        failure: {
+          kind: 'execution',
+          category: 'contract',
+          code: VALIDATION_CONTRACT_DEFECT_CODE,
+          message: result.executor.validationDefect,
+          retryable: work.ticket.originFailure.retryable,
+          switchProvider: work.ticket.originFailure.switchProvider,
+          details: {
+            ...(work.ticket.originFailure.details ?? {}),
+            defectKind: 'validation-contract',
+            originFailureCategory: work.ticket.originFailure.category,
+            originFailureCode: work.ticket.originFailure.code,
+            discoveringStepId: work.step.id,
+          },
+        },
+        rawEvidenceRef: work.ticket.originFailure.rawEvidenceRef,
+        tool: work.ticket.originFailure.tool,
+        exitCode: work.ticket.originFailure.exitCode,
+        statusCode: work.ticket.originFailure.statusCode,
+        discoveringStepId: work.step.id,
+        correlationId: work.ticket.source.correlationId,
+        causationId: work.ticket.id,
+        parentChangeRequestId: work.ticket.id,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
@@ -303,7 +370,11 @@ export class AttemptResultProcessor {
     ticketType: string,
     correlationId: ObjectId,
   ): Promise<void> {
-    await this.options.tickets.routeAndAssign(ticketId);
+    const routed = await this.options.tickets.routeAndAssign(ticketId);
+    const [creator, assignee] = await Promise.all([
+      this.options.tickets.actorById(routed.ticket.creatorActorId),
+      this.options.tickets.actorById(routed.assignment.assigneeActorId),
+    ]);
     await this.options.onTransition({
       event: 'ticket_routed',
       projectId: phase.projectId,
@@ -311,12 +382,23 @@ export class AttemptResultProcessor {
       stepId: source.step.id,
       stepName: source.step.name,
       ticketId,
+      ticketName: routed.ticket.name,
       ticketType,
+      creatorActorId: creator.id,
+      creatorRole: creator.role,
+      assigneeActorId: assignee.id,
+      assigneeRole: assignee.role,
+      assigneeAgent: routed.ticket.agent,
       correlationId,
       causationId: source.ticket.id,
-      message: `${ticketType} routed from ${source.step.name}`,
+      message: `${creator.role} created ${routed.ticket.name}; PM routed it to ${assignee.role}/${routed.ticket.agent}`,
     });
   }
+}
+
+export function isAgentExecutionStall(result: AttemptResult): boolean {
+  return result.failure?.category === 'internal' &&
+    result.failure.code === 'agent_execution_stalled';
 }
 
 function downstreamStepIds(steps: readonly Step[], source: Step): ObjectId[] {
@@ -324,6 +406,19 @@ function downstreamStepIds(steps: readonly Step[], source: Step): ObjectId[] {
   return steps
     .filter((step) => STEP_TYPE_ORDER[step.type] > sourceOrder)
     .map((step) => step.id);
+}
+
+/** Uses changed files, or an explicitly validated deferred disposition, as the CR's exact scope. */
+export function correctiveAffectedArtifacts(
+  _steps: readonly Step[],
+  source: Step,
+  result: AttemptResult,
+): string[] {
+  if (result.changedFiles.length > 0) return [...new Set(result.changedFiles)];
+  if (result.bugResolutionDisposition?.outcome === 'deferred') {
+    return [...new Set(result.bugResolutionDisposition.affectedArtifacts)];
+  }
+  return [...source.outputs];
 }
 
 function correctiveSolution(

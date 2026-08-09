@@ -398,13 +398,22 @@ class FallbackClient implements LLMClient {
                 remaining: this.chain.length - i - 1,
                 error: validationError,
                 output_preview: out.slice(0, 400),
+                output_tail: out.slice(-400),
+                output_chars: out.length,
+                output_has_done: /"done"\s*:/u.test(out),
               },
             );
             if (providerAttempt < FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS) {
+              const rejectedOutput = validationOutputForRetry(
+                out,
+                operationWindow.feedbackCharBudget,
+              );
               providerMessages = [
                 ...messages,
-                { role: 'assistant', content: validationOutputForRetry(out, operationWindow.feedbackCharBudget) },
-                { role: 'user', content: t().llm.providerValidationRepairPrompt(validationError) },
+                {
+                  role: 'user',
+                  content: t().llm.providerValidationRepairPrompt(validationError, rejectedOutput),
+                },
               ];
               await this.audit?.event(
                 'note',

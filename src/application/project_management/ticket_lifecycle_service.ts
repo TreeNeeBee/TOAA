@@ -203,11 +203,12 @@ function traceEventForTransition(from: TicketState, to: TicketState): TicketTrac
  *
  * Capacity is reserved when an assignment is accepted (see TicketRegistrationService) and released
  * as soon as the work leaves `in_progress`. It is deliberately *not* held for `resolved`,
- * `reopened`, or `pending`: a source-Step Story stays open until its paired verification closes it,
- * and a Story blocked by a corrective Ticket waits in `reopened`/`pending` until that Ticket is
- * repaired. Holding capacity there would let one V-model Phase exhaust a single-capacity role and
- * deadlock the very Bug that unblocks it. Assignment ownership is unaffected: `activeAssignmentId`
- * survives the release, so resumed work returns to the same actor.
+ * `reopened`, or `pending`: a source-Step Story stays open until its paired verification closes it.
+ * A resolved Story blocked by corrective work remains resolved; the Bug or Enhancement owns the
+ * repair and must not turn that Story back into schedulable normal work. Holding capacity there
+ * would let one V-model Phase exhaust a single-capacity role and deadlock the corrective Ticket.
+ * Assignment ownership is unaffected: `activeAssignmentId` survives the release, so resumed work
+ * returns to the same actor.
  *
  * Routing reserves capacity at assignment time, while the Ticket is still `created`, so that a
  * single-capacity actor cannot be double-booked before its work starts. Blocking such a Ticket

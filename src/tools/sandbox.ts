@@ -120,18 +120,7 @@ export const runTestsTool: Tool<
     const requestedEffectiveArgs = ctx.language === 'typescript'
       ? normalizeTypeScriptTestArgs(requestedArgs)
       : requestedArgs;
-    const hasExplicitTestSelector =
-      ctx.language === 'typescript' && requestedEffectiveArgs.some((arg) => !arg.startsWith('-'));
-    const defaultTestArgs = ctx.defaultTestArgs ?? [];
-    const scopedDefaultArgs = requestedEffectiveArgs.some(isCoverageArgument)
-      ? defaultTestArgs.filter((arg) => !isCoverageArgument(arg))
-      : defaultTestArgs;
-    const runArgs =
-      ctx.language === 'typescript' && ctx.defaultTestArgs?.length && !hasExplicitTestSelector
-        ? [...scopedDefaultArgs, ...requestedEffectiveArgs]
-      : requestedEffectiveArgs.length === 0 && ctx.defaultTestArgs?.length
-          ? scopedDefaultArgs
-          : requestedEffectiveArgs;
+    const runArgs = mergeTestGateArgs(ctx.testGateArgs ?? [], requestedEffectiveArgs);
     const r = await ctx.sandbox.runTests(runArgs, { cwd: cwd.abs, timeoutMs: args.timeoutMs });
     const networkFailure = detectNetworkApiFailureInExec(r);
     const passed = r.exitCode === 0 && !r.timedOut && !networkFailure;
@@ -231,6 +220,19 @@ function isProductAuthoringPending(phase: StepType | undefined): boolean {
 
 function isCoverageArgument(arg: string): boolean {
   return arg === '--coverage' || arg.startsWith('--coverage.');
+}
+
+function mergeTestGateArgs(gateArgs: readonly string[], requestedArgs: readonly string[]): string[] {
+  if (gateArgs.length === 0) return [...requestedArgs];
+  const merged = [...gateArgs];
+  for (const arg of requestedArgs) {
+    // The Runtime owns selectors. The model may add runner flags, but it cannot replace the exact
+    // paired gate with a smaller or unrelated test scope.
+    if (!arg.startsWith('-')) continue;
+    if (isCoverageArgument(arg) && merged.some(isCoverageArgument)) continue;
+    if (!merged.includes(arg)) merged.push(arg);
+  }
+  return merged;
 }
 
 async function resolveSandboxCwd(

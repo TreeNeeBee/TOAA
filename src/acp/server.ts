@@ -322,6 +322,7 @@ export class AcpServer {
   private createRuntimeIO(session: AcpSession, task: AcpTask, phase: 'build' | 'run'): RuntimeIO {
     const io: RuntimeIO = {
       terminalOutput: false,
+      permissionPolicy: phase === 'run' ? 'request' : 'deny',
       emit: async (event) => {
         if (event.type === 'permission' && event.status === 'requested') return;
         if (event.type === 'result') {

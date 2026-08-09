@@ -39,12 +39,20 @@ function harness(options: {
   startError?: Error;
   verdictOk?: boolean;
   verdictReason?: string;
+  failMergedStateCommitOnce?: boolean;
 }) {
-  const squashMerge = vi.fn(async () => 'c'.repeat(40));
+  const checkScopes: string[] = [];
+  let mergeMessage = '';
+  let mergedHead = false;
+  const squashMerge = vi.fn(async (input: { message: string }) => {
+    mergeMessage = input.message;
+    mergedHead = true;
+    return 'c'.repeat(40);
+  });
   const releaseChangeSet = vi.fn(async () => undefined);
   const committed: unknown[][] = [];
   const gateRun = (status: MergeGateRun['status']) => ({
-    id: createObjectId(), status, targetRevision: 'd'.repeat(40),
+    id: createObjectId(), objectType: 'merge-gate-run', status, targetRevision: 'd'.repeat(40),
   } as unknown as MergeGateRun);
   const status = options.checks.some((c) => !c.ok && c.kind === 'infrastructure')
     ? 'infrastructure-failed'
@@ -61,6 +69,7 @@ function harness(options: {
     const record = object as Record<string, unknown>;
     if (typeof record?.id === 'string') stored.set(record.id, record);
   };
+  let rejectMergedState = options.failMergedStateCommitOnce ?? false;
 
   const service = new MergeIntegrationService({
     repository: {
@@ -68,26 +77,70 @@ function harness(options: {
       read: async (id: string) => id === rootTicketId
         ? { objectType: 'ticket', id: rootTicketId, phaseId }
         : stored.get(id) ?? mergeRequest,
-      commit: async (objects: unknown[]) => { committed.push(objects); objects.forEach(put); },
+      commit: async (objects: unknown[]) => {
+        if (rejectMergedState && objects.some((object) =>
+          (object as { objectType?: string; state?: string }).objectType === 'merge-request' &&
+          (object as { state?: string }).state === 'merged')) {
+          rejectMergedState = false;
+          throw new Error('registry unavailable');
+        }
+        committed.push(objects);
+        objects.forEach(put);
+      },
       update: async (object: unknown) => { put(object); },
     } as never,
     gates: {
-      open: async () => mergeRequest,
+      open: async () => {
+        const current = stored.get(changeSetId) ?? changeSet;
+        if (!current.mergeRequestId) {
+          put({ ...current, revision: Number(current.revision ?? 0) + 1, mergeRequestId });
+        }
+        return stored.get(mergeRequestId) ?? mergeRequest;
+      },
       start: async () => {
         if (options.startError) throw options.startError;
         return { run: gateRun('running'), root: '/gate' };
       },
-      complete: async () => gateRun(status as MergeGateRun['status']),
-      currentVerdict: async () => ({ ok: options.verdictOk ?? true, reason: options.verdictReason }),
+      complete: async () => {
+        const run = gateRun(status as MergeGateRun['status']);
+        put(run);
+        const current = stored.get(mergeRequestId) ?? mergeRequest;
+        put({
+          ...current,
+          revision: Number(current.revision ?? 0) + 1,
+          state: status === 'passed' ? 'approved' : 'changes-requested',
+          gateRunIds: [...((current.gateRunIds as string[] | undefined) ?? []), run.id],
+        });
+        return run;
+      },
+      currentVerdict: async () => {
+        const request = stored.get(mergeRequestId) ?? mergeRequest;
+        const runId = (request.gateRunIds as string[] | undefined)?.at(-1);
+        return {
+          ok: options.verdictOk ?? true,
+          reason: options.verdictReason,
+          run: runId ? stored.get(runId) : gateRun('passed'),
+        };
+      },
     } as never,
-    git: { squashMerge } as never,
-    runChecks: async () => options.checks,
+    git: {
+      squashMerge,
+      readCommit: async () => ({
+        revision: mergedHead ? 'c'.repeat(40) : 'd'.repeat(40),
+        parents: mergedHead ? ['d'.repeat(40)] : ['a'.repeat(40)],
+        message: mergeMessage,
+      }),
+    } as never,
+    runChecks: async (_root, scope) => {
+      checkScopes.push(scope);
+      return options.checks;
+    },
     targetBranch: 'master',
     mayMerge: options.mayMerge ?? true,
     authorizeMerge: options.authorizeMerge,
     releaseChangeSet,
   });
-  return { service, squashMerge, releaseChangeSet, committed };
+  return { service, squashMerge, releaseChangeSet, committed, checkScopes };
 }
 
 const ok = (name: string): GateCheckResult => ({ name, ok: true, summary: 'ok', kind: 'execution' });
@@ -96,7 +149,7 @@ const failed = (name: string, kind: GateCheckResult['kind'] = 'execution'): Gate
 
 describe('merge integration', () => {
   it('squashes a passing ChangeSet onto the mainline', async () => {
-    const { service, squashMerge } = harness({ checks: [ok('dependencies'), ok('tests')] });
+    const { service, squashMerge, checkScopes } = harness({ checks: [ok('dependencies'), ok('tests')] });
     const outcome = await service.integratePhase(projectId, phaseId);
 
     expect(outcome.status).toBe('merged');
@@ -107,6 +160,7 @@ describe('merge integration', () => {
       sourceBranch: 'xcompiler/ticket/T1',
       expectedTargetRevision: 'd'.repeat(40),
     });
+    expect(checkScopes).toEqual(['phase']);
   });
 
   it('reports a failed gate with the failing checks, which become a Bug at the caller', async () => {
@@ -200,6 +254,23 @@ describe('merge integration', () => {
     expect(outcome.mergedRevisions).toEqual([]);
   });
 
+  it('reconciles a squash that landed before domain-state persistence failed', async () => {
+    const { service, squashMerge, releaseChangeSet } = harness({
+      checks: [ok('dependencies'), ok('tests')],
+      failMergedStateCommitOnce: true,
+    });
+
+    const interrupted = await service.integratePhase(projectId, phaseId);
+    expect(interrupted.status).toBe('blocked');
+    expect(interrupted.reason).toContain('next run will reconcile');
+
+    const recovered = await service.integratePendingAuthorization(projectId, phaseId);
+    expect(recovered.status, recovered.reason).toBe('merged');
+    expect(recovered.mergedRevisions).toEqual(['c'.repeat(40)]);
+    expect(squashMerge).toHaveBeenCalledOnce();
+    expect(releaseChangeSet).toHaveBeenCalledWith(changeSetId);
+  });
+
   it('refuses to merge when the mainline moved after the gate passed', async () => {
     const { service, squashMerge } = harness({
       checks: [ok('dependencies'), ok('tests')],
@@ -224,13 +295,14 @@ describe('merge at Ticket delivery', () => {
   it('lands the delivering Ticket, so the next Step can read its work', async () => {
     // V-model Steps are sequentially dependent. A change still sitting on its own branch when the
     // Step delivers is invisible to everything that follows it in the Phase.
-    const { service, squashMerge, releaseChangeSet } = harness({ checks: [ok('tests')] });
+    const { service, squashMerge, releaseChangeSet, checkScopes } = harness({ checks: [ok('tests')] });
     const outcome = await service.integrateTicket(projectId, rootTicketId);
 
     expect(outcome.status).toBe('merged');
     expect(outcome.mergedRevisions).toEqual(['c'.repeat(40)]);
     expect(squashMerge).toHaveBeenCalledOnce();
     expect(releaseChangeSet).toHaveBeenCalledWith(changeSetId);
+    expect(checkScopes).toEqual(['ticket']);
   });
 
   it('lands the branch for a corrective Ticket recorded against it', async () => {

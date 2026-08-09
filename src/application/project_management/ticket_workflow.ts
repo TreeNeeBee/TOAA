@@ -6,6 +6,7 @@ import {
   TicketSchema,
   transitionTicket,
   type BugTicket,
+  type ChangeRequestApplicationDecision,
   type ChangeRequestTicket,
   type EnhancementTicket,
   type Ticket,
@@ -15,39 +16,33 @@ import {
 import { ChangelistSchema, type Changelist } from '../../domain/evidence/evidence.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import { capabilitiesForStep } from '../../domain/workflow/role_profile.js';
-import { TicketLifecycleService, releaseCapacityFor } from './ticket_lifecycle_service.js';
+import { TicketLifecycleService } from './ticket_lifecycle_service.js';
 import { TicketTraceService } from './ticket_trace_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 import type { ActorRegistration } from '../../domain/project_management/index.js';
 import type { PersistedDomainObject } from '../../domain/objects/persisted.js';
+import { TicketCatalog } from './ticket_catalog.js';
+import { TicketBlockerService } from './ticket_blocker_service.js';
 
 export class TicketWorkflow {
   private readonly lifecycle: TicketLifecycleService;
   private readonly traces: TicketTraceService;
+  private readonly catalog: TicketCatalog;
+  private readonly blockers: TicketBlockerService;
 
   constructor(private readonly repository: DomainObjectRepositoryPort) {
     this.lifecycle = new TicketLifecycleService(repository);
     this.traces = new TicketTraceService(repository);
+    this.catalog = new TicketCatalog(repository);
+    this.blockers = new TicketBlockerService(repository);
   }
 
   async list(): Promise<Ticket[]> {
-    const tickets: Ticket[] = [];
-    for (const entry of this.repository.registry.byType('ticket')) {
-      const object = await this.repository.read(entry.id);
-      if (object.objectType === 'ticket') tickets.push(object);
-    }
-    return tickets;
+    return this.catalog.list();
   }
 
   async storyForStep(stepId: ObjectId): Promise<WorkTicket> {
-    const story = (await this.list()).find(
-      (ticket): ticket is WorkTicket =>
-        ticket.type === 'story' &&
-        ticket.workKind === 'v-model-step' &&
-        ticket.stepId === stepId,
-    );
-    if (!story) throw new Error(`V-model Story not found for Step ${stepId}`);
-    return story;
+    return this.catalog.storyForStep(stepId);
   }
 
   async openBug(input: {
@@ -71,6 +66,7 @@ export class TicketWorkflow {
     correlationId: ObjectId;
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
+    routingObjects?: readonly PersistedDomainObject[];
   }): Promise<BugTicket> {
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
@@ -110,7 +106,7 @@ export class TicketWorkflow {
       description: input.summary,
       acceptance: [
         `Repair ${input.targetStep.name} without unrelated rewrites.`,
-        `Pass ${input.verificationStep.name}.`,
+        `Propagate the accepted correction through Change Requests until ${input.verificationStep.name} passes.`,
         'Persist the verified solution to debug-wiki.',
       ],
       relatedTicketIds: [targetStory.id, ...(parentChangeRequest ? [parentChangeRequest.id] : [])],
@@ -145,7 +141,7 @@ export class TicketWorkflow {
         statusCode: input.statusCode,
       },
     }) as BugTicket;
-    const blockedStory = await this.prepareBlockedTicket(targetStory, bug.id, 'defect');
+    const blockedStory = await this.blockers.prepareWorkIfLive(targetStory, bug.id, 'defect');
     // A defect found by a verification Step blocks that Step's own Story too: its verdict cannot be
     // trusted until the repair lands. Leaving it in progress would also keep the verifying actor's
     // capacity held while the correction is routed back through the very same Step.
@@ -153,12 +149,13 @@ export class TicketWorkflow {
       ? undefined
       : await this.storyForStep(input.failedStep.id);
     const blockedFailedStory = failedStory
-      ? await this.prepareBlockedTicket(failedStory, bug.id, 'defect')
+      ? await this.blockers.prepareWorkIfLive(failedStory, bug.id, 'defect')
       : undefined;
     const blockedParent = parentChangeRequest
-      ? await this.prepareBlockedTicket(parentChangeRequest, bug.id, 'defect')
+      ? await this.blockers.prepare(parentChangeRequest, bug.id, 'defect')
       : undefined;
     await this.repository.commit([
+      ...(input.routingObjects ?? []),
       bug,
       ...blockedStory,
       ...(blockedFailedStory ?? []),
@@ -179,6 +176,7 @@ export class TicketWorkflow {
     parentChangeRequestId?: ObjectId;
     correlationId: ObjectId;
     causationId?: ObjectId;
+    routingObjects?: readonly PersistedDomainObject[];
   }): Promise<EnhancementTicket> {
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
@@ -235,11 +233,16 @@ export class TicketWorkflow {
       targetStepId: input.targetStep.id,
       verificationStepId: input.verificationStep.id,
     }) as EnhancementTicket;
-    const blockedStory = await this.prepareBlockedTicket(targetStory, enhancement.id, 'quality-gap');
+    const blockedStory = await this.blockers.prepareWorkIfLive(
+      targetStory,
+      enhancement.id,
+      'quality-gap',
+    );
     const blockedParent = parentChangeRequest
-      ? await this.prepareBlockedTicket(parentChangeRequest, enhancement.id, 'quality-gap')
+      ? await this.blockers.prepare(parentChangeRequest, enhancement.id, 'quality-gap')
       : undefined;
     await this.repository.commit([
+      ...(input.routingObjects ?? []),
       enhancement,
       ...blockedStory,
       ...(blockedParent ?? []),
@@ -316,7 +319,7 @@ export class TicketWorkflow {
     // Step — so the run aborted with no actor able to take it.
     if (input.requestingTicket) {
       await this.repository.commit(
-        await this.prepareBlockedTicket(input.requestingTicket, request.id, 'dependency'),
+        await this.blockers.prepare(input.requestingTicket, request.id, 'dependency'),
       );
     }
     return request;
@@ -349,8 +352,6 @@ export class TicketWorkflow {
     implementationPlan: string[];
     verificationGate: string[];
     parentChangeRequestId?: ObjectId;
-    /** Overrides the description when a child carries a parent's delta forward. */
-    summary?: string;
   }): Promise<ChangeRequestTicket> {
     const targetObject = await this.repository.read(input.targetStepId);
     if (targetObject.objectType !== 'step') {
@@ -393,7 +394,7 @@ export class TicketWorkflow {
       priority: source.priority,
       parentTicketId: parent.id,
       rootTicketId: source.rootTicketId,
-      description: input.summary ?? input.contractDelta.summary,
+      description: input.contractDelta.summary,
       acceptance: input.verificationGate,
       /** Source linkage is causal, not a scheduling dependency: the source waits for this CR. */
       dependencyTicketIds: [],
@@ -411,6 +412,7 @@ export class TicketWorkflow {
       triggerStepId: input.triggerStepId,
       sourceStepId: input.sourceStepId,
       targetStepId: input.targetStepId,
+      originFailure: source.type === 'bug' ? source.failure : undefined,
       contractDelta: input.contractDelta,
       implementationPlan: input.implementationPlan,
       verificationGate: input.verificationGate,
@@ -556,6 +558,7 @@ export class TicketWorkflow {
     commit?: string;
     verification?: string[];
     verificationAssessmentId?: ObjectId;
+    application?: ChangeRequestApplicationDecision;
   }): Promise<Changelist> {
     const ticket = await this.requireTicket(input.ticketId);
     if (input.verificationAssessmentId) {
@@ -613,6 +616,12 @@ export class TicketWorkflow {
             changelistId: changelist.id,
             verificationAssessmentId: input.verificationAssessmentId,
             appliedAt: new Date().toISOString(),
+            ...(input.application ?? {
+              outcome: 'applied' as const,
+              reasonCategory: 'contract-applied' as const,
+              inspectedArtifacts: [],
+              evidence: [],
+            }),
           },
         ],
       });
@@ -625,7 +634,13 @@ export class TicketWorkflow {
         projectId: ticket.projectId,
         aggregate: { id: ticket.id, objectType: 'ticket' },
         eventType: 'ticket.changelist_recorded',
-        payload: { changelistId: changelist.id, stepId: input.stepId },
+        payload: {
+          changelistId: changelist.id,
+          stepId: input.stepId,
+          ...(ticket.type === 'change-request'
+            ? { applicationOutcome: input.application?.outcome ?? 'applied' }
+            : {}),
+        },
         phaseId: ticket.phaseId,
         stepId: input.stepId,
         ticketId: ticket.id,
@@ -702,7 +717,7 @@ export class TicketWorkflow {
         await this.closeVerified(source.id);
       }
     }
-    await this.releaseBlockedTickets(ticket);
+    await this.blockers.release(ticket);
     return ticket;
   }
 
@@ -724,14 +739,12 @@ export class TicketWorkflow {
       throw new Error(`Resolved Ticket ${ticket.name} cannot be cancelled as unresolved`);
     }
     ticket = await this.saveTransition(ticket, 'cancelled');
-    await this.releaseBlockedTickets(ticket);
+    await this.blockers.release(ticket);
     return ticket;
   }
 
   private async requireTicket(id: ObjectId): Promise<Ticket> {
-    const object = await this.repository.read(id);
-    if (object.objectType !== 'ticket') throw new Error(`Object ${id} is not a Ticket`);
-    return object;
+    return this.catalog.require(id);
   }
 
   private async findEquivalentChangelist(
@@ -790,118 +803,6 @@ export class TicketWorkflow {
     return actor;
   }
 
-  private async prepareBlockedTicket(
-    work: Ticket,
-    blockerId: ObjectId,
-    pendingReason: 'defect' | 'quality-gap' | 'dependency',
-  ): Promise<PersistedDomainObject[]> {
-    if (work.state === 'closed' || work.state === 'cancelled') {
-      throw new Error(`Cannot block terminal Ticket ${work.name}`);
-    }
-    const actor = await this.processingActor(work);
-    const marker = {
-      eventType: 'escalated' as const,
-      initiatorActorId: actor.id,
-      initiatorRole: actor.role,
-      assignmentId: work.activeAssignmentId,
-      fromOwnerActorId: actor.id,
-      toOwnerActorId: actor.id,
-      reasonCode: `ticket.blocked_by_${pendingReason}`,
-      reason: `${work.name} is blocked by corrective Ticket ${blockerId}.`,
-      evidenceRefs: [blockerId],
-      correlationId: work.source.correlationId,
-      causationId: blockerId,
-    };
-    // Only work that has actually started needs a state change to become blocked. A Ticket still in
-    // `created` has no owner yet, and the scheduler already skips any Ticket carrying a blocker, so
-    // recording the blocker is enough and avoids forcing an assignment just to park it.
-    const next = work.state === 'resolved'
-      ? 'reopened' as const
-      : work.state === 'in_progress'
-        ? 'pending' as const
-        : undefined;
-    if (next) {
-      const prepared = await this.lifecycle.prepareTransition(work, next, {
-        pendingReason: next === 'pending' ? pendingReason : undefined,
-        beforeTrace: [marker],
-      });
-      const updated = TicketSchema.parse({
-        ...prepared.ticket,
-        blockedByTicketIds: [...new Set([...prepared.ticket.blockedByTicketIds, blockerId])],
-      });
-      return replaceTicket(prepared.objects, updated);
-    }
-    const built = await this.traces.build(work, [marker]);
-    const updated = TicketSchema.parse({
-      ...built.ticket,
-      blockedByTicketIds: [...new Set([...built.ticket.blockedByTicketIds, blockerId])],
-    });
-    // A Ticket parked before it started still holds the reservation routing made for it. Nothing
-    // else reconciles that, and holding it would let one blocked Ticket exhaust a single-capacity
-    // role and starve the corrective Ticket that unblocks it.
-    const released = await releaseCapacityFor(this.repository, work);
-    return [
-      ...built.events,
-      ...(released ? [released] : []),
-      updated,
-      createDomainEvent({
-        projectId: work.projectId,
-        aggregate: { id: work.id, objectType: 'ticket' },
-        eventType: 'ticket.blocker_added',
-        payload: { blockerId, pendingReason },
-        phaseId: work.phaseId,
-        stepId: work.stepId,
-        ticketId: work.id,
-        correlationId: work.source.correlationId,
-        causationId: blockerId,
-        objectRevision: updated.revision,
-      }),
-    ];
-  }
-
-  /**
-   * Clears a terminal corrective Ticket from every Ticket it blocked. This sweeps the actual blocker
-   * lists rather than a curated parent/related set, so a Ticket can never stay blocked by a Ticket
-   * that is already closed or cancelled.
-   */
-  private async releaseBlockedTickets(blocker: Ticket): Promise<void> {
-    const blocked = (await this.list()).filter(
-      (ticket) => ticket.blockedByTicketIds.includes(blocker.id),
-    );
-    for (const ticket of blocked) await this.unblockTicket(ticket, blocker.id);
-  }
-
-  private async unblockTicket(blocked: Ticket, blockerId: ObjectId): Promise<void> {
-    const blockers = blocked.blockedByTicketIds.filter((id) => id !== blockerId);
-    if (blockers.length === 0 && blocked.state === 'pending') {
-      const prepared = await this.lifecycle.prepareTransition(blocked, 'in_progress', {
-        reasonCode: 'ticket.blocker_cleared',
-        reason: `Corrective Ticket ${blockerId} closed; ${blocked.name} can resume.`,
-        evidenceRefs: [blockerId],
-      });
-      const resumed = TicketSchema.parse({ ...prepared.ticket, blockedByTicketIds: blockers });
-      await this.repository.commit(replaceTicket(prepared.objects, resumed));
-      return;
-    }
-    const updated = TicketSchema.parse({
-      ...blocked,
-      ...reviseObjectEnvelope(blocked),
-      blockedByTicketIds: blockers,
-    });
-    await this.repository.commit([updated, createDomainEvent({
-      projectId: blocked.projectId,
-      aggregate: { id: blocked.id, objectType: 'ticket' },
-      eventType: 'ticket.blocker_removed',
-      payload: { blockerId, remainingBlockers: blockers.length },
-      phaseId: blocked.phaseId,
-      stepId: blocked.stepId,
-      ticketId: blocked.id,
-      correlationId: blocked.source.correlationId,
-      causationId: blockerId,
-      objectRevision: updated.revision,
-    })]);
-  }
-
   private async prepareSourceChangeRequest(
     source: BugTicket | EnhancementTicket,
     request: ChangeRequestTicket,
@@ -943,12 +844,7 @@ export class TicketWorkflow {
   }
 
   private async nextName(prefix: string, phaseName: string): Promise<string> {
-    const expression = new RegExp(`^${escapeRegExp(prefix)}-${escapeRegExp(phaseName)}-(\\d+)$`, 'u');
-    const used = this.repository.registry.byType('ticket').map((entry) => {
-      const match = expression.exec(entry.name);
-      return match ? Number.parseInt(match[1]!, 10) : 0;
-    });
-    return `${prefix}-${phaseName}-${String(Math.max(0, ...used) + 1).padStart(3, '0')}`;
+    return this.catalog.nextName(prefix, phaseName);
   }
 }
 
@@ -957,10 +853,6 @@ function severityPriority(severity: BugTicket['severity']): number {
   if (severity === 'high') return TICKET_PRIORITY.high;
   if (severity === 'medium') return TICKET_PRIORITY.normal;
   return TICKET_PRIORITY.low;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 }
 
 function replaceTicket(

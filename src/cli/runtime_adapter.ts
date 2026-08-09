@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import { confirm, editor, input, select } from '@inquirer/prompts';
 import { spinner as ora } from '../util/spinner.js';
 import type { RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimeProgress } from '../runtime.js';
+import { isCancellationError } from '../core/cancellation.js';
 
 function renderLog(level: RuntimeLogLevel, message: string): void {
   switch (level) {
@@ -27,35 +28,21 @@ function renderLog(level: RuntimeLogLevel, message: string): void {
   }
 }
 
-/**
- * The IO an execution stage runs under: identical to the interactive adapter except that it never
- * stops to ask.
- *
- * Every clarification and approval belongs to `build`, which owns the human gates and the plan the
- * user confirmed. Asking again at execution time stalls an unattended run on a question that was
- * already answered, and there is no new information at that point to answer it with.
- *
- * The request is still recorded: the permission service writes an InteractionRequest and a
- * DecisionRecord either way, so the audit shows what was authorized and on what basis.
- */
-export function createNonInteractiveCliRuntimeIO(): RuntimeIO {
-  const io = createCliRuntimeIO();
-  return {
-    ...io,
-    requestPermission: async (request) => ({
-      approved: true,
-      reason:
-        `Authorized by the build-stage gate: ${request.operationType} carries no separate ` +
-        'execution-time prompt.',
-    }),
-  };
-}
-
 export function createCliRuntimeIO(): RuntimeIO {
   return {
+    permissionPolicy: 'request',
     terminalOutput: true,
     emit(event) {
       if (event.type === 'log') renderLog(event.level, event.message);
+      if (event.type === 'workflow' && event.event === 'ticket_routed') {
+        console.log(chalk.cyan('↳'), event.message ?? [
+          event.creatorRole ?? 'discoverer',
+          'created',
+          event.ticketName ?? event.ticketType ?? 'ticket',
+          '→ PM →',
+          [event.assigneeRole, event.assigneeAgent].filter(Boolean).join('/'),
+        ].join(' '));
+      }
     },
     progress(message, opts): RuntimeProgress {
       const spin = ora(message, { animate: opts?.animate ?? true }).start();
@@ -76,12 +63,39 @@ export function createCliRuntimeIO(): RuntimeIO {
         ].join('\n'),
         default: false,
       });
+      const denialReason = approved
+        ? ''
+        : (await input({ message: 'Reason for denial (optional):' })).trim();
       return {
         approved,
-        reason: approved ? 'Approved by CLI user.' : request.denyBehavior,
+        reason: approved
+          ? 'Approved by CLI user.'
+          : `${request.denyBehavior}${denialReason ? ` User reason: ${denialReason}` : ''}`,
       };
     },
   };
+}
+
+/** Gives the Runtime one graceful interrupt so the active attempt can roll back its Git baseline. */
+export async function runCliAbortable<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const onSigint = () => {
+    if (!controller.signal.aborted) {
+      const error = new Error('CLI task cancelled by SIGINT');
+      error.name = 'AbortError';
+      controller.abort(error);
+    }
+  };
+  process.on('SIGINT', onSigint);
+  try {
+    return await task(controller.signal);
+  } finally {
+    process.off('SIGINT', onSigint);
+  }
+}
+
+export function isCliCancellation(error: unknown): boolean {
+  return isCancellationError(error);
 }
 
 function createCliInteraction(): RuntimeInteraction {

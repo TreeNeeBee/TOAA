@@ -87,6 +87,12 @@ export function describeToolForStep(tool: Tool, context: ToolContext, step: Step
     );
     if (tool.name === 'replace_in_file') {
       details.push('The target must already exist; use read_file on that exact path before replacing when current bytes are uncertain.');
+    } else if (tool.name === 'write_file' && context.preserveExistingFiles) {
+      const rewriteTargets = compactPathCandidates(context.rewriteExistingFiles ?? []);
+      details.push(
+        `This is an incremental attempt. Existing files require a focused patch, except exact Runtime-authorized ` +
+        `failure-evidence rewrite targets=[${rewriteTargets}]. Missing files may still be created.`,
+      );
     }
   } else if (tool.name === 'apply_patch') {
     details.push(

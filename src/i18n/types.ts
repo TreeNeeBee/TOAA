@@ -23,7 +23,7 @@ export interface Messages {
     invalidBaseUrl: (raw: string, fallback: string) => string;
     providerValidationFailed: (role: string, model: string) => string;
     providerValidationRetry: (role: string, model: string) => string;
-    providerValidationRepairPrompt: (error: string) => string;
+    providerValidationRepairPrompt: (error: string, rejectedOutput: string) => string;
     providerCallFailed: (role: string, model: string) => string;
     scoreReadFailed: (path: string, message: string) => string;
     scoreChanged: (provider: string, score: string, previous: string) => string;
@@ -40,7 +40,6 @@ export interface Messages {
     unhandledError: (message: string) => string;
     unsupportedSubprocessNetworkOff: string;
     dockerInsideContainerUnsupported: string;
-    firejailUnsupported: string;
     smokeHeader: (baseUrl: string) => string;
     smokeOk: (model: string, totalMs: number, firstTokenMs: number, chunks: number, preview: string) => string;
     smokeFail: (model: string, message: string) => string;

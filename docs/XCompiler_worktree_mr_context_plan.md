@@ -912,11 +912,12 @@ later requires exactly three things, all scoped by this plan: a registry-cursor-
 (invariant 39), a per-fingerprint sandbox preparation lock (§4A), and actor-level LLM binding (P9).
 No domain invariant changes.
 
-## 14. Sandbox dependency install (open)
+## 14. Sandbox dependency install (resolved)
 
-Live validation of a TypeScript project stops at the same place every time: `npm install` inside the
-sandbox runs for minutes and fails, so no Step after the one that writes `package.json` can run a
-test, and the merge gate is never reached.
+Live validation originally stopped at `npm install` because the isolated HOME discarded the host's
+registry endpoint. The current implementation keeps credentials isolated while accepting an
+explicit registry endpoint, shares a project download cache, and refreshes the idle timer whenever
+the environment or cache grows. Merge-gate validation has since reached and passed this boundary.
 
 Measured, not inferred:
 
@@ -925,18 +926,11 @@ Measured, not inferred:
 | Host shell, with `~/.npmrc` | 181 ms |
 | Clean `HOME`, default registry — what the sandbox does | still running past 5 min |
 
-`baseEnvironment()` redirects `HOME` to an empty sandbox directory, deliberately, so that host
-credentials never reach a generated project. That also discards `~/.npmrc`, and with it the registry
-endpoint — npm falls back to `registry.npmjs.org`, which this network does not reach.
+`baseEnvironment()` still redirects `HOME` to an empty sandbox directory so host credentials never
+reach generated code. `sandbox.*.registry` supplies only the selected endpoint through
+`NPM_CONFIG_REGISTRY`; tokens and the rest of the host npm configuration remain unavailable.
 
-The endpoint is network configuration, not a credential; the auth token beside it is. Passing the
-first through while withholding the second keeps the isolation intent intact and makes installs work.
-
-Decided with the user, not yet implemented:
-
-1. Sandbox creation moves to S1 for every language, and a run does not proceed past it unless the
-   sandbox is ready. For TypeScript that means the manifest has to exist at S1, which reverses the
-   current decision that HIGH_LEVEL_DESIGN authors `package.json` (`run.ts` §manifest seeding).
-2. Any Step may append dependencies. Appending checks what is already declared and at which version,
-   and syncs the sandbox afterwards.
-3. A conflict resolves toward compatibility with what is already there, not toward the newest.
+The manifest remains owned by HIGH_LEVEL_DESIGN. A need discovered elsewhere becomes a dependency
+Change Request, is checked against the accepted dependency set, and returns through the normal CR
+chain. Direct manifest writes and `add_dependency` both synchronize the appropriate isolated
+environment; incompatible requests do not silently replace accepted versions.

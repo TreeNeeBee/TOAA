@@ -4,18 +4,26 @@ import {
   buildDebugBrief,
   compactFailureEvidence,
   renderDebugBriefForPrompt,
+  type DebugBriefInput,
 } from '../../core/debug_brief.js';
 import type { Plan, Step } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
+import { defaultQualityGateForPhase } from '../../core/quality_gate.js';
 import { pairedTestAssetPaths } from '../../core/test_assets.js';
 import type { DomainLog } from '../../domain/observability/records.js';
 import { workStepId, type Ticket } from '../../domain/tickets/ticket.js';
 
 export type AttemptMode = 'normal' | 'debug' | 'enhancement' | 'change-request';
 
+export function shouldPreserveExistingFiles(mode: AttemptMode): boolean {
+  return mode !== 'normal';
+}
+
 export interface AttemptVerificationScope {
   testArgs: string[];
   inheritedFromTicket: boolean;
+  /** The original failed gate is rerun after the upstream correction travels through its CR chain. */
+  deferredToChangeRequest?: boolean;
   verificationStepId?: string;
   verificationPhase?: Step['phase'];
 }
@@ -86,19 +94,63 @@ export function reconcileMeasuredQualityAssessment(
   };
 }
 
+export function reconcileDeferredSourceQualityAssessment(
+  value: StageQualityAssessment | undefined,
+  input: {
+    currentPhase: Step['phase'];
+    deferredToChangeRequest?: boolean;
+    verificationPhase?: Step['phase'];
+    changedFiles: readonly string[];
+  },
+): StageQualityAssessment | undefined {
+  if (
+    !value ||
+    !input.deferredToChangeRequest ||
+    isVerificationPhase(input.currentPhase) ||
+    !input.verificationPhase ||
+    !isVerificationPhase(input.verificationPhase) ||
+    input.changedFiles.length === 0 ||
+    value.gaps.length === 0 ||
+    value.blockedBy.length === 0 ||
+    value.unavailableMetrics.length === 0 ||
+    value.tolerance.failedTests > 0 ||
+    value.tolerance.skippedTests > 0 ||
+    value.tolerance.warnings > 0
+  ) {
+    return value;
+  }
+  const downstreamMetrics = new Set(
+    Object.keys(defaultQualityGateForPhase(input.verificationPhase).metrics),
+  );
+  if (!value.unavailableMetrics.every((metric) => downstreamMetrics.has(metric))) return value;
+  return {
+    ...value,
+    gaps: [],
+    blockedBy: [...new Set([
+      ...value.blockedBy,
+      ...value.gaps.map((gap) =>
+        `deferred to ${input.verificationPhase}: ${gap}`
+      ),
+    ])],
+  };
+}
+
 export function renderAttemptRetryFeedback(log: DomainLog, phase: Step['phase']): string {
   const failureLog = typeof log.data.failureLog === 'string' ? log.data.failureLog : log.message;
+  const typedFailure = structuredFailureEvidence(log.data.structuredFailure);
   const brief = buildDebugBrief({
     reason: log.message,
     failureLog,
     phase,
     targetPhase: phase,
+    typedFailure,
   });
   const evidence = compactFailureEvidence({
     reason: log.message,
     failureLog,
     phase,
     targetPhase: phase,
+    typedFailure,
     maxChars: 2600,
     maxLines: 36,
   });
@@ -109,6 +161,51 @@ export function renderAttemptRetryFeedback(log: DomainLog, phase: Step['phase'])
     renderDebugBriefForPrompt(brief),
     ...(evidence ? ['## compact failure evidence', '```text', evidence, '```'] : []),
   ].join('\n');
+}
+
+export function prioritizeAttemptFailureEvidence(
+  originalFailure: string,
+  retryFeedback?: string,
+): string {
+  if (!retryFeedback?.trim()) return originalFailure;
+  return [
+    retryFeedback.trim(),
+    '## original bug context',
+    originalFailure.trim(),
+  ].filter(Boolean).join('\n\n');
+}
+
+export function selectActionableAttemptFailure(logs: readonly DomainLog[]): DomainLog | undefined {
+  const latestFirst = [...logs].reverse();
+  return latestFirst.find((log) => !isInfrastructureFailureLog(log)) ?? latestFirst[0];
+}
+
+function isInfrastructureFailureLog(log: DomainLog): boolean {
+  const failure = log.data.structuredFailure;
+  if (!failure || typeof failure !== 'object' || Array.isArray(failure)) return false;
+  const record = failure as Record<string, unknown>;
+  return record.kind === 'infrastructure' || record.category === 'llm-provider';
+}
+
+function structuredFailureEvidence(value: unknown): DebugBriefInput['typedFailure'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const categories: NonNullable<DebugBriefInput['typedFailure']>['category'][] = [
+    'llm-provider',
+    'tool',
+    'test',
+    'quality',
+    'contract',
+    'internal',
+  ];
+  if (!categories.includes(record.category as never) || typeof record.code !== 'string') {
+    return undefined;
+  }
+  return {
+    category: record.category as NonNullable<DebugBriefInput['typedFailure']>['category'],
+    code: record.code,
+    ...(typeof record.statusCode === 'number' ? { statusCode: record.statusCode } : {}),
+  };
 }
 
 export function resolveAttemptVerificationScope(
@@ -125,6 +222,28 @@ export function resolveAttemptVerificationScope(
   // Same rule PM routes and WorkScheduler dispatches by; keeping a local copy is how routing and
   // scheduling drifted apart before.
   const targetStepId = workStepId(ticket);
+  const routedToUpstreamSource =
+    verificationStepId !== undefined &&
+    targetStepId === executionStep.id &&
+    !isVerificationPhase(executionStep.phase) &&
+    verificationStepId !== executionStep.id &&
+    (ticket.type !== 'bug' || ticket.failure.failedStepId !== ticket.failure.targetStepId);
+  if (routedToUpstreamSource) {
+    const verificationStep = plan.steps.find((step) => step.id === verificationStepId);
+    return {
+      // S1-S4 author their paired tests, but a corrective attempt in an upstream source phase cannot
+      // prove the failed gate until downstream CRs have applied the accepted contract. The exact
+      // selectors are still retained as a safety boundary: if the Debugger voluntarily verifies a
+      // local test-asset repair, run_tests must not widen into the full project suite.
+      testArgs: verificationStep
+        ? pairedTestAssetPaths(plan.steps, verificationStep, plan.language)
+        : currentTestArgs,
+      inheritedFromTicket: false,
+      deferredToChangeRequest: true,
+      verificationStepId: verificationStep?.id,
+      verificationPhase: verificationStep?.phase,
+    };
+  }
   const inheritedFromTicket =
     verificationStepId !== undefined &&
     targetStepId === executionStep.id &&

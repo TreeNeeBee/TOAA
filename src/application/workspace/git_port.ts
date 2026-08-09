@@ -18,6 +18,12 @@ export interface WorktreeRecord {
   head?: string;
 }
 
+export interface GitCommitRecord {
+  revision: string;
+  parents: string[];
+  message: string;
+}
+
 /** A merge candidate could not be assembled because source and target edit the same paths. */
 export class MergeConflictError extends Error {
   constructor(
@@ -42,6 +48,8 @@ export interface GitWorktreePort {
 export interface GitMergePort extends GitWorktreePort {
   /** Resolves a branch or ref to a commit sha. */
   revision(ref: string): Promise<string>;
+  /** Reads immutable commit evidence used to reconcile an interrupted merge transaction. */
+  readCommit(ref: string): Promise<GitCommitRecord>;
   /** Merges `source` into the working copy at `root`, returning the resulting commit. */
   mergeInto(root: string, source: string): Promise<string>;
   deleteBranch(branch: string, options?: { force?: boolean }): Promise<void>;

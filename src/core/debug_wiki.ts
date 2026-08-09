@@ -173,6 +173,12 @@ export class DebugWiki {
       this.entries.push(...await this.readLayer(layer));
     }
     await this.applyFeedbackLog();
+    const quarantined = this.entries.filter((entry) =>
+      entry.status === 'active' && hasLegacyMergedSolutions(entry.solution));
+    for (const entry of quarantined) transitionDebugWikiEntry(entry, 'needs_review');
+    if (quarantined.some((entry) => entry.layer === this.writableLayer())) {
+      await this.persistExternalEntries();
+    }
     await this.writeIndex();
   }
 
@@ -248,13 +254,15 @@ export class DebugWiki {
     const now = new Date().toISOString();
     const used = this.byIds(input.usedEntryIds ?? []);
     const writable = this.writableLayer();
-    const externalTargets = used.filter((entry) => entry.layer === writable);
-    const target = externalTargets.length > 0
-      ? externalTargets
-      : this.rank(input.brief, input.language)
-          .filter((match) => match.entry.layer === writable && match.score >= 8)
-          .slice(0, 1)
-          .map((m) => m.entry);
+    // Retrieval returns hypotheses, not proof that the current Bug has the same root cause.
+    // Updating every retrieved project entry merged unrelated fixes into one contradictory page.
+    // Only the Ticket that owns an entry may revise it. A later Ticket that disproves a reviewed
+    // hypothesis creates a replacement entry and links it with supersedes instead of erasing or
+    // reactivating the disputed history.
+    const target = dedup(this.entries.filter((entry) =>
+      entry.layer === writable &&
+      input.ticketId !== undefined &&
+      entry.sourceTicketId === input.ticketId));
     const updated: string[] = [];
     let createdId: string | undefined;
     for (const entry of target) {
@@ -263,7 +271,8 @@ export class DebugWiki {
     }
     if (updated.length === 0) {
       const created = createEntry(input, now, this.nextWritableId(now), writable);
-      created.supersedes = used.length > 0 ? used.map((entry) => entry.id) : undefined;
+      const reviewed = used.filter((entry) => entry.status === 'needs_review');
+      created.supersedes = reviewed.length > 0 ? reviewed.map((entry) => entry.id) : undefined;
       this.entries.push(created);
       createdId = created.id;
     }
@@ -370,6 +379,7 @@ export class DebugWiki {
     now: string,
     kind: DebugWikiFeedback['kind'],
   ): void {
+    const replacingDisputedSolution = entry.status === 'needs_review';
     transitionDebugWikiEntry(entry, 'active');
     entry.updatedAt = now;
     entry.summary = input.brief.summary;
@@ -379,7 +389,9 @@ export class DebugWiki {
     entry.symptoms = dedup([...input.brief.evidence, ...entry.symptoms]).slice(0, 12);
     entry.evidence = dedup([...(input.evidence ?? []), ...entry.evidence]).slice(0, 12);
     if (input.resolutionPlan?.trim()) entry.resolutionPlan = input.resolutionPlan.trim();
-    entry.solution = mergeSolution(entry.solution, input.solution);
+    entry.solution = replacingDisputedSolution
+      ? input.solution.trim()
+      : mergeSolution(entry.solution, input.solution);
     entry.repairFiles = dedup([...(input.repairFiles ?? []), ...(entry.repairFiles ?? [])]).slice(0, 12);
     entry.stats.successes += 1;
     pushFeedback(entry, {
@@ -545,8 +557,10 @@ export function renderDebugWikiMatchesForPrompt(matches: DebugWikiMatch[]): stri
       `- ${entry.id} layer=${entry.layer} score=${match.score.toFixed(2)} confidence=${match.confidence.toFixed(2)} status=${entry.status}`,
       `  problem: [${entry.category}] ${entry.summary}`,
       `  symptoms: ${entry.symptoms.slice(0, 4).join(' | ') || entry.primaryError}`,
-      entry.resolutionPlan ? `  priorPlan: ${entry.resolutionPlan}` : '',
-      `  confirmedSolution: ${entry.solution}`,
+      entry.status !== 'needs_review' && entry.resolutionPlan ? `  priorPlan: ${entry.resolutionPlan}` : '',
+      entry.status === 'needs_review'
+        ? '  disputedSolution: hidden because prior reuse failed or the legacy entry merged unrelated fixes; derive a fresh solution from current evidence'
+        : `  candidateSolution: ${entry.solution}`,
       `  feedback: uses=${entry.stats.uses} successes=${entry.stats.successes} failures=${entry.stats.failures}`,
     );
     if (entry.repairFiles?.length) lines.push(`  repairFiles: ${entry.repairFiles.join(', ')}`);
@@ -802,6 +816,10 @@ function mergeSolution(previous: string, next: string): string {
   if (!trimmed || previous.includes(trimmed)) return previous;
   if (!previous.trim()) return trimmed;
   return `${previous.trim()}\nCorrected/confirmed resolution: ${trimmed}`;
+}
+
+function hasLegacyMergedSolutions(solution: string): boolean {
+  return solution.split('Corrected/confirmed resolution:').length - 1 > 1;
 }
 
 function pushFeedback(entry: DebugWikiEntry, feedback: DebugWikiFeedback): void {

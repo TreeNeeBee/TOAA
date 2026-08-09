@@ -99,6 +99,7 @@ const PYTHON_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只能�
 {
   "thoughts": "<用一句话说明本轮意图>",
   "bugResolutionPlan": "<仅 DEBUG Bug Ticket 必填：简明说明根因假设、修复目标和验证方案>",
+  "changeRequestDisposition": null,
   "validationDefect": null,
   "qualityAssessment": {
     "completion": 1,
@@ -207,6 +208,7 @@ const TYPESCRIPT_EXECUTOR_SYSTEM = `你是 XCompiler 的 Step Executor。你只�
 {
   "thoughts": "<用一句话说明本轮意图>",
   "bugResolutionPlan": "<仅 DEBUG Bug Ticket 必填：简明说明根因假设、修复目标和验证方案>",
+  "changeRequestDisposition": null,
   "validationDefect": null,
   "qualityAssessment": {
     "completion": 1,
@@ -289,6 +291,11 @@ function buildPlannerPhaseDecomposeSystem(profile: LanguageProfile): string {
 
 你会收到已经冻结的 PhasePlan 和一个 phaseId。只允许为该 phaseId 生成 Step；planned phase 不得展开到本次 steps 中。
 
+目标 phase 的 objective、scope、deliverables 和 verificationGate 是本次 StepPlan 的权威规格。
+所有 planned phase 都是本次明确的范围外内容：禁止把其功能、依赖包、产物或验收条件提前复制到
+当前 phase。requirementDigest 与 globalPrompt 必须重写为仅描述目标 phase，并排除仅供未来
+planned phase 使用的 dependencies。
+
 每个当前 phase 必须使用完整标准 V 模型：
 REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TEST -> INTEGRATION_TEST -> MODULE_TEST -> FUNCTIONAL_TEST。
 
@@ -340,9 +347,12 @@ const messages: Messages = {
     invalidBaseUrl: (raw, fallback) => `[xcompiler] base_url 无效（${raw}）；请配置有效的 HTTP(S) URL（默认值：${fallback}）`,
     providerValidationFailed: (role, model) => `[${role}] provider ${model} 输出契约校验失败`,
     providerValidationRetry: (role, model) => `[${role}] provider ${model} 在切换前携带契约错误原模型纠错重试`,
-    providerValidationRepairPrompt: (error) =>
-      `上一次输出未通过调用方契约校验：${error.slice(0, 1800)}\n` +
-      '请根据原始 system 和 user 要求修正并重新返回完整结果。只返回要求的格式，不要解释或输出 Markdown。',
+    providerValidationRepairPrompt: (error, rejectedOutput) =>
+      `上一次候选输出在任何 action 被解析、授权、执行或持久化之前就未通过调用方契约校验：${error.slice(0, 1800)}\n` +
+      '该候选输出声称的工作区变更均未发生；只有原始对话中明确返回的工具结果才属于已执行状态。' +
+      '请根据原始 system 和 user 要求重新返回完整结果。若被拒绝的候选输出原本要执行修改，必须再次提交该修改；在调用方工具结果确认修改成功前，不得直接跳到验证。' +
+      '只返回要求的格式，不要解释或输出 Markdown。\n\n' +
+      `<rejected-output never-executed="true">\n${rejectedOutput}\n</rejected-output>`,
     providerCallFailed: (role, model) => `[${role}] provider ${model} 调用失败，切换到下一个`,
     scoreReadFailed: (p, message) => `读取 ${p} 失败：${message}`,
     scoreChanged: (provider, score, previous) => `评分（${provider}）=${score}（原值 ${previous}）`,
@@ -360,7 +370,6 @@ const messages: Messages = {
       'subprocess 模式无法兑现 sandbox network=off；请改用 mode=docker，或明确选择 download-only/full。',
     dockerInsideContainerUnsupported:
       '检测到 XCompiler 运行在容器内，sandbox mode=docker 可能导致 bind-mount 路径及 docker.sock 权限错位，因此不受支持。请使用 agent.sandboxes.<language>.mode=subprocess、改在宿主机运行，或仅在受控环境设置 XC_IN_CONTAINER=0。',
-    firejailUnsupported: '尚未实现 sandbox=firejail，请使用 subprocess 或 docker。',
     smokeHeader: (baseUrl) => `正在对 ${baseUrl} 执行流式冒烟测试`,
     smokeOk: (model, totalMs, firstTokenMs, chunks, preview) =>
       `[成功 总耗时=${totalMs}ms 首Token=${firstTokenMs}ms 分块=${chunks}] ${model} -> ${preview}`,
@@ -802,6 +811,8 @@ ${opts.phasePlan}
 请只为 ${opts.phaseId} 输出完整 V 模型 StepPlan：
 - steps 中每个 Step.iterationId 必须等于 "${opts.phaseId}"。
 - 禁止输出其他 planned phase 的 Step；P2/P3 的详细计划留到它们成为 current phase 时再生成。
+- 其他 planned phase 都是明确的排除范围；不得把其功能、依赖包、产物或验收条件写入当前
+  requirementDigest、globalPrompt、dependencies、architectureModules 或 steps。
 - 如果 ${opts.phaseId} 横跨多个关注点（领域逻辑、CLI/API、文件 I/O、外部集成、流程编排、测试），必须在 architectureModules 中体现当前 phase 的模块边界，并在 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 的 subTasks 下分解模块级工作。
 - architectureModules.sourcePaths 只能是 src/ 下的产品源码文件；随产品交付的运行时非代码资产写入 assetPaths。不要把 tests/fixtures、tests/utils、样例输入、临时输出、目录或文档登记为架构模块。
 - architectureModules.testPaths 只能填写由 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 读取执行的模块契约测试（通常为 tests/modules/*）；CODE 必须另行输出单元测试，禁止与这些 testPaths 重复。

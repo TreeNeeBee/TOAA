@@ -23,6 +23,11 @@ export interface DebugBriefInput {
   failureLog?: string;
   phase?: Phase;
   targetPhase?: Phase;
+  typedFailure?: {
+    category: 'llm-provider' | 'tool' | 'test' | 'quality' | 'contract' | 'internal';
+    code: string;
+    statusCode?: number;
+  };
 }
 
 const MAX_EVIDENCE = 8;
@@ -38,12 +43,18 @@ export function buildDebugBrief(input: DebugBriefInput): DebugBrief {
   const rootSignals = extractSignals(sections.root || raw);
   const latestSignals = sections.latest ? extractSignals(sections.latest) : undefined;
   const chosen = choosePrimarySignals(rootSignals, latestSignals);
-  const category = chosen.category;
+  const category = input.typedFailure
+    ? typedFailureCategory(input.typedFailure)
+    : chosen.category;
   const primaryError = chosen.primaryError || reason || 'Unknown failure';
   const failedTests = dedup([...(rootSignals.failedTests ?? []), ...(latestSignals?.failedTests ?? [])]).slice(0, MAX_FAILED_TESTS);
   const files = dedup([...(rootSignals.files ?? []), ...(latestSignals?.files ?? [])]).slice(0, MAX_FILES);
   const toolFailures = dedup([...(rootSignals.toolFailures ?? []), ...(latestSignals?.toolFailures ?? [])]).slice(0, MAX_TOOL_FAILURES);
-  const statusCodes = dedup([...(rootSignals.statusCodes ?? []), ...(latestSignals?.statusCodes ?? [])]).slice(0, 6);
+  const statusCodes = dedup([
+    ...(input.typedFailure?.statusCode ? [String(input.typedFailure.statusCode)] : []),
+    ...(rootSignals.statusCodes ?? []),
+    ...(latestSignals?.statusCodes ?? []),
+  ]).slice(0, 6);
   const evidence = selectEvidenceLines(raw, category, primaryError, failedTests, files, toolFailures);
   return {
     version: 2,
@@ -58,6 +69,17 @@ export function buildDebugBrief(input: DebugBriefInput): DebugBrief {
     evidence: evidence.lines,
     omittedEvidenceLines: evidence.omitted,
   };
+}
+
+function typedFailureCategory(failure: NonNullable<DebugBriefInput['typedFailure']>): DebugFailureCategory {
+  if (failure.category === 'llm-provider') return 'llm_provider';
+  if (failure.category === 'test') return 'test_failure';
+  if (failure.code.includes('permission')) return 'permission_denied';
+  if (failure.code.includes('missing_output')) return 'missing_output';
+  if (failure.code.includes('dependency')) return 'dependency_error';
+  if (failure.code.includes('network') || failure.code.includes('http')) return 'network_api_failure';
+  if (failure.code.includes('loop')) return 'tool_loop';
+  return 'exception';
 }
 
 export function renderDebugBriefForPrompt(brief: DebugBrief): string {

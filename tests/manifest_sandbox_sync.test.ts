@@ -36,6 +36,33 @@ describe('manifest writes and the sandbox', () => {
     expect(events).toEqual(['execute.sandbox_synced_after_manifest_write']);
   });
 
+  it('requests install permission for an implicit manifest-triggered rebuild', async () => {
+    const { ctx, builds, events } = context(async () => undefined);
+    const requests: string[] = [];
+    ctx.stepId = 'P1-S002';
+    ctx.requestPermission = async (request) => {
+      requests.push(`${request.operationType}:${request.target}:${request.tool}`);
+      return { approved: true };
+    };
+
+    await syncSandboxIfManifestWritten({ tool: 'write_file', args: { path: 'package.json' } }, ok, ctx);
+
+    expect(requests).toEqual(['install_dependency:package.json:sandbox_sync']);
+    expect(builds).toEqual(['package.json']);
+    expect(events).toEqual(['execute.sandbox_synced_after_manifest_write']);
+  });
+
+  it('keeps the manifest but skips its implicit rebuild when install permission is denied', async () => {
+    const { ctx, builds, events } = context(async () => undefined);
+    ctx.stepId = 'P1-S002';
+    ctx.requestPermission = async () => ({ approved: false, reason: 'user denied install' });
+
+    await syncSandboxIfManifestWritten({ tool: 'write_file', args: { path: 'package.json' } }, ok, ctx);
+
+    expect(builds).toEqual([]);
+    expect(events).toEqual(['execute.sandbox_sync_after_manifest_write_denied']);
+  });
+
   it('ignores writes to anything else, and failed writes', async () => {
     const { ctx, builds } = context(async () => undefined);
     await syncSandboxIfManifestWritten({ tool: 'write_file', args: { path: 'src/cli.ts' } }, ok, ctx);

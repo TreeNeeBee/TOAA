@@ -186,6 +186,41 @@ describe('paired source test product-reference contract', () => {
     expect(integrated.ok).toBe(true);
   });
 
+  it('rejects integration tests that copy orchestration and failure policy around product calls', async () => {
+    const plan = contractPlan(
+      'typescript',
+      'tests/integration/renderer-pipeline.test.ts',
+      'DETAILED_DESIGN',
+    );
+    plan.architectureModules!.push({
+      id: 'M002',
+      name: 'Pipeline',
+      responsibility: 'Coordinate collaborators and render the resulting records.',
+      sourcePaths: ['src/pipeline/run.ts'],
+      testPaths: ['tests/modules/pipeline.test.ts'],
+      dependencies: ['M001'],
+    });
+    await workspace.writeFile(
+      'tests/integration/renderer-pipeline.test.ts',
+      [
+        'import { render } from "../../src/renderer/render.ts";',
+        'import { run } from "../../src/pipeline/run.ts";',
+        'test("pipeline", async () => {',
+        '  const values: string[] = [];',
+        '  for (const input of ["news"]) {',
+        '    try { values.push(await run(render, input)); } catch { /* copied fallback */ }',
+        '  }',
+        '  expect(values).toHaveLength(1);',
+        '});',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+
+    expect(result.ok).toBe(false);
+    expect(result.invalid.join('\n')).toContain('duplicates orchestration/failure-handling');
+  });
+
   it('accepts a Python import and rejects a local-only stand-in', async () => {
     const plan = contractPlan('python', 'tests/test_renderer.py');
     await workspace.writeFile(

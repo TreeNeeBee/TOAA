@@ -1,6 +1,6 @@
 # XCompiler 0.3 Architecture Refactor Plan
 
-Status: implemented — see §16 for per-item status, revised sections, and what remains  
+Status: implemented — see §16 for per-item status, revised sections, and what remains
 Target release: v0.3.0  
 Scope: architecture, execution governance, testing infrastructure, and release baseline  
 Compatibility policy: intentionally breaking; no backward-compatibility layer
@@ -1012,7 +1012,9 @@ The refactor is complete only when all of the following are true:
 
 Recorded after the R0-R8 implementation pass and re-verified after the worktree/MR/context
 workstream (P1-P9) and its final lifecycle review. `npm run typecheck`, `npm run lint`, and the full
-test matrix pass: 92 files and 821 tests.
+test matrix pass. The final refactor-hardening gate is 93 files and 826 tests, including explicit
+permission denial, interrupted-merge reconciliation, semantic scheduler progress, and whole-project
+delivery-report coverage.
 
 ### Definition of Done
 

@@ -79,9 +79,6 @@ export function createSandbox(
       environmentRoot,
     });
   }
-  if (kind === 'firejail') {
-    throw new Error(t().system.firejailUnsupported);
-  }
   // 在容器内默认提示（但不抦截）：subprocess 是唯一推荐选项
   return new SubprocessSandbox({
     ws,

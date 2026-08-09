@@ -6,7 +6,7 @@ XCompiler 的插件层位于核心流程与扩展能力之间。既支持直接�
 
 设计参考 [VS Code Extension Manifest](https://code.visualstudio.com/api/references/extension-manifest)：插件元数据与可执行入口分离，唯一 ID、插件 SemVer 和宿主兼容声明都是必填项。XCompiler 使用可序列化的 `manifest`；`loadPluginSources()` 会先读取并检查全部 manifest，全部通过后才 import 任一模块，因此 registry / marketplace 可在不执行插件代码的前提下索引和预检。
 
-XCompiler 核心版本和 Plugin API 版本独立演进：核心使用 package SemVer，Plugin API 使用整数主版本（当前 `1`）。每个插件清单必须声明：
+XCompiler 核心版本和 Plugin API 版本独立演进：核心使用 package SemVer，Plugin API 使用整数主版本（当前 `2`）。每个插件清单必须声明：
 
 | 字段 | 必填 | 语义 |
 |---|---|---|
@@ -65,7 +65,7 @@ export const policyPlugin: XCompilerPlugin = {
     description: 'Enforces organization plan policies.',
     version: '1.0.0',
     apiVersion: XCOMPILER_PLUGIN_API_VERSION,
-    minXCompilerVersion: '0.2.4',
+    minXCompilerVersion: '0.3.0',
     license: 'Apache-2.0',
     keywords: ['policy', 'compliance'],
   },

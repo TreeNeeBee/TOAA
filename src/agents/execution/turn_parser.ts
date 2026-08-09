@@ -8,6 +8,8 @@ export interface LLMAction {
 export interface LLMTurn {
   thoughts?: string;
   bugResolutionPlan?: string;
+  bugResolutionDisposition?: unknown;
+  bug_resolution_disposition?: unknown;
   bug_resolution_plan?: string;
   resolutionPlan?: string;
   handlingPlan?: string;
@@ -18,9 +20,67 @@ export interface LLMTurn {
   validation_failure?: string | null;
   qualityAssessment?: unknown;
   quality_assessment?: unknown;
+  changeRequestDisposition?: unknown;
+  change_request_disposition?: unknown;
   actions?: unknown;
   done?: boolean;
 }
+
+export interface ChangeRequestDisposition {
+  outcome: 'applied' | 'not-applicable';
+  reasonCategory:
+    | 'contract-applied'
+    | 'already-aligned'
+    | 'outside-step-scope'
+    | 'downstream-owned'
+    | 'diagnosis-contradicted';
+  rationale: string;
+  inspectedArtifacts: string[];
+  evidence: string[];
+}
+
+export interface BugResolutionDisposition {
+  outcome: 'deferred';
+  reasonCategory: 'downstream-owned' | 'external-dependency';
+  rationale: string;
+  affectedArtifacts: string[];
+  evidence: string[];
+}
+
+const CHANGE_REQUEST_REASON_CATEGORIES = new Set<ChangeRequestDisposition['reasonCategory']>([
+  'contract-applied',
+  'already-aligned',
+  'outside-step-scope',
+  'downstream-owned',
+  'diagnosis-contradicted',
+]);
+
+const EXECUTION_TURN_ROOT_KEYS = new Set([
+  'thoughts',
+  'bugResolutionPlan',
+  'bugResolutionDisposition',
+  'bug_resolution_disposition',
+  'bug_resolution_plan',
+  'resolutionPlan',
+  'handlingPlan',
+  'fixPlan',
+  'validationDefect',
+  'validation_defect',
+  'validationFailure',
+  'validation_failure',
+  'qualityAssessment',
+  'quality_assessment',
+  'changeRequestDisposition',
+  'change_request_disposition',
+  'actions',
+  'done',
+  // Provider-native single tool calls are normalized by parseTurn.
+  'type',
+  'tool',
+  'name',
+  'function',
+  'id',
+]);
 
 export function parseTurn(text: string): LLMTurn {
   const cleaned = stripFence(text).trim();
@@ -54,6 +114,19 @@ export function isCompleteTurnJson(text: string): boolean {
   return !!turn && typeof turn.done === 'boolean' && Array.isArray(turn.actions);
 }
 
+/**
+ * Returns an impossible top-level key as soon as a streamed JSON object exposes it.
+ * This lets the provider router stop request-envelope echoes and switch models without
+ * waiting for the entire invalid payload to be generated.
+ */
+export function rejectedExecutionTurnEnvelopeKey(text: string): string | undefined {
+  const cleaned = stripFence(text).trimStart();
+  const match = /^\{\s*"((?:\\.|[^"\\])*)"\s*:/u.exec(cleaned);
+  if (!match?.[1]) return undefined;
+  const key = parseJsonStringLiteral(match[1]);
+  return key && !EXECUTION_TURN_ROOT_KEYS.has(key) ? key : undefined;
+}
+
 export function extractBugResolutionPlan(turn: LLMTurn): string | undefined {
   return firstBoundedText([
     turn.bugResolutionPlan,
@@ -64,6 +137,28 @@ export function extractBugResolutionPlan(turn: LLMTurn): string | undefined {
   ]);
 }
 
+export function extractBugResolutionDisposition(
+  turn: LLMTurn,
+): BugResolutionDisposition | undefined {
+  const raw = turn.bugResolutionDisposition ?? turn.bug_resolution_disposition;
+  if (!isPlainRecord(raw) || raw.outcome !== 'deferred') return undefined;
+  const reasonCategory = raw.reasonCategory ?? raw.reason_category;
+  if (reasonCategory !== 'downstream-owned' && reasonCategory !== 'external-dependency') {
+    return undefined;
+  }
+  if (typeof raw.rationale !== 'string' || raw.rationale.trim().length < 20) return undefined;
+  const affectedArtifacts = stringArray(raw.affectedArtifacts ?? raw.affected_artifacts);
+  const evidence = stringArray(raw.evidence);
+  if (affectedArtifacts.length === 0 || evidence.length === 0) return undefined;
+  return {
+    outcome: 'deferred',
+    reasonCategory,
+    rationale: raw.rationale.trim(),
+    affectedArtifacts,
+    evidence,
+  };
+}
+
 export function extractValidationDefect(turn: LLMTurn): string | undefined {
   return firstBoundedText([
     turn.validationDefect,
@@ -71,6 +166,31 @@ export function extractValidationDefect(turn: LLMTurn): string | undefined {
     turn.validationFailure,
     turn.validation_failure,
   ]);
+}
+
+export function extractChangeRequestDisposition(
+  turn: LLMTurn,
+): ChangeRequestDisposition | undefined {
+  const raw = turn.changeRequestDisposition ?? turn.change_request_disposition;
+  if (!isPlainRecord(raw)) return undefined;
+  if (raw.outcome !== 'applied' && raw.outcome !== 'not-applicable') return undefined;
+  const reasonCategory = raw.reasonCategory ?? raw.reason_category;
+  if (
+    typeof reasonCategory !== 'string' ||
+    !CHANGE_REQUEST_REASON_CATEGORIES.has(reasonCategory as ChangeRequestDisposition['reasonCategory'])
+  ) return undefined;
+  if ((raw.outcome === 'applied') !== (reasonCategory === 'contract-applied')) return undefined;
+  if (typeof raw.rationale !== 'string' || raw.rationale.trim().length < 20) return undefined;
+  const inspectedArtifacts = stringArray(raw.inspectedArtifacts ?? raw.inspected_artifacts);
+  const evidence = stringArray(raw.evidence);
+  if (inspectedArtifacts.length === 0 || evidence.length === 0) return undefined;
+  return {
+    outcome: raw.outcome,
+    reasonCategory: reasonCategory as ChangeRequestDisposition['reasonCategory'],
+    rationale: raw.rationale.trim(),
+    inspectedArtifacts,
+    evidence,
+  };
 }
 
 function salvageMalformedTurn(text: string): LLMTurn | null {
@@ -132,6 +252,13 @@ function normalizeNativeToolUse(value: Record<string, unknown>): LLMAction | und
     }
   }
   return undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => item.trim());
 }
 
 function extractJsonObjectAt(text: string, start: number): string | null {

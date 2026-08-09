@@ -4,8 +4,8 @@
 
 ```json
 {
-  "version": "0.1.3",
-  "xcompiler": { "pluginApiVersion": 1 }
+  "version": "0.3.0",
+  "xcompiler": { "pluginApiVersion": 2 }
 }
 ```
 

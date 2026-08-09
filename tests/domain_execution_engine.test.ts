@@ -13,8 +13,31 @@ import { DomainObjectRepository } from '../src/infrastructure/repository/domain_
 import { PluginHost } from '../src/plugins/host.js';
 import { Workspace } from '../src/workspace/workspace.js';
 import { reviseActor } from '../src/domain/project_management/index.js';
+import { VALIDATION_CONTRACT_DEFECT_CODE } from '../src/domain/tickets/ticket.js';
 
 describe('ProjectOrchestrator', () => {
+  it('returns cancelled attempt capacity to PM without opening a project defect', async () => {
+    const setup = await fixture();
+    const cancelled = new Error('CLI task cancelled by SIGINT');
+    cancelled.name = 'AbortError';
+    const runner = {
+      initialize: async () => undefined,
+      run: async (): Promise<AttemptResult> => { throw cancelled; },
+    };
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
+
+    await expect(engine.run(setup.graph.phases[0]!.id)).rejects.toBe(cancelled);
+
+    const firstStep = await setup.repository.read(setup.graph.steps[0]!.id);
+    const tickets = await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id });
+    const story = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.stepId === firstStep.id);
+    expect(firstStep.objectType === 'step' && firstStep.state).toBe('in_progress');
+    expect(firstStep.objectType === 'step' && firstStep.attempts).toBe(0);
+    expect(story?.objectType === 'ticket' && story.state).toBe('in_progress');
+    expect(story?.objectType === 'ticket' && story.attempts).toBe(0);
+    expect(tickets.some((ticket) => ticket.objectType === 'ticket' && ticket.type === 'bug')).toBe(false);
+  });
+
   it('keeps infrastructure failures on the same Ticket without opening a Bug', async () => {
     const setup = await fixture();
     let first = true;
@@ -146,6 +169,25 @@ describe('ProjectOrchestrator', () => {
       initialize: base.initialize,
       run: async (input: AttemptInput): Promise<AttemptResult> => {
         calls.push(`${input.domainStep.name}:${input.mode}`);
+        if (input.domainStep.type === 'INTEGRATION_TEST' && input.mode === 'change-request') {
+          const tickets = await setup.repository.list({
+            objectType: 'ticket',
+            projectId: setup.graph.project.id,
+          });
+          const sourceBug = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.type === 'bug');
+          expect(sourceBug?.objectType === 'ticket' && sourceBug.state).toBe('pending');
+          const activeRequest = tickets.find((ticket) =>
+            ticket.objectType === 'ticket' &&
+            ticket.type === 'change-request' &&
+            ticket.targetStepId === input.domainStep.id &&
+            ticket.state !== 'closed');
+          const failedStory = tickets.find((ticket) =>
+            ticket.objectType === 'ticket' &&
+            ticket.type === 'story' &&
+            ticket.stepId === setup.graph.steps.find((step) => step.type === 'UNIT_TEST')!.id);
+          expect(activeRequest?.objectType).toBe('ticket');
+          expect(failedStory?.objectType === 'ticket' && failedStory.blockedByTicketIds).toContain(activeRequest!.id);
+        }
         if (input.domainStep.type === 'UNIT_TEST' && input.mode === 'normal' && !failedUnit) {
           failedUnit = true;
           return {
@@ -158,7 +200,13 @@ describe('ProjectOrchestrator', () => {
           };
         }
         const result = await passingAttempt(setup.repository, input.domainStep);
-        return input.mode === 'debug' ? { ...result, wikiEntryIds: ['known-fix'] } : result;
+        if (input.mode === 'debug') return { ...result, wikiEntryIds: ['known-fix'] };
+        // A downstream owner can verify that the CR requires no local file edit. This no-op is an
+        // application record, not permission to skip the remaining V-model gates.
+        if (input.mode === 'change-request' && input.domainStep.type === 'UNIT_TEST') {
+          return { ...result, changedFiles: [], commit: undefined };
+        }
+        return result;
       },
       recordVerifiedBugResolution: async (ticketId: string) => {
         calls.push(`wiki:${ticketId}`);
@@ -177,6 +225,13 @@ describe('ProjectOrchestrator', () => {
     const request = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.type === 'change-request');
     expect(bug?.objectType === 'ticket' && bug.state).toBe('closed');
     expect(request?.objectType === 'ticket' && request.state).toBe('closed');
+    const rootRequests = tickets.filter((ticket) =>
+      ticket.type === 'change-request' && ticket.sourceTicketId === bug!.id,
+    );
+    expect(rootRequests.length).toBeGreaterThan(1);
+    expect(new Set(rootRequests.map((ticket) => ticket.description))).toEqual(
+      new Set([rootRequests[0]!.contractDelta.summary]),
+    );
     expect(bug?.objectType === 'ticket' && bug.type === 'bug' && bug.changelistIds).toHaveLength(1);
     const bugChange = bug?.objectType === 'ticket' && bug.type === 'bug'
       ? await setup.repository.read(bug.changelistIds[0]!)
@@ -259,6 +314,80 @@ describe('ProjectOrchestrator', () => {
     // S006 is attempted twice: the application that failed, and the one after the repair landed.
     expect(calls.filter((call) => call === 'P1-S006:change-request')).toHaveLength(2);
     expect(calls).toContain('P1-S003:debug');
+    // The corrective Ticket owns the S003 repair. Closing it must not leave the ordinary Story
+    // reopened and schedule a second full detailed-design pass before the parent CR resumes.
+    expect(calls.filter((call) => call === 'P1-S003:normal')).toHaveLength(1);
+  });
+
+  it('routes a CR diagnosis contradiction from its discoverer back through the original failed gate', async () => {
+    const setup = await fixture();
+    const calls: string[] = [];
+    let failedFunctional = false;
+    let reportedContradiction = false;
+    const runner = {
+      initialize: async () => undefined,
+      run: async (input: AttemptInput): Promise<AttemptResult> => {
+        calls.push(`${input.domainStep.name}:${input.mode}`);
+        if (input.domainStep.type === 'FUNCTIONAL_TEST' && input.mode === 'normal' && !failedFunctional) {
+          failedFunctional = true;
+          return {
+            ok: false,
+            reason: 'functional CLI acceptance failed',
+            failureLog: 'npm test exit=1 args=tests/functional/cli.test.ts',
+            changedFiles: [],
+            wikiEntryIds: [],
+            testOutcomes: [],
+          };
+        }
+        if (input.domainStep.type === 'CODE' && input.mode === 'change-request' && !reportedContradiction) {
+          reportedContradiction = true;
+          return {
+            ok: false,
+            reason: 'validation defect reported: the CR diagnosis is contradicted by current files',
+            failureLog: 'src/cli.ts exists; the functional test calls live HTTP without deterministic fixtures',
+            changedFiles: [],
+            wikiEntryIds: [],
+            testOutcomes: [],
+            executor: {
+              success: false,
+              rounds: 1,
+              toolCalls: [],
+              validationDefect: 'The CR premise is false; the functional test must isolate live HTTP.',
+              metrics: {
+                rounds: 1,
+                parseFailures: 0,
+                repeatedTurns: 0,
+                toolFailRatio: 0,
+                progressRatio: 1,
+                healthScore: 1,
+                providers: ['test'],
+              },
+            },
+          };
+        }
+        return passingAttempt(setup.repository, input.domainStep);
+      },
+    };
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
+    const result = await engine.run(setup.graph.phases[0]!.id);
+
+    expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
+    const tickets = (await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id }))
+      .filter((ticket) => ticket.objectType === 'ticket');
+    const bugs = tickets.filter((ticket) => ticket.type === 'bug');
+    const discovered = bugs.find((ticket) => ticket.description.includes('CR premise is false'));
+    const requirement = setup.graph.steps.find((step) => step.type === 'REQUIREMENT_ANALYSIS')!;
+    const functional = setup.graph.steps.find((step) => step.type === 'FUNCTIONAL_TEST')!;
+
+    expect(bugs).toHaveLength(2);
+    expect(discovered?.type).toBe('bug');
+    expect(discovered?.type === 'bug' && discovered.failure.failedStepId).toBe(functional.id);
+    expect(discovered?.type === 'bug' && discovered.failure.targetStepId).toBe(requirement.id);
+    expect(discovered?.type === 'bug' && discovered.failure.category).toBe('contract');
+    expect(discovered?.type === 'bug' && discovered.failure.code).toBe(VALIDATION_CONTRACT_DEFECT_CODE);
+    expect(discovered?.type === 'bug' && discovered.failure.details?.originFailureCode).toBe('unclassified_execution_failure');
+    expect(discovered?.parentTicketId).toBeDefined();
+    expect(calls.filter((call) => call === 'P1-S001:debug')).toHaveLength(2);
   });
 
   it('routes a CR quality shortfall through a linked Enhancement instead of a Bug', async () => {
@@ -363,10 +492,7 @@ describe('ProjectOrchestrator', () => {
     expect(outcome.failureReason ?? '').not.toContain('merge gate failed');
   });
 
-  // A gate that passed but was not merged is not an error and must not stop the run — but a run that
-  // completes having merged nothing looked completely healthy, and finding out why meant reading
-  // Merge Request revisions by hand.
-  it('records a gate that passed but was not merged, without stopping', async () => {
+  it('stops before downstream execution when merge authorization is missing', async () => {
     const setup = await fixture();
     const calls: string[] = [];
     const notes: Array<Record<string, unknown>> = [];
@@ -385,7 +511,8 @@ describe('ProjectOrchestrator', () => {
     }, setup.plan);
     const outcome = await engine.run(setup.graph.phases[0]!.id);
 
-    expect(outcome.failureReason ?? '').not.toContain('awaiting-authorization');
+    expect(outcome.failureReason).toContain('already existed');
+    expect(calls).toHaveLength(1);
     const recorded = notes.filter((note) => note.messageId === 'domain.merge_awaiting_authorization');
     expect(recorded.length).toBeGreaterThan(0);
     expect(String(recorded[0]!.reason)).toContain('already existed');
@@ -407,6 +534,7 @@ function options(
     sandbox: {} as ProjectOrchestratorOptions['sandbox'],
     router: {} as ProjectOrchestratorOptions['router'],
     audit: { event: async () => undefined } as unknown as ProjectOrchestratorOptions['audit'],
+    requestPermission: async () => ({ approved: true }),
   };
 }
 
@@ -481,7 +609,15 @@ function samplePlan(): Plan {
     steps: phases.map(([phase, role], index) => ({
       id: `S${String(index + 1).padStart(3, '0')}`, iterationId: 'P1', phase,
       title: phase, description: `Execute ${phase}.`, systemPrompt: `Execute ${phase}.`, role,
-      tools: ['read_file'], inputs: [], outputs: [`artifact-${index + 1}`], subTasks: [],
+      tools: ['read_file'], inputs: [], outputs: [`artifact-${index + 1}`],
+      subTasks: index === 6
+        ? [{
+            id: 'M001',
+            title: 'Validate module contract',
+            description: 'Run the module-level contract checks.',
+            acceptance: 'Module contract passes.',
+          }]
+        : [],
       dependsOn: index ? [`S${String(index).padStart(3, '0')}`] : [], acceptance: `${phase} passes.`,
       maxAttempts: 4,
     })),

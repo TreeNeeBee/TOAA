@@ -19,6 +19,7 @@ import {
 import { ProjectSchema, transitionProject, type Project } from '../../domain/projects/project.js';
 import { StepSchema, transitionStep, type Step } from '../../domain/steps/step.js';
 import type { Ticket } from '../../domain/tickets/ticket.js';
+import type { PersistedDomainObject } from '../../domain/objects/persisted.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 import { GovernanceService } from './governance_service.js';
 import { TicketLifecycleService } from './ticket_lifecycle_service.js';
@@ -124,6 +125,55 @@ export class ProjectStateService {
     return current;
   }
 
+  /**
+   * Builds the Step side of a corrective route without committing it.
+   *
+   * TicketWorkflow commits these revisions together with the discovered Bug/Enhancement and its
+   * blocker edges. Keeping this as a prepared batch prevents a crash from leaving a pending source
+   * Step or reopened target Step with no corrective Ticket for PM to schedule.
+   */
+  prepareCorrectiveRouting(
+    source: Step,
+    target: Step,
+    reason: 'defect' | 'quality-gap',
+  ): { source: Step; target: Step; objects: PersistedDomainObject[] } {
+    const pending = this.prepareStepPending(source, reason);
+    const objects: PersistedDomainObject[] = [...pending.objects];
+    const preparedSource = pending.step;
+    const advance = (step: Step, next: Parameters<typeof transitionStep>[1], pendingReason?: PendingReason) => {
+      const updated = transitionStep(step, next, { pendingReason });
+      objects.push(updated, stepTransitionEvent(step, updated, pendingReason));
+      return updated;
+    };
+
+    let preparedTarget = target.id === source.id ? preparedSource : target;
+    if (
+      preparedTarget.id !== preparedSource.id &&
+      (preparedTarget.state === 'delivered' || preparedTarget.state === 'closed')
+    ) {
+      preparedTarget = advance(preparedTarget, 'reopened');
+    }
+    return { source: preparedSource, target: preparedTarget, objects };
+  }
+
+  /** Prepares an additional discovering Step to wait on the corrective Ticket atomically. */
+  prepareStepPending(
+    source: Step,
+    reason: 'defect' | 'quality-gap' | 'dependency',
+  ): { step: Step; objects: PersistedDomainObject[] } {
+    const objects: PersistedDomainObject[] = [];
+    let step = source;
+    const advance = (next: Parameters<typeof transitionStep>[1], pendingReason?: PendingReason) => {
+      const updated = transitionStep(step, next, { pendingReason });
+      objects.push(updated, stepTransitionEvent(step, updated, pendingReason));
+      step = updated;
+    };
+    if (step.state === 'delivered' || step.state === 'closed') advance('reopened');
+    if (step.state === 'created' || step.state === 'reopened') advance('in_progress');
+    if (step.state === 'in_progress') advance('pending', reason);
+    return { step, objects };
+  }
+
   async transitionStep(
     step: Step,
     next: Parameters<typeof transitionStep>[1],
@@ -131,17 +181,7 @@ export class ProjectStateService {
   ): Promise<Step> {
     if (step.state === next) return step;
     const updated = transitionStep(step, next, { pendingReason });
-    await this.repository.commit([updated, createDomainEvent({
-      projectId: step.projectId,
-      aggregate: { id: step.id, objectType: 'step' },
-      eventType: `step.${next}`,
-      payload: { stepType: step.type, fromState: step.state, toState: next, pendingReason },
-      phaseId: step.phaseId,
-      stepId: step.id,
-      correlationId: step.id,
-      causationId: step.phaseId,
-      objectRevision: updated.revision,
-    })]);
+    await this.repository.commit([updated, stepTransitionEvent(step, updated, pendingReason)]);
     return updated;
   }
 
@@ -297,6 +337,29 @@ export class ProjectStateService {
   ): Promise<Ticket> {
     return this.lifecycle.transitionPath(ticket, path, { pendingReason });
   }
+}
+
+function stepTransitionEvent(
+  previous: Step,
+  updated: Step,
+  pendingReason?: PendingReason,
+): PersistedDomainObject {
+  return createDomainEvent({
+    projectId: previous.projectId,
+    aggregate: { id: previous.id, objectType: 'step' },
+    eventType: `step.${updated.state}`,
+    payload: {
+      stepType: previous.type,
+      fromState: previous.state,
+      toState: updated.state,
+      pendingReason,
+    },
+    phaseId: previous.phaseId,
+    stepId: previous.id,
+    correlationId: previous.id,
+    causationId: previous.phaseId,
+    objectRevision: updated.revision,
+  });
 }
 
 function reviseStep(

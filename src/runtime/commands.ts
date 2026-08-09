@@ -19,7 +19,6 @@ export interface RuntimeBuildCommandResult {
   workspace: string;
   planPath?: string;
 }
-
 export async function runBuildCommand(opts: RuntimeBuildCommandOptions): Promise<RuntimeBuildCommandResult> {
   const workspace = await resolveCompileWorkspace(opts);
   const result = await runCompile({
@@ -168,5 +167,4 @@ export async function runAppendCommand(opts: RuntimeAppendCommandOptions): Promi
   });
   return { workspace: project.workspace, planPath: compiled.planPath, execution };
 }
-
 

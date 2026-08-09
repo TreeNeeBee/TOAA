@@ -3,7 +3,7 @@ import { XCOMPILER_VERSION, XCompilerRuntime, type ExecuteResult } from '../runt
 import { setLocale, t } from '../i18n/index.js';
 import { configureLocalizedHelp, localeFromArgv, parseLocale, parseRecordReplayMode } from './arguments.js';
 import { xcEnv } from '../config/env.js';
-import { createCliRuntimeIO, createNonInteractiveCliRuntimeIO } from './runtime_adapter.js';
+import { createCliRuntimeIO, isCliCancellation, runCliAbortable } from './runtime_adapter.js';
 
 setLocale(localeFromArgv(process.argv) ?? xcEnv('LANG') ?? 'en');
 const runtime = new XCompilerRuntime({ io: createCliRuntimeIO() });
@@ -27,9 +27,9 @@ program
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .action(async (planArg, opts) => {
-    const result = await runtime.runCommand({
+    const result = await runCliAbortable((abortSignal) => runtime.runCommand({
       // Execution asks nothing: the human gates all live in `build`.
-      io: createNonInteractiveCliRuntimeIO(),
+      io: createCliRuntimeIO(),
       planArg,
       output: opts.output,
       workspace: opts.workspace,
@@ -40,14 +40,19 @@ program
       debugWikiPath: opts.debugWikiPath,
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      abortSignal,
       cwd: process.cwd(),
-    });
+    }));
     applyExecuteExitCode(result);
   });
 
 program.parseAsync(process.argv).catch((err) => {
+  if (isCliCancellation(err)) {
+    process.exitCode = 130;
+    return;
+  }
   console.error(t().system.unhandledError(err?.message ?? String(err)));
-  process.exit(1);
+  process.exitCode = 1;
 });
 
 function applyExecuteExitCode(result: ExecuteResult): void {

@@ -8,9 +8,12 @@ import { ProjectGraphPersistenceService } from '../src/application/planning/proj
 import { ProjectController, type ScheduledWork } from '../src/application/project_management/project_controller.js';
 import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
+import { createObjectEnvelope } from '../src/domain/objects/object_envelope.js';
 import { compileProjectGraph } from '../src/domain/planning/compiler.js';
+import { TicketSchema } from '../src/domain/tickets/ticket.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../src/workspace/workspace.js';
+import { ProjectStateService } from '../src/application/project_management/project_state_service.js';
 
 describe('PM WorkScheduler', () => {
   it('keeps a source Step delivered until its paired verification closes it', async () => {
@@ -57,6 +60,73 @@ describe('PM WorkScheduler', () => {
     await repository.load();
     const resumed = await new ProjectController(repository).resume(fixture.graph.phases[0]!.id);
     expect(resumed).toMatchObject({ mode: 'debug', step: { id: code.id }, ticket: { id: bug.id } });
+  });
+
+  it('resumes an owned Ticket whose Step is pending before dispatching an earlier created CR', async () => {
+    const fixture = await setup();
+    for (let index = 0; index < 7; index += 1) {
+      await deliverPassing(fixture, await startNext(fixture));
+    }
+    const functionalWork = await startNext(fixture);
+    const activeAssignmentId = functionalWork.ticket.activeAssignmentId;
+    expect(activeAssignmentId).toBeDefined();
+
+    const unitStep = fixture.graph.steps.find((step) => step.type === 'UNIT_TEST')!;
+    const unitStory = fixture.graph.tickets.find((ticket) =>
+      ticket.type === 'story' && ticket.stepId === unitStep.id)!;
+    const tester = fixture.graph.actors.find((actor) => actor.role === 'tester')!;
+    const {
+      workKind: _workKind,
+      verificationTicketId: _verificationTicketId,
+      pairedSourceTicketId: _pairedSourceTicketId,
+      ...ticketBase
+    } = unitStory;
+    const earlierRequest = TicketSchema.parse({
+      ...ticketBase,
+      ...createObjectEnvelope({
+        name: 'CR-P1-S005-RECOVERY',
+        objectType: 'ticket',
+        projectId: unitStory.projectId,
+      }),
+      type: 'change-request',
+      creatorActorId: tester.id,
+      state: 'created',
+      assignmentIds: [],
+      activeAssignmentId: undefined,
+      attempts: 0,
+      solution: undefined,
+      resolvedAt: undefined,
+      closedAt: undefined,
+      sourceTicketId: unitStory.id,
+      triggerStepId: unitStep.id,
+      sourceStepId: unitStep.id,
+      targetStepId: unitStep.id,
+      contractDelta: {
+        summary: 'Re-check the earlier unit contract.',
+        before: ['previous contract'],
+        after: ['corrected contract'],
+        affectedArtifacts: ['tests/unit.test.ts'],
+      },
+      implementationPlan: ['Apply the corrected unit contract.'],
+      verificationGate: ['Unit verification passes.'],
+    });
+    await fixture.repository.insert(earlierRequest, earlierRequest.state);
+    await fixture.registration.register(earlierRequest.id);
+
+    const state = new ProjectStateService(fixture.repository);
+    await state.transitionStep(await state.requireStep(unitStep.id), 'reopened');
+    await state.moveStepPending(await state.requireStep(functionalWork.step.id), 'defect');
+
+    const resumed = await fixture.controller.resume(fixture.graph.phases[0]!.id);
+    expect(resumed).toMatchObject({
+      mode: 'normal',
+      step: { id: functionalWork.step.id },
+      ticket: { id: functionalWork.ticket.id },
+    });
+    const routed = await fixture.registration.routeAndAssign(resumed!.ticket.id, {
+      forStepId: resumed!.step.id,
+    });
+    expect(routed.assignment.id).toBe(activeAssignmentId);
   });
 
   it('closes a Phase only after all Step and delivery Tickets close', async () => {

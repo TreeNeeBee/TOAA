@@ -1,5 +1,4 @@
 import type { Workspace } from '../workspace/workspace.js';
-import type { PhasePlan as LegacyPhasePlan } from './phase_plan.js';
 import type { Plan } from './plan.js';
 import type { ProjectAuditResult } from './project_audit.js';
 import type { Phase } from '../domain/phases/phase.js';
@@ -20,7 +19,6 @@ export const PROJECT_DEVELOPMENT_REPORT_PATH = 'docs/project-development-report.
 export async function generateProjectDevelopmentReport(input: {
   workspace: Workspace;
   plan: Plan;
-  phasePlan?: LegacyPhasePlan;
   projectAudit?: ProjectAuditResult;
   finalDelivery: boolean;
   repository?: DomainObjectRepository;
@@ -51,38 +49,43 @@ export async function generateProjectDevelopmentReport(input: {
   const interactions = objects.filter((object) => object.objectType === 'interaction-request');
   const flow = await new TicketFlowMetricsService(repository).calculate(project.id);
   const currentPhase = phases.find((phase) => phase.name === input.plan.phaseId);
-  const currentSteps = currentPhase
-    ? steps.filter((step) => step.phaseId === currentPhase.id)
-    : [];
-  const currentTickets = currentPhase
-    ? tickets.filter((ticket) => ticket.phaseId === currentPhase.id)
-    : [];
+  const reportPhases = input.finalDelivery ? phases : currentPhase ? [currentPhase] : [];
+  const reportPhaseIds = new Set(reportPhases.map((phase) => phase.id));
+  const reportSteps = steps.filter((step) => reportPhaseIds.has(step.phaseId));
+  const reportTickets = tickets.filter((ticket) => reportPhaseIds.has(ticket.phaseId));
   const unresolved = tickets.filter((ticket) => ticket.state !== 'closed' && ticket.state !== 'cancelled');
-  const qualityRows = currentSteps.map((step) => ({
+  const qualityRows = reportSteps.map((step) => ({
     step,
     assessment: step.qualityAssessmentId
       ? assessments.find((assessment) => assessment.id === step.qualityAssessmentId)
       : undefined,
   }));
-  const allStepsClosed = currentSteps.length === 8 && currentSteps.every((step) => step.state === 'closed');
-  const allQualityPassed = qualityRows.length === 8 && qualityRows.every((row) => row.assessment?.passed);
-  const epic = currentPhase
-    ? currentTickets.find((ticket) => ticket.id === currentPhase.epicTicketId)
-    : undefined;
-  const delivery = currentTickets.find(
-    (ticket) => ticket.type === 'story' && ticket.workKind === 'delivery',
-  );
+  const completeVModels = reportPhases.length > 0 && reportPhases.every((phase) => {
+    const phaseSteps = reportSteps.filter((step) => step.phaseId === phase.id);
+    return phaseSteps.length === 8 && phaseSteps.every((step) => step.state === 'closed');
+  });
+  const allQualityPassed = qualityRows.length === reportPhases.length * 8 &&
+    qualityRows.every((row) => row.assessment?.passed);
+  const allPhaseDeliveriesClosed = reportPhases.length > 0 && reportPhases.every((phase) => {
+    const phaseTickets = reportTickets.filter((ticket) => ticket.phaseId === phase.id);
+    const epic = phaseTickets.find((ticket) => ticket.id === phase.epicTicketId);
+    const delivery = phaseTickets.find(
+      (ticket) => ticket.type === 'story' && ticket.workKind === 'delivery',
+    );
+    return phase.state === 'closed' && epic?.state === 'closed' && delivery?.state === 'closed';
+  });
   const auditPassed = input.projectAudit?.ok ?? false;
+  const unresolvedCorrective = unresolved.filter((ticket) =>
+    reportPhaseIds.has(ticket.phaseId) &&
+    (ticket.type === 'bug' || ticket.type === 'enhancement' || ticket.type === 'change-request')
+  );
   const deliveryPassed =
-    allStepsClosed &&
+    completeVModels &&
     allQualityPassed &&
-    epic?.state === 'closed' &&
-    delivery?.state === 'closed' &&
+    allPhaseDeliveriesClosed &&
     auditPassed &&
-    unresolved.filter((ticket) =>
-      ticket.phaseId === currentPhase?.id &&
-      (ticket.type === 'bug' || ticket.type === 'enhancement' || ticket.type === 'change-request')
-    ).length === 0;
+    unresolvedCorrective.length === 0 &&
+    (!input.finalDelivery || project.state === 'closed');
   const verdict = deliveryPassed
     ? input.finalDelivery ? 'DELIVERED' : 'ITERATION PASSED'
     : 'NOT READY';
@@ -103,7 +106,8 @@ export async function generateProjectDevelopmentReport(input: {
     `- Project type: ${project.projectType}`,
     `- Complexity: ${input.plan.complexityAssessment.level}`,
     `- Current iteration: ${input.plan.phaseId}`,
-    `- V-model Steps closed: ${currentSteps.filter((step) => step.state === 'closed').length}/${currentSteps.length}`,
+    `- Report scope: ${input.finalDelivery ? 'all phases' : input.plan.phaseId}`,
+    `- V-model Steps closed: ${reportSteps.filter((step) => step.state === 'closed').length}/${reportSteps.length}`,
     `- Quality gates passed: ${qualityRows.filter((row) => row.assessment?.passed).length}/${qualityRows.length}`,
     `- PM plan status: ${management.status}`,
     '',
@@ -117,9 +121,11 @@ export async function generateProjectDevelopmentReport(input: {
     '',
     '## Stage Quality',
     '',
-    '| Step | Stage | State | Score | KPI observations | Gaps |',
-    '| --- | --- | --- | --- | --- | --- |',
-    ...qualityRows.map(({ step, assessment }) => renderQualityRow(step, assessment)),
+    '| Iteration | Step | Stage | State | Score | KPI observations | Gaps |',
+    '| --- | --- | --- | --- | --- | --- | --- |',
+    ...qualityRows.map(({ step, assessment }) =>
+      renderQualityRow(reportPhases.find((phase) => phase.id === step.phaseId)?.name ?? step.phaseId, step, assessment)
+    ),
     '',
     '## Ticket Summary',
     '',
@@ -162,7 +168,7 @@ export async function generateProjectDevelopmentReport(input: {
     '',
     deliveryPassed
       ? '- All Step, Ticket, quality, and project audit gates passed.'
-      : '- Delivery remains blocked by an incomplete Step, open corrective Ticket, failed quality assessment, or project audit.',
+      : '- Delivery remains blocked by an incomplete Phase/Step, open corrective Ticket, failed quality assessment, PM state, or project audit.',
     '',
   ];
   const reportPath = input.finalDelivery || !currentPhase
@@ -182,11 +188,12 @@ export async function generateProjectDevelopmentReport(input: {
     reportType: input.finalDelivery ? 'delivery' : 'phase',
     path: reportPath,
     title: 'Project Development Report',
-    summary: `${verdict}: ${currentSteps.filter((step) => step.state === 'closed').length}/${currentSteps.length} Steps closed.`,
+    summary: `${verdict}: ${reportSteps.filter((step) => step.state === 'closed').length}/${reportSteps.length} Steps closed.`,
     verdict: deliveryPassed ? 'passed' : 'failed',
     relatedObjectIds: [
-      ...currentSteps.map((step) => step.id),
-      ...currentTickets.map((ticket) => ticket.id),
+      ...reportPhases.map((phase) => phase.id),
+      ...reportSteps.map((step) => step.id),
+      ...reportTickets.map((ticket) => ticket.id),
       ...qualityRows.flatMap((row) => row.assessment ? [row.assessment.id] : []),
     ],
     generatedAt: new Date().toISOString(),
@@ -209,14 +216,14 @@ export async function generateProjectDevelopmentReport(input: {
   return reportPath;
 }
 
-function renderQualityRow(step: Step, assessment?: QualityAssessment): string {
+function renderQualityRow(phaseName: string, step: Step, assessment?: QualityAssessment): string {
   if (!assessment) {
-    return `| ${step.name} | ${step.type} | ${step.state} | NOT ASSESSED | - | - |`;
+    return `| ${phaseName} | ${step.name} | ${step.type} | ${step.state} | NOT ASSESSED | - | - |`;
   }
   const observations = assessment.observations.map((item) =>
     `${item.kpiId.slice(0, 8)}=${formatRatio(item.value)} (${item.passed ? 'pass' : 'fail'})`
   ).join('; ') || '-';
-  return `| ${step.name} | ${step.type} | ${step.state} | ${formatRatio(assessment.score)} | ` +
+  return `| ${phaseName} | ${step.name} | ${step.type} | ${step.state} | ${formatRatio(assessment.score)} | ` +
     `${escapeTable(observations)} | ${escapeTable(assessment.gaps.join('; ') || '-')} |`;
 }
 

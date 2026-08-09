@@ -22,6 +22,12 @@ import {
   validateArchitectureContract,
 } from '../core/architecture.js';
 import type { LLMClient } from '../llm/types.js';
+import {
+  PlannerContractViolation,
+  errorMessage,
+  formatPlannerValidationFeedback,
+  isPlannerStructuredValidationError,
+} from './planning/validation_retry.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { makeStreamReporter } from '../llm/stream.js';
 import { t } from '../i18n/index.js';
@@ -357,22 +363,6 @@ function plannerStructuredRepairAttemptLimit(context: DraftParseContext): number
 }
 
 /**
- * A generated plan that breaks a rule the planner could have satisfied.
- *
- * Recognised by a field rather than by its prose: the retry predicate below still matches message
- * text for the older validation errors, and prose is exactly what stops describing the failure the
- * moment someone improves the wording.
- */
-class PlannerContractViolation extends Error {
-  readonly plannerContractViolation = true;
-
-  constructor(message: string) {
-    super(message);
-    this.name = 'PlannerContractViolation';
-  }
-}
-
-/**
  * Runs the plan's own rules while the planner can still fix them.
  *
  * These rules were only checked after decompose returned, so a plan that broke one killed the build
@@ -396,73 +386,6 @@ function assertPlanRulesSatisfied(draft: DraftPlan, context: DraftParseContext):
       issues.map((issue) => `[${issue.stepId ?? '*'}] ${issue.message}`).join('; ')
     }`,
   );
-}
-
-function formatPlannerValidationFeedback(err: unknown): string {
-  if (!err) return '';
-  const message = errorMessage(err).slice(0, 1800);
-  return [
-    '',
-    '',
-    '上一次输出未通过 XCompiler 计划契约校验。请根据以下错误修正后重新输出完整、严格 JSON，禁止解释或 Markdown：',
-    `校验错误：${message}`,
-    '修正要求：',
-    '- 保留已确认的 PhasePlan 约束；只生成当前 current phase 的内容。',
-    '- architectureModules 必须满足 sourcePaths/testPaths 和 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 可追踪性；不要为凑数量拆散内聚模块。',
-    '- architectureModules.testPaths 是 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 消费的模块契约测试，不能同时出现在 CODE 的单元测试输出中。',
-    '- 若一个 CODE 宏 Step 覆盖多个模块，必须在该 CODE Step 的 subTasks 中逐一列出对应模块。',
-    '- 每个 output 文件在一次 V 流程中只能由一个 Step 产出；其它 Step 需要它就写进 inputs，不要重复声明为 outputs。',
-    '- 不要删除标准 V 模型 8 个宏 Step。',
-  ].join('\n');
-}
-
-const PLANNER_CONTRACT_MESSAGE =
-  /^Planner (?:architecture|phase|PhasePlan|JSON|draft|complexityAssessment|implementationPhases|iteration)/u;
-
-/**
- * Whether the planner's last failure is one it could fix if told what was wrong.
- *
- * Walks the `cause` chain because the provider router wraps every per-provider failure in one
- * `all LLM providers failed for role Planner: ...` error. Reading only the outer message, this
- * matched nothing, so the repair round never fired in a real run — the test that covers it drives a
- * bare client, where the underlying error propagates unwrapped, and passed throughout.
- */
-function isPlannerStructuredValidationError(err: unknown): boolean {
-  // Checked on the outer error only: the router names the transport failure there, and a chain that
-  // died on the network is not repairable by rewriting the prompt.
-  if (isPlannerTransportFailure(errorMessage(err))) return false;
-  let current: unknown = err;
-  for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
-    if (isPlannerContractViolation(current)) return true;
-    if (PLANNER_CONTRACT_MESSAGE.test(errorMessage(current))) return true;
-    current = (current as { cause?: unknown }).cause;
-  }
-  return false;
-}
-
-/** Identified by a field, so the check survives the router copying a message but not a class. */
-function isPlannerContractViolation(err: unknown): boolean {
-  return typeof err === 'object' && err !== null &&
-    (err as { plannerContractViolation?: unknown }).plannerContractViolation === true;
-}
-
-function isPlannerTransportFailure(message: string): boolean {
-  const text = message.toLowerCase();
-  return (
-    text.includes('fetch failed') ||
-    text.includes('timed out') ||
-    text.includes('timeout') ||
-    text.includes('connection') ||
-    text.includes('econnrefused') ||
-    text.includes('econnreset') ||
-    text.includes('socket') ||
-    text.includes('terminated') ||
-    text.includes('server closed')
-  );
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function formatClarificationTranscript(input: PlannerInput['clarifications']): string {

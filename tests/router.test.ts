@@ -348,6 +348,34 @@ describe('LLMRouter fallback chain', () => {
     expect(scores.get('ollama_code')).toBeGreaterThanOrEqual(ScoreStore.DEFAULT);
   });
 
+  it('marks a contract-rejected candidate as never executed during provider correction', async () => {
+    const cfg = mkCfg({ fallbacks: ['openai'] });
+    const router = new LLMRouter(cfg, undefined, undefined, undefined, undefined, stubProbe);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clientsMap: Map<string, LLMClient> = (router as any).clients;
+    let calls = 0;
+    let correction = '';
+    clientsMap.set('ollama_code', {
+      name: 'fake-primary',
+      chat: async (messages) => {
+        calls++;
+        correction = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        return calls === 1 ? 'rejected mutation candidate' : 'corrected mutation';
+      },
+    });
+
+    const output = await router.for('Coder').chat([{ role: 'user', content: 'repair' }], {
+      validate: (text) => {
+        if (text.startsWith('rejected')) throw new Error('incomplete JSON turn');
+      },
+    });
+
+    expect(output).toBe('corrected mutation');
+    expect(correction).toContain('before any action was parsed, authorized, executed, or persisted');
+    expect(correction).toContain('never-executed="true"');
+    expect(correction).toContain('rejected mutation candidate');
+  });
+
   it('can disable success score boosts for workflow-level LLM calls', async () => {
     const cfg = mkCfg({});
     const scores = new ScoreStore('/tmp/x/config.yaml');
