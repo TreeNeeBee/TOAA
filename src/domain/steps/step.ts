@@ -4,6 +4,11 @@ import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_en
 import { ObjectIdSchema } from '../identity/object_id.js';
 import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
+import {
+  DeliveryGateSchema,
+  baselineDeliveryGate,
+  verificationDeliveryGate,
+} from '../quality/delivery_gate.js';
 
 export const V_MODEL_STEP_PAIRS = [
   ['REQUIREMENT_ANALYSIS', 'FUNCTIONAL_TEST'],
@@ -85,6 +90,8 @@ export const StepSchema = ObjectEnvelopeSchema.extend({
   inputs: z.array(z.string().min(1)).default([]),
   outputs: z.array(z.string().min(1)).default([]),
   acceptance: z.array(z.string().min(1)).min(1),
+  /** Canonical delivery contract for this V-model Step. */
+  deliveryGate: DeliveryGateSchema.optional(),
   tolerance: StepToleranceSchema,
   kpiIds: z.array(ObjectIdSchema).default([]),
   qualityAssessmentId: ObjectIdSchema.optional(),
@@ -98,6 +105,15 @@ export const StepSchema = ObjectEnvelopeSchema.extend({
 }).strict();
 
 export type Step = z.infer<typeof StepSchema>;
+
+export function resolveStepDeliveryGate(
+  step: Pick<Step, 'name' | 'type' | 'deliveryGate'>,
+) {
+  if (step.deliveryGate) return step.deliveryGate;
+  return (DEVELOPMENT_STEP_TYPES as readonly string[]).includes(step.type)
+    ? baselineDeliveryGate(step.name, step.type as DevelopmentStepType)
+    : verificationDeliveryGate(step.name);
+}
 
 export function transitionStep(
   step: Step,

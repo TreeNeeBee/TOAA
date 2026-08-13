@@ -46,6 +46,7 @@ export type AuditKind =
   | 'quality.gate.passed'
   | 'quality.gate.enhancement'
   | 'quality.gate.bug'
+  | 'phase.delivery_gate'
   | 'project.report.generated'
   | 'note';
 

@@ -26,6 +26,8 @@ import {
 import { AttemptResultProcessor } from './attempt_result_processor.js';
 import { ProjectProgressGuard } from './progress_guard.js';
 import { isCancellationError } from '../../core/cancellation.js';
+import type { DeliveryGateFinding } from '../../domain/quality/delivery_gate.js';
+import { QualityAssessmentService } from '../execution/quality_assessment_service.js';
 
 interface MergeIntegrationResult {
   status: 'merged' | 'nothing-to-merge' | 'failed' | 'blocked' | 'awaiting-authorization';
@@ -44,7 +46,13 @@ export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, '
     synchronizeVerifiedBugResolutions?(projectId: ObjectId): Promise<void>;
     recordVerifiedBugResolution?(ticketId: ObjectId): Promise<void>;
   };
-  finalGate?: () => Promise<{ ok: boolean; reason?: string; failureLog?: string }>;
+  finalGate?: () => Promise<{
+    ok: boolean;
+    reason?: string;
+    failureLog?: string;
+    findings?: DeliveryGateFinding[];
+    evidence?: string[];
+  }>;
   /**
    * Carries the Phase's ChangeSets onto the mainline once its work is finished.
    *
@@ -98,6 +106,7 @@ export class ProjectOrchestrator {
   private readonly projection: ProjectStatusProjectionService;
   private readonly outbox: OutboxDispatcher;
   private readonly results: AttemptResultProcessor;
+  private readonly quality: QualityAssessmentService;
 
   constructor(private readonly options: ProjectOrchestratorOptions, private readonly draft: Plan) {
     this.scheduler = new ProjectController(options.repository);
@@ -118,6 +127,7 @@ export class ProjectOrchestrator {
       recordVerifiedBugResolution: this.runner.recordVerifiedBugResolution?.bind(this.runner),
       onTransition: (event) => this.transition(event),
     });
+    this.quality = new QualityAssessmentService(options.repository);
   }
 
   async run(phaseId: ObjectId): Promise<ProjectOrchestratorResult> {
@@ -197,31 +207,36 @@ export class ProjectOrchestrator {
         return this.failure(phase.id, steps.length, executed, undefined, (error as Error).message);
       }
       if (!work) {
-        if (this.options.finalGate) {
-          const gate = await this.options.finalGate();
-          if (!gate.ok) {
-            const acceptance = steps.find((step) => step.type === 'FUNCTIONAL_TEST');
-            if (!acceptance) {
-              return this.failure(phase.id, steps.length, executed, undefined, gate.reason ?? 'Final gate failed');
-            }
-            await this.scheduler.routeFailure({
-              creatorActorId: await this.tickets.discovererActorIdForStep(acceptance.id),
-              failedStepId: acceptance.id,
-              message: gate.failureLog ?? gate.reason ?? 'Final project gate failed.',
-              summary: gate.reason ?? 'Final project gate failed.',
-              failure: {
-                kind: 'execution',
-                category: 'test',
-                code: 'final_delivery_gate_failed',
-                message: gate.failureLog ?? gate.reason ?? 'Final project gate failed.',
-                retryable: true,
-                switchProvider: false,
-              },
-              correlationId: createObjectId(),
-            });
-            continue;
+        const gate = this.options.finalGate
+          ? await this.options.finalGate()
+          : { ok: true, evidence: ['All Step and corrective Ticket gates are closed.'] };
+        const phaseAssessment = await this.quality.assessPhase({
+          phase: await this.requirePhase(phase.id),
+          passed: gate.ok,
+          evidence: gate.evidence ?? [gate.reason ?? 'Phase delivery gate evaluated.'],
+          findings: gate.findings ?? [],
+        });
+        if (!gate.ok) {
+          const acceptance = steps.find((step) => step.type === 'FUNCTIONAL_TEST');
+          if (!acceptance || !gate.findings?.length) {
+            return this.failure(
+              phase.id,
+              steps.length,
+              executed,
+              acceptance,
+              gate.reason ?? 'Phase delivery gate failed without routable findings',
+            );
           }
+          await this.scheduler.intakeProblems({
+            projectId: phase.projectId,
+            phaseId: phase.id,
+            origin: 'phase-delivery-gate',
+            reports: gate.findings,
+            correlationId: createObjectId(),
+          });
+          continue;
         }
+        await this.scheduler.attachPhaseQuality(phase.id, phaseAssessment.id);
         if (this.options.integratePhase) {
           const integration = await this.options.integratePhase(phase.id);
           if (integration.status === 'blocked' || integration.status === 'awaiting-authorization') {

@@ -3,6 +3,7 @@ import { assertStateTransition, type StateTransitions } from '../../util/state_m
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { ObjectIdSchema } from '../identity/object_id.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
+import { DeliveryGateSchema, phaseDeliveryGate } from '../quality/delivery_gate.js';
 
 export const PHASE_STATES = [
   'created',
@@ -42,6 +43,8 @@ export const PhaseSchema = ObjectEnvelopeSchema.extend({
   reportIds: z.array(ObjectIdSchema).default([]),
   scope: z.array(z.string().min(1)).default([]),
   verificationGate: z.array(z.string().min(1)).min(1),
+  /** Phase-level integrated delivery and live-scenario acceptance contract. */
+  deliveryGate: DeliveryGateSchema.optional(),
 }).strict().superRefine((phase, ctx) => {
   if (['in_progress', 'delivered', 'reopened', 'closed'].includes(phase.state) && phase.stepIds.length === 0) {
     ctx.addIssue({
@@ -53,6 +56,12 @@ export const PhaseSchema = ObjectEnvelopeSchema.extend({
 });
 
 export type Phase = z.infer<typeof PhaseSchema>;
+
+export function resolvePhaseDeliveryGate(
+  phase: Pick<Phase, 'name' | 'verificationGate' | 'deliveryGate'>,
+) {
+  return phase.deliveryGate ?? phaseDeliveryGate(phase.name, phase.verificationGate);
+}
 
 export function transitionPhase(
   phase: Phase,

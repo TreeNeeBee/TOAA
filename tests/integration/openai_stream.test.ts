@@ -44,6 +44,41 @@ describe('OpenAI-compatible streaming', () => {
     }
   });
 
+  it('rejects a provider protocol error embedded in streamed choice content', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const providerError = JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'tool_choice is not supported for this model',
+        },
+      });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: providerError } }] })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const client = new OpenAIClient({
+        providerName: 'openrouter',
+        apiKey: 'dummy',
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        model: 'provider-model',
+        requestTimeoutMs: 5000,
+      });
+      await expect(client.chat([{ role: 'user', content: 'json please' }], {
+        responseFormat: 'json',
+        onToken: () => {},
+      })).rejects.toThrow(
+        /invalid_request_error: tool_choice is not supported for this model/u,
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it('keeps non-streaming OpenAI-compatible responses working', async () => {
     const server = createServer((req, res) => {
       let body = '';

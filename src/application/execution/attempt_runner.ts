@@ -1,9 +1,7 @@
 import type { AuditLogger } from '../../audit/audit.js';
 import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
 import { ensureEssentialToolRefs } from '../../agents/calibration.js';
-import {
-  buildDebugBrief,
-} from '../../core/debug_brief.js';
+import { buildDebugBrief } from '../../core/debug_brief.js';
 import { DebugWiki, defaultDebugWikiPath, type DebugWikiMatch } from '../../core/debug_wiki.js';
 import {
   ContextAssembler,
@@ -20,7 +18,8 @@ import {
   inspectPairedSourceTests,
   mergePairedSourceTestQuality,
 } from '../../core/paired_test_contract.js';
-import { isTestFilePath, normalizeGitPath } from './v_model_policy.js';
+import { normalizeGitPath } from './v_model_policy.js';
+import { RECORDED_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
 import { getLanguageProfile, type LanguageProfile } from '../../core/language.js';
 import type { Plan, Step as ExecutionStep } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
@@ -35,6 +34,7 @@ import {
 import { reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import { QualityAssessmentService } from './quality_assessment_service.js';
 import type { QualityAssessment } from '../../domain/quality/quality.js';
+import type { DeliveryGateFinding } from '../../domain/quality/delivery_gate.js';
 import type { Changelist } from '../../domain/evidence/evidence.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import { DomainAuditTrail } from '../observability/domain_audit_trail.js';
@@ -74,6 +74,8 @@ import {
   resolveAttemptRoundLimit,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  resolveBaselineGateExecution,
+  shouldPreserveFailedCandidate,
   shouldPreserveExistingFiles,
   type AttemptMode,
 } from './attempt_policy.js';
@@ -82,6 +84,7 @@ import {
   discoverDebugContextPaths,
   extractWorkspacePaths,
 } from './debug_context_snippets.js';
+import { resolveCorrectionChainOrigin } from './correction_provenance.js';
 
 export {
   prioritizeAttemptFailureEvidence,
@@ -92,6 +95,8 @@ export {
   resolveAttemptRoundLimit,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  resolveBaselineGateExecution,
+  shouldPreserveFailedCandidate,
   shouldPreserveExistingFiles,
 } from './attempt_policy.js';
 
@@ -175,6 +180,8 @@ export interface AttemptResult {
   wikiEntryIds: string[];
   executor?: ExecutorRunResult;
   testOutcomes: TestOutcome[];
+  /** Independent problems found before/past assessment persistence. */
+  gateFindings?: DeliveryGateFinding[];
 }
 
 export class DomainAttemptRunner {
@@ -219,14 +226,6 @@ export class DomainAttemptRunner {
   }
 
   async run(input: AttemptInput): Promise<AttemptResult> {
-    const recordReplay = this.options.recordReplay;
-    if (
-      isVerification(input.domainStep) &&
-      recordReplay &&
-      (recordReplay.mode === 'record' || recordReplay.mode === 'auto' || recordReplay.mode === 'refresh')
-    ) {
-      return recordReplay.runWithMode('replay', () => this.runAttempt(input));
-    }
     return this.runAttempt(input);
   }
 
@@ -240,15 +239,15 @@ export class DomainAttemptRunner {
 
   private async runAttempt(input: AttemptInput): Promise<AttemptResult> {
     const scope = await this.options.resolveScope?.(input) ?? this.canonicalScope();
-    // Persist the baseline before doing any work. Held only in memory, a crash between snapshot and
-    // rollback would leave the working copy changed with nothing recording where to return.
+    // Persist the baseline before doing any work. Project defects preserve a committed candidate
+    // for incremental correction; infrastructure and non-progress failures return here.
     const baseline = await this.recordTicketCommit(scope, input, 'baseline', 'attempt baseline');
     let wikiMatches: DebugWikiMatch[] = [];
     try {
       if (isVerification(input.domainStep)) {
         const inspection = await this.testValidator(scope).inspect(input.plan, input.executionStep);
         if (!inspection.ok) {
-          return await this.failAndRollback(scope, baseline, input, {
+          return await this.failAttempt(scope, baseline, input, {
             reason: `${input.domainStep.type} test assets are incomplete`,
             failureLog: inspection.failureLog,
             failure: {
@@ -259,6 +258,22 @@ export class DomainAttemptRunner {
               retryable: true,
               switchProvider: false,
             },
+            gateFindings: [
+              ...inspection.missing.map((file): DeliveryGateFinding => ({
+                category: 'test-incomplete',
+                summary: `Required baseline test asset is missing: ${file}`,
+                evidence: [inspection.failureLog],
+                target: 'paired-source',
+                dependencyPackages: [],
+              })),
+              ...inspection.invalid.map((detail): DeliveryGateFinding => ({
+                category: 'test-incomplete',
+                summary: detail,
+                evidence: [inspection.failureLog],
+                target: 'paired-source',
+                dependencyPackages: [],
+              })),
+            ],
           });
         }
       }
@@ -286,10 +301,56 @@ export class DomainAttemptRunner {
       }
 
       const environment = await this.buildEnvironment(scope, input, debugContext?.suggestions);
+      if (environment.baselineGateExecution.mode !== 'not-applicable') {
+        if (environment.verificationScope.testArgs.length === 0) {
+          const failureLog = `${input.domainStep.name} declares no executable paired baseline test asset.`;
+          return await this.failAttempt(scope, baseline, input, {
+            reason: 'Development delivery gate has no paired baseline tests',
+            failureLog,
+            failure: {
+              kind: 'execution',
+              category: 'quality',
+              code: 'baseline_test_assets_missing',
+              message: failureLog,
+              retryable: true,
+              switchProvider: false,
+            },
+            gateFindings: [{
+              category: 'test-incomplete',
+              summary: failureLog,
+              evidence: [
+                `Declared outputs: ${input.executionStep.outputs.join(', ') || '(none)'}`,
+              ],
+              target: 'current-step',
+              dependencyPackages: [],
+            }],
+          });
+        }
+        await this.options.audit.event(
+          'note',
+          `${input.domainStep.name} development delivery gate: baseline execution ${environment.baselineGateExecution.mode}`,
+          {
+            messageId: 'domain.development_delivery_gate_policy',
+            projectId: input.domainStep.projectId,
+            phaseId: input.domainStep.phaseId,
+            stepId: input.domainStep.id,
+            stepName: input.domainStep.name,
+            ticketId: input.ticket.id,
+            mode: input.mode,
+            stageChecks: input.domainStep.deliveryGate?.checks ?? [],
+            baselineGateExecution: environment.baselineGateExecution,
+            baselineTestArgs: environment.context.testGateArgs ?? [],
+          },
+        );
+      }
       const result = await environment.executor.run({
         step: input.executionStep,
         stepName: input.domainStep.name,
         executionRole: input.mode === 'debug' ? 'Debugger' : input.domainStep.agent,
+        baselineTestExecution: environment.baselineGateExecution.mode === 'defer'
+          ? 'defer'
+          : 'execute',
+        baselineTestExecutionReason: environment.baselineGateExecution.reason,
         tools: environment.tools,
         ctx: environment.context,
         contextSnippets: environment.snippets,
@@ -300,7 +361,7 @@ export class DomainAttemptRunner {
         debugContext: input.ticket.type === 'bug' ? {
           bugTicketId: input.ticket.id,
           reason: retryFeedback
-            ? 'The previous repair attempt made partial progress and was rolled back. Continue from the latest failed-attempt evidence; do not restart the original repair.'
+            ? 'The previous repair attempt produced newer failure evidence. Continue from the current workspace state and that evidence; do not restart the original repair.'
             : input.ticket.failure.summary,
           failureLog: prioritizeAttemptFailureEvidence(
             input.ticket.failure.message,
@@ -369,7 +430,7 @@ export class DomainAttemptRunner {
             reason: result.error,
           });
         }
-        return await this.failAndRollback(scope, baseline, input, {
+        return await this.failAttempt(scope, baseline, input, {
           reason: result.error ?? 'Step executor did not complete',
           failureLog: renderExecutorFailure(result),
           failureKind,
@@ -423,7 +484,7 @@ export class DomainAttemptRunner {
           : scopedAssessment,
       );
       if (!assessment.passed) {
-        return await this.failAndRollback(scope, baseline, input, {
+        return await this.failAttempt(scope, baseline, input, {
           reason: `Quality gate failed: ${assessment.gaps.join('; ')}`,
           failureLog: assessment.gaps.join('\n'),
           assessment,
@@ -438,6 +499,30 @@ export class DomainAttemptRunner {
           executor: result,
           wikiEntryIds: wikiMatches.map((match) => match.entry.id),
         });
+      }
+      if (environment.baselineGateExecution.mode !== 'not-applicable') {
+        const baselineCalls = result.toolCalls.filter((call) => call.tool === 'run_tests');
+        await this.options.audit.event(
+          'note',
+          `${input.domainStep.name} development delivery gate passed`,
+          {
+            messageId: 'domain.development_delivery_gate_passed',
+            projectId: input.domainStep.projectId,
+            phaseId: input.domainStep.phaseId,
+            stepId: input.domainStep.id,
+            stepName: input.domainStep.name,
+            ticketId: input.ticket.id,
+            stageValidation: 'passed',
+            baselineExecution: environment.baselineGateExecution.mode === 'defer'
+              ? environment.baselineGateExecution.reason === 'initial-pre-code'
+                ? 'skipped-initial-pre-code'
+                : 'skipped-pre-code-correction'
+              : baselineCalls.length > 0
+                ? 'passed'
+                : 'not-configured',
+            baselineEvidence: baselineCalls.map((call) => call.summary ?? call.error ?? call.tool),
+          },
+        );
       }
       // The manifest can be delivered as a plain file output, not only through add_dependency, and
       // writing it changes nothing about the sandbox on its own. A design that declared its
@@ -459,6 +544,7 @@ export class DomainAttemptRunner {
         wikiEntryIds: wikiMatches.map((match) => match.entry.id),
         executor: result,
         testOutcomes: collectTestOutcomes(result.toolCalls, input.domainStep.type),
+        gateFindings: [],
       };
     } catch (error) {
       if (isAttemptCancellation(error, this.options.abortSignal)) {
@@ -467,7 +553,7 @@ export class DomainAttemptRunner {
       }
       // A thrown error on our own execution path carries a message this runtime authored.
       const failure = classifyFailure(error, { trustProviderText: true });
-      return this.failAndRollback(scope, baseline, input, {
+      return this.failAttempt(scope, baseline, input, {
         reason: error instanceof Error ? error.message : String(error),
         failureLog: error instanceof Error ? error.stack ?? error.message : String(error),
         failureKind: failure.kind,
@@ -484,6 +570,17 @@ export class DomainAttemptRunner {
       input.executionStep,
       input.ticket,
     );
+    const correctionOrigin = await resolveCorrectionChainOrigin(
+      this.options.repository,
+      input.plan,
+      input.ticket,
+    );
+    const baselineGateExecution = resolveBaselineGateExecution(
+      input.plan,
+      input.executionStep,
+      input.ticket,
+      correctionOrigin,
+    );
     const refs = ensureEssentialToolRefs(input.executionStep);
     const expanded = this.skills.resolve(incremental
       ? [...refs, 'read_file', 'list_dir', 'code_search', 'replace_in_file', 'apply_patch']
@@ -498,23 +595,31 @@ export class DomainAttemptRunner {
     if (debugSuggestions) expanded.hints.push(`[debug-wiki] ${debugSuggestions}`);
     const resolvedToolNames = [...expanded.resolvedToolNames];
     if (
-      verificationScope.inheritedFromTicket &&
+      (verificationScope.inheritedFromTicket || baselineGateExecution.mode === 'execute') &&
       verificationScope.testArgs.length > 0 &&
       this.registry.get('run_tests')
     ) {
       resolvedToolNames.push('run_tests');
     }
     const toolNames = [...new Set(resolvedToolNames)].filter((name) =>
-      !verificationScope.inheritedFromTicket || name !== 'run_program'
+      baselineGateExecution.mode !== 'defer' || name !== 'run_tests'
     );
     const baseWrites = incremental
       ? computeDebugAllowedWrites(input.plan, input.executionStep, this.profile)
       : computeStepAllowedWrites(input.executionStep);
-    const affected = input.ticket.type === 'change-request'
-      ? input.ticket.contractDelta.affectedArtifacts
+    const affected = input.ticket.type === 'change-request' && !isVerification(input.domainStep)
+      ? input.ticket.contractDelta.affectedArtifacts.filter((artifact) =>
+          input.executionStep.outputs.some((output) => pathsOverlap(output, artifact))
+        )
       : [];
-    const allowedWrites = [...new Set([...baseWrites, ...affected])]
-      .filter((candidate) => !isVerification(input.domainStep) || !isTestFilePath(candidate));
+    const supplementalTestRoot = isVerification(input.domainStep)
+      ? this.testValidator(scope).supplementalRoot(input.executionStep)
+      : undefined;
+    const allowedWrites = [...new Set([
+      ...baseWrites,
+      ...affected,
+      ...(supplementalTestRoot ? [supplementalTestRoot, `${RECORDED_FIXTURE_DIR}/`] : []),
+    ])];
     const retryFeedback = await this.latestAttemptFailure(input);
     const rewriteExistingFiles = input.mode === 'debug'
       ? await this.failureEvidenceRewriteTargets(scope, input, allowedWrites, retryFeedback)
@@ -559,6 +664,7 @@ export class DomainAttemptRunner {
       readChunkBytes: window.readChunkBytes,
       writeChunkBytes: resolveWriteChunkBytes(window.writeChunkBytes, budgetContext),
       testGateArgs: resolveAttemptTestArgs(verificationScope, input.plan.language),
+      supplementalTestRoot,
       preserveExistingFiles: shouldPreserveExistingFiles(input.mode),
       rewriteExistingFiles,
       requestPermission: this.options.requestPermission,
@@ -586,6 +692,7 @@ export class DomainAttemptRunner {
       snippets,
       hints: expanded.hints,
       verificationScope,
+      baselineGateExecution,
     };
   }
 
@@ -708,6 +815,7 @@ export class DomainAttemptRunner {
           ? [`warnings=${value!.tolerance.warnings}`]
           : []),
       ],
+      findings: value?.findings ?? [],
     });
   }
 
@@ -805,22 +913,36 @@ export class DomainAttemptRunner {
     return revision;
   }
 
-  private async failAndRollback(
+  private async failAttempt(
     scope: ExecutionScope,
     baseline: string,
     input: AttemptInput,
-    failure: Omit<AttemptResult, 'ok' | 'changedFiles' | 'wikiEntryIds' | 'testOutcomes'> & {
+    failure: Omit<AttemptResult, 'ok' | 'changedFiles' | 'wikiEntryIds' | 'testOutcomes' | 'gateFindings'> & {
       wikiEntryIds?: string[];
       testOutcomes?: TestOutcome[];
+      gateFindings?: DeliveryGateFinding[];
     },
   ): Promise<AttemptResult> {
-    await scope.git.revertTo(baseline);
     // `reason` is authored by this runtime, so provider phrasing in it is trustworthy evidence.
     // `failureLog` is captured from the generated project and must not be text-matched.
     const classified = failure.failure ?? (failure.reason !== undefined
       ? classifyFailure(failure.reason)
       : classifyFailure(failure.failureLog, { trustProviderText: false }));
     const failureKind = failure.failureKind ?? classified.kind;
+    const preserveCandidate = shouldPreserveFailedCandidate(
+      classified,
+      failure.dependencyRequest !== undefined,
+    );
+    const status = await scope.git.raw().status();
+    const changedFiles = status.files.map((file) => normalizeGitPath(file.path));
+    const changes = status.files.map((file) => ({
+      path: normalizeGitPath(file.path),
+      operation: gitChangeOperation(file.index, file.working_dir),
+    }));
+    const commit = preserveCandidate
+      ? await this.recordTicketCommit(scope, input, 'attempt', 'rejected candidate')
+      : undefined;
+    if (!preserveCandidate) await scope.git.revertTo(baseline);
     const testOutcomes = failure.testOutcomes ?? collectTestOutcomes(
       failure.executor?.toolCalls ?? [],
       input.domainStep.type,
@@ -863,6 +985,9 @@ export class DomainAttemptRunner {
         structuredFailure: classified,
         testOutcomes,
         failureSignature,
+        workspaceDisposition: preserveCandidate ? 'candidate-preserved' : 'rolled-back',
+        candidateRevision: commit,
+        changedFiles,
       },
       correlationId: input.ticket.source.correlationId,
       causationId: input.ticket.source.causationId,
@@ -873,15 +998,22 @@ export class DomainAttemptRunner {
       ticketId: input.ticket.id,
       failure: classified,
       testOutcomes,
+      gateFindings: failure.gateFindings ?? failure.assessment?.findings ?? [],
+      workspaceDisposition: preserveCandidate ? 'candidate-preserved' : 'rolled-back',
+      candidateRevision: commit,
+      changedFiles,
     });
     return {
       ok: false,
-      changedFiles: [],
+      changedFiles,
+      changes,
+      commit,
       wikiEntryIds: [],
       ...failure,
       failure: classified,
       failureKind,
       testOutcomes,
+      gateFindings: failure.gateFindings ?? failure.assessment?.findings ?? [],
     };
   }
 }
@@ -947,6 +1079,12 @@ function gitChangeOperation(index: string, workingDirectory: string): Changelist
   if (status.includes('R')) return 'rename';
   if (status.includes('A') || status.includes('?')) return 'create';
   return 'update';
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const a = normalizeGitPath(left);
+  const b = normalizeGitPath(right);
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
 function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {

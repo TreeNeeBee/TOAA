@@ -159,9 +159,16 @@ export async function generateProjectDevelopmentReport(input: {
     '## Project Audit',
     '',
     ...(input.projectAudit
-      ? input.projectAudit.checks.map((check) =>
-          `- ${check.ok ? 'PASS' : check.severity.toUpperCase()}: ${check.name} - ${check.summary}`
-        )
+      ? input.projectAudit.checks.flatMap((check) => [
+          `- ${check.ok ? 'PASS' : check.severity.toUpperCase()}: ${check.name} - ${check.summary}`,
+          ...(check.scene
+            ? [
+                `  - Scene: ${check.scene.scenario.operation}`,
+                `  - Command: \`${check.scene.command}\` (${check.scene.exitCode}, timeout=${check.scene.timedOut})`,
+                `  - Captured: ${check.scene.capturedAt} in ${check.scene.scenario.environment}`,
+              ]
+            : []),
+        ])
       : ['- NOT RUN: no final project audit result was supplied.']),
     '',
     '## Delivery Decision',

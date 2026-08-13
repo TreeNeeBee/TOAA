@@ -916,11 +916,75 @@ describe('StepExecutor system prompt assembly', () => {
     });
 
     expect(r.success).toBe(true);
-    expect(executed).toEqual(['tests']);
-    expect(r.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_tests']);
+    expect(executed).toEqual(['tsc', 'tests']);
+    expect(r.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_program', 'run_tests']);
     expect(llm.lastUser).toContain('## inherited paired verification gate');
     expect(llm.lastUser).toContain('tests/unit/x.test.ts');
-    expect(llm.lastUser).toContain('Do not run broad compiler or all-project test commands');
+    expect(llm.lastUser).toContain('Do not widen it to all-project tests');
+  });
+
+  it('executes the paired baseline after a post-CODE rollback reaches a design Step', async () => {
+    class DesignRepairLLM implements LLMClient {
+      readonly name = 'design-repair';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'repair the architecture contract exposed by module verification',
+          bugResolutionPlan: 'Update the architecture contract and rerun its module baseline.',
+          actions: [{
+            tool: 'write_file',
+            args: {
+              path: 'docs/02-high-level-design.md',
+              content: '# High-level design\n\nCorrected module contract.\n',
+            },
+          }],
+          done: false,
+        });
+      }
+    }
+    let baselineRuns = 0;
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled module baseline gate',
+      argsSchema: { args: 'string[]?' },
+      async run(_args, toolCtx) {
+        baselineRuns++;
+        expect(toolCtx.testGateArgs).toEqual(['tests/module/core.test.ts']);
+        return { ok: true, summary: 'module baseline passed' };
+      },
+    };
+    const exec = new StepExecutor({ llm: new DesignRepairLLM(), maxRounds: 1 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        outputs: ['docs/02-high-level-design.md'],
+        tools: ['write_file', 'run_tests'],
+      },
+      executionRole: 'Debugger',
+      baselineTestExecution: 'execute',
+      tools: [writeFileTool, runTests],
+      ctx: {
+        ...ctx,
+        allowedWrites: ['docs/'],
+        testGateArgs: ['tests/module/core.test.ts'],
+      },
+      debugContext: {
+        bugTicketId: 'BUG-DESIGN-ROLLBACK',
+        reason: 'MODULE_TEST found an architecture contract defect',
+        failureLog: 'tests/module/core.test.ts failed',
+        repairRequired: true,
+        verificationScope: {
+          stepId: 'S007',
+          phase: 'MODULE_TEST',
+          testArgs: ['tests/module/core.test.ts'],
+        },
+      },
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(baselineRuns).toBe(1);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_tests']);
   });
 
   it('returns the DEBUG Bug Ticket resolution plan when the Bug Ticket is fixed', async () => {
@@ -1544,7 +1608,7 @@ describe('StepExecutor system prompt assembly', () => {
         outputs: ['docs/design.md'],
       },
       tools: [readFileTool],
-      ctx: { ...ctx, allowedWrites: ['docs/'] },
+      ctx: { ...ctx, allowedWrites: ['docs/', 'tests/'] },
       contextSnippets: [{ path: 'src/cli.ts', content: 'export async function run() { return 1; }\n' }],
       changeRequest: {
         id: 'CR-MISSING-DISPOSITION',
@@ -2070,7 +2134,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.error).toContain('without repair evidence');
   });
 
-  it('omits executed write payloads from assistant history instead of inventing contentBytes args', async () => {
+  it('omits executed write payloads without adding non-protocol fields to assistant history', async () => {
     class HistoryInspectingLLM implements LLMClient {
       readonly name = 'history-inspecting';
       calls = 0;
@@ -2093,10 +2157,19 @@ describe('StepExecutor system prompt assembly', () => {
     const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
 
     expect(r.success).toBe(true);
-    expect(llm.assistantHistory).toContain('payload omitted');
+    expect(llm.assistantHistory).not.toContain('transcriptNote');
+    expect(llm.assistantHistory).not.toContain('Content omitted from this transcript');
     expect(llm.assistantHistory).not.toContain('contentBytes');
     expect(llm.assistantHistory).not.toContain('sensitive generated payload');
-    expect(JSON.parse(llm.assistantHistory).actions).toEqual([]);
+    const historyTurn = JSON.parse(llm.assistantHistory) as Record<string, unknown>;
+    expect(historyTurn).not.toHaveProperty('executedPayloadActions');
+    expect(historyTurn.actions).toEqual([]);
+    expect(Object.keys(historyTurn).sort()).toEqual([
+      'actions',
+      'bugResolutionPlan',
+      'done',
+      'thoughts',
+    ]);
   });
 
   it('parses LLM output that contains multiple back-to-back ```json blocks (uses first)', async () => {
@@ -2252,6 +2325,13 @@ describe('StepExecutor system prompt assembly', () => {
               tool: 'write_file',
               args: { path: 'docs/tests/integration-test-plan.md', content: '# Integration Test Plan\n' },
             },
+            {
+              tool: 'write_file',
+              args: {
+                path: 'tests/integration/pipeline.test.ts',
+                content: 'import { describe, expect, it } from "vitest";\nimport { pipeline } from "../../src/pipeline.ts";\ndescribe("pipeline", () => { it("exposes its contract", () => { expect(typeof pipeline).toBe("function"); }); });\n',
+              },
+            },
           ],
           done: false,
         });
@@ -2265,13 +2345,18 @@ describe('StepExecutor system prompt assembly', () => {
         phase: 'DETAILED_DESIGN',
         role: 'Architect',
         tools: ['write_file'],
-        outputs: ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'],
+        outputs: [
+          'docs/03-detailed-design.md',
+          'docs/tests/integration-test-plan.md',
+          'tests/integration/pipeline.test.ts',
+        ],
       },
+      baselineTestExecution: 'defer',
       tools: [writeFileTool],
-      ctx: { ...ctx, allowedWrites: ['docs/'] },
+      ctx: { ...ctx, allowedWrites: ['docs/', 'tests/'] },
     });
 
-    expect(result.success).toBe(true);
+    expect(result.success, result.error).toBe(true);
     expect(result.rounds).toBe(1);
     expect(llm.calls).toBe(1);
   });
@@ -2349,6 +2434,93 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.calls).toBe(2);
     expect(llm.sawQualityFeedback).toBe(true);
     expect(result.toolCalls).toHaveLength(1);
+  });
+
+  it('rejects a contradictory deferred-baseline assessment before PM can create an Enhancement', async () => {
+    class DeferredAssessmentLLM implements LLMClient {
+      readonly name = 'deferred-assessment';
+      calls = 0;
+      sawConsistencyFeedback = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'the design is complete but product code is a downstream precondition',
+            qualityAssessment: {
+              completion: 1,
+              upstreamAlignment: 1,
+              metrics: { moduleCoverage: 1 },
+              tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+              evidence: ['docs/02-high-level-design.md', 'tests/modules/x.test.ts'],
+              unavailableMetrics: ['moduleCoverage'],
+              gaps: ['the module baseline cannot execute before CODE implements the product'],
+              blockedBy: ['CODE owns the product implementation'],
+              findings: [],
+            },
+            actions: [],
+            done: true,
+          });
+        }
+        this.sawConsistencyFeedback = messages.at(-1)?.content.includes(
+          'conflicts with qualityAssessment.unavailableMetrics',
+        ) ?? false;
+        return JSON.stringify({
+          thoughts: 'report the deferred execution precondition without inventing a current-Step gap',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['docs/02-high-level-design.md', 'tests/modules/x.test.ts'],
+            unavailableMetrics: ['moduleCoverage'],
+            gaps: [],
+            blockedBy: ['CODE owns the product implementation'],
+            findings: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('docs/02-high-level-design.md', '# High-level design\n');
+    await ws.writeFile(
+      'tests/modules/x.test.ts',
+      'import { describe, expect, it } from "vitest";\n' +
+        'import { x } from "../../src/x.ts";\n' +
+        'describe("x", () => { it("has a contract", () => expect(typeof x).toBe("function")); });\n',
+    );
+    const llm = new DeferredAssessmentLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        tools: [],
+        outputs: ['docs/02-high-level-design.md', 'tests/modules/x.test.ts'],
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      baselineTestExecution: 'defer',
+      tools: [],
+      ctx,
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(llm.calls).toBe(2);
+    expect(llm.sawConsistencyFeedback).toBe(true);
+    expect(result.qualityAssessment?.gaps).toEqual([]);
+    expect(result.qualityAssessment?.blockedBy).toEqual(['CODE owns the product implementation']);
   });
 
   it('hands a measured test-quality gap to the outer Ticket gate without looping on the failed probe', async () => {
@@ -2804,7 +2976,7 @@ describe('StepExecutor system prompt assembly', () => {
     ]));
   });
 
-  it('does not require rerunning tests after writing validation-only Markdown reports', async () => {
+  it('does not require rerunning tests after writing verification Markdown reports', async () => {
     class TestThenReportLLM implements LLMClient {
       readonly name = 'test-then-report';
       calls = 0;
@@ -3451,6 +3623,29 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.error).toContain('missing outputs: src/x.py');
     expect(llm.calls).toBe(2);
     expect(llm.sawWarning).toBe(true);
+  });
+
+  it('focuses a no-progress retry on the first exact missing output', async () => {
+    class FocusedEmptyTurnLLM implements LLMClient {
+      readonly name = 'focused-empty-turn';
+      calls = 0;
+      feedback = '';
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 2) this.feedback = messages.at(-1)?.content ?? '';
+        return JSON.stringify({ thoughts: 'create the files', actions: [], done: false });
+      }
+    }
+    const llm = new FocusedEmptyTurnLLM();
+    await new StepExecutor({ llm, maxRounds: 10 }).run({
+      step: { ...baseStep, outputs: ['src/first.py', 'src/second.py'] },
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(llm.feedback).toContain('Create exactly the first missing output now');
+    expect(llm.feedback).toContain('path="src/first.py"');
+    expect(llm.feedback).not.toContain('path="src/second.py"');
   });
 
   it('rejects an incomplete done-only quality handshake through provider validation', async () => {
@@ -4511,7 +4706,8 @@ describe('StepExecutor system prompt assembly', () => {
     class LargeWriteThenInspectLLM implements LLMClient {
       readonly name = 'large-history';
       calls = 0;
-      sawPayloadOmitted = false;
+      sawOmissionNote = false;
+      sawNonProtocolPayloadSummary = false;
       sawContentBytes = false;
       sawRawContent = false;
       async chat(messages: ChatMessage[]): Promise<string> {
@@ -4524,7 +4720,8 @@ describe('StepExecutor system prompt assembly', () => {
           });
         }
         const history = messages.map((message) => message.content).join('\n');
-        this.sawPayloadOmitted = history.includes('payload omitted');
+        this.sawOmissionNote = history.includes('Content omitted from this transcript');
+        this.sawNonProtocolPayloadSummary = history.includes('executedPayloadActions');
         this.sawContentBytes = history.includes('"contentBytes"');
         this.sawRawContent = history.includes('A'.repeat(500));
         return JSON.stringify({ thoughts: 'finish', actions: [], done: true });
@@ -4534,7 +4731,8 @@ describe('StepExecutor system prompt assembly', () => {
     const exec = new StepExecutor({ llm, maxRounds: 2 });
     const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
     expect(r.success).toBe(true);
-    expect(llm.sawPayloadOmitted).toBe(true);
+    expect(llm.sawOmissionNote).toBe(false);
+    expect(llm.sawNonProtocolPayloadSummary).toBe(false);
     expect(llm.sawContentBytes).toBe(false);
     expect(llm.sawRawContent).toBe(false);
   });

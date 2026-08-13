@@ -21,6 +21,7 @@ import {
 } from './window.js';
 import { LLMRequestError } from './errors.js';
 import type { RecordReplayController } from '../application/record_replay/controller.js';
+import { isCancellationError } from '../core/cancellation.js';
 
 
 type ProviderConfig = XCompilerConfig['llm']['providers'][string];
@@ -311,6 +312,9 @@ class FallbackClient implements LLMClient {
         try {
           out = await c.client.chat(providerMessages, providerOptions);
         } catch (err) {
+          // Host/user cancellation is control flow, not provider quality. It must never consume a
+          // fallback, trigger a retry, or alter the provider's score.
+          if (isCancellationError(err, options?.signal)) throw err;
           lastErr = err;
           const retryDelayMs = retryDelayForLLMError(err);
           if (

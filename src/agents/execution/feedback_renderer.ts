@@ -3,6 +3,7 @@ import {
   type Step,
 } from '../../core/plan.js';
 import {
+  qualityAssessmentConsistencyIssues,
   resolveQualityGate,
   type StageQualityAssessment,
 } from '../../core/quality_gate.js';
@@ -135,7 +136,10 @@ export function renderExecutionFeedback(
   if (turn.noProgressWarning) {
     lines.push(
       'No-progress warning: actions=[] with done=false does not advance the step. ' +
-      'The next response must run a concrete tool action or return done=true only when completion is already verified.',
+      (!verify.ok && verify.missing.length > 0
+        ? `Create exactly the first missing output now: return one write_file action with path="${verify.missing[0]}" and its complete content. ` +
+          'Do not merely describe the action or try to generate several remaining files in one response.'
+        : 'The next response must run a concrete tool action or return done=true only when completion is already verified.'),
     );
   }
   if (turn.bugResolutionPlanMissing) lines.push(messages.executorFeedbackBugResolutionPlanMissing);
@@ -266,6 +270,7 @@ export function missingQualityAssessmentFields(
   step: Step,
   assessment: StageQualityAssessment | undefined,
   freshAfterTools = true,
+  context: { baselineExecutionDeferred?: boolean } = {},
 ): string[] {
   if (!step.qualityGate) return [];
   if (!assessment) return ['qualityAssessment'];
@@ -286,6 +291,7 @@ export function missingQualityAssessmentFields(
     }
   }
   if (assessment.evidence.length === 0) missing.push('qualityAssessment.evidence');
+  missing.push(...qualityAssessmentConsistencyIssues(assessment, context));
   return missing;
 }
 

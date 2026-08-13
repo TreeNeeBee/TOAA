@@ -118,12 +118,24 @@ REQUIREMENT_ANALYSIS ---------------------- FUNCTIONAL_TEST
 
 | 产出阶段 | 验证阶段 | 同步生成内容 |
 | --- | --- | --- |
-| REQUIREMENT_ANALYSIS | FUNCTIONAL_TEST | 验收/功能测试计划和用例 |
+| REQUIREMENT_ANALYSIS | FUNCTIONAL_TEST | 功能验收基线计划和可执行用例 |
 | HIGH_LEVEL_DESIGN | MODULE_TEST | 系统、模块和接口契约测试 |
 | DETAILED_DESIGN | INTEGRATION_TEST | 集成场景和测试 |
 | CODE | UNIT_TEST | 单元测试计划和用例 |
 
-S1-S4 负责产出并验证完成度及上游对齐度。S5-S8 不重新设计或重写产品，只检查测试资产完整性、运行既有测试并提交结构化指标。
+门禁包含三类验证：交付物/方案校验、配对基线测试、风险驱动的追加功能测试。S1-S4 产出阶段交付物和配对基线测试，其门禁由“阶段特有的交付物/方案校验 + 基线测试资产校验与执行”组成。首次正向执行 S1-S3 时产品代码尚不存在，只显式跳过基线的可执行运行；交付物、方案、追溯关系以及基线测试资产仍必须通过校验。S4 始终执行单元基线。任何由 S4-S8 发现的问题回退到 S1-S3 后，代码基线已经存在，回退阶段必须执行其精确配对基线后才能重新交付。
+
+| Step 场景 | 本阶段产生 | 交付门禁 | 基线执行策略 |
+| --- | --- | --- | --- |
+| S1-S3 首次正向执行 | 阶段交付物、阶段特有校验依据、配对基线测试 | 交付物/方案校验 + 基线测试资产校验 | 仅跳过可执行运行，并记录 `initial-pre-code` |
+| S1-S3 纠正执行，因果链起点在 S1-S3 | 对本阶段交付物和基线的增量修正 | 交付物/方案校验 + 基线测试资产校验 | 仍无代码基线时跳过，并记录 `pre-code-correction` |
+| S1-S3 纠正执行，因果链起点在 S4-S8 | 对本阶段交付物和基线的增量修正 | 交付物/方案校验 + 精确配对基线 | 必须执行；Bug、Enhancement、父/子 CR 的多层传递不得丢失原始回退阶段 |
+| S4 | 代码交付物、单元基线测试 | 交付物/方案校验 + 单元基线 | 必须执行 |
+| S5-S8 | 独立风险分析和验证阶段拥有的追加功能测试 | 冻结后的配对基线 + 追加功能测试 | 必须完整执行 |
+
+该规则由领域对象直接承载：`DeliveryGate.validationTypes` 保存 `deliverable-validation`、`baseline-test`、`supplemental-functional-test` 的组合，`baselineExecutionPolicy` 保存 `defer-until-code`、`required`、`freeze-then-required` 或 Phase 聚合策略。状态机依据这些字段执行，LLM 不能通过自定义 Step 文本改写门禁类别。
+
+S5-S8 不修改左侧基线：它们独立复核基线并做风险分析，只能在各自的验证命名空间追加聚焦的功能测试；随后冻结“基线 + 追加测试”集合并完整执行。测试自身缺陷、产品缺陷、完整度/质量短板分别建票，依赖问题走独立路由。八个 Step 都不拥有绕过 Record/Replay 的真实网络特权。
 
 ## 6. Ticket 模型
 
@@ -164,7 +176,16 @@ reopened -> in_progress
 closed -> reopened   # 已验证上游 CR 可重新打开
 ```
 
-Phase 在八个 Step 和所有纠正 Ticket 关闭后执行 Delivery Story，随后 `delivered -> closed`。Project 根据 Phase 依赖选择下一个可运行 Phase；所有 Phase 关闭后才 `delivered -> closed`。追加需求可让已关闭 Project 回到 `planning`，但保持原 ID 和历史。
+每个 Step 都包含结构化 `deliveryGate`：
+
+- S1 额外校验需求产物对 topic 的追溯、可观测验收条件、范围、约束和未决项，并校验功能基线设计。
+- S2 额外校验系统定位、模块边界、外部接口/API、依赖和所有权，验证架构可行性及模块测试追溯。
+- S3 额外校验内部数据/控制流、异常处理、实现契约和上游架构对齐，验证实现方案及集成测试追溯。
+- S4 额外校验代码对详细设计、源码所有权和公开契约的对齐，并执行构建/静态检查与单元基线。
+- S1-S3 首轮只将基线执行记录为 `skipped-initial-pre-code`；由 S4-S8 触发的回退不得使用该跳过理由。
+- S5-S8 是 `verification-acceptance` 门禁，检查基线独立评审、追加功能测试归属、冻结后的完整执行、KPI 与 tolerance。
+
+Phase 也包含 `deliveryGate`，覆盖完整交付物、集成构建/测试及真实用户场景 case。Runtime 在关闭 Replay 的真实环境运行每个 case，并保存操作、命令、环境、时间、退出状态、超时和输出尾部。Phase 在八个 Step 和所有纠正 Ticket 关闭且 Phase QualityAssessment 通过后执行 Delivery Story，随后 `delivered -> closed`。Project 根据 Phase 依赖选择下一个可运行 Phase；所有 Phase 关闭后才 `delivered -> closed`。
 
 ## 8. 调度规则
 
@@ -175,14 +196,14 @@ Application 层的 PM Orchestrator 是唯一项目推进者；它通过 `WorkSch
 3. 同一 Step 优先执行未阻塞的 CR，其次 Bug、Enhancement，最后普通 Story。
 4. CR 已记录 application 的 Step 不得重复调度。
 5. Step 尝试前递增 `attempts`；达到 `maxAttempts` 时明确失败。
-6. 没有可运行项时，只有所有 Step、Story、纠正 Ticket 和最终审计通过才允许关闭 Phase。
+6. 没有可运行项时，执行 Phase `deliveryGate`；只有所有 Step、Story、纠正 Ticket、完整交付物和真实场景验收通过才允许关闭 Phase。
 7. 调度不使用固定的全局跳转次数。`ProjectProgressGuard` 比较 Phase、Step、Ticket、
    ChangeSet、Merge Request 和 Gate 的语义快照；只有连续三次调度后状态完全没有推进才停止，
    因而复杂项目不会因规模大被误杀，真实循环也不会无限消耗模型额度。
 
 数组顺序不构成依赖，显示名不构成身份，Planner 状态不参与裁决。
 
-PM 只创建有项目上下文的 Epic 和 Story。Task、Bug、Enhancement、CR 由掌握技术上下文的发现角色创建，先提交 PM 注册，再由 PM 按能力、状态、容量和稳定排序路由。所有权由已接受 Assignment 表示；每次提交、注册、路由、接受、转交和关闭都追加不可变 TicketTraceEvent。
+Ticket 只在 Phase 内产生和消费。Phase 内的 Task、Bug、Enhancement、CR 由掌握技术上下文的发现角色创建；Phase 外部只能向 PM 提交问题、数据和现场，不能构造 Ticket。PM 的统一 intake 校验结构化报告后创建 Phase 内 Ticket，再按能力、状态、容量和稳定排序路由。该入口保留 `external-usage` 来源，用于后续交付后问题重启 V 流程，本版本不开放 Project 自动重激活。所有权由已接受 Assignment 表示；每次提交、注册、路由、接受、转交和关闭都追加不可变 TicketTraceEvent。
 
 ## 9. 错误、Enhancement 与 CR
 
@@ -226,6 +247,15 @@ parent CR failure -> linked Bug (parent CR pending/blocked)
 
 指标不足创建 Enhancement；实际测试或执行失败创建 Bug。QualityAssessment 是不可替换的领域证据，不使用单独的旧质量状态文件。
 
+门禁结果保留多个独立 `findings`，不得拼成一段错误后只建一张票：
+
+- `test-defect`：验证阶段自己补充的测试有误，Bug 回到当前验证 Step；基线测试契约有误则指向配对源 Step。
+- `product-defect`：Bug 指向产品/契约所有 Step，并按 V 模型通过 CR 向下游传播。
+- `test-incomplete`、`quality-shortfall`、`deliverable-defect`：分别形成 Enhancement，追加缺失工作。
+- `dependency`：不混入 Bug/Enhancement，保持独立 Dependency CR 路由。
+
+一次 Step 或 Phase 门禁可产生多条 finding。发现角色逐条创建 Ticket 并提交 PM；PM 只负责注册、路由、阻塞关系和重启受影响的 V 模型路径。为避免多条纠正链同时关闭同一后续 Step，PM 按最上游受影响 Step 到最下游建立批次调度依赖，依赖类 Ticket 保持独立 CR 路由并排在该批次末尾。任一修复完成后通过 CR 增量传导，并重新执行后续 Step 与 Phase 门禁。
+
 ## 11. Debug Wiki
 
 Debug Wiki 按 LLM-wiki 方式组织：
@@ -264,7 +294,7 @@ Git 合并使用可恢复的领域事务：门禁通过后先把 Merge Request �
 
 ## 13. Record/Replay
 
-HTTP、LLM 和 subprocess 外部交互通过统一端口记录；测试逻辑不内嵌特定 API 的 fixture 规则。`record`/`refresh` 只能由显式 fixture 准备命令触发，验证阶段强制 `replay`，缺失、歧义、哈希链损坏、未脱敏或过期 fixture 都明确失败。`refresh` 追加 supersession 关系，不覆盖历史证据。
+HTTP、LLM 和 subprocess 外部交互通过统一端口记录；测试逻辑不内嵌特定 API 的 fixture 规则。S1-S4 可为基线测试使用 `record`/`refresh`，S5-S8 的外部数据补充与冻结执行使用 Record/Replay；只有 Phase 交付门禁声明的真实用户场景强制 `off`。缺失、歧义、哈希链损坏或未脱敏 fixture 都明确失败；`refresh` 追加 supersession 关系，不覆盖历史证据。
 
 ## 14. Runtime 事件与权限
 

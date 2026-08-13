@@ -14,6 +14,7 @@ import {
   type StepType,
   type VerificationStepType,
 } from '../domain/steps/step.js';
+import { DeliveryGateSchema } from '../domain/quality/delivery_gate.js';
 
 export const PLAN_VERSION = '2';
 
@@ -174,6 +175,8 @@ export const ImplementationPhaseSchema = z
     deliverables: z.array(z.string().min(1)).default([]),
     dependsOn: z.array(z.string()).default([]),
     verificationGate: IterationVerificationGateSchema.optional(),
+    /** Phase-wide integrated delivery gate; Runtime supplies a canonical default when omitted. */
+    deliveryGate: DeliveryGateSchema.optional(),
   })
   .strict();
 
@@ -224,6 +227,8 @@ export const StepSchema = z
     acceptance: z.string().min(1),
     /** Engineering delivery thresholds evaluated before the Step can become DONE. */
     qualityGate: StageQualityGateSchema.optional(),
+    /** Step delivery contract: baseline-test on S1-S4, acceptance on S5-S8. */
+    deliveryGate: DeliveryGateSchema.optional(),
     /** Attempt policy copied into the canonical Step; this draft never owns execution state. */
     maxAttempts: z.number().int().positive().default(3),
   })

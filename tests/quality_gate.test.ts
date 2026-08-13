@@ -3,10 +3,49 @@ import {
   defaultQualityGateForPhase,
   evaluateQualityGate,
   normalizeQualityAssessment,
+  qualityAssessmentConsistencyIssues,
 } from '../src/core/quality_gate.js';
 import type { Step } from '../src/core/plan.js';
 
 describe('LLM quality evidence normalization', () => {
+  it('preserves independently routable gate findings', () => {
+    const parsed = normalizeQualityAssessment({
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['verification report'],
+      gaps: [],
+      findings: [
+        {
+          category: 'test-defect',
+          summary: 'The supplemental assertion contradicts the accepted contract.',
+          evidence: ['tests/verification/p1/unit-test/s005/risk.test.ts:18'],
+          target: 'current-step',
+          dependencyPackages: [],
+        },
+        {
+          category: 'product-defect',
+          summary: 'The implementation returns the wrong status.',
+          evidence: ['expected=ready actual=pending'],
+          target: 'code',
+          dependencyPackages: [],
+        },
+      ],
+    });
+
+    expect(parsed?.findings).toHaveLength(2);
+    expect(evaluateQualityGate(testStep('UNIT_TEST'), parsed).bugFailures).toHaveLength(2);
+  });
+
+  it('rejects a malformed finding instead of silently dropping it', () => {
+    expect(normalizeQualityAssessment({
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['verification report'],
+      gaps: [],
+      findings: [{ category: 'dependency', summary: 'needs a package', evidence: ['import failed'] }],
+    })).toBeUndefined();
+  });
+
   it('defines source completion/alignment and stage-specific test metrics', () => {
     expect(defaultQualityGateForPhase('CODE')).toMatchObject({ completionMin: 0.95, upstreamAlignmentMin: 0.9 });
     expect(defaultQualityGateForPhase('UNIT_TEST').metrics).toEqual({
@@ -158,5 +197,89 @@ describe('preconditions a Step does not own', () => {
     });
     expect(parsed?.blockedBy).toEqual(['the manifest is written by HIGH_LEVEL_DESIGN']);
     expect(parsed?.unavailableMetrics).toEqual(['lineCoverage']);
+  });
+
+  it('rejects measured/unavailable metric conflicts without interpreting model prose', () => {
+    const parsed = normalizeQualityAssessment({
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: { moduleCoverage: 1 },
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['tests/modules/x.test.ts'],
+      unavailableMetrics: ['moduleCoverage'],
+      gaps: [],
+      blockedBy: [],
+    })!;
+
+    expect(qualityAssessmentConsistencyIssues(parsed)).toEqual([
+      'qualityAssessment.metrics.moduleCoverage conflicts with qualityAssessment.unavailableMetrics',
+    ]);
+  });
+
+  it('rejects a deferred pre-CODE blocker duplicated as a completed Step gap', () => {
+    const parsed = normalizeQualityAssessment({
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['docs/02-high-level-design.md'],
+      unavailableMetrics: ['moduleCoverage'],
+      gaps: ['the paired baseline cannot run before its implementation exists'],
+      blockedBy: ['CODE owns the product implementation'],
+      findings: [],
+    })!;
+
+    expect(qualityAssessmentConsistencyIssues(parsed, {
+      baselineExecutionDeferred: true,
+    })).toEqual([
+      expect.stringContaining('gaps contradict completion=1 during deferred baseline execution'),
+    ]);
+    expect(qualityAssessmentConsistencyIssues(parsed, {
+      baselineExecutionDeferred: false,
+    })).toEqual([]);
+  });
+});
+
+describe('a gap about a tool the Step does not have', () => {
+  const codeStep = (tools: string[]) => ({
+    id: 'S004', phase: 'CODE', title: 'x', description: 'x', systemPrompt: 'x',
+    role: 'Coder', tools, inputs: [], outputs: [], dependsOn: [], acceptance: 'ok',
+  } as unknown as Step);
+  const base = {
+    completion: 1,
+    upstreamAlignment: 1,
+    metrics: {},
+    tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+    evidence: ['src/cli.ts'],
+    unavailableMetrics: [],
+    blockedBy: [],
+  };
+
+  // Seen three times in live runs: CODE reported "cannot run tsc/vitest here, the whitelist has no
+  // run_program/run_tests", the gate failed it for being right, an Enhancement was raised, and the
+  // Step then had nothing left to do and stalled. `blockedBy` is the channel for this; a model that
+  // uses it never reaches here, and this only stops the gate punishing accuracy.
+  it('does not fail the Step, because the whitelist says so', () => {
+    const result = evaluateQualityGate(codeStep(['write_file']), {
+      ...base,
+      gaps: ['cannot run tsc --noEmit or vitest: the tool whitelist has no run_program/run_tests'],
+    });
+    expect(result.passed).toBe(true);
+  });
+
+  it('still fails when the Step does have the tool', () => {
+    const result = evaluateQualityGate(codeStep(['write_file', 'run_tests']), {
+      ...base,
+      gaps: ['run_tests reports 3 failing cases'],
+    });
+    expect(result.passed).toBe(false);
+  });
+
+  it('still fails on a gap that names no tool at all', () => {
+    const result = evaluateQualityGate(codeStep(['write_file']), {
+      ...base,
+      gaps: ['the renderer has no error handling'],
+    });
+    expect(result.passed).toBe(false);
   });
 });

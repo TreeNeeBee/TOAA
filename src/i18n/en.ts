@@ -23,18 +23,18 @@ Mandatory phase documents:
 For P2+ iterations, put the same basenames under \`docs/iterations/<iterationId>/\`. The top-level \`docs/topic.md\` is written by xcompiler build and must never appear in Step outputs.
 
 Synchronous test-design rule:
-- REQUIREMENT_ANALYSIS must output \`docs/tests/functional-test-plan.md\` and executable functional/acceptance tests under \`tests/\`.
+- REQUIREMENT_ANALYSIS outputs the functional acceptance baseline test plan and executable functional tests with its requirements and acceptance criteria.
 - HIGH_LEVEL_DESIGN must output \`docs/tests/module-test-plan.md\` and executable module/contract tests, including every \`architectureModules.testPaths\`.
 - DETAILED_DESIGN must output \`docs/tests/integration-test-plan.md\` and executable integration tests.
 - CODE must output \`docs/tests/unit-test-plan.md\` and executable unit tests together with the implementation.
 For P2+ iterations, put those under \`docs/iterations/<iterationId>/tests/\`.
 
 Phase responsibilities:
-- REQUIREMENT_ANALYSIS defines functional scope, acceptance criteria, boundaries, and user-visible behaviour, then authors the paired functional tests.
+- REQUIREMENT_ANALYSIS defines functional scope, acceptance criteria, boundaries, and user-visible behaviour, then authors the paired functional baseline tests.
 - HIGH_LEVEL_DESIGN defines the current development module's position in the whole system plus system-level external interfaces and dependencies, including external APIs, third-party library choices, dependency confirmation, data contracts, and integration boundaries, then authors the paired module/contract tests.
 - DETAILED_DESIGN defines module-internal functions, data structures, algorithms, control flow, error handling and architecture, then authors the paired integration tests.
 - CODE implements only the designed scope and authors its paired unit tests.
-- UNIT_TEST, INTEGRATION_TEST, MODULE_TEST, and FUNCTIONAL_TEST inspect their existing paired tests for completeness/consistency, run them, and write validation reports. They must not create or rewrite tests or product code.
+- UNIT_TEST, INTEGRATION_TEST, MODULE_TEST, and FUNCTIONAL_TEST uniformly inspect the paired baseline, add only risk-driven supplements under their own verification namespace, freeze the combined suite, execute it with deterministic external data, and write reports. Baseline incompleteness routes an Enhancement to the paired source; a supplemental-test defect routes a Bug to the verification owner; a product defect routes a Bug to the product owner. Real-user live-network cases belong only to the Phase delivery gate.
 
 Functional documentation bundle: P1 FUNCTIONAL_TEST outputs must include \`README.md\`, \`docs/quickstart.md\`, and \`docs/08-functional-test.md\`; for \`projectType\` = \`library\` or \`mixed\`, also include \`docs/api-guide.md\`. P2+ uses \`docs/iterations/<iterationId>/08-functional-test.md\`, \`quickstart.md\`, and optional \`api-guide.md\`. Documentation must follow the active i18n language.
 
@@ -44,13 +44,13 @@ Mandatory rules:
 3. Each macro Step may have \`subTasks\` nested at most two levels; do not explode internal tasks into many executable Steps unless there is a real execution boundary.
 4. dependsOn must follow the phase order and be acyclic. Right-side test phases must directly or transitively depend on their paired left-side source phase.
 5. Every CODE Step must be covered by a UNIT_TEST Step in the same iteration.
-6. REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN may output their paired tests under tests/ but must not output product code under src/. CODE owns product source/runtime assets and unit tests. Right-side test phases own only reports/delivery docs and must not modify src/ or tests/.
+6. REQUIREMENT_ANALYSIS/HIGH_LEVEL_DESIGN/DETAILED_DESIGN own their paired baseline tests but no src/ product code. CODE owns product source/runtime assets and unit tests. Right-side phases may write tests only under their Runtime-declared verification supplement root and must not modify paired baselines or src/.
 7. The same outputs path is globally unique. DEBUG may modify dependency-chain files at runtime; planned Steps should not duplicate outputs.
 8. id has the form S001, S002, ...; role is Planner / Architect / Coder / Tester / Debugger.
 9. Every Step needs a systemPrompt that pins scope, inputs, outputs, acceptance, forbidden actions, and the paired test-design obligation when applicable.
 10. projectType is inferred by the LLM after clarification: application, library, or mixed. There is no CLI project-type override.
 11. complexityAssessment is your plan-stage complexity assessment. simple => P1 only; moderate => at least P1+P2; complex => at least P1+P2+P3. If the user explicitly asks for phases/stages, set userForcedPhaseSplit=true and split.
-12. implementationPhases must include P1 current and any planned executable phases. Each phase has a verificationGate whose failurePolicy says to feed the failure log to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.
+12. implementationPhases must include P1 current and any planned executable phases. Each phase has a verificationGate whose failurePolicy says to feed the failure log to Debugger, roll back to the paired V-model phase, and rerun subsequent phases. Its deliveryGate must declare validationTypes, baselineExecutionPolicy, and at least one live real-user scenario with operation, expected result, and a concrete execution command/args derived from the requirement; \`--help\` alone is not functional acceptance.
 13. dependencies is a Python pip dependency list. Include \`pytest\`; use bare package names only; never list \`requirements.txt\` in Step outputs.
 14. Application/mixed projects need a directly executable Python entry point (\`src/main.py\` or package \`__main__.py\`) that reuses CODE modules. Library/mixed projects need a stable public API and \`docs/api-guide.md\`.
 15. Structured HIGH_LEVEL_DESIGN -> CODE -> MODULE_TEST contract: for non-trivial work, return \`architectureModules\` with each module's id, name, responsibility, sourcePaths, optional assetPaths, testPaths, and dependencies. HIGH_LEVEL_DESIGN authors testPaths, CODE authors implementation paths, and MODULE_TEST consumes testPaths. Every module needs at least one \`testPaths\` entry, and \`sourcePaths\` and \`assetPaths\` cannot both be empty — a module with no test path cannot be consumed by MODULE_TEST. Macro Steps may cover multiple modules but must list module-level work in subTasks.
@@ -64,7 +64,7 @@ Output JSON shape:
   "projectType": "application | library | mixed",
   "complexityAssessment": { "level": "simple | moderate | complex", "rationale": "string", "splitRecommended": true, "userForcedPhaseSplit": false },
   "implementationPhases": [
-    { "id": "P1", "title": "Core functionality", "objective": "string", "status": "current", "scope": ["..."], "deliverables": ["..."], "dependsOn": [], "verificationGate": { "summary": "string", "checks": ["run tests", "probe entrypoint/API", "verify functional docs"], "failurePolicy": "Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases." } }
+    { "id": "P1", "title": "Core functionality", "objective": "string", "status": "current", "scope": ["..."], "deliverables": ["..."], "dependsOn": [], "verificationGate": { "summary": "string", "checks": ["run tests", "verify functional docs"], "failurePolicy": "Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases." }, "deliveryGate": { "kind": "phase-delivery", "summary": "string", "checks": ["complete deliverables", "run real-user scenarios"], "validationTypes": ["deliverable-validation", "baseline-test", "supplemental-functional-test"], "baselineExecutionPolicy": "phase-aggregate", "testAssetPolicy": "phase-aggregate", "externalDataPolicy": "live", "scenarios": [{ "name": "primary-user-flow", "description": "string", "operation": "string", "environment": "live", "expected": "string", "execution": { "command": "string", "args": ["..."] } }], "freezeBeforeExecution": true, "routeEachFinding": true } }
   ],
   "dependencies": ["pytest"],
   "architectureModules": [
@@ -109,7 +109,8 @@ Every round you must return strict JSON:
     "evidence": ["artifact path, test report, or command result"],
     "unavailableMetrics": [],
     "gaps": [],
-    "blockedBy": []
+    "blockedBy": [],
+    "findings": []
   },
   "actions": [ { "tool": "<tool name>", "args": { ... } }, ... ],
   "done": true | false
@@ -146,13 +147,14 @@ Rules:
    - [Time stability] Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
 4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
-   These four development phases author their paired tests but do not run them unless the current Step explicitly authorises a verification tool. Their scheduled execution in UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST is not a current-phase gap and must not be listed in qualityAssessment.gaps.
+   REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE author the baseline tests consumed by FUNCTIONAL_TEST / MODULE_TEST / INTEGRATION_TEST / UNIT_TEST. Authored baseline tests are not run until their paired verification Step unless the current Step explicitly authorises verification.
    A shortfall in this Step's own work goes in qualityAssessment.gaps and fails this Step. A precondition this Step does not own and cannot satisfy — product source another Step writes, a dependency another phase declares, a test whose scheduled execution belongs to the paired verification phase — goes in qualityAssessment.blockedBy, which is recorded as evidence and does not fail this Step. Never put one in the other's field, and never leave a true blocker out of both.
    Every paired test must import or execute the real product modules/public APIs declared by the Plan. Never duplicate product types, classes, algorithms, renderers, parsers, schedulers, or other business behavior inside a test to make it pass without product code.
+   S001-S004 baseline authors may use mocks and Record/Replay for controlled external I/O. S005-S008 independently inspect that baseline, may add only focused risk supplements under the writable verification supplement root, freeze baseline plus supplements, and execute the full frozen set with Record/Replay for external data. No Step performs privileged live-network acceptance; declared real-user cases run only at the Phase delivery gate. Put every independent problem in qualityAssessment.findings: a baseline test-defect targets paired-source, a supplemental test-defect targets current-step, a product-defect targets the owning source, test-incomplete/quality-shortfall become Enhancements, and dependency findings name dependencyPackages for separate routing.
    Every DETAILED_DESIGN integration test must exercise at least two declared product source modules when the Plan declares two or more; an inline stand-in for either side is not integration evidence.
    UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
    Ratios use 0..1. Never invent measurements: after a concrete probe fails to produce a required metric, put its exact identifier in unavailableMetrics and explain the cause in gaps so Runtime can create an Enhancement Ticket.
-   In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
+   A verification Step may correct a supplement it created before the frozen execution, but never the paired baseline or product code. After freeze, report each test-defect, product-defect, or completeness gap as a separate structured finding and set done=false.
 5. Correct any error in the next round's actions; never overstep authority or invent tools.
 6. [Large-file chunked writes] write_file / append_file content must stay under the current Step's runtime chunk limit shown in the tool docs.
    - For larger files: in the same actions array, first write_file the head (imports + top-level constants + first function/class),
@@ -170,7 +172,7 @@ REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TES
 DEBUG is runtime rollback/repair only. If a test phase fails, XCompiler rolls back to its paired source phase and reruns subsequent phases.
 
 Use the same phase documents and synchronous test-design rule as the Python planner:
-- REQUIREMENT_ANALYSIS: \`docs/01-requirement-analysis.md\` plus \`docs/tests/functional-test-plan.md\`.
+- REQUIREMENT_ANALYSIS: \`docs/01-requirement-analysis.md\` only during normal execution.
 - HIGH_LEVEL_DESIGN: \`docs/02-high-level-design.md\` plus \`docs/tests/module-test-plan.md\`.
 - DETAILED_DESIGN: \`docs/03-detailed-design.md\` plus \`docs/tests/integration-test-plan.md\`.
 - CODE: implementation outputs plus \`docs/tests/unit-test-plan.md\` and executable unit tests.
@@ -219,7 +221,8 @@ Every round you must return strict JSON:
     "evidence": ["artifact path, test report, or command result"],
     "unavailableMetrics": [],
     "gaps": [],
-    "blockedBy": []
+    "blockedBy": [],
+    "findings": []
   },
   "actions": [ { "tool": "<tool name>", "args": { ... } }, ... ],
   "done": true | false
@@ -237,13 +240,14 @@ Rules:
    - [Time stability] Time-dependent tests must freeze the system clock (for example \`vi.setSystemTime\` or patched datetime) or derive expected values from the current clock. Never call \`new Date()\` / \`date.today()\` while hard-coding a calendar year.
 4. When all outputs files exist and self-check passes, set done = true with empty actions and a qualityAssessment backed by concrete evidence.
    REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE report completion and upstreamAlignment.
-   These four development phases author their paired tests but do not run them unless the current Step explicitly authorises a verification tool. Their scheduled execution in UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST is not a current-phase gap and must not be listed in qualityAssessment.gaps.
+   REQUIREMENT_ANALYSIS / HIGH_LEVEL_DESIGN / DETAILED_DESIGN / CODE author the baseline tests consumed by FUNCTIONAL_TEST / MODULE_TEST / INTEGRATION_TEST / UNIT_TEST. Authored baseline tests are not run until their paired verification Step unless the current Step explicitly authorises verification.
    A shortfall in this Step's own work goes in qualityAssessment.gaps and fails this Step. A precondition this Step does not own and cannot satisfy — product source another Step writes, a dependency another phase declares, a test whose scheduled execution belongs to the paired verification phase — goes in qualityAssessment.blockedBy, which is recorded as evidence and does not fail this Step. Never put one in the other's field, and never leave a true blocker out of both.
    Every paired test must import or execute the real product modules/public APIs declared by the Plan. Never duplicate product types, classes, algorithms, renderers, parsers, schedulers, or other business behavior inside a test to make it pass without product code.
+   S001-S004 baseline authors may use mocks and Record/Replay for controlled external I/O. S005-S008 independently inspect that baseline, may add only focused risk supplements under the writable verification supplement root, freeze baseline plus supplements, and execute the full frozen set with Record/Replay for external data. No Step performs privileged live-network acceptance; declared real-user cases run only at the Phase delivery gate. Put every independent problem in qualityAssessment.findings: a baseline test-defect targets paired-source, a supplemental test-defect targets current-step, a product-defect targets the owning source, test-incomplete/quality-shortfall become Enhancements, and dependency findings name dependencyPackages for separate routing.
    Every DETAILED_DESIGN integration test must exercise at least two declared product source modules when the Plan declares two or more; an inline stand-in for either side is not integration evidence.
    UNIT_TEST reports lineCoverage, branchCoverage, and testCasePassRate; INTEGRATION_TEST reports interfaceCoverage, integrationScenarioCoverage, and testCasePassRate; MODULE_TEST reports moduleCoverage, contractCoverage, and testCasePassRate; FUNCTIONAL_TEST reports functionalCoverage, requirementCoverage, and endToEndPassRate.
    Ratios use 0..1. Never invent measurements: after a concrete probe fails to produce a required metric, put its exact identifier in unavailableMetrics and explain the cause in gaps so Runtime can create an Enhancement Ticket.
-   In UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST, do not repair test or product code. If inspection finds a semantic test defect that a test run may not expose, set validationDefect to concrete evidence and done=false so Runtime can open a Bug Ticket and route the paired source phase.
+   A verification Step may correct a supplement it created before the frozen execution, but never the paired baseline or product code. After freeze, report each test-defect, product-defect, or completeness gap as a separate structured finding and set done=false.
 5. Correct any error in the next round's actions; never overstep authority or invent tools.
 6. [Large-file chunked writes] write_file / append_file content must stay under the current Step's runtime chunk limit shown in the tool docs.
    - For larger files: in the same actions array, first write_file the head (imports + top-level constants + first function/class), then several append_file calls each adding one function/class block.
@@ -271,7 +275,7 @@ The PhasePlan must:
 1. Classify projectType: application / library / mixed.
 2. Assess complexityAssessment: simple / moderate / complex with rationale.
 3. Produce implementationPhases: P1 status=current; later P2/P3 status=planned. simple uses P1 only; moderate uses at least P1+P2; complex uses at least P1+P2+P3; user-forced staging uses at least P1+P2 and userForcedPhaseSplit=true.
-4. Give each phase objective, scope, deliverables, dependsOn, and verificationGate.
+4. Give each phase objective, scope, deliverables, dependsOn, verificationGate, and deliveryGate. The deliveryGate declares validationTypes and baselineExecutionPolicy, owns live real-user scenarios, and must include concrete command/args; no V-model Step owns live-network acceptance.
 5. Keep planned phases as goals and gates only. Do not expand any Step for them; a separate pass will generate a full V-model plan for one phase at a time.
 
 Return strict JSON only:
@@ -281,7 +285,7 @@ Return strict JSON only:
   "projectType": "application | library | mixed",
   "complexityAssessment": { "level": "simple | moderate | complex", "rationale": "string", "splitRecommended": true, "userForcedPhaseSplit": false },
   "implementationPhases": [
-    { "id": "P1", "title": "Core functionality", "objective": "string", "status": "current", "scope": ["..."], "deliverables": ["..."], "dependsOn": [], "verificationGate": { "summary": "string", "checks": ["..."], "failurePolicy": "Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases." } }
+    { "id": "P1", "title": "Core functionality", "objective": "string", "status": "current", "scope": ["..."], "deliverables": ["..."], "dependsOn": [], "verificationGate": { "summary": "string", "checks": ["..."], "failurePolicy": "Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases." }, "deliveryGate": { "kind": "phase-delivery", "summary": "string", "checks": ["complete deliverables", "run real-user scenarios"], "validationTypes": ["deliverable-validation", "baseline-test", "supplemental-functional-test"], "baselineExecutionPolicy": "phase-aggregate", "testAssetPolicy": "phase-aggregate", "externalDataPolicy": "live", "scenarios": [{ "name": "primary-user-flow", "description": "string", "operation": "string", "environment": "live", "expected": "string", "execution": { "command": "string", "args": ["..."] } }], "freezeBeforeExecution": true, "routeEachFinding": true } }
   ]
 }
 
@@ -295,7 +299,7 @@ Target language: ${profile.displayName}.
 
 You will receive a frozen PhasePlan and a phaseId. Generate Steps only for that phaseId. Planned phases must not be expanded into this StepPlan.
 
-The target phase's objective, scope, deliverables, and verification gate are the authoritative
+The target phase's objective, scope, deliverables, and delivery gate are the authoritative
 specification for this StepPlan. Every planned phase is explicitly out of scope: do not copy its
 features, packages, artifacts, or acceptance criteria into the current phase. Rewrite
 requirementDigest and globalPrompt for the target phase only, and exclude dependencies used solely
@@ -305,15 +309,15 @@ Every current phase must use the canonical V-model:
 REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TEST -> INTEGRATION_TEST -> MODULE_TEST -> FUNCTIONAL_TEST.
 
 Phase responsibilities:
-- REQUIREMENT_ANALYSIS defines functional scope, acceptance, boundaries, and user-visible behaviour, and synchronously authors the functional test plan and executable functional tests.
+- REQUIREMENT_ANALYSIS defines functional scope, acceptance, boundaries, and user-visible behaviour, and synchronously authors the functional baseline test plan and executable cases.
 - HIGH_LEVEL_DESIGN defines system position, external interfaces, third-party choices, dependencies and integration boundaries, and synchronously authors the module test plan and executable module/contract tests.
 - DETAILED_DESIGN defines module-internal functions/classes, data structures, algorithms, control flow, error handling and architecture, and synchronously authors the integration test plan and executable integration tests.
 - CODE implements the current phase and synchronously authors the unit test plan and executable unit tests.
-- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST inspect the existing paired tests, run them, and write reports; they do not create or rewrite test/product code.
+- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST uniformly inspect the baseline, may add risk-driven tests only under their verification-owned supplement root, freeze and run the combined set with deterministic external data, then write reports. Real-user live-network cases run only at the Phase delivery gate. None rewrites baseline tests or product code.
 
 Strict output ownership:
-- REQUIREMENT_ANALYSIS owns functional tests; HIGH_LEVEL_DESIGN owns module tests and architectureModules.testPaths; DETAILED_DESIGN owns integration tests; CODE owns unit tests plus product source/runtime assets.
-- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST consume those tests as inputs and output validation reports/delivery docs only.
+- REQUIREMENT_ANALYSIS owns functional baseline tests; HIGH_LEVEL_DESIGN owns module baseline tests and architectureModules.testPaths; DETAILED_DESIGN owns integration baseline tests; CODE owns unit baseline tests plus product source/runtime assets.
+- UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST consume paired baselines and own only validation reports/delivery docs. Runtime assigns the exact risk-supplement root when the Step executes; no Step inputs/outputs in Planner JSON may predeclare supplement, supplemental, or tests/verification paths.
 - For greenfield TypeScript, exactly one HIGH_LEVEL_DESIGN Step must output package.json with scripts, dependencies, and devDependencies. CODE must not output package.json.
 - For TypeScript package.json, use Vitest only: "test": "vitest run", "build": "tsc --noEmit", and include typescript/tsx/vitest/@vitest/coverage-v8/@types/node in devDependencies with compatible Vitest/provider versions. Scope tsconfig product build/typecheck to src/**/*.ts and src/**/*.tsx; each V-model test Step runs only its paired tests through Vitest. Do not mention or request Jest, ts-jest, @types/jest, ts-node, or nodemon.
 
@@ -353,6 +357,9 @@ const messages: Messages = {
     providerValidationRetry: (role, model) => `[${role}] retrying provider ${model} with contract feedback before fallback`,
     providerValidationRepairPrompt: (error, rejectedOutput) =>
       `Your previous candidate failed the caller contract before any action was parsed, authorized, executed, or persisted: ${error.slice(0, 1800)}\n` +
+      (error.includes('Executor response: incomplete or invalid JSON turn')
+        ? 'This is Executor JSON: the top level must contain both an actions array and a boolean done field, even when reporting only an assessment or finding. To handle an assigned Ticket, actions must submit the actual handling operation instead of repeating the problem statement.\n'
+        : '') +
       'Nothing claimed by that candidate changed the workspace. Treat only explicit tool results in the original conversation as executed state. ' +
       'Return a complete corrected response using the original system and user requirements. If the rejected candidate intended a mutation, submit that mutation again; do not jump to verification until a caller tool result confirms it succeeded. ' +
       'Return only the requested format without explanation or Markdown.\n\n' +
@@ -783,7 +790,7 @@ ${opts.baseline || '(missing baseline)'}
 - Assess complexity and choose phase count: simple => P1 current only; moderate => P1 current + at least P2 planned; complex => P1 current + at least P2/P3 planned.
 - P1 objective must be an independently deliverable and verifiable core slice.
 - P2/P3 should contain only future enhancement goals, scope, deliverables, and verification gates. Do not expand any V-model Step.
-- Every phase verificationGate must say failures are fed to Debugger, rolled back to the paired V-model phase, and followed by rerunning subsequent phases.
+- Every phase verificationGate must say failures are fed to Debugger, rolled back to the paired V-model phase, and followed by rerunning subsequent phases. Every deliveryGate must declare executable live real-user cases; \`--help\` alone is only an entrypoint smoke check.
 - Return only PhasePlan JSON. Do not include steps, architectureModules, or dependencies.`,
     plannerPhaseDecompose: (raw, qa, addenda, opts) =>
       `Original requirement:

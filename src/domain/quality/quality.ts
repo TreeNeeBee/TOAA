@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ObjectEnvelopeSchema } from '../objects/object_envelope.js';
 import { ObjectIdSchema } from '../identity/object_id.js';
 import { ObjectRefSchema } from '../objects/object_ref.js';
+import { DeliveryGateFindingSchema } from './delivery_gate.js';
 
 export const KPI_COMPARATORS = ['gte', 'lte', 'eq'] as const;
 
@@ -36,6 +37,8 @@ export const QualityAssessmentSchema = ObjectEnvelopeSchema.extend({
   passed: z.boolean(),
   gaps: z.array(z.string().min(1)).default([]),
   evidence: z.array(z.string().min(1)).default([]),
+  /** Independent gate findings retained until each has been converted into its own Ticket. */
+  findings: z.array(DeliveryGateFindingSchema).default([]),
 }).strict();
 
 export type QualityAssessment = z.infer<typeof QualityAssessmentSchema>;

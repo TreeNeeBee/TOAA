@@ -78,7 +78,16 @@ export function buildDefaultSkills(): SkillRegistry {
   reg.register({
     name: 'tester',
     prompt: SK.tester,
-    tools: ['read_file', 'list_dir', 'write_file', 'append_file', 'run_tests', 'analyze_error', 'http_fetch'],
+    tools: [
+      'read_file',
+      'list_dir',
+      'write_file',
+      'append_file',
+      'run_tests',
+      'run_program',
+      'analyze_error',
+      'http_fetch',
+    ],
   });
   reg.register({
     name: 'dep_resolver',

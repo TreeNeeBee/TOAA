@@ -21,11 +21,12 @@ describe('language-specific planner/executor prompts', () => {
 
   it('keeps TypeScript StepPlan output ownership explicit in the two-level planner prompt', () => {
     const prompt = t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile('typescript'));
-    expect(prompt).toContain('CODE owns unit tests plus product source/runtime assets');
+    expect(prompt).toContain('CODE owns unit baseline tests plus product source/runtime assets');
     expect(prompt).toContain('assetPaths is optional and may contain only non-code files under src/');
     expect(prompt).toContain('Do not put test fixtures, sample inputs, temporary outputs, or documentation there.');
-    expect(prompt).toContain('HIGH_LEVEL_DESIGN owns module tests and architectureModules.testPaths');
-    expect(prompt).toContain('output validation reports/delivery docs only');
+    expect(prompt).toContain('HIGH_LEVEL_DESIGN owns module baseline tests and architectureModules.testPaths');
+    expect(prompt).toContain('consume paired baselines and own only validation reports/delivery docs');
+    expect(prompt).toContain('Runtime assigns the exact risk-supplement root');
     expect(prompt).toContain('HIGH_LEVEL_DESIGN Step must output package.json');
     expect(prompt).toContain('CODE must not output package.json');
     expect(prompt).toContain('"test": "vitest run"');

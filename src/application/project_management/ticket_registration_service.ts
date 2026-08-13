@@ -31,14 +31,17 @@ export class TicketRegistrationService {
     if (ticket.registeredAt) return ticket;
     const creator = await this.roles.require(ticket.creatorActorId);
     this.assertCreationAuthority(ticket, creator);
+    const pmIntake = ticket.source.kind === 'pm-intake';
     const now = new Date().toISOString();
     const built = await this.traces.build(ticket, [
       {
         eventType: 'created',
         initiatorActorId: creator.id,
         initiatorRole: creator.role,
-        reasonCode: 'ticket.created_by_context_owner',
-        reason: `${creator.role} created ${ticket.type} with source context.`,
+        reasonCode: pmIntake ? 'pm.problem_report_materialized' : 'ticket.created_by_context_owner',
+        reason: pmIntake
+          ? `Project Manager created ${ticket.type} from a validated external problem report.`
+          : `${creator.role} created ${ticket.type} with source context.`,
         correlationId: ticket.source.correlationId,
         causationId: ticket.source.causationId,
         occurredAt: ticket.submittedAt,
@@ -47,8 +50,10 @@ export class TicketRegistrationService {
         eventType: 'submitted',
         initiatorActorId: creator.id,
         initiatorRole: creator.role,
-        reasonCode: 'ticket.submitted_to_pm',
-        reason: 'Context owner submitted the Ticket to Project Manager routing.',
+        reasonCode: pmIntake ? 'pm.problem_report_accepted' : 'ticket.submitted_to_pm',
+        reason: pmIntake
+          ? 'Project Manager accepted the report into the Phase Ticket workflow.'
+          : 'Context owner submitted the Ticket to Project Manager routing.',
         correlationId: ticket.source.correlationId,
         causationId: ticket.id,
         occurredAt: ticket.submittedAt,
@@ -89,6 +94,45 @@ export class TicketRegistrationService {
     const tickets = objects.filter((object): object is Ticket => object.objectType === 'ticket');
     const registered: Ticket[] = [];
     for (const ticket of tickets) registered.push(await this.register(ticket.id));
+    return registered;
+  }
+
+  /**
+   * Registers every finding from one gate while serializing overlapping corrective flows.
+   *
+   * The Tickets remain independent records. Their scheduling dependencies only prevent two repair
+   * chains from reaching and closing the same downstream Step concurrently.
+   */
+  async registerGateBatch(ticketIds: readonly ObjectId[]): Promise<Ticket[]> {
+    const ids = [...new Set(ticketIds)];
+    const registered: Ticket[] = [];
+    let predecessor: Ticket | undefined;
+    for (const id of ids) {
+      let ticket = await this.register(id);
+      if (predecessor && !ticket.dependencyTicketIds.includes(predecessor.id)) {
+        if (ticket.projectId !== predecessor.projectId) {
+          throw new Error('A delivery-gate Ticket batch cannot cross Project boundaries');
+        }
+        const pm = await this.projectManager(ticket.projectId);
+        const built = await this.traces.build(ticket, [{
+          eventType: 'queued',
+          initiatorActorId: pm.id,
+          initiatorRole: pm.role,
+          reasonCode: 'pm.delivery_gate_batch_order',
+          reason: `${ticket.name} waits for ${predecessor.name} so corrective V-model chains do not overlap.`,
+          evidenceRefs: [predecessor.id],
+          correlationId: ticket.source.correlationId,
+          causationId: predecessor.id,
+        }]);
+        ticket = TicketSchema.parse({
+          ...built.ticket,
+          dependencyTicketIds: [...ticket.dependencyTicketIds, predecessor.id],
+        });
+        await this.repository.commit([...built.events, ticket]);
+      }
+      registered.push(ticket);
+      predecessor = ticket;
+    }
     return registered;
   }
 
@@ -320,6 +364,11 @@ export class TicketRegistrationService {
     return actor.id;
   }
 
+  /** PM identity used by the single external-problem intake boundary. */
+  async projectManagerActorId(projectId: ObjectId): Promise<ObjectId> {
+    return (await this.projectManager(projectId)).id;
+  }
+
   /** The registered actor behind an assignment, for callers that hold an assignment rather than a Ticket. */
   async actorById(actorId: ObjectId): Promise<ActorRegistration> {
     return this.roles.require(actorId);
@@ -338,7 +387,8 @@ export class TicketRegistrationService {
   }
 
   private assertCreationAuthority(ticket: Ticket, creator: ActorRegistration): void {
-    const pmOwned = ticket.type === 'epic' || ticket.type === 'story';
+    const pmIntake = ticket.source.kind === 'pm-intake';
+    const pmOwned = ticket.type === 'epic' || ticket.type === 'story' || pmIntake;
     if (pmOwned && creator.role !== 'project-manager') {
       throw new Error(`${ticket.type} ${ticket.name} must be created by Project Manager`);
     }

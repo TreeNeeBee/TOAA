@@ -42,7 +42,11 @@ export function normalizeActions(raw: unknown, toolMap?: Map<string, Tool>): Nor
       });
       return;
     }
-    const normalizedArgs = normalizeActionArgs(item.tool, item.args);
+    const selectedTool = toolMap?.get(item.tool);
+    const normalizedArgs = normalizeActionArgs(
+      item.tool,
+      actionArgsInput(item, selectedTool),
+    );
     if (!normalizedArgs.ok) {
       invalid.push({
         index,
@@ -51,7 +55,6 @@ export function normalizeActions(raw: unknown, toolMap?: Map<string, Tool>): Nor
       });
       return;
     }
-    const selectedTool = toolMap?.get(item.tool);
     const schemaError = selectedTool
       ? validateToolArgsAgainstSchema(selectedTool, normalizedArgs.args)
       : undefined;
@@ -96,6 +99,7 @@ export function describeToolForStep(tool: Tool, context: ToolContext, step: Step
     }
   } else if (tool.name === 'apply_patch') {
     details.push(
+      'Use the exact action envelope {"tool":"apply_patch","args":{"patch":"<unified diff>"}}; patch must be nested under args. ' +
       'Every target in the unified diff +++ header must be workspace-relative and allowed by this Step. ' +
       `Path candidates: outputs=[${outputs}], writable=[${writable}].`,
     );
@@ -189,6 +193,23 @@ function normalizeActionArgs(
     }
   }
   return { ok: false, error: 'args must be an object' };
+}
+
+/**
+ * Some OpenAI-compatible models emit provider-style tool arguments beside `tool` even when the
+ * requested execution envelope uses `args`. The tool schema makes this shape unambiguous, so fold
+ * only declared argument keys into the canonical envelope. The original response remains in the
+ * executor audit, while validation and execution still use the same strict tool schema.
+ */
+function actionArgsInput(item: Record<string, unknown>, tool: Tool | undefined): unknown {
+  if (item.args !== undefined && item.args !== null) return item.args;
+  if (!tool) return item.args;
+  const flattened = Object.fromEntries(
+    Object.keys(tool.argsSchema)
+      .filter((key) => item[key] !== undefined)
+      .map((key) => [key, item[key]]),
+  );
+  return Object.keys(flattened).length > 0 ? flattened : item.args;
 }
 
 const STRING_ARG_TOOL_KEYS: Record<string, string> = {

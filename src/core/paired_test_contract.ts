@@ -22,21 +22,24 @@ export function mergePairedSourceTestQuality(
   inspection: PairedSourceTestInspection,
 ): StageQualityAssessment {
   if (inspection.ok) return assessment;
-  const completion = inspection.testPaths.length === 0
-    ? 0
-    : inspection.valid.length / inspection.testPaths.length;
+  const remediation =
+    'Rewrite the invalid test to import and exercise the declared product modules. Before CODE, ' +
+    'imports may target planned source paths that do not exist yet. Do not create src/** stubs or ' +
+    'product implementations during requirement/design phases, and do not duplicate product ' +
+    'behavior inside tests.';
   return {
     ...assessment,
-    completion: Math.min(assessment.completion ?? 1, completion),
     evidence: dedup([...assessment.evidence, ...inspection.testPaths]),
-    gaps: dedup([
-      ...assessment.gaps,
-      ...inspection.invalid.map((failure) => `paired test contract invalid: ${failure}`),
-      'paired test remediation: rewrite the invalid tests to import and exercise the declared product modules; ' +
-        'before CODE those imports may target planned source paths that do not exist yet. ' +
-        'Do not create src/** stubs or product implementations during requirement/design phases, ' +
-        'and do not duplicate product behavior inside tests.',
-    ]),
+    findings: [
+      ...(assessment.findings ?? []),
+      ...inspection.invalid.map((failure) => ({
+        category: 'test-incomplete' as const,
+        summary: `Paired baseline test contract is incomplete: ${failure}`,
+        evidence: [failure, remediation],
+        target: 'current-step' as const,
+        dependencyPackages: [],
+      })),
+    ],
   };
 }
 
@@ -65,6 +68,11 @@ export async function inspectPairedSourceTests(
   const valid: string[] = [];
   const invalid: string[] = [];
   const references: Record<string, string[]> = {};
+  const contractDocuments = await developmentContractDocuments(workspace, sourceStep);
+  const requiredContractIdentifiers = sourceStep.phase === 'REQUIREMENT_ANALYSIS'
+    ? extractRequiredContractIdentifiers(contractDocuments)
+    : [];
+  const controlledDataStrategyDeclared = declaresControlledTestData(contractDocuments);
 
   for (const testPath of testPaths) {
     if (!(await workspace.exists(testPath))) {
@@ -95,7 +103,18 @@ export async function inspectPairedSourceTests(
     const behaviorRisks = sourceStep.phase === 'DETAILED_DESIGN'
       ? duplicatedIntegrationBehavior(content, plan.language)
       : [];
-    if (matched.length >= requiredReferences && behaviorRisks.length === 0) {
+    const contractAlignmentRisks = sourceStep.phase === 'REQUIREMENT_ANALYSIS'
+      ? requirementTestAlignmentRisks(content, plan.language, requiredContractIdentifiers)
+      : [];
+    const reproducibilityRisks = controlledDataStrategyDeclared
+      ? controlledExternalDataRisks(content, plan.language)
+      : [];
+    if (
+      matched.length >= requiredReferences &&
+      behaviorRisks.length === 0 &&
+      contractAlignmentRisks.length === 0 &&
+      reproducibilityRisks.length === 0
+    ) {
       valid.push(testPath);
       continue;
     }
@@ -110,6 +129,8 @@ export async function inspectPairedSourceTests(
       );
     }
     invalid.push(...behaviorRisks.map((risk) => `${testPath}: ${risk}`));
+    invalid.push(...contractAlignmentRisks.map((risk) => `${testPath}: ${risk}`));
+    invalid.push(...reproducibilityRisks.map((risk) => `${testPath}: ${risk}`));
   }
 
   return {
@@ -119,6 +140,111 @@ export async function inspectPairedSourceTests(
     invalid,
     references,
   };
+}
+
+async function developmentContractDocuments(
+  workspace: Workspace,
+  sourceStep: Step,
+): Promise<string> {
+  const paths = sourceStep.outputs
+    .map(normalizePath)
+    .filter((output) => /(?:^|\/)docs\/.+\.md$/iu.test(output));
+  const contents = await Promise.all(paths.map(async (documentPath) =>
+    await workspace.exists(documentPath)
+      ? workspace.readFile(documentPath).catch(() => '')
+      : '',
+  ));
+  return contents.filter(Boolean).join('\n\n');
+}
+
+/** Extract machine-readable required fields from ordinary Markdown contract tables. */
+function extractRequiredContractIdentifiers(content: string): string[] {
+  const identifiers: string[] = [];
+  const headings = new Set(['field', 'name', 'property', 'parameter', '字段', '名称', '属性', '参数']);
+  for (const line of content.split(/\r?\n/u)) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = line
+      .split('|')
+      .slice(1, -1)
+      .map((cell) => cell.trim().replace(/^`|`$/gu, ''));
+    const identifier = cells[0] ?? '';
+    if (!/^[A-Za-z_$][\w$]*$/u.test(identifier) || headings.has(identifier.toLowerCase())) continue;
+    if (!cells.slice(1).some((cell) => /^(?:yes|true|required|mandatory|是|必填)$/iu.test(cell))) continue;
+    identifiers.push(identifier);
+  }
+  return dedup(identifiers);
+}
+
+function requirementTestAlignmentRisks(
+  content: string,
+  language: Plan['language'],
+  requiredIdentifiers: string[],
+): string[] {
+  if (requiredIdentifiers.length === 0) return [];
+  const missing = requiredIdentifiers.filter((identifier) => !containsIdentifier(content, identifier));
+  const duplicatedShape = language === 'typescript'
+    ? duplicatedRequiredTypeShape(content, requiredIdentifiers)
+    : [];
+  if (missing.length === 0 && duplicatedShape.length === 0) return [];
+  return [
+    [
+      missing.length > 0
+        ? `does not assert required contract identifier(s): ${missing.join(', ')}`
+        : '',
+      duplicatedShape.length > 0
+        ? `redeclares the product contract locally (${duplicatedShape.join(', ')}) instead of importing its type`
+        : '',
+    ].filter(Boolean).join('; '),
+  ];
+}
+
+function duplicatedRequiredTypeShape(content: string, requiredIdentifiers: string[]): string[] {
+  const declarations = [
+    ...content.matchAll(/\binterface\s+([A-Za-z_$][\w$]*)[^{]*\{([\s\S]*?)\}/gu),
+    ...content.matchAll(/\btype\s+([A-Za-z_$][\w$]*)\s*=\s*\{([\s\S]*?)\}/gu),
+  ];
+  return declarations.flatMap((match) => {
+    const body = match[2] ?? '';
+    const overlap = requiredIdentifiers.filter((identifier) => containsIdentifier(body, identifier));
+    const threshold = Math.max(2, Math.ceil(requiredIdentifiers.length / 2));
+    return overlap.length >= threshold ? [match[1] ?? 'anonymous contract'] : [];
+  });
+}
+
+function declaresControlledTestData(content: string): boolean {
+  return /\b(?:mocks?|fixtures?|stubs?|cassettes?|record\s*\/?\s*replay)\b|模拟|夹具|录制\s*\/?\s*回放/iu.test(content);
+}
+
+function controlledExternalDataRisks(content: string, language: Plan['language']): string[] {
+  if (hasDeterministicExternalDataControl(content, language)) return [];
+  const calls = language === 'typescript'
+    ? importedNoArgumentAwaitCalls(content)
+    : [];
+  if (calls.length === 0) return [];
+  return [
+    `declares controlled Mock/Fixture/Record-Replay data but directly awaits product call(s) ` +
+      `${calls.join(', ')} without an executable isolation mechanism`,
+  ];
+}
+
+function hasDeterministicExternalDataControl(content: string, language: Plan['language']): boolean {
+  if (language === 'python') {
+    return /\b(?:monkeypatch|requests_mock|responses\.|respx\.|vcr\.use_cassette|unittest\.mock|patch\s*\()/u.test(content);
+  }
+  return /\bvi\.(?:mock|doMock|fn|spyOn|stubGlobal|hoisted)\s*\(|\b(?:mockImplementation|mockResolvedValue|mockRejectedValue)\s*\(|\b(?:MockAgent|nock|msw|setupServer)\b/u.test(content) ||
+    /(?:^|\n)\s*import\s+[^\n]*\s+from\s+["'][^"']*(?:fixtures?|record-replay)[^"']*["']/iu.test(content);
+}
+
+function importedNoArgumentAwaitCalls(content: string): string[] {
+  const imports = [...content.matchAll(
+    /^\s*import\s+(?!type\b)([^'"\n]*?)\s+from\s+["'](?:\.\.\/)+src\/[^"']+["']\s*;?/gmu,
+  )];
+  const bindings = dedup(imports.flatMap((match) => typescriptImportBindings(match[1] ?? '')));
+  const body = stripCommentsAndStrings(content);
+  return bindings.filter((binding) => {
+    const escaped = binding.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    return new RegExp(`\\bawait\\s+${escaped}\\s*\\(\\s*\\)`, 'u').test(body);
+  });
 }
 
 function duplicatedIntegrationBehavior(content: string, language: Plan['language']): string[] {

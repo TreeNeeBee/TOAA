@@ -225,8 +225,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
-  // 7. phase purity — 左侧需求/设计阶段可产出 tests/，但不得提前写 src/；
-  //    右侧测试阶段只写报告/交付文档，不得拥有 src/ 或可执行测试。
+  // 7. phase purity — 左侧需求/设计阶段可产出基线 tests/，但不得提前写 src/；
+  //    右侧计划不得把补充测试声明成普通输出。运行时补充测试只能进入隔离命名空间。
   const DESIGN_PHASES = new Set(['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN']);
   const TEST_PHASES = new Set(['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST']);
   for (const s of plan.steps) {
@@ -242,7 +242,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
           stepId: s.id,
           message:
             TEST_PHASES.has(s.phase)
-              ? `${s.phase} is validation-only and must not output implementation/test code: ${out}`
+              ? `${s.phase} planned outputs must not own implementation or baseline test code; ` +
+                `risk supplements are runtime-owned under tests/verification/: ${out}`
               : `${s.phase} must not output implementation product code: ${out}`,
         });
       }
@@ -346,7 +347,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
               level: 'error',
               stepId: testStep.id,
               message:
-                `${testPhase} is validation-only; move executable tests to ${sourcePhase}: ${ownedTestOutputs.join(', ')}`,
+                `${testPhase} planned outputs cannot own baseline tests; move them to ${sourcePhase}. ` +
+                `Risk supplements are created at runtime under tests/verification/: ${ownedTestOutputs.join(', ')}`,
             });
           }
           const missingInputs = sourceTestAssets.filter((asset) => !testStep.inputs.includes(asset));

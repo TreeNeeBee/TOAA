@@ -226,6 +226,10 @@ export class OpenAIClient implements LLMClient {
           aggregate += piece;
           streamedContentChars += piece.length;
           armIdle();
+          const embeddedProtocolError = openAIProtocolErrorEnvelope(aggregate);
+          if (embeddedProtocolError) {
+            throw new Error(`OpenAI error: ${embeddedProtocolError}`);
+          }
           options.onToken?.(piece);
           if (expectsJsonObject && hasDegenerateJsonPrefix(aggregate)) {
             throw new Error('detected degenerate non-JSON prefix in OpenAI stream; aborting');
@@ -284,6 +288,10 @@ export class OpenAIClient implements LLMClient {
         ctrl.abort();
         throw abortReason ?? (err as Error);
       }
+      const embeddedProtocolError = openAIProtocolErrorEnvelope(aggregate);
+      if (embeddedProtocolError) {
+        throw new Error(`OpenAI error: ${embeddedProtocolError}`);
+      }
       return aggregate;
     } catch (err) {
       throw wrapOpenAIError(this.cfg, err, 'stream');
@@ -291,6 +299,30 @@ export class OpenAIClient implements LLMClient {
       cleanup();
     }
   }
+}
+
+/**
+ * Some OpenAI-compatible gateways return a provider protocol error as generated content inside a
+ * successful SSE choice instead of using HTTP status or the top-level `error` field. Treat only the
+ * canonical error envelope as protocol failure; ordinary user-requested JSON remains content.
+ */
+function openAIProtocolErrorEnvelope(content: string): string | undefined {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.type !== 'error' || !envelope.error || typeof envelope.error !== 'object') {
+    return undefined;
+  }
+  const error = envelope.error as Record<string, unknown>;
+  if (typeof error.type !== 'string' || typeof error.message !== 'string') return undefined;
+  return `${error.type}: ${error.message}`;
 }
 
 interface OpenAIHttpFailure {

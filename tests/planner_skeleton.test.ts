@@ -81,6 +81,36 @@ function iterationTestPlan(iterationId: string, basename: string): string {
   return iterationId === 'P1' ? `docs/tests/${basename}` : `docs/iterations/${iterationId}/tests/${basename}`;
 }
 
+function testPhaseDeliveryGate(name: string) {
+  return {
+    kind: 'phase-delivery' as const,
+    summary: `${name} real-user delivery gate`,
+    checks: ['Run the primary real-user flow.'],
+    testAssetPolicy: 'phase-aggregate' as const,
+    externalDataPolicy: 'live' as const,
+    scenarios: [{
+      name: `${name.toLowerCase()}-primary-flow`,
+      description: 'Exercise the fixture as a real user.',
+      operation: 'Run the primary fixture command.',
+      environment: 'live' as const,
+      expected: 'The command succeeds.',
+      execution: { command: 'python', args: ['src/main.py', '--fixture'] },
+    }],
+    freezeBeforeExecution: true,
+    routeEachFinding: true as const,
+  };
+}
+
+function withDeliveryGates<T extends { implementationPhases: readonly Record<string, unknown>[] }>(plan: T): T {
+  return {
+    ...plan,
+    implementationPhases: plan.implementationPhases.map((phase) => ({
+      ...phase,
+      deliveryGate: phase.deliveryGate ?? testPhaseDeliveryGate(String(phase.id ?? 'phase')),
+    })),
+  } as T;
+}
+
 function vModelSteps(iterationId = 'P1', start = 1, sourcePath = 'src/x.py', moduleTestPath = 'tests/test_x.py') {
   const functionalDocs = iterationId === 'P1'
     ? ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md']
@@ -119,6 +149,7 @@ const planMetadata = {
       scope: ['Core fixture'],
       deliverables: ['Valid draft plan'],
       dependsOn: [],
+      deliveryGate: testPhaseDeliveryGate('P1'),
     },
   ],
 };
@@ -347,7 +378,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       architectureModules,
     };
     const p = new Planner(fakeLLM([
-      JSON.stringify(phasePlan),
+      JSON.stringify(withDeliveryGates(phasePlan)),
       JSON.stringify(invalidStepPlan),
       JSON.stringify(validStepPlan),
     ]));
@@ -472,6 +503,21 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     ).rejects.toThrow(/projectType/);
   });
 
+  it('拒绝没有可执行真实用户场景的 PhasePlan', async () => {
+    const phaseWithoutGate = { ...planMetadata.implementationPhases[0]!, deliveryGate: undefined };
+    const phasePlan = {
+      requirementDigest: 'Build a runnable command.',
+      globalPrompt: '',
+      projectType: 'application',
+      complexityAssessment: planMetadata.complexityAssessment,
+      implementationPhases: [phaseWithoutGate],
+    };
+    const planner = new Planner(fakeLLM(JSON.stringify(phasePlan)));
+
+    await expect(planner.decompose({ rawRequirement: 'Build a runnable command.', clarifications: [] }))
+      .rejects.toThrow(/deliveryGate with executable real-user scenarios/);
+  });
+
   it('多阶段需求先生成 PhasePlan，再只展开当前 P1 的 V 模型 StepPlan', async () => {
     const requirementDigest = 'Build a staged number formatting utility. Phase 1 core, Phase 2 polish, Phase 3 scale.';
     const phasePlan = {
@@ -520,7 +566,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       dependencies: ['pytest'],
       steps: vModelSteps('P1', 1, 'src/main.py', 'tests/test_main.py'),
     };
-    const p = new Planner(fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]));
+    const p = new Planner(fakeLLM([JSON.stringify(withDeliveryGates(phasePlan)), JSON.stringify(stepPlan)]));
     const plan = await p.decompose({ rawRequirement: requirementDigest, clarifications: [] });
     expect(plan.implementationPhases?.map((phase) => phase.id)).toEqual(['P1', 'P2', 'P3']);
     expect(plan.steps).toHaveLength(8);
@@ -570,7 +616,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     const plan = await planner.decomposePhase(
       { rawRequirement: requirementDigest, clarifications: [], intent: 'feature' },
-      phasePlan,
+      withDeliveryGates(phasePlan),
       'P2',
     );
 
@@ -626,8 +672,8 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     };
 
     const p = new Planner(fakeLLM([
-      JSON.stringify(invalidPhasePlan),
-      JSON.stringify(repairedPhasePlan),
+      JSON.stringify(withDeliveryGates(invalidPhasePlan)),
+      JSON.stringify(withDeliveryGates(repairedPhasePlan)),
       JSON.stringify(stepPlan),
     ]));
     const plan = await p.decompose({ rawRequirement: requirementDigest, clarifications: [] });
@@ -691,7 +737,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     const plan = await planner.decomposePhase(
       { rawRequirement: requirementDigest, clarifications: [] },
-      phasePlan,
+      withDeliveryGates(phasePlan),
       'P1',
     );
 
@@ -757,7 +803,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     const plan = await planner.decomposePhase(
       { rawRequirement: requirementDigest, clarifications: [] },
-      phasePlan,
+      withDeliveryGates(phasePlan),
       'P1',
     );
 
@@ -823,7 +869,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     const plan = await planner.decomposePhase(
       { rawRequirement: requirementDigest, clarifications: [] },
-      phasePlan,
+      withDeliveryGates(phasePlan),
       'P1',
     );
 
@@ -912,7 +958,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       steps,
     };
 
-    const p = new Planner(fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]), undefined, 'typescript');
+    const p = new Planner(fakeLLM([JSON.stringify(withDeliveryGates(phasePlan)), JSON.stringify(stepPlan)]), undefined, 'typescript');
     const plan = await p.decompose({ rawRequirement, clarifications: [] });
 
     expect(plan.architectureModules).toHaveLength(4);
@@ -969,7 +1015,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       dependencies: ['pytest'],
       steps: vModelSteps('P1', 1, 'src/main.py', 'tests/test_main.py'),
     };
-    const p = new Planner(fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]));
+    const p = new Planner(fakeLLM([JSON.stringify(withDeliveryGates(phasePlan)), JSON.stringify(stepPlan)]));
     await expect(
       p.decompose({ rawRequirement: requirementDigest, clarifications: [] }),
     ).rejects.toThrow(/omitted architectureModules/);

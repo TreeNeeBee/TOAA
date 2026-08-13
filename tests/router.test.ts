@@ -139,6 +139,35 @@ describe('LLMRouter fallback chain', () => {
     expect(selectedProvider).toBe('openai');
   });
 
+  it('propagates host cancellation without fallback or score decay', async () => {
+    const cfg = mkCfg({ fallbacks: ['openai'] });
+    const scores = new ScoreStore('/tmp/x/config.yaml');
+    const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clientsMap: Map<string, LLMClient> = (router as any).clients;
+    let secondaryCalls = 0;
+    clientsMap.set('ollama_code', {
+      name: 'fake-primary',
+      chat: async () => {
+        const error = new Error('CLI task cancelled by SIGINT');
+        error.name = 'AbortError';
+        throw error;
+      },
+    });
+    clientsMap.set('openai', {
+      name: 'fake-secondary',
+      chat: async () => {
+        secondaryCalls++;
+        return 'must not run';
+      },
+    });
+
+    await expect(router.for('Coder').chat([{ role: 'user', content: 'hi' }]))
+      .rejects.toThrow('CLI task cancelled by SIGINT');
+    expect(secondaryCalls).toBe(0);
+    expect(scores.get('ollama_code')).toBe(ScoreStore.DEFAULT);
+  });
+
   it('reports all provider failures when the whole chain fails', async () => {
     const cfg = mkCfg({ fallbacks: ['openai'] });
     const router = new LLMRouter(cfg, undefined, undefined, undefined, undefined, stubProbe);

@@ -53,6 +53,7 @@ import {
 import { createRuntimeRecordReplay } from './record_replay.js';
 import { withRecordReplaySandbox } from '../infrastructure/record_replay/sandbox.js';
 import { ProjectPermissionService } from '../application/project_management/permission_service.js';
+import { resolvePhaseDeliveryGate } from '../domain/phases/phase.js';
 import { PhaseMaterializationService } from '../application/project_management/phase_materialization_service.js';
 import { PhaseProgressionService } from '../application/planning/phase_progression_service.js';
 import type { RecordReplayMode } from '../application/record_replay/types.js';
@@ -575,6 +576,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       });
     },
     finalGate: async () => {
+      const phaseGate = resolvePhaseDeliveryGate(domainPhase);
       if (requestPermission) {
         const decision = await requestPermission({
           operationType: 'test_command',
@@ -586,8 +588,36 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           denyBehavior: 'Keep the phase open and return a failed run.',
         });
         if (!decision.approved) return { ok: false, reason: 'project audit permission denied' };
+        if (phaseGate.scenarios.some((scenario) => scenario.environment === 'live')) {
+          const networkDecision = await requestPermission({
+            operationType: 'network_access',
+            target: `${domainPhase.name} live delivery scenarios`,
+            reason: 'Validate the delivered functionality through declared real-user operations.',
+            risk: 'The product commands may contact live external services using the configured sandbox.',
+            scope: 'current workspace sandbox',
+            skippable: false,
+            denyBehavior: 'Keep the Phase open without creating a product-defect Ticket.',
+          });
+          if (!networkDecision.approved) {
+            return { ok: false, reason: 'phase delivery live-scenario permission denied' };
+          }
+        }
       }
-      finalProjectAudit = await runProjectAudit({ ws, sandbox, plan, profile });
+      finalProjectAudit = await runProjectAudit({
+        ws,
+        sandbox,
+        plan,
+        profile,
+        scenarios: phaseGate.scenarios,
+        runLiveScenario: (operation) => recordReplay.runWithMode('off', operation),
+      });
+      await audit.event('phase.delivery_gate', `${domainPhase.name} delivery gate evaluated`, {
+        messageId: 'domain.phase_delivery_gate_evaluated',
+        projectId: domainProject.id,
+        phaseId: domainPhase.id,
+        gate: phaseGate,
+        result: finalProjectAudit,
+      });
       await emitProjectAudit(io, finalProjectAudit);
       return {
         ok: finalProjectAudit.ok,
@@ -598,6 +628,12 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           .filter((check) => check.severity === 'error' && !check.ok)
           .map((check) => `${check.name}: ${check.summary}${check.detail ? `\n${check.detail}` : ''}`)
           .join('\n'),
+        findings: finalProjectAudit.checks
+          .filter((check) => check.severity === 'error' && !check.ok)
+          .flatMap((check) => check.finding ? [check.finding] : []),
+        evidence: finalProjectAudit.checks.map((check) =>
+          `${check.ok ? 'PASS' : 'FAIL'} ${check.name}: ${check.summary}`
+        ),
       };
     },
   }, plan);

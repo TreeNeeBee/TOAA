@@ -75,7 +75,7 @@ describe('calibratePlanCoverage', () => {
     expect(out[3]!.dependsOn).toEqual(['S002']);
   });
 
-  it('adds runnable tests to left-side stages and keeps existing test steps validation-only', () => {
+  it('adds baselines to left-side stages and keeps supplements out of planned verification outputs', () => {
     const steps: Step[] = [
       mkStep({
         id: 'S000',
@@ -116,6 +116,42 @@ describe('calibratePlanCoverage', () => {
     expect(out[0]!.outputs).toContain('tests/test_integration_s000.py');
     expect(out[3]!.outputs).toEqual(['docs/06-integration-test.md']);
     expect(out[3]!.inputs).toContain('tests/test_integration_s000.py');
+  });
+
+  it('drops planner-declared supplement paths instead of promoting them to baseline ownership', () => {
+    const steps: Step[] = [
+      mkStep({
+        id: 'S001',
+        phase: 'CODE',
+        outputs: [
+          'src/app.py',
+          'tests/test_app.py',
+          'tests/supplements/unit-supplement.py',
+        ],
+      }),
+      mkStep({
+        id: 'S002',
+        phase: 'UNIT_TEST',
+        role: 'Tester',
+        inputs: [
+          'tests/test_app.py',
+          'tests/supplements/unit-supplement.py',
+        ],
+        outputs: [
+          'docs/05-unit-test.md',
+          'tests/verification/p1/unit-test/s002/risk_case.py',
+        ],
+        dependsOn: ['S001'],
+      }),
+    ];
+
+    const out = calibratePlanCoverage(steps);
+
+    expect(out[0]!.outputs).toContain('tests/test_app.py');
+    expect(out[0]!.outputs).not.toContain('tests/supplements/unit-supplement.py');
+    expect(out[1]!.inputs).toEqual(['tests/test_app.py']);
+    expect(out[1]!.outputs).toEqual(['docs/05-unit-test.md']);
+    expect(out[1]!.systemPrompt).toContain('tests/verification/p1/unit-test/s002/');
   });
 
   it('adds the paired unit test asset without adding a UNIT_TEST step for an init-only CODE marker', () => {

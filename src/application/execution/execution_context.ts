@@ -1,3 +1,5 @@
+import { RECORDED_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
+import { isTestFilePath, normalizeGitPath } from './v_model_policy.js';
 import type { LanguageProfile } from '../../core/language.js';
 import {
   PHASE_ORDER,
@@ -67,7 +69,14 @@ export function computeDebugAllowedWrites(
 }
 
 export function computeStepAllowedWrites(step: Step): string[] {
-  return [...new Set(step.outputs)];
+  const outputs = [...new Set(step.outputs)];
+  // A Step that owns paired tests may also write the responses those tests replay. The rule that
+  // UNIT/INTEGRATION/MODULE must verify against data captured from the real dependency is useless
+  // without somewhere to put it: no plan declares this directory, so the Step would be told to
+  // record a fixture and then denied the write — a refusal it cannot act on.
+  return outputs.some((output) => isTestFilePath(normalizeGitPath(output)))
+    ? [...outputs, `${RECORDED_FIXTURE_DIR}/`]
+    : outputs;
 }
 
 export function stepContextChars(plan: Plan, step: Step): number {

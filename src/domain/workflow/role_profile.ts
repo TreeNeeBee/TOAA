@@ -6,9 +6,9 @@ const ROLE_CAPABILITIES: Readonly<Record<DomainRole, readonly string[]>> = {
   'project-manager': ['project-management', 'phase-control', 'ticket-routing', 'delivery-control'],
   'requirements-engineer': ['requirement-analysis', 'functional-test-design'],
   'system-engineer': ['high-level-design', 'detailed-design', 'module-test-design', 'integration-test-design'],
-  integrator: ['integration-verification', 'contract-verification'],
+  integrator: ['integration-verification', 'contract-verification', 'risk-test-supplement'],
   developer: ['code', 'unit-test-design', 'debug', 'change-implementation'],
-  tester: ['unit-verification', 'module-verification', 'functional-verification'],
+  tester: ['unit-verification', 'module-verification', 'functional-verification', 'risk-test-supplement'],
 };
 
 /**
@@ -23,10 +23,10 @@ const STEP_CAPABILITIES: Readonly<Record<StepType, readonly string[]>> = {
   HIGH_LEVEL_DESIGN: ['high-level-design', 'module-test-design'],
   DETAILED_DESIGN: ['detailed-design', 'integration-test-design'],
   CODE: ['code', 'unit-test-design'],
-  FUNCTIONAL_TEST: ['functional-verification'],
-  MODULE_TEST: ['module-verification'],
-  INTEGRATION_TEST: ['integration-verification', 'contract-verification'],
-  UNIT_TEST: ['unit-verification'],
+  FUNCTIONAL_TEST: ['functional-verification', 'risk-test-supplement'],
+  MODULE_TEST: ['module-verification', 'risk-test-supplement'],
+  INTEGRATION_TEST: ['integration-verification', 'contract-verification', 'risk-test-supplement'],
+  UNIT_TEST: ['unit-verification', 'risk-test-supplement'],
 };
 
 /** The working mode a corrective Ticket adds on top of the Step's own capabilities. */

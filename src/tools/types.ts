@@ -89,6 +89,8 @@ export interface ToolContext {
   readChunkBytes?: number;
   /** Runtime-owned executable gate. Model-provided selectors cannot replace or widen this scope. */
   testGateArgs?: string[];
+  /** Verification-owned directory scanned at run_tests time and appended to the baseline gate. */
+  supplementalTestRoot?: string;
   /** Incremental Tickets may create files but must patch, rather than overwrite, accepted files. */
   preserveExistingFiles?: boolean;
   /**

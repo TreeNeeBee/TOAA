@@ -28,11 +28,14 @@ export class WorkScheduler {
     const resumed = await this.inProgressWork(phase, steps, tickets);
     if (resumed) return resumed;
     for (const step of steps) {
-      if (step.state === 'closed' || !(await this.stepDependenciesReady(step))) continue;
-      const corrective = activeCorrectiveTicket(step, tickets);
-      if (corrective && await this.ticketDependenciesReady(corrective, tickets)) {
+      if (!(await this.stepDependenciesReady(step))) continue;
+      const corrective = await this.readyCorrectiveTicket(step, tickets);
+      if (corrective) {
         return { phase, step, ticket: corrective, mode: modeFor(corrective) };
       }
+      // Closed Steps suppress their ordinary Story only. A queued corrective Ticket is allowed to
+      // reopen one, and was therefore considered above.
+      if (step.state === 'closed') continue;
       const story = tickets.find(
         (ticket): ticket is WorkTicket =>
           ticket.type === 'story' &&
@@ -65,7 +68,7 @@ export class WorkScheduler {
     if (resumed) return resumed;
     if (inProgress.length === 0) return this.next(phaseId);
     const step = inProgress[0]!;
-    const active = activeCorrectiveTicket(step, tickets) ?? tickets.find(
+    const active = await this.readyCorrectiveTicket(step, tickets) ?? tickets.find(
       (ticket) => ticket.type === 'story' && ticket.stepId === step.id && ticket.state === 'in_progress',
     );
     if (!active) throw new Error(`In-progress Step ${step.name} has no active Ticket`);
@@ -140,6 +143,16 @@ export class WorkScheduler {
     });
   }
 
+  private async readyCorrectiveTicket(
+    step: Step,
+    tickets: readonly Ticket[],
+  ): Promise<Ticket | undefined> {
+    for (const candidate of activeCorrectiveTickets(step, tickets)) {
+      if (await this.ticketDependenciesReady(candidate, tickets)) return candidate;
+    }
+    return undefined;
+  }
+
   private async requirePhase(id: ObjectId): Promise<Phase> {
     const object = await this.repository.read(id);
     if (object.objectType !== 'phase') throw new Error(`Object ${id} is not a Phase`);
@@ -147,7 +160,7 @@ export class WorkScheduler {
   }
 }
 
-function activeCorrectiveTicket(step: Step, tickets: readonly Ticket[]): Ticket | undefined {
+function activeCorrectiveTickets(step: Step, tickets: readonly Ticket[]): Ticket[] {
   return tickets
     .filter((ticket) => isActiveTicket(ticket))
     .filter((ticket) => ticket.blockedByTicketIds.length === 0)
@@ -162,7 +175,9 @@ function activeCorrectiveTicket(step: Step, tickets: readonly Ticket[]): Ticket 
         ticket.targetStepId === step.id &&
         !ticket.applications.some((application) => application.stepId === step.id)))
     .sort((left, right) =>
-      correctionRank(right) - correctionRank(left) || right.priority - left.priority)[0];
+      correctionRank(right) - correctionRank(left) ||
+      right.priority - left.priority ||
+      left.id.localeCompare(right.id));
 }
 
 function correctionRank(ticket: Ticket): number {

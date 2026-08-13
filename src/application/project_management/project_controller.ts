@@ -16,6 +16,7 @@ import {
   type ChangeRequestTicket,
   type EnhancementTicket,
   type Ticket,
+  type TicketSource,
   type TicketSolution,
   type WorkTicket,
 } from '../../domain/tickets/ticket.js';
@@ -30,6 +31,10 @@ import { createDomainEvent } from '../observability/domain_event_factory.js';
 import type { AttemptFailure } from '../execution/failure_classification.js';
 import { WorkScheduler, type ScheduledWork } from './work_scheduler.js';
 import { CorrectiveWorkflowService } from './corrective_workflow_service.js';
+import {
+  ProjectManagerIntakeService,
+  type ProjectManagerProblemIntake,
+} from './project_manager_intake.js';
 
 export type { ScheduledWork, WorkMode } from './work_scheduler.js';
 
@@ -40,6 +45,7 @@ export class ProjectController {
   private readonly governance: GovernanceService;
   private readonly scheduler: WorkScheduler;
   private readonly corrective: CorrectiveWorkflowService;
+  private readonly intake: ProjectManagerIntakeService;
 
   constructor(private readonly repository: DomainObjectRepositoryPort) {
     this.tickets = new TicketWorkflow(repository);
@@ -48,6 +54,7 @@ export class ProjectController {
     this.governance = new GovernanceService(repository);
     this.scheduler = new WorkScheduler(repository);
     this.corrective = new CorrectiveWorkflowService(repository);
+    this.intake = new ProjectManagerIntakeService(repository);
   }
 
   async next(phaseId: ObjectId): Promise<ScheduledWork | undefined> {
@@ -228,9 +235,11 @@ export class ProjectController {
 
   async routeFailure(input: {
     failedStepId: ObjectId;
+    targetStepId?: ObjectId;
     message: string;
     summary: string;
     failure: AttemptFailure;
+    bugKind?: BugTicket['bugKind'];
     rawEvidenceRef?: string;
     tool?: string;
     exitCode?: number;
@@ -240,12 +249,15 @@ export class ProjectController {
     parentChangeRequestId?: ObjectId;
     discoveringStepId?: ObjectId;
     creatorActorId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<BugTicket> {
     return this.corrective.routeFailure(input);
   }
 
   async routeQualityGap(input: {
     sourceStepId: ObjectId;
+    targetStepId?: ObjectId;
     finding: string;
     kind: EnhancementTicket['enhancementKind'];
     qualityAssessmentId?: ObjectId;
@@ -253,6 +265,8 @@ export class ProjectController {
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
     creatorActorId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<EnhancementTicket> {
     return this.corrective.routeQualityGap(input);
   }
@@ -261,6 +275,11 @@ export class ProjectController {
     input: Parameters<CorrectiveWorkflowService['routeDependencyChange']>[0],
   ): ReturnType<CorrectiveWorkflowService['routeDependencyChange']> {
     return this.corrective.routeDependencyChange(input);
+  }
+
+  /** The only boundary that may turn a Phase-external problem report into an internal Ticket. */
+  intakeProblems(input: ProjectManagerProblemIntake) {
+    return this.intake.accept(input);
   }
 
   async propagateCorrectiveChange(input: {
@@ -327,6 +346,18 @@ export class ProjectController {
 
   async completePhase(phaseId: ObjectId): Promise<{ nextPhaseId?: ObjectId; projectDelivered: boolean }> {
     let phase = await this.requirePhase(phaseId);
+    if (!phase.qualityAssessmentId) {
+      throw new Error(`Cannot deliver ${phase.name}: Phase delivery gate has no passing assessment`);
+    }
+    const phaseAssessment = await this.repository.read(phase.qualityAssessmentId);
+    if (
+      phaseAssessment.objectType !== 'quality-assessment' ||
+      phaseAssessment.subject.objectType !== 'phase' ||
+      phaseAssessment.subject.id !== phase.id ||
+      !phaseAssessment.passed
+    ) {
+      throw new Error(`Cannot deliver ${phase.name}: Phase delivery assessment is invalid or failed`);
+    }
     const incomplete = (await this.scheduler.phaseSteps(phase)).filter((step) => step.state !== 'closed');
     const activeDefects = (await this.tickets.list()).filter((ticket) =>
       ticket.phaseId === phase.id &&
@@ -382,6 +413,10 @@ export class ProjectController {
     project = await this.saveProjectTransition(project, 'delivered');
     await this.saveProjectTransition(project, 'closed');
     return { projectDelivered: true };
+  }
+
+  async attachPhaseQuality(phaseId: ObjectId, qualityAssessmentId: ObjectId): Promise<Phase> {
+    return this.state.attachPhaseQuality(await this.requirePhase(phaseId), qualityAssessmentId);
   }
 
   private async startTasks(story: WorkTicket): Promise<void> {

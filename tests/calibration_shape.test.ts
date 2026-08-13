@@ -20,7 +20,7 @@ describe('calibrateStepShape', () => {
     expect(s!.role).toBe('Tester');
     expect(s!.acceptance.length).toBeGreaterThan(0);
     expect(s!.systemPrompt.length).toBeGreaterThanOrEqual(20);
-    expect(s!.tools).toEqual(['skill:tester']);
+    expect(s!.tools).toEqual(['skill:tester', 'read_file', 'list_dir']);
     expect(s!.dependsOn).toEqual([]);
     expect(s!.maxAttempts).toBe(3);
   });
@@ -32,9 +32,15 @@ describe('calibrateStepShape', () => {
       { id: 'S003', phase: 'CODE', title: '实现代码', description: '编写实现', systemPrompt: 'x'.repeat(30), role: 'Coder', outputs: ['src/app.py'] },
     ] as unknown as Step[];
     const out = calibrateStepShape(raw);
-    expect(out[0]!.tools).toEqual(['skill:author']);
-    expect(out[1]!.tools).toEqual(['skill:tester']);
-    expect(out[2]!.tools).toEqual(['skill:author']);
+    expect(out[0]!.tools).toEqual(['skill:author', 'read_file', 'list_dir']);
+    expect(out[1]!.tools).toEqual(['skill:tester', 'read_file', 'list_dir']);
+    expect(out[2]!.tools).toEqual([
+      'skill:author',
+      'run_program',
+      'run_tests',
+      'read_file',
+      'list_dir',
+    ]);
   });
 
   it('preserves tester capabilities when a test phase already has a write tool', () => {
@@ -51,6 +57,28 @@ describe('calibrateStepShape', () => {
   // the manifest, the Change Request routed there and the flow rolled back — and HIGH_LEVEL_DESIGN
   // had `skill:author`, which carries no `add_dependency`. Every dependency Change Request ended at
   // a Step told to do something it had no tool to do. `skill:dep_resolver` existed, wired to nobody.
+  // A planner that declared only write tools left three of the four development phases unable to
+  // read anything. The Change Request disposition contract requires inspecting the affected
+  // artifacts before recording an outcome, so a Step that cannot read produces no valid completion
+  // and spends its whole round budget — how a downstream dependency re-check stalled without making
+  // a single tool call.
+  it('gives every Step the ability to read what it is judged on', async () => {
+    const { buildDefaultSkills } = await import('../src/skills/skill.js');
+    for (const phase of [
+      'REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE',
+      'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST',
+    ] as const) {
+      const refs = ensureEssentialToolRefs({
+        phase,
+        tools: ['write_file', 'append_file'],
+        outputs: ['docs/x.md'],
+      });
+      const effective = buildDefaultSkills().resolve(refs).resolvedToolNames;
+      expect(effective, phase).toContain('read_file');
+      expect(effective, phase).toContain('list_dir');
+    }
+  });
+
   it('hands the manifest owner the tool it owns', async () => {
     const tools = ensureEssentialToolRefs({
       phase: 'HIGH_LEVEL_DESIGN',
@@ -82,13 +110,29 @@ describe('calibrateStepShape', () => {
       phase: 'CODE',
       tools: ['write_file'],
       outputs: ['src/app.ts'],
-    })).toEqual(['write_file', 'append_file']);
+    })).toEqual([
+      'write_file',
+      'skill:author',
+      'run_program',
+      'run_tests',
+      'append_file',
+      'read_file',
+      'list_dir',
+    ]);
 
     expect(ensureEssentialToolRefs({
       phase: 'CODE',
       tools: ['append_file'],
       outputs: ['src/app.ts'],
-    })).toEqual(['append_file', 'write_file']);
+    })).toEqual([
+      'append_file',
+      'skill:author',
+      'run_program',
+      'run_tests',
+      'write_file',
+      'read_file',
+      'list_dir',
+    ]);
   });
 
   it('maps role aliases to whitelist (developer -> Coder, qa -> Tester)', () => {
@@ -163,6 +207,37 @@ describe('calibrateStepShape', () => {
       'docs/08-functional-test.md',
       'docs/api-guide.md',
     ]);
+  });
+
+  it('normalizes and guarantees the canonical topic input for requirement analysis', () => {
+    const raw = [
+      {
+        id: 'S001',
+        phase: 'REQUIREMENT_ANALYSIS',
+        title: 'requirements',
+        description: 'requirements',
+        systemPrompt: 'x'.repeat(30),
+        role: 'Planner',
+        inputs: ['docs/project-topic.md'],
+        outputs: ['docs/topic.md'],
+      },
+      {
+        id: 'S002',
+        phase: 'REQUIREMENT_ANALYSIS',
+        title: 'requirements without declared input',
+        description: 'requirements without declared input',
+        systemPrompt: 'x'.repeat(30),
+        role: 'Planner',
+        inputs: [],
+        outputs: [],
+      },
+    ] as unknown as Step[];
+
+    const out = calibrateDocPaths(raw, 'application');
+
+    expect(out[0]!.inputs).toEqual(['docs/topic.md']);
+    expect(out[0]!.outputs).not.toContain('docs/topic.md');
+    expect(out[1]!.inputs).toEqual(['docs/topic.md']);
   });
 
   it('removes test-plan docs from the right-side test phases that do not own them', () => {

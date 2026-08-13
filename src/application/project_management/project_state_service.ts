@@ -7,7 +7,7 @@ import {
   objectRevisionRef,
   type DomainObjectRepositoryPort,
 } from '../../domain/ports/repository.js';
-import { transitionPhase, type Phase } from '../../domain/phases/phase.js';
+import { PhaseSchema, transitionPhase, type Phase } from '../../domain/phases/phase.js';
 import { ProjectPlanSchema } from '../../domain/planning/plan.js';
 import {
   ProjectManagementPlanSchema,
@@ -84,6 +84,27 @@ export class ProjectStateService {
 
   async attachQuality(step: Step, qualityAssessmentId: ObjectId): Promise<Step> {
     const updated = reviseStep(step, { qualityAssessmentId });
+    await this.repository.update(updated, updated.state);
+    return updated;
+  }
+
+  async attachPhaseQuality(phase: Phase, qualityAssessmentId: ObjectId): Promise<Phase> {
+    const object = await this.repository.read(qualityAssessmentId);
+    if (
+      object.objectType !== 'quality-assessment' ||
+      object.subject.objectType !== 'phase' ||
+      object.subject.id !== phase.id
+    ) {
+      throw new Error(`Quality Assessment ${qualityAssessmentId} does not assess Phase ${phase.name}`);
+    }
+    if (!object.passed) {
+      throw new Error(`Phase Quality Assessment ${object.name} did not pass: ${object.gaps.join('; ')}`);
+    }
+    const updated = PhaseSchema.parse({
+      ...phase,
+      ...reviseObjectEnvelope(phase),
+      qualityAssessmentId,
+    });
     await this.repository.update(updated, updated.state);
     return updated;
   }

@@ -1,5 +1,6 @@
 import type { StepType } from '../steps/step.js';
 import type { ExecutionAgent } from '../workflow/role.js';
+import type { DeliveryGate } from '../quality/delivery_gate.js';
 
 /**
  * The planning DTO the Domain plan compiler accepts as input.
@@ -54,6 +55,7 @@ export interface PlanDraftPhase {
   deliverables: readonly string[];
   dependsOn: readonly string[];
   verificationGate?: PlanDraftVerificationGate;
+  deliveryGate?: DeliveryGate;
 }
 
 export interface PlanDraftTask {
@@ -81,6 +83,7 @@ export interface PlanDraftStep {
   dependsOn: readonly string[];
   acceptance: string;
   qualityGate?: PlanDraftQualityGate;
+  deliveryGate?: DeliveryGate;
   maxAttempts: number;
 }
 

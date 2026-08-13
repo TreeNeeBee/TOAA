@@ -52,7 +52,7 @@ export async function discoverDebugContextPaths(input: {
 
 export function extractWorkspacePaths(text: string): string[] {
   const paths: string[] = [];
-  const pattern = /(?:^|[\s"'`(=:\[])((?:\.{1,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=[,:;)}\s"'`\]])/gmu;
+  const pattern = /(?:^|[\s"'`(=:[])((?:\.{1,2}\/)?(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=[,:;)}\s"'`\]])/gmu;
   for (const match of text.matchAll(pattern)) {
     const candidate = normalizeWorkspacePath(match[1] ?? '');
     if (candidate) paths.push(candidate);

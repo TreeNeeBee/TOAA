@@ -66,7 +66,7 @@ export function renderExecutionUserPrompt(
         'exact executable tests:',
         ...input.debugContext.verificationScope.testArgs.map((testPath) => `- ${testPath}`),
         'This Bug was routed back from the paired verification Step. Repair only the root cause exposed by these tests.',
-        'Use run_tests without replacing the inherited selectors. Do not run broad compiler or all-project test commands that include tests owned by later V-model Steps.',
+        'Use run_tests without replacing the inherited selectors. Do not widen it to all-project tests owned by later V-model Steps; the CODE delivery gate may separately run its stage-specific compiler/static check.',
         'A defect outside this exact gate belongs to its own owning Step and Ticket; do not absorb it into the current Bug.',
         '',
       ].join('\n')
@@ -156,13 +156,18 @@ export function renderExecutionUserPrompt(
         `kind: ${input.enhancement.enhancementKind}`,
         `finding: ${input.enhancement.finding}`,
         `verification step: ${input.enhancement.verificationStepId}`,
+        'This finding is already registered and assigned. Implement it now; do not report the same finding again in qualityAssessment.findings.',
+        'Completion requires a focused successful mutation of an artifact owned by this Step, followed by the gate evidence Runtime permits. ' +
+          'If current workspace evidence proves the finding itself is invalid, return a concrete blocker instead of duplicating or silently closing it.',
         'Append or patch only the missing, incomplete, or below-threshold content.',
         'Preserve accepted baseline behavior and artifacts. Do not regenerate the whole phase or project.',
         'For coverage gaps, use measured coverage evidence to add focused tests around uncovered production behavior. ' +
           'Do not rewrite accepted production code merely to inflate a metric.',
         'When this Enhancement is routed from a downstream verification Step, the current source Step only authors the focused test delta. ' +
-          'After a real mutation, return completion/upstreamAlignment evidence with qualityAssessment.gaps=[]; put the coverage rerun in blockedBy. ' +
-          'Do not report downstream coverage metrics in unavailableMetrics or gaps, and do not keep adding tests because run_tests is intentionally unavailable here.',
+          'After a real mutation, return completion/upstreamAlignment evidence with qualityAssessment.gaps=[].',
+        input.baselineTestExecution === 'execute'
+          ? 'Runtime will rerun this source Step\'s exact baseline suite. Do not replace its selectors or widen it to later verification-owned supplements.'
+          : 'Executable baseline verification is deferred only because this correction still originates before CODE; record that precondition in blockedBy instead of inventing product code.',
         '',
       ].join('\n')
     : '';
@@ -178,6 +183,31 @@ export function renderExecutionUserPrompt(
         '',
       ].join('\n')
     : '';
+  const baselineGateBlock = (['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE'] as const)
+    .includes(input.step.phase as never)
+    ? input.baselineTestExecution === 'defer'
+      ? [
+          '## development delivery gate',
+          ...(input.step.deliveryGate?.checks ?? []).map((check) => `- ${check}`),
+          'Validate all declared stage deliverables, upstream alignment, solution evidence, and paired baseline test assets.',
+          input.baselineTestExecutionReason === 'pre-code-correction'
+            ? 'This correction still occurs before S4 has established product code: update and statically validate the exact baseline tests, but defer their executable run.'
+            : 'This is the initial pre-CODE pass: author and statically validate the baseline tests, but do not execute them because product code does not exist yet.',
+          'Keep planned product imports, calls, and behavioral assertions executable in the test source. Do not comment them out, replace them with expect(true)/assert True, or duplicate the planned product behavior inside the test. Missing product files are an expected pre-CODE condition; an inert test is not.',
+          'Only executable baseline execution is deferred; no deliverable, plan, contract, or test-asset check is skipped.',
+          'Do not report unavailable paired-test metrics as measured values. If completion=1 and the only remaining condition is product code owned by S4, put it only in blockedBy with gaps=[]; duplicating it in gaps is a contradictory quality report and Runtime will reject it before PM intake.',
+          '',
+        ].join('\n')
+      : [
+          '## development delivery gate',
+          ...(input.step.deliveryGate?.checks ?? []).map((check) => `- ${check}`),
+          'Validate all declared stage deliverables, upstream alignment, solution evidence, and paired baseline test assets.',
+          input.baselineTestExecutionReason === 'post-code-correction'
+            ? 'This correction was triggered by S4 or a later Step. Product code exists, so execute the source Step\'s exact baseline selectors and require them to pass before redelivery.'
+            : 'Product code exists for this gate. Execute the exact baseline test selectors supplied by Runtime and require them to pass before delivery.',
+          '',
+        ].join('\n')
+    : '';
 
   return [
     `# Step ${input.step.id} — ${input.step.title}`,
@@ -187,6 +217,7 @@ export function renderExecutionUserPrompt(
     '',
     missingOutputPriority,
     workTicketBlock,
+    baselineGateBlock,
     enhancementBlock,
     changeRequestBlock,
     '## description',

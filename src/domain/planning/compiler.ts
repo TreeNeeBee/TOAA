@@ -23,6 +23,11 @@ import {
   type WorkTicket,
 } from '../tickets/ticket.js';
 import { KpiSchema, type Kpi } from '../quality/quality.js';
+import {
+  baselineDeliveryGate,
+  phaseDeliveryGate,
+  verificationDeliveryGate,
+} from '../quality/delivery_gate.js';
 import { DeliverableSchema, type Deliverable } from '../evidence/evidence.js';
 import {
   PhasePlanSchema,
@@ -245,6 +250,10 @@ export function compilePhaseMaterialization(input: {
       draftPhase.verificationGate?.summary ?? `Phase ${draftPhase.id} verification passes.`,
       ...(draftPhase.verificationGate?.checks ?? []),
     ],
+    deliveryGate: draftPhase.deliveryGate ?? phaseDeliveryGate(
+      draftPhase.id,
+      draftPhase.verificationGate?.checks ?? [],
+    ),
     stepIds: compiled.steps.map((step) => step.id),
   });
   const phasePlan = PhasePlanSchema.parse({
@@ -254,13 +263,14 @@ export function compilePhaseMaterialization(input: {
     scope: phase.scope,
     stepIds: phase.stepIds,
     verificationGate: phase.verificationGate,
+    deliveryGate: phase.deliveryGate,
     materialized: true,
   });
   const epic = TicketSchema.parse({
     ...input.epic,
     ...reviseObjectEnvelope(input.epic),
     description: phase.objective,
-    acceptance: phase.verificationGate,
+    acceptance: [phase.deliveryGate!.summary, ...phase.deliveryGate!.checks],
   }) as WorkTicket;
   for (const ticket of compiled.tickets) {
     if (ticket.type === 'story') {
@@ -351,7 +361,7 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
       priority: TICKET_PRIORITY.high,
       rootTicketId: epic.id,
       description: draftPhase.objective,
-      acceptance: [draftPhase.verificationGate?.summary ?? `Phase ${draftPhase.id} is delivered.`],
+      acceptance: phaseGateAcceptance(draftPhase),
       dependencyTicketIds: dependencies,
       state: 'created',
       source: { kind: 'plan', correlationId: projectPlanEnvelope.id, externalId: draftPhase.id },
@@ -391,6 +401,10 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
         draftPhase.verificationGate?.summary ?? `Phase ${draftPhase.id} verification passes.`,
         ...(draftPhase.verificationGate?.checks ?? []),
       ],
+      deliveryGate: draftPhase.deliveryGate ?? phaseDeliveryGate(
+        draftPhase.id,
+        draftPhase.verificationGate?.checks ?? [],
+      ),
     });
   });
 
@@ -406,6 +420,7 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
       dependencyPhaseIds: phase.dependencyPhaseIds,
       stepIds: phase.stepIds,
       verificationGate: phase.verificationGate,
+      deliveryGate: phase.deliveryGate,
       materialized: phase.stepIds.length > 0,
     });
   });
@@ -450,7 +465,7 @@ export function compileProjectGraph(input: CompileProjectGraphInput): CompiledPr
     pmActorId: pmActor.id,
     objective: input.draft.requirementDigest,
     scopeBaseline: draftPhases.flatMap((phase) => phase.scope.length > 0 ? phase.scope : [phase.objective]),
-    successCriteria: draftPhases.map((phase) => phase.verificationGate?.summary ?? `${phase.id} verification passes.`),
+    successCriteria: draftPhases.map((phase) => phaseGateAcceptance(phase)[0]!),
     constraints: [],
     stakeholderRefs: input.topicSourceRef ? [input.topicSourceRef] : [],
     milestonePhaseIds: phases.map((phase) => phase.id),
@@ -531,6 +546,11 @@ function compileActivePhase(input: {
       outputs: draftStep.outputs,
       acceptance: [draftStep.acceptance],
       tolerance: draftStep.qualityGate?.tolerance ?? {},
+      // The V-model owns Step gate semantics. Planner text may add acceptance detail elsewhere, but
+      // it cannot redefine which validation classes execute or when a baseline becomes executable.
+      deliveryGate: isDevelopmentStepType(type)
+        ? baselineDeliveryGate(`${input.phase.id}-${draftStep.id}`, type)
+        : verificationDeliveryGate(`${input.phase.id}-${draftStep.id}`),
       kpiIds: [],
       systemPrompt: draftStep.systemPrompt,
       tools: draftStep.tools,
@@ -633,7 +653,7 @@ function compileActivePhase(input: {
     parentTicketId: input.epicEnvelope.id,
     rootTicketId: input.epicEnvelope.id,
     description: `Deliver Phase ${input.phase.id}.`,
-    acceptance: [input.phase.verificationGate?.summary ?? `Phase ${input.phase.id} passes.`],
+    acceptance: phaseGateAcceptance(input.phase),
     dependencyTicketIds: steps.map((step) => storyByStep.get(step.id)!.id),
     state: 'created',
     source: { kind: 'plan', correlationId: input.epicEnvelope.id, externalId: `${input.phase.id}:delivery` },
@@ -789,6 +809,14 @@ function defaultKpis(type: StepType): Array<{
 function phasePriority(phase: DraftPhase, all: readonly DraftPhase[]): number {
   const index = all.findIndex((item) => item.id === phase.id);
   return Math.max(1, TICKET_PRIORITY.high - index * 8);
+}
+
+function phaseGateAcceptance(phase: DraftPhase): string[] {
+  const gate = phase.deliveryGate ?? phaseDeliveryGate(
+    phase.id,
+    phase.verificationGate?.checks ?? [],
+  );
+  return [gate.summary, ...gate.checks];
 }
 
 function isObjectId(value: ObjectId | undefined): value is ObjectId {

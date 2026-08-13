@@ -47,6 +47,18 @@ describe('Debugger context discovery', () => {
     ]);
   });
 
+  // The leading character class accepts `[` so bracketed reporter output yields its path. Nothing
+  // covered that character, and it was the one carrying a redundant escape.
+  it('extracts a path a reporter wrote inside brackets', () => {
+    expect(extractWorkspacePaths([
+      '[src/renderer/markdown.ts] threw',
+      'FAIL [tests/unit/cli.test.ts] 1 failed',
+    ].join('\n'))).toEqual([
+      'src/renderer/markdown.ts',
+      'tests/unit/cli.test.ts',
+    ]);
+  });
+
   it('extracts only explicit artifact paths, not nearby bare filenames', () => {
     expect(extractWorkspacePaths([
       'pipeline.test.ts is failing',

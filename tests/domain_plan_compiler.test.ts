@@ -52,6 +52,42 @@ describe('domain plan compiler', () => {
     );
     expect(graph.steps.map((step) => step.type)).toEqual(STEP_TYPES);
     expect(new Set(graph.steps.map((step) => step.maxAttempts))).toEqual(new Set([9]));
+    expect(graph.steps.slice(0, 4).every((step) =>
+      step.deliveryGate?.kind === 'baseline-test' &&
+      step.deliveryGate.testAssetPolicy === 'generate-baseline' &&
+      step.deliveryGate.validationTypes.join(',') ===
+        'deliverable-validation,baseline-test'
+    )).toBe(true);
+    expect(graph.steps[0]?.deliveryGate?.checks.join(' ')).toContain('requirement deliverables');
+    expect(graph.steps[1]?.deliveryGate?.checks.join(' ')).toContain('architecture feasibility');
+    expect(graph.steps[2]?.deliveryGate?.checks.join(' ')).toContain('implementation solution');
+    expect(graph.steps[3]?.deliveryGate?.checks.join(' ')).toContain('build/static checks');
+    expect(graph.steps.slice(0, 3).every((step) =>
+      step.deliveryGate?.checks.some((check) => check.includes('initial pre-CODE pass'))
+    )).toBe(true);
+    expect(graph.steps[3]?.deliveryGate?.checks.some((check) =>
+      check.includes('Execute the paired unit baseline tests')
+    )).toBe(true);
+    expect(graph.steps.slice(0, 3).every((step) =>
+      step.deliveryGate?.baselineExecutionPolicy === 'defer-until-code'
+    )).toBe(true);
+    expect(graph.steps[3]?.deliveryGate?.baselineExecutionPolicy).toBe('required');
+    expect(graph.steps.slice(4).every((step) =>
+      step.deliveryGate?.kind === 'verification-acceptance' &&
+      step.deliveryGate.testAssetPolicy === 'inspect-supplement-freeze-execute' &&
+      step.deliveryGate.validationTypes.join(',') ===
+        'baseline-test,supplemental-functional-test' &&
+      step.deliveryGate.baselineExecutionPolicy === 'freeze-then-required' &&
+      step.deliveryGate.freezeBeforeExecution
+    )).toBe(true);
+    expect(graph.steps.at(-1)?.deliveryGate?.externalDataPolicy).toBe('record-replay');
+    expect(graph.phases.every((phase) =>
+      phase.deliveryGate?.kind === 'phase-delivery' &&
+      phase.deliveryGate.routeEachFinding &&
+      phase.deliveryGate.baselineExecutionPolicy === 'phase-aggregate' &&
+      phase.deliveryGate.externalDataPolicy === 'live' &&
+      phase.deliveryGate.scenarios.some((scenario) => scenario.name === 'real-user-entrypoint')
+    )).toBe(true);
     expect(validateDomainGraph(graph)).toEqual([]);
   });
 

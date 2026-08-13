@@ -47,7 +47,8 @@ export const TicketCommitSchema = z.object({
   revision: GitRevisionSchema,
   /**
    * `baseline` marks where an attempt started, and is therefore the target that attempt rolls back
-   * to. `attempt` is work that was rolled back. `verified` survived its gate.
+   * to. `attempt` is a rejected candidate preserved for diagnosis and incremental correction.
+   * `verified` survived its gate.
    */
   kind: z.enum(TICKET_COMMIT_KINDS),
   attempt: z.number().int().nonnegative(),
@@ -80,11 +81,13 @@ export const TicketSolutionSchema = z.object({
 export type TicketSolution = z.infer<typeof TicketSolutionSchema>;
 
 export const TicketSourceSchema = z.object({
-  kind: z.enum(['plan', 'runtime', 'quality-gate', 'external']),
+  kind: z.enum(['plan', 'runtime', 'quality-gate', 'pm-intake']),
   correlationId: ObjectIdSchema,
   causationId: ObjectIdSchema.optional(),
   externalId: z.string().min(1).optional(),
 }).strict();
+
+export type TicketSource = z.infer<typeof TicketSourceSchema>;
 
 const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   objectType: z.literal('ticket'),
@@ -184,6 +187,8 @@ export const BugTicketSchema = TicketBaseSchema.extend({
 
 export const EnhancementTicketSchema = TicketBaseSchema.extend({
   type: z.literal('enhancement'),
+  /** Step that discovered the quality gap; this determines whether CODE already existed. */
+  stepId: ObjectIdSchema,
   enhancementKind: z.enum(['functional-gap', 'test-incomplete', 'quality-shortfall']),
   finding: z.string().min(1),
   sourceBugTicketId: ObjectIdSchema.optional(),
@@ -313,8 +318,8 @@ export function isActiveTicket(ticket: Ticket): boolean {
  * the verifying role instead of the repairing one.
  */
 /**
- * Records a commit against a Ticket. The list is append-only: a rolled-back attempt keeps its
- * entries so the history shows what was tried, not only what survived.
+ * Records a commit against a Ticket. The list is append-only: rejected candidates keep their
+ * entries so the history shows what was tried and gives corrective work an exact starting point.
  *
  * The first commit recorded also fixes `baselineRevision`, which is where unwinding the whole
  * Ticket returns to.

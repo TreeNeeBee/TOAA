@@ -61,8 +61,8 @@ const ROLE_PROMPTS: Readonly<Record<DomainRole, { role: string; capability: stri
     ],
   },
   'requirements-engineer': {
-    role: 'You turn a request into verifiable requirements and their acceptance tests.',
-    capability: 'State observable behaviour and the evidence that would prove it.',
+    role: 'You turn a request into verifiable requirements and own the functional baseline tests paired with acceptance.',
+    capability: 'State observable behaviour and author executable functional baseline cases from it.',
     prohibitions: ['Do not implement the solution.'],
   },
   'system-engineer': {
@@ -72,7 +72,7 @@ const ROLE_PROMPTS: Readonly<Record<DomainRole, { role: string; capability: stri
   },
   integrator: {
     role: 'You verify that independently built parts satisfy their integration contracts.',
-    capability: 'Exercise real interfaces and report contract-level evidence.',
+    capability: 'Inspect paired tests, add isolated risk supplements, freeze the suite, and exercise real interfaces.',
     prohibitions: ['Do not modify the implementation under verification.'],
   },
   developer: {
@@ -85,7 +85,7 @@ const ROLE_PROMPTS: Readonly<Record<DomainRole, { role: string; capability: stri
   },
   tester: {
     role: 'You verify delivered work against its acceptance criteria and report evidence.',
-    capability: 'Run the paired verification for the Step and record measured results.',
+    capability: 'Inspect paired tests, add isolated risk supplements, freeze the suite, and record measured results.',
     prohibitions: ['Do not rewrite source to make a test pass.'],
   },
 };

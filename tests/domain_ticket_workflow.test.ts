@@ -347,6 +347,15 @@ describe('TicketWorkflow', () => {
         && t.type === 'change-request' && t.state !== 'closed' && t.state !== 'cancelled');
     const afterDesign = await openRequests();
     expect(afterDesign).toHaveLength(1);
+    // A re-check hop owns no part of the manifest and cannot call add_dependency. Handed the
+    // request's own plan it was told to "add cron after a compatibility check" when cron was
+    // already installed — nothing to do, no stated way to conclude, and it probed until the
+    // no-progress guard stopped it.
+    const recheck = afterDesign[0]!;
+    expect(recheck.type === 'change-request' && recheck.implementationPlan.join(' '))
+      .toContain('Check this Step');
+    expect(recheck.type === 'change-request' && recheck.implementationPlan.join(' '))
+      .not.toContain('Add zod after');
     expect(afterDesign[0]!.type === 'change-request' && afterDesign[0]!.targetStepId)
       .toBe(byType('DETAILED_DESIGN').id);
   });

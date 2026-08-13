@@ -10,6 +10,7 @@ import {
   type ChangeRequestTicket,
   type EnhancementTicket,
   type Ticket,
+  type TicketSource,
   type TicketSolution,
   type WorkTicket,
 } from '../../domain/tickets/ticket.js';
@@ -67,6 +68,8 @@ export class TicketWorkflow {
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
     routingObjects?: readonly PersistedDomainObject[];
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<BugTicket> {
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
@@ -83,7 +86,8 @@ export class TicketWorkflow {
       ticket.parentTicketId === (parentChangeRequest?.id ?? targetStory.id) &&
       ticket.failure.failedStepId === input.failedStep.id &&
       ticket.failure.targetStepId === input.targetStep.id &&
-      ticket.failure.code === input.code,
+      ticket.failure.code === input.code &&
+      ticket.failure.summary === input.summary,
     );
     if (existing) return existing;
     const envelope = createObjectEnvelope({
@@ -113,10 +117,10 @@ export class TicketWorkflow {
       state: 'created',
       submittedAt: envelope.createdAt,
       source: {
-        kind: 'runtime',
+        kind: input.sourceKind ?? 'runtime',
         correlationId: input.correlationId,
         causationId: input.causationId,
-        externalId: input.failedStep.name,
+        externalId: input.sourceExternalId ?? input.failedStep.name,
       },
       bugKind: input.kind,
       maxAttempts: input.targetStep.maxAttempts,
@@ -177,6 +181,8 @@ export class TicketWorkflow {
     correlationId: ObjectId;
     causationId?: ObjectId;
     routingObjects?: readonly PersistedDomainObject[];
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<EnhancementTicket> {
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
@@ -194,7 +200,8 @@ export class TicketWorkflow {
       ticket.stepId === input.sourceStep.id &&
       ticket.targetStepId === input.targetStep.id &&
       ticket.enhancementKind === input.kind &&
-      ticket.sourceQualityAssessmentId === input.sourceQualityAssessmentId,
+      ticket.sourceQualityAssessmentId === input.sourceQualityAssessmentId &&
+      ticket.finding === input.finding,
     );
     if (existing) return existing;
     const envelope = createObjectEnvelope({
@@ -221,10 +228,10 @@ export class TicketWorkflow {
       state: 'created',
       submittedAt: envelope.createdAt,
       source: {
-        kind: 'quality-gate',
+        kind: input.sourceKind ?? 'quality-gate',
         correlationId: input.correlationId,
         causationId: input.causationId,
-        externalId: input.sourceStep.name,
+        externalId: input.sourceExternalId ?? input.sourceStep.name,
       },
       enhancementKind: input.kind,
       finding: input.finding,
@@ -262,10 +269,18 @@ export class TicketWorkflow {
     requestingStepId: ObjectId;
     /** The Ticket whose attempt raised the request; parked so it stops holding its role's capacity. */
     requestingTicket?: Ticket;
+    /**
+     * `request` asks the manifest owner to change the dependency set. `recheck` tells a downstream
+     * Step the set already changed and asks whether its own work still holds — it owns no part of
+     * the manifest and must not be handed the request's instructions.
+     */
+    kind?: 'request' | 'recheck';
     targetStep: Step;
     packages: string[];
     reason: string;
     correlationId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<ChangeRequestTicket> {
     const existing = await this.findOpenDependencyRequest(input.targetStep, input.packages);
     if (existing) return existing;
@@ -289,14 +304,24 @@ export class TicketWorkflow {
       requiredCapabilities: capabilitiesForStep(input.targetStep.type, 'change-request'),
       priority: TICKET_PRIORITY.high,
       description: `${summary}. ${input.reason}`,
-      acceptance: [
-        'Check the requested packages against the accepted dependency set for compatibility.',
-        'Update the manifest through add_dependency so the sandbox is rebuilt with them.',
-      ],
+      acceptance: input.kind === 'recheck'
+        ? [
+            `Confirm ${input.targetStep.name} still holds against the changed dependency set.`,
+            'Record an explicit not-applicable disposition when nothing here is affected.',
+          ]
+        : [
+            'Check the requested packages against the accepted dependency set for compatibility.',
+            'Update the manifest through add_dependency so the sandbox is rebuilt with them.',
+          ],
       dependencyTicketIds: [],
       state: 'created',
       submittedAt: envelope.createdAt,
-      source: { kind: 'runtime', correlationId: input.correlationId, causationId: requester.id },
+      source: {
+        kind: input.sourceKind ?? 'runtime',
+        correlationId: input.correlationId,
+        causationId: requester.id,
+        externalId: input.sourceExternalId,
+      },
       rootTicketId: envelope.id,
       relatedTicketIds: [requester.id],
       sourceTicketId: requester.id,
@@ -309,8 +334,19 @@ export class TicketWorkflow {
         after: input.packages.map((name) => `${name} is available to the project`),
         affectedArtifacts: ['package.json'],
       },
-      implementationPlan: [`Add ${input.packages.join(', ')} after a compatibility check.`],
-      verificationGate: ['The sandbox rebuilds and the requesting Step can resolve the packages.'],
+      // A re-check hop owns none of the manifest and cannot call add_dependency. Handing it the
+      // request's plan told a CODE Step to "add cron after a compatibility check" when cron was
+      // already installed — nothing to do, no stated way to conclude, and it listed directories
+      // until the no-progress guard stopped it.
+      implementationPlan: input.kind === 'recheck'
+        ? [
+            `Check this Step's artifacts and tests against the accepted dependency change (${input.packages.join(', ')}).`,
+            'Apply only what this Step owns; if nothing here is affected, record that as the outcome.',
+          ]
+        : [`Add ${input.packages.join(', ')} after a compatibility check.`],
+      verificationGate: input.kind === 'recheck'
+        ? [`${input.targetStep.name} still holds against the changed dependency set.`]
+        : ['The sandbox rebuilds and the requesting Step can resolve the packages.'],
     }) as ChangeRequestTicket;
     await this.repository.insert(request, request.state);
     // The work that raised the request cannot proceed until the design answers, and a Ticket that

@@ -8,6 +8,7 @@ import type {
   ChangeRequestTicket,
   EnhancementTicket,
   Ticket,
+  TicketSource,
   TicketSolution,
   WorkTicket,
 } from '../../domain/tickets/ticket.js';
@@ -50,6 +51,8 @@ export class CorrectiveWorkflowService {
     reason: string;
     creatorActorId: ObjectId;
     correlationId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<ChangeRequestTicket> {
     if (input.packages.length === 0) {
       throw new Error('A dependency change request must name at least one package');
@@ -72,6 +75,8 @@ export class CorrectiveWorkflowService {
       packages: [...input.packages],
       reason: input.reason,
       correlationId: input.correlationId,
+      sourceKind: input.sourceKind,
+      sourceExternalId: input.sourceExternalId,
     });
     await this.registration.register(request.id);
     await this.state.checkpoint(parked, `Dependency change requested through ${request.name}`);
@@ -91,9 +96,12 @@ export class CorrectiveWorkflowService {
 
   async routeFailure(input: {
     failedStepId: ObjectId;
+    /** Explicit owner for test-defect and phase-gate findings; defaults to the V-model pair. */
+    targetStepId?: ObjectId;
     message: string;
     summary: string;
     failure: AttemptFailure;
+    bugKind?: BugTicket['bugKind'];
     rawEvidenceRef?: string;
     tool?: string;
     exitCode?: number;
@@ -103,15 +111,21 @@ export class CorrectiveWorkflowService {
     parentChangeRequestId?: ObjectId;
     discoveringStepId?: ObjectId;
     creatorActorId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<BugTicket> {
     let failed = await this.state.requireStep(input.failedStepId);
     if (!failed.pairedStepId) throw new Error(`Failure routing requires a paired Step: ${failed.name}`);
-    let target = isVerificationStep(failed)
-      ? await this.state.requireStep(failed.pairedStepId)
-      : failed;
-    const verification = isVerificationStep(failed)
-      ? failed
-      : await this.state.requireStep(failed.pairedStepId);
+    let target = input.targetStepId
+      ? await this.state.requireStep(input.targetStepId)
+      : isVerificationStep(failed)
+        ? await this.state.requireStep(failed.pairedStepId)
+        : failed;
+    const verification = isVerificationStep(target)
+      ? target
+      : isVerificationStep(failed)
+        ? failed
+        : await this.state.requireStep(target.pairedStepId ?? failed.pairedStepId);
     const routing = this.state.prepareCorrectiveRouting(failed, target, 'defect');
     failed = routing.source;
     target = routing.target;
@@ -125,7 +139,7 @@ export class CorrectiveWorkflowService {
       failedStep: failed,
       targetStep: target,
       verificationStep: verification,
-      kind: 'test-failure',
+      kind: input.bugKind ?? 'test-failure',
       severity: 'high',
       message: input.message,
       summary: input.summary,
@@ -142,6 +156,8 @@ export class CorrectiveWorkflowService {
       causationId: input.causationId,
       parentChangeRequestId: input.parentChangeRequestId,
       routingObjects: [...routing.objects, ...(discovering?.objects ?? [])],
+      sourceKind: input.sourceKind,
+      sourceExternalId: input.sourceExternalId,
     });
     await this.state.checkpoint(failed, `Failure routed to ${target.name} through ${bug.name}`);
     await this.state.checkpoint(target, `Reopened by ${bug.name}`);
@@ -153,6 +169,8 @@ export class CorrectiveWorkflowService {
 
   async routeQualityGap(input: {
     sourceStepId: ObjectId;
+    /** Explicit owner selected during gate triage; defaults to the paired source. */
+    targetStepId?: ObjectId;
     finding: string;
     kind: EnhancementTicket['enhancementKind'];
     qualityAssessmentId?: ObjectId;
@@ -160,15 +178,21 @@ export class CorrectiveWorkflowService {
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
     creatorActorId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
   }): Promise<EnhancementTicket> {
     let source = await this.state.requireStep(input.sourceStepId);
     if (!source.pairedStepId) throw new Error(`Quality routing requires a paired Step: ${source.name}`);
-    const target = isVerificationStep(source)
-      ? await this.state.requireStep(source.pairedStepId)
-      : source;
-    const verification = isVerificationStep(source)
-      ? source
-      : await this.state.requireStep(source.pairedStepId);
+    const target = input.targetStepId
+      ? await this.state.requireStep(input.targetStepId)
+      : isVerificationStep(source)
+        ? await this.state.requireStep(source.pairedStepId)
+        : source;
+    const verification = isVerificationStep(target)
+      ? target
+      : isVerificationStep(source)
+        ? source
+        : await this.state.requireStep(target.pairedStepId ?? source.pairedStepId);
     const routing = this.state.prepareCorrectiveRouting(source, target, 'quality-gap');
     source = routing.source;
     const reopenedTarget = routing.target;
@@ -184,6 +208,8 @@ export class CorrectiveWorkflowService {
       causationId: input.causationId,
       parentChangeRequestId: input.parentChangeRequestId,
       routingObjects: routing.objects,
+      sourceKind: input.sourceKind,
+      sourceExternalId: input.sourceExternalId,
     });
     await this.state.checkpoint(source, `Quality gap routed to ${reopenedTarget.name} through ${enhancement.name}`);
     return enhancement;
@@ -340,7 +366,10 @@ export class CorrectiveWorkflowService {
     // closes the Bug/Enhancement, unblocks its failed Story, and can consume the role capacity the
     // next hop needs.
     if (next) {
-      await this.openChildChangeRequest(request, next, handedOnBy!);
+      await this.openChildChangeRequest(request, next, handedOnBy!, {
+        summary: input.summary,
+        entries: input.entries,
+      });
     }
     // This CR closes as soon as its own Step is verified. The already-persisted child carries the
     // remaining work, so the current assignee's capacity is released without closing the source.
@@ -432,7 +461,10 @@ export class CorrectiveWorkflowService {
       targetStep: reopened,
       packages: parent.contractDelta.after.map((line) => line.split(' ')[0] ?? line),
       reason: `The dependency set changed upstream; confirm ${reopened.name} still holds against it.`,
+      kind: 'recheck',
       correlationId: parent.source.correlationId,
+      sourceKind: parent.source.kind,
+      sourceExternalId: parent.source.externalId,
     });
     await this.registration.register(child.id);
   }
@@ -521,15 +553,34 @@ export class CorrectiveWorkflowService {
     parent: ChangeRequestTicket,
     targetStepId: ObjectId,
     creatorActorId: ObjectId,
+    applied: { summary: string; entries: Changelist['entries'] },
   ): Promise<ChangeRequestTicket> {
+    // What travels downstream is what this hop changed, not the instructions that repaired the
+    // Step where the chain began. Copying the parent's plan verbatim handed a DETAILED_DESIGN Step
+    // "create docs/01-requirement-analysis.md" — files it does not own and that already existed —
+    // so it had nothing to do, produced no actions, and the attempt stopped for no progress.
+    const changed = [...new Set(applied.entries.map((entry) => entry.path))];
+    const artifacts = changed.length > 0 ? changed : parent.contractDelta.affectedArtifacts;
     const child = await this.tickets.openChangeRequest({
       creatorActorId,
       sourceTicketId: parent.sourceTicketId,
       triggerStepId: parent.triggerStepId,
       sourceStepId: parent.targetStepId,
       targetStepId,
-      contractDelta: parent.contractDelta,
-      implementationPlan: parent.implementationPlan,
+      contractDelta: {
+        summary: changed.length > 0
+          ? applied.summary
+          : `${parent.contractDelta.summary} (no artifact changed at the previous Step)`,
+        before: parent.contractDelta.after,
+        after: artifacts.map((artifact) => `${artifact} is accepted in its current form`),
+        affectedArtifacts: artifacts,
+      },
+      // A downstream hop checks its own work against the accepted change; it does not re-run the
+      // repair that produced it.
+      implementationPlan: [
+        `Check this Step's artifacts and tests against the accepted change to ${artifacts.join(', ')}.`,
+        'Apply only what this Step owns; if nothing here is affected, record that as the outcome.',
+      ],
       verificationGate: parent.verificationGate,
       parentChangeRequestId: parent.id,
     });

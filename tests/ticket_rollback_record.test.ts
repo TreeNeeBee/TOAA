@@ -67,7 +67,7 @@ describe('ticket rollback record', () => {
     expect(lastVerifiedRevision(subject)).toBe('c'.repeat(40));
   });
 
-  it('keeps rolled-back attempts in the record rather than erasing them', () => {
+  it('keeps rejected candidate attempts in the record rather than erasing them', () => {
     let subject = appendTicketCommit(ticket(), commit({ revision: 'b'.repeat(40) }));
     subject = appendTicketCommit(subject, commit({ revision: 'e'.repeat(40), kind: 'attempt' }));
     expect(subject.commits.map((entry) => entry.kind)).toEqual(['baseline', 'attempt']);

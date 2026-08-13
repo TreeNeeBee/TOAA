@@ -9,6 +9,8 @@ import {
   selectActionableAttemptFailure,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  resolveBaselineGateExecution,
+  shouldPreserveFailedCandidate,
   shouldPreserveExistingFiles,
   deliveredManifest,
   isAttemptCancellation,
@@ -19,7 +21,7 @@ import type { Plan, Step } from '../src/core/plan.js';
 import type { Ticket } from '../src/domain/tickets/ticket.js';
 
 describe('attempt verification scope', () => {
-  it('defers the paired test gate when a verification Bug returns to an upstream source Step', () => {
+  it('reruns the source baseline gate when a verification Bug returns upstream', () => {
     const plan = fixturePlan();
     const code = plan.steps[0]!;
     const ticket = bugTicket({
@@ -30,8 +32,7 @@ describe('attempt verification scope', () => {
 
     expect(resolveAttemptVerificationScope(plan, code, ticket)).toEqual({
       testArgs: ['tests/unit/core.test.ts'],
-      inheritedFromTicket: false,
-      deferredToChangeRequest: true,
+      inheritedFromTicket: true,
       verificationStepId: 'unit-id',
       verificationPhase: 'UNIT_TEST',
     });
@@ -47,7 +48,7 @@ describe('attempt verification scope', () => {
     });
 
     expect(resolveAttemptVerificationScope(plan, code, ticket)).toEqual({
-      testArgs: [],
+      testArgs: ['tests/unit/core.test.ts'],
       inheritedFromTicket: false,
       verificationStepId: undefined,
       verificationPhase: undefined,
@@ -67,6 +68,102 @@ describe('attempt verification scope', () => {
       verificationStepId: 'integration-id',
       verificationPhase: 'INTEGRATION_TEST',
     }, 'typescript')).toEqual(['tests/integration/core.test.ts']);
+  });
+
+  it('defers only the executable baseline on an initial S1-S3 pass', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(design);
+
+    expect(resolveBaselineGateExecution(
+      plan,
+      design,
+      { type: 'task' } as Ticket,
+    )).toEqual({ mode: 'defer', reason: 'initial-pre-code' });
+  });
+
+  it('executes an S1-S3 baseline when the correction originated at S4 or later', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(design);
+    const ticket = {
+      type: 'bug',
+      failure: {
+        failedStepId: 'code-id',
+        failedStepType: 'CODE',
+        targetStepId: 'design-id',
+        verificationStepId: 'unit-id',
+      },
+    } as Ticket;
+
+    expect(resolveBaselineGateExecution(plan, design, ticket)).toEqual({
+      mode: 'execute',
+      reason: 'post-code-correction',
+      originStepId: 'code-id',
+      originPhase: 'CODE',
+    });
+  });
+
+  it('keeps a pre-CODE corrective retry deferred until a code baseline exists', () => {
+    const plan = fixturePlan();
+    const requirement = {
+      ...plan.steps[0]!,
+      id: 'requirement-id',
+      phase: 'REQUIREMENT_ANALYSIS' as const,
+      outputs: ['docs/01-requirement-analysis.md', 'tests/functional/core.test.ts'],
+    };
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(requirement, design);
+
+    expect(resolveBaselineGateExecution(plan, requirement, {
+      type: 'enhancement',
+      stepId: 'design-id',
+      targetStepId: 'requirement-id',
+      verificationStepId: 'unit-id',
+    } as Ticket)).toEqual({
+      mode: 'defer',
+      reason: 'pre-code-correction',
+      originStepId: 'design-id',
+      originPhase: 'HIGH_LEVEL_DESIGN',
+    });
+  });
+
+  it('executes an S1-S3 baseline for an Enhancement discovered by a right-side Step', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(design);
+
+    expect(resolveBaselineGateExecution(plan, design, {
+      type: 'enhancement',
+      stepId: 'unit-id',
+      targetStepId: 'design-id',
+      verificationStepId: 'unit-id',
+    } as Ticket)).toEqual({
+      mode: 'execute',
+      reason: 'post-code-correction',
+      originStepId: 'unit-id',
+      originPhase: 'UNIT_TEST',
+    });
   });
 });
 
@@ -144,7 +241,7 @@ describe('attempt retry feedback', () => {
     expect(failure).toContain('AssertionError: invalid matcher');
   });
 
-  it('passes a compact actionable failure from a rolled-back Ticket attempt', () => {
+  it('passes compact actionable failure from a rolled-back non-progress attempt', () => {
     const feedback = renderAttemptRetryFeedback({
       message: 'Step executor reached max rounds',
       data: {
@@ -160,6 +257,20 @@ describe('attempt retry feedback', () => {
     expect(feedback).toContain('file changes were rolled back');
     expect(feedback).toContain('tests/unit/rss.spec.ts');
     expect(feedback).toContain("Cannot read properties of undefined");
+  });
+
+  it('explains when a failed candidate was preserved for incremental correction', () => {
+    const feedback = renderAttemptRetryFeedback({
+      message: 'Quality gate failed',
+      data: {
+        workspaceDisposition: 'candidate-preserved',
+        failureLog: 'paired baseline test contract is incomplete',
+        structuredFailure: { kind: 'execution', category: 'quality' },
+      },
+    } as unknown as DomainLog, 'REQUIREMENT_ANALYSIS');
+
+    expect(feedback).toContain('candidate files were committed and preserved');
+    expect(feedback).toContain('Inspect and patch the preserved candidate');
   });
 
   it('places the latest rolled-back failure before the original Bug context', () => {
@@ -205,6 +316,31 @@ describe('attempt retry feedback', () => {
 
     expect(selectActionableAttemptFailure([projectFailure, providerFailure]))
       .toBe(projectFailure);
+  });
+});
+
+describe('failed candidate persistence', () => {
+  it('preserves project defects and rolls back infrastructure, dependency, and agent stalls', () => {
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'quality', code: 'quality_gate_failed',
+      message: 'quality failed', retryable: true, switchProvider: false,
+    })).toBe(true);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'test', code: 'test_command_failed',
+      message: 'test failed', retryable: true, switchProvider: false,
+    })).toBe(true);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'infrastructure', category: 'llm-provider', code: 'provider_failed',
+      message: 'provider failed', retryable: true, switchProvider: true,
+    })).toBe(false);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'internal', code: 'agent_execution_stalled',
+      message: 'no progress', retryable: true, switchProvider: true,
+    })).toBe(false);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'tool', code: 'dependency_not_owned',
+      message: 'manifest owner required', retryable: true, switchProvider: false,
+    }, true)).toBe(false);
   });
 });
 
@@ -331,7 +467,12 @@ function bugTicket(ids: {
 }): Ticket {
   return {
     type: 'bug',
-    failure: ids,
+    failure: {
+      ...ids,
+      failedStepType: ids.failedStepId === 'unit-id' ? 'UNIT_TEST' : 'CODE',
+      targetStepType: 'CODE',
+      verificationStepType: 'UNIT_TEST',
+    },
   } as unknown as Ticket;
 }
 

@@ -140,6 +140,64 @@ describe('paired source test product-reference contract', () => {
     expect(result.ok).toBe(true);
   });
 
+  it('rejects a requirement baseline that drifts from required field contracts', async () => {
+    const plan = contractPlan(
+      'typescript',
+      'tests/functional/acceptance.test.ts',
+      'REQUIREMENT_ANALYSIS',
+    );
+    plan.steps[0]!.outputs.unshift('docs/01-requirements.md');
+    await workspace.writeFile('docs/01-requirements.md', [
+      '| Field | Type | Required |',
+      '| --- | --- | --- |',
+      '| title | string | yes |',
+      '| summary | string | yes |',
+      '| heatIndex | number | yes |',
+      '| category | string | yes |',
+    ].join('\n'));
+    await workspace.writeFile('tests/functional/acceptance.test.ts', [
+      'import { render } from "../../src/renderer/render.ts";',
+      'interface NewsItem { title: string; summary: string; heatScore: number; tags: string[] }',
+      'it("renders", () => expect(render({ title: "news", summary: "brief", heatScore: 1, tags: [] })).toBeTruthy());',
+    ].join('\n'));
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+
+    expect(result.ok).toBe(false);
+    expect(result.invalid.join('\n')).toContain('heatIndex, category');
+    expect(result.invalid.join('\n')).toContain('redeclares the product contract locally (NewsItem)');
+  });
+
+  it('rejects direct awaited product access when the baseline promises controlled fixtures', async () => {
+    const plan = contractPlan(
+      'typescript',
+      'tests/functional/acceptance.test.ts',
+      'REQUIREMENT_ANALYSIS',
+    );
+    plan.steps[0]!.outputs.unshift('docs/tests/functional-test-plan.md');
+    await workspace.writeFile(
+      'docs/tests/functional-test-plan.md',
+      '# Test plan\nAll external responses use controlled fixtures and mocks.\n',
+    );
+    await workspace.writeFile('tests/functional/acceptance.test.ts', [
+      'import { fetchNews } from "../../src/renderer/render.ts";',
+      'it("loads", async () => expect(await fetchNews()).toBeTruthy());',
+    ].join('\n'));
+
+    const direct = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(direct.ok).toBe(false);
+    expect(direct.invalid.join('\n')).toContain('without an executable isolation mechanism');
+
+    await workspace.writeFile('tests/functional/acceptance.test.ts', [
+      'import { vi } from "vitest";',
+      'import { fetchNews } from "../../src/renderer/render.ts";',
+      'vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true }));',
+      'it("loads", async () => expect(await fetchNews()).toBeTruthy());',
+    ].join('\n'));
+    const controlled = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(controlled.ok).toBe(true);
+  });
+
   it('requires a detailed-design integration test to exercise two product sources', async () => {
     const plan = contractPlan(
       'typescript',
@@ -246,7 +304,7 @@ describe('paired source test product-reference contract', () => {
     expect(localOnly.ok).toBe(false);
   });
 
-  it('tells design remediation to reference future product paths without creating source stubs', () => {
+  it('routes one actionable finding without duplicating it as KPI and remediation gaps', () => {
     const merged = mergePairedSourceTestQuality(
       {
         completion: 1,
@@ -265,8 +323,13 @@ describe('paired source test product-reference contract', () => {
       },
     );
 
-    expect(merged.gaps.join('\n')).toContain('imports may target planned source paths that do not exist yet');
-    expect(merged.gaps.join('\n')).toContain('Do not create src/** stubs');
+    expect(merged.completion).toBe(1);
+    expect(merged.gaps).toEqual([]);
+    expect(merged.findings).toHaveLength(1);
+    expect(merged.findings?.[0]?.summary).toContain('exercises 0/2 required');
+    expect(merged.findings?.[0]?.evidence.join('\n'))
+      .toContain('imports may target planned source paths that do not exist yet');
+    expect(merged.findings?.[0]?.evidence.join('\n')).toContain('Do not create src/** stubs');
   });
 });
 

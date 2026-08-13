@@ -10,6 +10,7 @@ import type { AuditLogger } from '../../audit/audit.js';
 import { changelistEntries, type AttemptResult } from '../execution/attempt_runner.js';
 import type { ProjectController, ScheduledWork } from './project_controller.js';
 import type { TicketRegistrationService } from './ticket_registration_service.js';
+import type { DeliveryGateFinding } from '../../domain/quality/delivery_gate.js';
 
 export interface AttemptResultProcessorOptions {
   repository: DomainObjectRepositoryPort;
@@ -53,7 +54,7 @@ export class AttemptResultProcessor {
     result: AttemptResult;
   }): Promise<AttemptDisposition> {
     const { phase, work, steps, result } = input;
-    if (!result.ok) return this.processFailure(phase, work, result);
+    if (!result.ok) return this.processFailure(phase, work, steps, result);
     if (!result.assessment) {
       return { action: 'stop', reason: 'Passing attempt has no Quality Assessment' };
     }
@@ -155,6 +156,7 @@ export class AttemptResultProcessor {
   private async processFailure(
     phase: Phase,
     work: ScheduledWork,
+    steps: readonly Step[],
     result: AttemptResult,
   ): Promise<AttemptDisposition> {
     await this.options.audit.event('note', `${work.step.name} attempt rejected`, {
@@ -219,39 +221,18 @@ export class AttemptResultProcessor {
         reason: `Agent execution stalled; ${work.ticket.name} remains active and no Bug was created: ${result.failureLog ?? reason}`,
       };
     }
-    if (
-      result.assessment &&
-      !result.assessment.passed &&
-      (work.mode === 'normal' || work.mode === 'change-request')
-    ) {
-      const routed = await this.options.controller.routeQualityGap({
-        creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
-        sourceStepId: work.step.id,
-        finding: [result.reason ?? 'Step quality gate did not pass.', ...result.assessment.evidence]
-          .filter(Boolean)
-          .join('\n'),
-        kind: qualityGapKind(work.step),
-        qualityAssessmentId: result.assessment.id,
-        correlationId: work.ticket.source.correlationId,
-        causationId: work.ticket.id,
-        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
-      });
-      await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+    const gateFindings = deduplicateGateFindings([
+      ...(result.gateFindings ?? []),
+      ...(result.assessment?.findings ?? []),
+    ]);
+    if (gateFindings.length > 0 && (work.mode === 'normal' || work.mode === 'change-request')) {
+      await this.routeGateFindings(phase, work, steps, result, gateFindings);
       return { action: 'continue' };
     }
-    if (result.failure?.code === 'replay_miss') {
-      const routed = await this.options.controller.routeQualityGap({
-        creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
-        sourceStepId: work.step.id,
-        finding: result.failure.message,
-        kind: 'test-incomplete',
-        correlationId: work.ticket.source.correlationId,
-        causationId: work.ticket.id,
-        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
-      });
-      await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
-      return { action: 'continue' };
-    }
+    // A verifier that disproves the active CR diagnosis has identified a concrete test/contract
+    // defect. Route that Bug before the broader "test suite may be incomplete" fallback; otherwise
+    // the discoverer's evidence is downgraded to an Enhancement and the original failed gate is
+    // never repaired.
     if (
       work.mode === 'change-request' &&
       work.ticket.type === 'change-request' &&
@@ -290,6 +271,62 @@ export class AttemptResultProcessor {
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
     }
+    const semanticTestGap =
+      !!result.executor?.validationDefect &&
+      !result.testOutcomes.some((outcome) => outcome.status === 'failed' || outcome.status === 'timed_out');
+    if (
+      (result.failure?.code === 'test_assets_incomplete' || semanticTestGap) &&
+      (work.mode === 'normal' || work.mode === 'change-request')
+    ) {
+      const routed = await this.options.controller.routeQualityGap({
+        creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
+        sourceStepId: work.step.id,
+        finding: result.failureLog ?? result.executor?.validationDefect ?? result.reason ??
+          'The paired test suite is incomplete.',
+        kind: 'test-incomplete',
+        correlationId: work.ticket.source.correlationId,
+        causationId: work.ticket.id,
+        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+      });
+      await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+      return { action: 'continue' };
+    }
+    if (
+      result.assessment &&
+      !result.assessment.passed &&
+      (work.mode === 'normal' || work.mode === 'change-request')
+    ) {
+      const gaps = result.assessment.gaps.length > 0
+        ? result.assessment.gaps
+        : [result.reason ?? 'Step quality gate did not pass.'];
+      for (const gap of gaps) {
+        const routed = await this.options.controller.routeQualityGap({
+          creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
+          sourceStepId: work.step.id,
+          finding: [gap, ...result.assessment.evidence].filter(Boolean).join('\n'),
+          kind: qualityGapKind(work.step),
+          qualityAssessmentId: result.assessment.id,
+          correlationId: work.ticket.source.correlationId,
+          causationId: work.ticket.id,
+          parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        });
+        await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+      }
+      return { action: 'continue' };
+    }
+    if (result.failure?.code === 'replay_miss') {
+      const routed = await this.options.controller.routeQualityGap({
+        creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
+        sourceStepId: work.step.id,
+        finding: result.failure.message,
+        kind: 'test-incomplete',
+        correlationId: work.ticket.source.correlationId,
+        causationId: work.ticket.id,
+        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+      });
+      await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
+      return { action: 'continue' };
+    }
     if (work.mode === 'change-request') {
       const routed = await this.options.controller.routeFailure({
         creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
@@ -315,6 +352,77 @@ export class AttemptResultProcessor {
     });
     await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
     return { action: 'continue' };
+  }
+
+  private async routeGateFindings(
+    phase: Phase,
+    work: ScheduledWork,
+    steps: readonly Step[],
+    result: AttemptResult,
+    findings: readonly DeliveryGateFinding[],
+  ): Promise<void> {
+    const creatorActorId = await this.options.tickets.ownerActorId(work.ticket.id);
+    const queued: Array<{ id: ObjectId; order: number }> = [];
+    for (const finding of findings) {
+      const target = resolveFindingTarget(steps, work.step, finding);
+      if (finding.category === 'dependency') {
+        const routed = await this.options.controller.routeDependencyChange({
+          requestingStepId: work.step.id,
+          requestingTicket: work.ticket,
+          packages: finding.dependencyPackages,
+          reason: [finding.summary, ...finding.evidence].join('\n'),
+          creatorActorId,
+          correlationId: work.ticket.source.correlationId,
+        });
+        queued.push({ id: routed.id, order: Number.MAX_SAFE_INTEGER });
+        continue;
+      }
+      if (finding.category === 'test-defect' || finding.category === 'product-defect') {
+        const routed = await this.options.controller.routeFailure({
+          creatorActorId,
+          failedStepId: work.step.id,
+          targetStepId: target.id,
+          discoveringStepId: work.step.id,
+          message: [finding.summary, ...finding.evidence].join('\n'),
+          summary: finding.summary,
+          failure: {
+            kind: 'execution',
+            category: finding.category === 'test-defect' ? 'contract' : 'test',
+            code: finding.category === 'test-defect'
+              ? VALIDATION_CONTRACT_DEFECT_CODE
+              : 'delivery_gate_product_defect',
+            message: [finding.summary, ...finding.evidence].join('\n'),
+            retryable: true,
+            switchProvider: false,
+            details: { findingCategory: finding.category, findingTarget: finding.target },
+          },
+          correlationId: work.ticket.source.correlationId,
+          causationId: work.ticket.id,
+          parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        });
+        queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
+        continue;
+      }
+      const routed = await this.options.controller.routeQualityGap({
+        creatorActorId,
+        sourceStepId: work.step.id,
+        targetStepId: target.id,
+        finding: [finding.summary, ...finding.evidence].join('\n'),
+        kind: finding.category === 'test-incomplete'
+          ? 'test-incomplete'
+          : finding.category === 'deliverable-defect'
+            ? 'functional-gap'
+            : 'quality-shortfall',
+        qualityAssessmentId: result.assessment?.id,
+        correlationId: work.ticket.source.correlationId,
+        causationId: work.ticket.id,
+        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+      });
+      queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
+    }
+    await this.options.tickets.registerGateBatch(
+      queued.sort((left, right) => left.order - right.order).map((item) => item.id),
+    );
   }
 
   /**
@@ -364,35 +472,16 @@ export class AttemptResultProcessor {
   }
 
   private async routeTicket(
-    phase: Phase,
-    source: ScheduledWork,
+    _phase: Phase,
+    _source: ScheduledWork,
     ticketId: ObjectId,
-    ticketType: string,
-    correlationId: ObjectId,
+    _ticketType: string,
+    _correlationId: ObjectId,
   ): Promise<void> {
-    const routed = await this.options.tickets.routeAndAssign(ticketId);
-    const [creator, assignee] = await Promise.all([
-      this.options.tickets.actorById(routed.ticket.creatorActorId),
-      this.options.tickets.actorById(routed.assignment.assigneeActorId),
-    ]);
-    await this.options.onTransition({
-      event: 'ticket_routed',
-      projectId: phase.projectId,
-      phaseId: phase.id,
-      stepId: source.step.id,
-      stepName: source.step.name,
-      ticketId,
-      ticketName: routed.ticket.name,
-      ticketType,
-      creatorActorId: creator.id,
-      creatorRole: creator.role,
-      assigneeActorId: assignee.id,
-      assigneeRole: assignee.role,
-      assigneeAgent: routed.ticket.agent,
-      correlationId,
-      causationId: source.ticket.id,
-      message: `${creator.role} created ${routed.ticket.name}; PM routed it to ${assignee.role}/${routed.ticket.agent}`,
-    });
+    // Corrective work enters PM's registered queue first. The orchestrator's scheduler selects the
+    // next dependency-ready Ticket and only then calls routeAndAssign. Reserving actor capacity here
+    // can deadlock when another queued correction has higher scheduling priority.
+    await this.options.tickets.register(ticketId);
   }
 }
 
@@ -406,6 +495,46 @@ function downstreamStepIds(steps: readonly Step[], source: Step): ObjectId[] {
   return steps
     .filter((step) => STEP_TYPE_ORDER[step.type] > sourceOrder)
     .map((step) => step.id);
+}
+
+function resolveFindingTarget(
+  steps: readonly Step[],
+  current: Step,
+  finding: DeliveryGateFinding,
+): Step {
+  if (finding.target === 'current-step') return current;
+  if (finding.target === 'paired-source') {
+    const paired = current.pairedStepId
+      ? steps.find((step) => step.id === current.pairedStepId)
+      : undefined;
+    if (!paired) throw new Error(`Gate finding for ${current.name} requires a paired source Step`);
+    return paired;
+  }
+  const type = finding.target === 'requirement-analysis'
+    ? 'REQUIREMENT_ANALYSIS'
+    : finding.target === 'high-level-design'
+      ? 'HIGH_LEVEL_DESIGN'
+      : finding.target === 'detailed-design'
+        ? 'DETAILED_DESIGN'
+        : 'CODE';
+  const target = steps.find((step) => step.type === type);
+  if (!target) throw new Error(`Gate finding target ${type} is not materialized in this Phase`);
+  return target;
+}
+
+function deduplicateGateFindings(findings: readonly DeliveryGateFinding[]): DeliveryGateFinding[] {
+  const seen = new Set<string>();
+  return findings.filter((finding) => {
+    const key = JSON.stringify({
+      category: finding.category,
+      summary: finding.summary,
+      target: finding.target,
+      dependencyPackages: [...finding.dependencyPackages].sort(),
+    });
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Uses changed files, or an explicitly validated deferred disposition, as the CR's exact scope. */

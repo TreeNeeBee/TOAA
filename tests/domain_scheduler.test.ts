@@ -132,6 +132,16 @@ describe('PM WorkScheduler', () => {
   it('closes a Phase only after all Step and delivery Tickets close', async () => {
     const fixture = await setup();
     for (let index = 0; index < 8; index += 1) await deliverPassing(fixture, await startNext(fixture));
+    await expect(fixture.controller.completePhase(fixture.graph.phases[0]!.id))
+      .rejects.toThrow(/Phase delivery gate has no passing assessment/u);
+    const phase = await fixture.repository.read(fixture.graph.phases[0]!.id);
+    if (phase.objectType !== 'phase') throw new Error('expected Phase');
+    const assessment = await new QualityAssessmentService(fixture.repository).assessPhase({
+      phase,
+      passed: true,
+      evidence: ['deliverables complete', 'integrated tests pass', 'live scenario passes'],
+    });
+    await fixture.controller.attachPhaseQuality(phase.id, assessment.id);
     const result = await fixture.controller.completePhase(fixture.graph.phases[0]!.id);
     expect(result.projectDelivered).toBe(true);
     expect((await fixture.repository.read(fixture.graph.phases[0]!.id)).state).toBe('closed');

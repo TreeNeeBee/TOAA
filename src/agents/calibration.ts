@@ -18,7 +18,16 @@ import {
 } from '../core/docs.js';
 import { architectureImplementationPaths, pathCoveredByOutputs } from '../core/architecture.js';
 import { getLanguageProfile } from '../core/language.js';
-import { isExecutableTestPath } from '../core/test_assets.js';
+import {
+  isExecutableTestPath,
+  isRuntimeOwnedVerificationTestPath,
+  verificationSupplementRoot,
+} from '../core/test_assets.js';
+import {
+  baselineDeliveryGate,
+  type DevelopmentDeliveryGateStage,
+  verificationDeliveryGate,
+} from '../domain/quality/delivery_gate.js';
 import {
   isLoopbackNetworkFailureLine,
   isTestAssertionDiagnosticLine,
@@ -135,6 +144,10 @@ function packageKey(line: string): string {
 
 /** LLM 常用的旧文档名 → 规范化命名。 */
 export const DOC_PATH_ALIASES: Record<string, string> = {
+  'docs/project-topic.md': DOC_NAMES.topic,
+  'docs/project_topic.md': DOC_NAMES.topic,
+  'docs/project-topic.txt': DOC_NAMES.topic,
+  'docs/topic.txt': DOC_NAMES.topic,
   'docs/01-requirement.md': DOC_NAMES.requirementAnalysis,
   'docs/requirements.md': DOC_NAMES.requirementAnalysis,
   'docs/requirement.md': DOC_NAMES.requirementAnalysis,
@@ -199,7 +212,10 @@ export function calibrateDocPaths(steps: Step[], projectType: ProjectType = 'app
   const dropTopic = (p: string): boolean => p !== DOC_NAMES.topic;
   return steps.map((s) => {
     const iterationId = s.iterationId ?? 'P1';
-    const inputs = dedup((s.inputs ?? []).map((p) => iterationScopedInput(remap(p), s.phase, iterationId)));
+    let inputs = dedup((s.inputs ?? []).map((p) => iterationScopedInput(remap(p), s.phase, iterationId)));
+    if (s.phase === 'REQUIREMENT_ANALYSIS' && !inputs.includes(DOC_NAMES.topic)) {
+      inputs = [DOC_NAMES.topic, ...inputs];
+    }
     let outputs = dedup((s.outputs ?? []).map((p) => iterationScopedDoc(remap(p), s.phase, iterationId)).filter(dropTopic));
     outputs = outputs.filter((out) => {
       const ownerPhase = testPlanOwnerPhase(out, iterationId);
@@ -550,7 +566,8 @@ const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
   // wired to nobody, so the Step every dependency Change Request routes to could not act on one.
   HIGH_LEVEL_DESIGN: ['skill:author', 'skill:dep_resolver'],
   DETAILED_DESIGN: ['skill:author'],
-  CODE: ['skill:author'],
+  // CODE owns both build/static validation and the executable unit baseline gate.
+  CODE: ['skill:author', 'run_program', 'run_tests'],
   UNIT_TEST: ['skill:tester'],
   INTEGRATION_TEST: ['skill:tester'],
   MODULE_TEST: ['skill:tester'],
@@ -562,11 +579,22 @@ const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
 // edit — in both cases the planner's list is a preference, not the whole story.
 const PHASE_DEFAULT_TOOLS_REQUIRED = new Set([
   DEPENDENCY_MANIFEST_OWNER,
+  'CODE',
   'UNIT_TEST',
   'INTEGRATION_TEST',
   'MODULE_TEST',
   'FUNCTIONAL_TEST',
 ]);
+
+/**
+ * Reading is a precondition of every contract a Step is held to, not a capability a plan may omit.
+ *
+ * A planner that declared only write tools left three of the four development phases unable to read
+ * anything. A Change Request disposition requires inspecting the affected artifacts before it can be
+ * recorded; a Step that cannot inspect produces no valid completion and spends its whole round
+ * budget — which is exactly how a downstream dependency re-check stalled with no tool call at all.
+ */
+const ALWAYS_AVAILABLE_TOOL_REFS = ['read_file', 'list_dir'] as const;
 
 export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'outputs'>): string[] {
   const tools = Array.isArray(step.tools) ? [...step.tools] : [];
@@ -578,8 +606,16 @@ export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'ou
     : tools;
   const hasWriteCapability = baseTools.some((tool) => WRITE_CAPABLE_TOOL_REFS.has(tool));
   const withChunkedWritePair = ensureChunkedWritePair(baseTools);
-  if (!needsWritableOutputs || hasWriteCapability) return withChunkedWritePair;
-  return ensureChunkedWritePair([...baseTools, ...(phaseDefaults.length > 0 ? phaseDefaults : ['write_file'])]);
+  if (!needsWritableOutputs || hasWriteCapability) return withReadAccess(withChunkedWritePair);
+  return withReadAccess(
+    ensureChunkedWritePair([...baseTools, ...(phaseDefaults.length > 0 ? phaseDefaults : ['write_file'])]),
+  );
+}
+
+/** A skill that already carries reading satisfies this; only a Step with no reader gains one. */
+function withReadAccess(tools: string[]): string[] {
+  const missing = ALWAYS_AVAILABLE_TOOL_REFS.filter((tool) => !tools.includes(tool));
+  return missing.length === 0 ? tools : dedup([...tools, ...missing]);
 }
 
 function ensureChunkedWritePair(tools: string[]): string[] {
@@ -737,7 +773,7 @@ function dedup<T>(arr: T[]): T[] {
 /**
  * LLM 经常能正确列出 architectureModules，却没有把模块测试资产归给 HIGH_LEVEL_DESIGN。
  * 新版计划模型保留“大 Step”执行语义，不再把这些 Step 机械拆碎；模块级细分写入 subTasks。
- * MODULE_TEST 只消费并验证这些测试，不再负责创建测试文件。
+ * MODULE_TEST 消费这些基线，并只在自己的隔离命名空间按风险追加补充测试。
  */
 export function calibrateArchitectureStepMappings(
   steps: Step[],
@@ -896,9 +932,9 @@ function flattenSubTaskTexts(tasks: StepSubtask[]): string[] {
 // =============================================================================
 
 /**
- * 兜底保证每个左侧阶段拥有配对的可执行测试资产，右侧测试阶段只消费
- * 这些测试并产出报告。若缺少 UNIT_TEST 宏 Step，则补充一个验证 Step，
- * 但测试文件仍由 CODE 阶段拥有。
+ * 兜底保证每个左侧阶段拥有配对的可执行基线测试。右侧测试阶段独立检查基线、
+ * 在自己的隔离目录按风险补充测试、冻结并执行完整集合。若缺少 UNIT_TEST 宏 Step，
+ * 则补充一个遵循相同门禁的验证 Step；基线测试文件仍由 CODE 阶段拥有。
  */
 export function calibratePlanCoverage(steps: Step[], language: Language = 'python'): Step[] {
   const withPairedTestAssets = ensurePairedTestAssets(steps, language);
@@ -962,6 +998,11 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
     maxNum += 1;
     const newId = 'S' + String(maxNum).padStart(3, '0');
     const unitTestDoc = phaseDocForIteration('UNIT_TEST', iterationId);
+    const supplementalRoot = verificationSupplementRoot({
+      id: newId,
+      iterationId,
+      phase: 'UNIT_TEST',
+    });
     const testOutputs = uncovered.map((codeStep) => {
       const existing = codeStep.outputs.find((output) => isExecutableTestPath(output, language));
       if (existing) return existing;
@@ -979,20 +1020,21 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
       title: `自动补齐单元测试：覆盖 ${uncovered.map((c) => c.id).join(' / ')}`,
       description:
         `Planner 未为 ${targetTitles} 显式生成 UNIT_TEST Step，由 calibration 自动追加。` +
-        `Tester 只检查并执行 CODE 阶段已经生成的测试，记录验证结果。`,
+        `Tester 独立检查 CODE 基线，按风险补充、冻结并执行完整测试集合。`,
       systemPrompt:
         `本 Step 是 calibration 自动追加的 UNIT_TEST 验证兜底，覆盖以下 CODE Step：${targetTitles}。\n` +
-        `范围：读取并审查 ${testOutputs.join(', ')}，运行测试，只写 ${unitTestDoc ?? 'UNIT_TEST report'}；` +
-        `禁止创建或修改 tests/** 与 src/**。\n` +
-        `验收：测试完整性检查通过，所有既有测试在 ${tsMode ? 'npm test / Vitest' : 'pytest'} 下通过。`,
+        `范围：读取并审查 ${testOutputs.join(', ')}；只允许在 ${supplementalRoot} 新增风险补充测试，` +
+        `冻结“基线 + 补充”集合后运行测试，并写 ${unitTestDoc ?? 'UNIT_TEST report'}；` +
+        `禁止修改配对基线测试与 src/**。\n` +
+        `验收：测试完整性检查通过，冻结集合在 ${tsMode ? 'npm test / Vitest' : 'pytest'} 下全部通过。`,
       role: 'Tester',
       tools: ['skill:tester'],
       inputs: dedup(uncovered.flatMap((c) => c.outputs)),
       outputs: unitTestDoc ? [unitTestDoc] : [],
       dependsOn: uncovered.map((c) => c.id),
       acceptance: tsMode
-        ? `既有 Vitest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`
-        : `既有 pytest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`,
+        ? `Vitest 基线与风险补充测试完整、冻结且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`
+        : `pytest 基线与风险补充测试完整、冻结且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`,
       maxAttempts: 3,
     });
   }
@@ -1017,8 +1059,14 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
 function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
   const out = steps.map((step) => ({
     ...step,
-    inputs: dedup([...step.inputs]),
-    outputs: dedup([...step.outputs]),
+    inputs: dedup(step.inputs.filter((path) => !isRuntimeOwnedVerificationTestPath(path))),
+    outputs: dedup(step.outputs.filter((path) => !isRuntimeOwnedVerificationTestPath(path))),
+    deliveryGate: step.deliveryGate ?? (
+      (['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE'] as Step['phase'][])
+        .includes(step.phase)
+        ? baselineDeliveryGate(step.id, step.phase as DevelopmentDeliveryGateStage)
+        : verificationDeliveryGate(step.id)
+    ),
   }));
   const usedPaths = new Set(out.flatMap((step) => step.outputs));
   const iterationIds = dedup(out.map((step) => step.iterationId ?? 'P1'));
@@ -1083,18 +1131,22 @@ function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
         sourceStep.tools = ensureEssentialToolRefs(sourceStep);
       }
 
-      const validationMarker = 'V-model validation-only contract';
+      const validationMarker = 'V-model independent acceptance contract';
       for (const testStep of testSteps) {
         testStep.inputs = dedup([...testStep.inputs, ...testAssets]);
+        const supplementalRoot = verificationSupplementRoot(testStep);
         if (!testStep.systemPrompt.includes(validationMarker)) {
           testStep.systemPrompt +=
             `\n\n${validationMarker}（强制）：本 ${testPhase} 阶段先检查 ${testAssets.join(', ')} ` +
-            `与配对测试计划的完整性和一致性，再使用 ${testCommand} 运行这些既有测试；` +
-            `只写声明的验证报告/交付文档，禁止创建、修改或删除 tests/** 与 src/**。` +
-            `发现缺失、错误或失败时必须报告证据；若现有测试仍可能运行成功但语义覆盖不完整，` +
-            `在 JSON 中填写 validationDefect 并设置 done=false，由 Engine 建立 Bug Ticket 并路由回 ${sourcePhase}。`;
+            `与配对测试计划的完整性和一致性，执行风险分析；只允许在 ${supplementalRoot} ` +
+            `新增本阶段拥有的聚焦补充测试，禁止修改配对基线测试和 src/**。` +
+            `补充完成后冻结“基线 + 补充”测试集，再使用 ${testCommand} 完整执行。` +
+            `涉及外部数据时使用 Record/Replay 保持可复现；真实用户场景由 Phase 交付门禁统一执行。` +
+            `每个独立问题写入 qualityAssessment.findings；基线测试缺陷使用 test-defect + paired-source，` +
+            `补充测试缺陷使用 test-defect + current-step，` +
+            `产品缺陷使用 product-defect，测试不完整使用 test-incomplete，依赖问题使用 dependency。`;
           testStep.acceptance +=
-            ` 既有测试用例完整性检查通过且 ${testCommand} 执行成功；本阶段未改写测试或产品代码。`;
+            ` 基线与风险补充测试已冻结并由 ${testCommand} 执行成功；本阶段未改写基线测试或产品代码。`;
         }
         testStep.tools = ensureEssentialToolRefs(testStep);
       }

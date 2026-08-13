@@ -116,6 +116,54 @@ describe('project quality audit', () => {
     expect(result.warnings).toBe(0);
   });
 
+  it('executes a declared Phase user scenario and captures its scene', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-audit-'));
+    const ws = new Workspace(root);
+    await writeBaseDeliveryDocs(ws);
+    await ws.writeFile('src/main.ts', 'export function main() {}\n');
+    await ws.writeFile('tests/main.test.ts', 'import { describe, it, expect } from "vitest";\n');
+    await ws.writeFile('package.json', JSON.stringify({ name: 'audit-app', type: 'module', scripts: {} }));
+    const calls: string[] = [];
+    let liveBoundaryCalls = 0;
+
+    const result = await runProjectAudit({
+      ws,
+      sandbox: new FakeSandbox({
+        exec: (command, args) => {
+          calls.push([command, ...args].join(' '));
+          return okResult({ stdout: '{"headline":"ok"}\n' });
+        },
+        runTests: okResult(),
+      }),
+      plan: tsPlan(),
+      profile: getLanguageProfile('typescript'),
+      scenarios: [{
+        name: 'fetch-latest-news',
+        description: 'Use the application as an end user.',
+        operation: 'Request the latest news and render one result.',
+        environment: 'live',
+        expected: 'A usable headline is rendered.',
+        execution: { command: 'node', args: ['src/main.ts', '--limit', '1'] },
+      }],
+      runLiveScenario: async (operation) => {
+        liveBoundaryCalls += 1;
+        return operation();
+      },
+    });
+
+    expect(liveBoundaryCalls).toBe(1);
+    expect(calls).toContain('node src/main.ts --limit 1');
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      name: 'scenario:fetch-latest-news',
+      ok: true,
+      scene: expect.objectContaining({
+        command: 'node src/main.ts --limit 1',
+        exitCode: 0,
+        stdoutTail: '{"headline":"ok"}',
+      }),
+    }));
+  });
+
   it('fails a library project whose API guide is missing', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-audit-'));
     const ws = new Workspace(root);
@@ -139,6 +187,10 @@ describe('project quality audit', () => {
     expect(result.checks).toContainEqual(expect.objectContaining({
       name: 'api-guide', severity: 'error', ok: false,
     }));
+    expect(result.checks.find((check) => check.name === 'api-guide')?.finding).toMatchObject({
+      category: 'deliverable-defect',
+      target: 'current-step',
+    });
   });
 
   it('checks iteration-scoped delivery docs for P2 gates', async () => {
@@ -270,5 +322,9 @@ describe('project quality audit', () => {
     expect(result.ok).toBe(false);
     expect(result.errors).toBeGreaterThan(0);
     expect(result.checks.some((check) => check.name === 'build' && !check.ok)).toBe(true);
+    expect(result.checks.find((check) => check.name === 'build')?.finding).toMatchObject({
+      category: 'product-defect',
+      target: 'code',
+    });
   });
 });

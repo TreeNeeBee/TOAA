@@ -657,6 +657,43 @@ describe('runTestsTool / runPythonTool summary', () => {
     expect(r.summary).toBe('npm test exit=0 args=tests/unit/parser.test.ts');
   });
 
+  it('freezes verification supplements into the Runtime-owned test gate', async () => {
+    await ws.writeFile(
+      'tests/verification/p1/unit-test/s005/network-risk.test.ts',
+      'import { it } from "vitest";\nit("covers the risk", () => {});\n',
+    );
+    await ws.writeFile(
+      'tests/verification/p1/unit-test/s005/notes.md',
+      'not executable\n',
+    );
+    let seenArgs: string[] = [];
+    const fakeCtx: ToolContext = {
+      ws,
+      sandbox: {
+        async runTests(args = []) {
+          seenArgs = args;
+          return { exitCode: 0, stdout: '', stderr: '', timedOut: false, durationMs: 1 };
+        },
+        async runProgram() { throw new Error('not used'); },
+        async installDeps() { throw new Error('not used'); },
+      } as never,
+      allowedWrites: [],
+      stepId: 'S005',
+      language: 'typescript',
+      testGateArgs: ['tests/unit/parser.test.ts', '--coverage'],
+      supplementalTestRoot: 'tests/verification/p1/unit-test/s005/',
+    };
+
+    const result = await runTestsTool.run({}, fakeCtx);
+
+    expect(result.ok).toBe(true);
+    expect(seenArgs).toEqual([
+      'tests/unit/parser.test.ts',
+      '--coverage',
+      'tests/verification/p1/unit-test/s005/network-risk.test.ts',
+    ]);
+  });
+
   it('does not let explicit TypeScript selectors replace the Runtime-owned gate', async () => {
     const { runTestsTool } = await import('../src/tools/sandbox.js');
     let seenArgs: string[] = [];

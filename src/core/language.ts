@@ -56,7 +56,7 @@ export interface LanguageProfile {
   ensureTestBootstrap?(ws: Workspace, audit: AuditLogger): Promise<void>;
   /** 通用兜底：修复入口 import 路径问题（python sys.path；ts 无需）。 */
   autoFixImports?(ws: Workspace, audit: AuditLogger): Promise<string[]>;
-  /** FUNCTIONAL_TEST gate：探测入口 `--help` 是否开箱即用；缺失入口必须返回失败。 */
+  /** Phase delivery scenario fallback: probe whether the public entrypoint is directly usable. */
   probeEntry(ws: Workspace, sandbox: Sandbox): Promise<EntrypointProbe>;
 }
 
@@ -154,7 +154,7 @@ export function getLanguageProfile(language: Language): LanguageProfile {
   return PROFILES[language] ?? pythonProfile;
 }
 
-/** FUNCTIONAL_TEST gate（TypeScript）：优先尝试 `node src/main.ts --help`，确保源码入口开箱即用。 */
+/** Phase delivery fallback (TypeScript): probe `node src/main.ts --help` when no concrete case command exists. */
 async function probeTsEntrypoint(
   ws: Workspace,
   sandbox: Sandbox,

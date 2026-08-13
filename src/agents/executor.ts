@@ -18,6 +18,7 @@ import type {
 } from '../domain/tickets/ticket.js';
 import { VALIDATION_CONTRACT_DEFECT_CODE } from '../domain/tickets/ticket.js';
 import { getLanguageProfile, type LanguageProfile } from '../core/language.js';
+import { RECORDED_FIXTURE_DIR } from '../core/external_dependency_contract.js';
 import { isUnownedStepFailure } from '../tools/types.js';
 import type { ToolFailureCode } from '../tools/types.js';
 import type {
@@ -107,6 +108,15 @@ export interface ExecutorRunInput {
   stepName?: string;
   /** Runtime execution role. Debug retries keep the same source step but execute as Debugger. */
   executionRole?: Step['role'];
+  /** Whether this left-side delivery gate executes its authored baseline suite in this attempt. */
+  baselineTestExecution?: 'execute' | 'defer';
+  /** Auditable reason for executing or deferring that exact baseline suite. */
+  baselineTestExecutionReason?:
+    | 'initial-pre-code'
+    | 'pre-code-correction'
+    | 'code-step'
+    | 'post-code-correction'
+    | 'verification-step';
   /** 仅暴露给 LLM 的工具子集（已按 step.tools 过滤）。 */
   tools: Tool[];
   ctx: ToolContext;
@@ -380,7 +390,12 @@ export class StepExecutor {
           validate: validateCompletionQuality || validateDebuggerRecovery
             ? (text) => {
               if (validateCompletionQuality) {
-                validateExecutionTurnContract(text, inp.step, toolMap);
+                validateExecutionTurnContract(
+                  text,
+                  inp.step,
+                  toolMap,
+                  inp.baselineTestExecution === 'defer',
+                );
               }
               if (validateDebuggerRecovery) {
                 validateDebuggerRecoveryTurn(text, toolMap, {
@@ -635,26 +650,28 @@ export class StepExecutor {
           metrics,
         };
       }
-      const automaticCodeVerifications = await automaticCodeDebugVerificationActions({
+      const automaticDevelopmentVerifications = await automaticDevelopmentVerificationActions({
         actions,
-        role,
         phase: inp.step.phase,
+        baselineTestExecution: inp.baselineTestExecution ?? 'execute',
         language: profile.id,
         toolMap,
         ctx: inp.ctx,
       });
-      if (automaticCodeVerifications.length > 0) {
-        actions = [...actions, ...automaticCodeVerifications];
+      if (automaticDevelopmentVerifications.length > 0) {
+        actions = [...actions, ...automaticDevelopmentVerifications];
         await inp.ctx.audit?.event(
           'note',
-          `${inp.step.id} appended CODE verification gate(s) after Debugger mutation`,
+          `${inp.step.id} appended development delivery verification gate(s) after mutation`,
           {
-            messageId: 'audit.executor_automatic_code_verification',
+            messageId: 'audit.executor_automatic_development_verification',
             stepId: inp.step.id,
             role,
             round,
+            phase: inp.step.phase,
+            baselineTestExecution: inp.baselineTestExecution ?? 'execute',
             language: profile.id,
-            actions: automaticCodeVerifications,
+            actions: automaticDevelopmentVerifications,
           },
         );
       }
@@ -685,11 +702,16 @@ export class StepExecutor {
         const inspections = actions.filter((action) =>
           isPreVerificationInspectionAction(action) ||
           (action.tool !== 'run_tests' && !toolMap.has(action.tool)));
+        const supplements = actions.filter((action) =>
+          isVerificationSupplementAction(action, inp.ctx));
         deferredPreVerificationActions = actions.filter((action) =>
           action.tool !== 'run_tests' &&
           toolMap.has(action.tool) &&
-          !isPreVerificationInspectionAction(action));
-        actions = gate ? [...inspections, gate] : inspections;
+          !isPreVerificationInspectionAction(action) &&
+          !isVerificationSupplementAction(action, inp.ctx));
+        // Risk supplements are authored before the gate and become immutable input to the run that
+        // follows them. Every other mutation/report waits until the frozen suite has returned.
+        actions = gate ? [...inspections, ...supplements, gate] : [...inspections, ...supplements];
 
         // A report, diagnosis, or CR disposition produced before this Step's executable gate is
         // speculative. Preserve only evidence from earlier verified rounds and make the model
@@ -923,7 +945,11 @@ export class StepExecutor {
         if (successfulMutation) {
           const hadPendingVerification = mutationGeneration > verifiedMutationGeneration;
           mutationGeneration++;
-          if (!hadPendingVerification && !mutationRequiresExecutionVerification(a, r)) {
+          if (!hadPendingVerification && !mutationRequiresExecutionVerification(
+            a,
+            r,
+            inp.baselineTestExecution === 'defer',
+          )) {
             verifiedMutationGeneration = mutationGeneration;
           }
         }
@@ -1004,12 +1030,13 @@ export class StepExecutor {
           data: r.data,
         });
         turnResults.push({ ...r, tool: a.tool });
+        const isFailedVerificationAction = a.tool === 'run_tests';
         if (
-          a.tool === 'run_tests' &&
+          isFailedVerificationAction &&
           !r.ok &&
           r.code !== 'manifest_missing' &&
           (V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) &&
-          !advisoryFailureTools.has('run_tests')
+          !advisoryFailureTools.has(a.tool)
         ) {
           testGateFailure = { ...r, tool: a.tool };
           break;
@@ -1030,7 +1057,7 @@ export class StepExecutor {
       if (testGateFailure) {
         const verify = await verifyOutputs(inp);
         const validationDefect = extractValidationDefect(turn) ??
-          validationDefectFromTestFailure(inp.step.phase, testGateFailure);
+          validationDefectFromTestFailure(inp.step.phase, testGateFailure, inp.ctx.testGateArgs ?? []);
         const metrics = computeMetrics({
           rounds: actualRounds,
           parseFailures,
@@ -1114,11 +1141,14 @@ export class StepExecutor {
           metrics,
         };
       }
-      const validationDefect = extractValidationDefect(turn) ??
+      const reportedValidationDefect = extractValidationDefect(turn);
+      const validationDefect = reportedValidationDefect ??
         validationDefectFromChangeRequestDisposition(inp, changeRequestDisposition);
-      const currentExecutableFailure = calls.some((call) => call.tool === 'run_tests' && !call.ok);
+      const currentExecutableFailure = calls.some((call) => !call.ok && call.tool === 'run_tests');
       const supportedValidationDefect = validationDefect && (
-        ((V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) && currentExecutableFailure) ||
+        ((V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) &&
+          (currentExecutableFailure ||
+            (!!reportedValidationDefect && hasSuccessfulCompletionVerification(calls)))) ||
         inp.changeRequest?.originFailure !== undefined
       );
       const unsupportedValidationDefect = validationDefect && !supportedValidationDefect
@@ -1184,6 +1214,7 @@ export class StepExecutor {
         inp.step,
         qualityAssessment,
         qualityAssessmentRound > lastToolActionRound,
+        { baselineExecutionDeferred: inp.baselineTestExecution === 'defer' },
       );
       const invalidCompletionRound =
         turn.done === true &&
@@ -1778,6 +1809,7 @@ export class StepExecutor {
       inp.step,
       qualityAssessment,
       qualityAssessmentRound > lastToolActionRound,
+      { baselineExecutionDeferred: inp.baselineTestExecution === 'defer' },
     );
     const unresolvedFailureDetails = [...unresolvedToolFailures.values()];
     return {
@@ -1828,6 +1860,16 @@ function isPreVerificationInspectionAction(action: LLMAction): boolean {
     action.tool === 'list_dir' ||
     action.tool === 'code_search' ||
     action.tool === 'analyze_error';
+}
+
+function isVerificationSupplementAction(action: LLMAction, ctx: ToolContext): boolean {
+  if (!ctx.supplementalTestRoot) return false;
+  if (!isOutputMutationTool(action.tool) && action.tool !== 'http_fetch') return false;
+  const roots = [ctx.supplementalTestRoot, `${RECORDED_FIXTURE_DIR}/`].map(normalizeRelPath);
+  const targets = actionTargetPaths(action.tool, action.args).map(normalizeRelPath);
+  return targets.length > 0 && targets.every((target) =>
+    roots.some((root) => target === root || target.startsWith(`${root.replace(/\/$/u, '')}/`))
+  );
 }
 
 function boundRecoveryProbeActions(
@@ -2148,12 +2190,24 @@ function isValidationContractDefect(input: ExecutorRunInput): boolean {
     input.ticket.failure.code === VALIDATION_CONTRACT_DEFECT_CODE;
 }
 
-function validationDefectFromTestFailure(
+/**
+ * What a verification level hands back when the suite it runs fails.
+ *
+ * Both halves are needed and only one used to travel. The error detail says what went wrong; the
+ * case that produced it says what was being demanded — and a level that supplements the suite is
+ * usually failing on the case it just added, which the receiving Step has no other way to see.
+ */
+export function validationDefectFromTestFailure(
   phase: Step['phase'],
   failure: ToolResult & { tool: string },
+  executedTests: readonly string[] = [],
 ): string {
   const evidence = [failure.summary, failure.error].filter((value): value is string => !!value?.trim()).join('\n');
-  return `${phase} executable test gate failed:\n${truncate(evidence || 'run_tests failed without details', 4000)}`;
+  return [
+    `${phase} executable test gate failed:`,
+    executedTests.length > 0 ? `Cases under test: ${executedTests.join(', ')}` : '',
+    truncate(evidence || 'run_tests failed without details', 4000),
+  ].filter(Boolean).join('\n');
 }
 
 function validationDefectFromChangeRequestDisposition(
@@ -2203,6 +2257,7 @@ function validateExecutionTurnContract(
   text: string,
   step: Step,
   toolMap: Map<string, Tool>,
+  baselineExecutionDeferred = false,
 ): void {
   if (!isCompleteTurnJson(text)) {
     throw new Error('low-quality Executor response: incomplete or invalid JSON turn');
@@ -2214,7 +2269,9 @@ function validateExecutionTurnContract(
   const assessment = normalizeQualityAssessment(
     turn.qualityAssessment ?? turn.quality_assessment,
   );
-  const missing = missingQualityAssessmentFields(step, assessment, true);
+  const missing = missingQualityAssessmentFields(step, assessment, true, {
+    baselineExecutionDeferred,
+  });
   if (missing.length === 0) return;
   throw new Error(
     'low-quality Executor response: done=true with actions=[] requires a complete qualityAssessment; ' +
@@ -2310,6 +2367,7 @@ const OUTPUT_MUTATION_TOOLS = new Set([
   'apply_patch',
   'replace_in_file',
   'write_file',
+  'http_fetch',
 ]);
 
 function isRepairEvidenceTool(tool: string): boolean {
@@ -2320,23 +2378,26 @@ function isOutputMutationTool(tool: string): boolean {
   return OUTPUT_MUTATION_TOOLS.has(tool);
 }
 
-async function automaticCodeDebugVerificationActions(input: {
+async function automaticDevelopmentVerificationActions(input: {
   actions: LLMAction[];
-  role: string;
   phase: Step['phase'];
+  baselineTestExecution: 'execute' | 'defer';
   language: LanguageProfile['id'];
   toolMap: Map<string, Tool>;
   ctx: ToolContext;
 }): Promise<LLMAction[]> {
-  if (input.role !== 'Debugger' || input.phase !== 'CODE') return [];
+  if (!(V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(input.phase)) return [];
   if (!input.actions.some((action) => isOutputMutationTool(action.tool))) return [];
   const automatic: LLMAction[] = [];
   const requestedTools = new Set(input.actions.map((action) => action.tool));
-  const hasInheritedTestGate = (input.ctx.testGateArgs?.length ?? 0) > 0;
+  const codeMutationTargeted = input.actions.some((action) =>
+    actionTargetPaths(action.tool, action.args).some((target) =>
+      normalizeRelPath(target).startsWith('src/')),
+  );
   const hasStaticPrerequisites =
-    input.language === 'typescript' || await input.ctx.ws.exists('src');
+    input.language === 'typescript' || codeMutationTargeted || await input.ctx.ws.exists('src');
   if (
-    !hasInheritedTestGate &&
+    input.phase === 'CODE' &&
     hasStaticPrerequisites &&
     input.toolMap.has('run_program') &&
     !requestedTools.has('run_program')
@@ -2349,6 +2410,7 @@ async function automaticCodeDebugVerificationActions(input: {
     });
   }
   if (
+    input.baselineTestExecution === 'execute' &&
     (input.ctx.testGateArgs?.length ?? 0) > 0 &&
     input.toolMap.has('run_tests') &&
     !requestedTools.has('run_tests')
@@ -2367,12 +2429,17 @@ function automaticTestPhaseVerificationActions(input: {
   if (!(V_MODEL_TEST_PHASES as readonly string[]).includes(input.phase)) return [];
   if (!input.toolMap.has('run_tests')) return [];
   if (input.actions.some((action) => action.tool === 'run_tests')) return [];
-  if (input.calls.some((call) => call.tool === 'run_tests')) return [];
+  const mutatesFrozenInput = input.actions.some((action) =>
+    isOutputMutationTool(action.tool) &&
+    (action.tool !== 'http_fetch' || typeof action.args.saveAs === 'string')
+  );
+  if (input.calls.some((call) => call.tool === 'run_tests') && !mutatesFrozenInput) return [];
   return [{ tool: 'run_tests', args: {} }];
 }
 
 function didPerformSuccessfulMutation(action: LLMAction, result: ToolResult): boolean {
   if (!result.ok || !isOutputMutationTool(action.tool)) return false;
+  if (action.tool === 'http_fetch') return typeof action.args.saveAs === 'string';
   if (action.tool === 'write_file') {
     if (!isPlainRecord(result.data)) return true;
     return result.data.changed !== false;
@@ -2434,27 +2501,14 @@ function shouldExtendProductiveRun(p: {
 
 function compactTurnForHistory(turn: LLMTurn, toolMap?: Map<string, Tool>): string {
   const normalized = normalizeActions(turn.actions, toolMap);
-  const omittedPayloadActions = normalized.actions.filter(hasReplayUnsafePayload);
   const safeActions = normalized.actions.filter((action) => !hasReplayUnsafePayload(action));
-  const omittedSummary = omittedPayloadActions.length > 0
-    ? ` Previous payload actions already executed; do not replay these summaries as tool args: ${omittedPayloadActions
-        .map((action) => {
-          const targets = actionTargetPaths(action.tool, action.args).join(', ') || 'no target';
-          return `${action.tool}(${targets}; payload omitted)`;
-        })
-        .join('; ')}.`
-    : '';
   return JSON.stringify({
-    thoughts: truncate(`${turn.thoughts ?? ''}${omittedSummary}`, 900),
+    thoughts: truncate(turn.thoughts ?? '', 900),
     bugResolutionPlan: truncate(extractBugResolutionPlan(turn) ?? '', 900),
     bugResolutionDisposition: extractBugResolutionDisposition(turn),
     actions: safeActions.map((action) => ({
       tool: action.tool,
       args: compactActionArgs(action.tool, action.args),
-    })),
-    invalidActions: normalized.invalid.map((item) => ({
-      index: item.index,
-      error: item.result.error,
     })),
     done: turn.done === true,
   });
@@ -2702,7 +2756,12 @@ function changedFilesForAction(tool: string, args: unknown, result: ToolResult):
   return actionTargetPaths(tool, args);
 }
 
-function mutationRequiresExecutionVerification(action: LLMAction, result: ToolResult): boolean {
+function mutationRequiresExecutionVerification(
+  action: LLMAction,
+  result: ToolResult,
+  baselineExecutionDeferred = false,
+): boolean {
+  if (baselineExecutionDeferred) return false;
   if (action.tool === 'add_dependency') return true;
   const changedFiles = changedFilesForAction(action.tool, action.args, result);
   if (changedFiles.length === 0) return true;

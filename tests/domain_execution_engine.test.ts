@@ -152,11 +152,85 @@ describe('ProjectOrchestrator', () => {
     const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const result = await engine.run(setup.graph.phases[0]!.id);
 
-    expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
+    expect(result.failedStepId, JSON.stringify({ result, calls })).toBeUndefined();
     expect(result.projectDelivered).toBe(true);
     expect(calls).toEqual(setup.graph.steps.map((step) => `${step.name}:normal`));
     const project = await setup.repository.read(setup.graph.project.id);
     expect(project.objectType === 'project' && project.state).toBe('closed');
+  });
+
+  it('routes every Phase delivery finding as its own Ticket and keeps dependencies separate', async () => {
+    const setup = await fixture();
+    const calls: string[] = [];
+    let gateRuns = 0;
+    const base = options(setup.workspace, setup.repository, passingRunner(setup.repository, calls));
+    const engine = new ProjectOrchestrator({
+      ...base,
+      finalGate: async () => {
+        gateRuns += 1;
+        if (gateRuns > 1) return { ok: true, evidence: ['all corrected delivery checks pass'] };
+        return {
+          ok: false,
+          reason: 'Phase delivery found three independent problems.',
+          evidence: ['live acceptance and deliverable audit failed'],
+          findings: [
+            {
+              category: 'product-defect' as const,
+              summary: 'The live entrypoint returns an invalid payload.',
+              evidence: ['expected source:string, received undefined'],
+              target: 'code' as const,
+              dependencyPackages: [],
+            },
+            {
+              category: 'test-incomplete' as const,
+              summary: 'The functional baseline omits the empty-response scenario.',
+              evidence: ['requirement R-12 has no executable case'],
+              target: 'requirement-analysis' as const,
+              dependencyPackages: [],
+            },
+            {
+              category: 'dependency' as const,
+              summary: 'Schema validation requires the declared package.',
+              evidence: ['Cannot resolve package zod'],
+              target: 'high-level-design' as const,
+              dependencyPackages: ['zod'],
+            },
+          ],
+        };
+      },
+    }, setup.plan);
+
+    const result = await engine.run(setup.graph.phases[0]!.id);
+    expect(result.failedStepId, JSON.stringify({ result, calls })).toBeUndefined();
+    expect(gateRuns).toBeGreaterThanOrEqual(2);
+    const tickets = (await setup.repository.list({
+      objectType: 'ticket',
+      projectId: setup.graph.project.id,
+    })).filter((ticket) => ticket.objectType === 'ticket');
+    expect(tickets.filter((ticket) => ticket.type === 'bug' &&
+      ticket.description.includes('invalid payload'))).toHaveLength(1);
+    expect(tickets.filter((ticket) => ticket.type === 'enhancement' &&
+      ticket.description.includes('empty-response scenario'))).toHaveLength(1);
+    expect(tickets.filter((ticket) => ticket.type === 'change-request' &&
+      ticket.name.startsWith('DEP-') &&
+      ticket.description.includes('Schema validation'))).toHaveLength(1);
+    const actors = (await setup.repository.list({
+      objectType: 'actor-registration',
+      projectId: setup.graph.project.id,
+    })).filter((actor) => actor.objectType === 'actor-registration');
+    const pm = actors.find((actor) => actor.role === 'project-manager');
+    expect(pm).toBeDefined();
+    const intakeTickets = tickets.filter((ticket) => ticket.source.kind === 'pm-intake');
+    expect(intakeTickets.length).toBeGreaterThanOrEqual(3);
+    expect(intakeTickets.every((ticket) => ticket.creatorActorId === pm?.id)).toBe(true);
+    const phaseAssessments = (await setup.repository.list({
+      objectType: 'quality-assessment',
+      projectId: setup.graph.project.id,
+    })).filter((object) => object.objectType === 'quality-assessment' &&
+      object.subject.objectType === 'phase');
+    expect(phaseAssessments.some((assessment) => !assessment.passed && assessment.findings.length === 3))
+      .toBe(true);
+    expect(phaseAssessments.some((assessment) => assessment.passed)).toBe(true);
   });
 
   it('routes a test failure to Debug and propagates one CR through every downstream gate', async () => {
@@ -229,9 +303,20 @@ describe('ProjectOrchestrator', () => {
       ticket.type === 'change-request' && ticket.sourceTicketId === bug!.id,
     );
     expect(rootRequests.length).toBeGreaterThan(1);
-    expect(new Set(rootRequests.map((ticket) => ticket.description))).toEqual(
-      new Set([rootRequests[0]!.contractDelta.summary]),
-    );
+    // Every hop descends from the same Bug, but each carries the change it must check rather than a
+    // copy of the repair that started the chain: a downstream Step handed "create the requirement
+    // analysis docs" owns none of those files, has nothing to do, and stalls for no progress.
+    for (const hop of rootRequests) {
+      expect(hop.type === 'change-request' && hop.contractDelta.affectedArtifacts.length)
+        .toBeGreaterThan(0);
+    }
+    const hops = rootRequests.filter((ticket) => ticket.type === 'change-request');
+    const downstream = hops.filter((hop) => hop.parentChangeRequestId);
+    expect(downstream.length).toBeGreaterThan(0);
+    for (const hop of downstream) {
+      expect(hop.type === 'change-request' && hop.implementationPlan.join(' '))
+        .toContain('against the accepted change');
+    }
     expect(bug?.objectType === 'ticket' && bug.type === 'bug' && bug.changelistIds).toHaveLength(1);
     const bugChange = bug?.objectType === 'ticket' && bug.type === 'bug'
       ? await setup.repository.read(bug.changelistIds[0]!)

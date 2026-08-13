@@ -8,6 +8,11 @@ import type { LanguageProfile } from './language.js';
 import { deliveryDocsForIteration, deliveryDocsForProjectType } from './docs.js';
 import { t } from '../i18n/index.js';
 import { detectNetworkApiFailureInExec } from './network_api_gate.js';
+import {
+  type DeliveryGateFinding,
+  type DeliveryGateScenario,
+  type DeliveryGateScene,
+} from '../domain/quality/delivery_gate.js';
 
 export interface ProjectAuditCheck {
   name: string;
@@ -15,6 +20,10 @@ export interface ProjectAuditCheck {
   ok: boolean;
   summary: string;
   detail?: string;
+  /** Structured PM-routing input when this check fails. */
+  finding?: DeliveryGateFinding;
+  /** Captured real-user execution scene for audit and later PM intake. */
+  scene?: DeliveryGateScene;
 }
 
 export interface ProjectAuditResult {
@@ -55,6 +64,8 @@ export async function runProjectAudit(opts: {
   sandbox: Sandbox;
   plan: Plan;
   profile: LanguageProfile;
+  scenarios?: readonly DeliveryGateScenario[];
+  runLiveScenario?: <T>(operation: () => Promise<T>) => Promise<T>;
 }): Promise<ProjectAuditResult> {
   return runQualityAudit({ ...opts, scope: 'project' });
 }
@@ -76,6 +87,8 @@ async function runQualityAudit(opts: {
   profile: LanguageProfile;
   scope: 'project' | 'iteration';
   iterationId?: string;
+  scenarios?: readonly DeliveryGateScenario[];
+  runLiveScenario?: <T>(operation: () => Promise<T>) => Promise<T>;
 }): Promise<ProjectAuditResult> {
   const checks: ProjectAuditCheck[] = [];
 
@@ -88,8 +101,13 @@ async function runQualityAudit(opts: {
   );
   checks.push(await checkTestFiles(opts.ws));
   checks.push(await runTestAudit(opts.sandbox));
+  checks.push(await runEntrypointAudit(opts.ws, opts.sandbox, opts.profile));
 
-  checks.push(await runEntryAudit(opts.ws, opts.sandbox, opts.profile));
+  const scenarios = opts.scenarios ?? [];
+  for (const scenario of scenarios) {
+    const operation = () => runScenarioAudit(opts.sandbox, scenario);
+    checks.push(await (opts.runLiveScenario ? opts.runLiveScenario(operation) : operation()));
+  }
 
   if (opts.plan.language === 'typescript') {
     checks.push(...await runTypeScriptAudit(opts.ws, opts.sandbox));
@@ -116,6 +134,15 @@ async function checkDocumentationBundle(
       severity: exists ? 'info' : 'error',
       ok: exists,
       summary: exists ? t().execute.auditDocPresent(doc) : t().execute.auditDocMissing(doc),
+      ...(!exists ? {
+        finding: {
+          category: 'deliverable-defect' as const,
+          summary: `Required delivery document is missing: ${doc}`,
+          evidence: [`Phase audit could not find ${doc}.`],
+          target: 'current-step' as const,
+          dependencyPackages: [],
+        },
+      } : {}),
     });
   }
   return checks;
@@ -144,9 +171,16 @@ async function checkTestFiles(ws: Workspace): Promise<ProjectAuditCheck> {
   }
   return {
     name: 'test-files',
-    severity: 'warn',
+    severity: 'error',
     ok: false,
     summary: t().execute.auditTestFilesMissing,
+    finding: {
+      category: 'test-incomplete',
+      summary: 'The delivered project contains no executable test files.',
+      evidence: ['Phase audit found no Python or TypeScript tests under tests/.'],
+      target: 'paired-source',
+      dependencyPackages: [],
+    },
   };
 }
 
@@ -155,7 +189,7 @@ async function runTestAudit(sandbox: Sandbox): Promise<ProjectAuditCheck> {
   return toExecCheck('tests', result, 'error');
 }
 
-async function runEntryAudit(
+async function runEntrypointAudit(
   ws: Workspace,
   sandbox: Sandbox,
   profile: LanguageProfile,
@@ -175,13 +209,101 @@ async function runEntryAudit(
     ok: false,
     summary: t().execute.auditEntrypointFailed(probe.command),
     detail: tailText(probe.stderrTail || probe.stdoutTail),
+    finding: {
+      category: 'product-defect',
+      summary: `Entrypoint smoke check failed: ${probe.command}`,
+      evidence: [tailText(probe.stderrTail || probe.stdoutTail) || `exit=${probe.exitCode}`],
+      target: 'code',
+      dependencyPackages: [],
+    },
   };
+}
+
+async function runScenarioAudit(
+  sandbox: Sandbox,
+  scenario: DeliveryGateScenario,
+): Promise<ProjectAuditCheck> {
+  const capturedAt = new Date().toISOString();
+  const execution = scenario.execution;
+  if (!execution) {
+    throw new Error(`Phase delivery scenario ${scenario.name} has no concrete execution command`);
+  }
+  const result = await sandbox.exec(execution.command, execution.args, { timeoutMs: 120_000 });
+  const probe = {
+    ok: result.exitCode === 0 && !result.timedOut && !detectNetworkApiFailureInExec(result),
+    command: [execution.command, ...execution.args].join(' '),
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    stdoutTail: tailText(result.stdout),
+    stderrTail: tailText(result.stderr),
+  };
+  const scene: DeliveryGateScene = {
+    scenario,
+    capturedAt,
+    command: probe.command,
+    exitCode: probe.exitCode,
+    timedOut: probe.timedOut,
+    ...(probe.stdoutTail ? { stdoutTail: tailText(probe.stdoutTail) } : {}),
+    ...(probe.stderrTail ? { stderrTail: tailText(probe.stderrTail) } : {}),
+  };
+  if (probe.ok) {
+    return {
+      name: `scenario:${scenario.name}`,
+      severity: 'info',
+      ok: true,
+      summary: t().execute.auditEntrypointOk(probe.command),
+      scene,
+    };
+  }
+  const sceneEvidence = renderSceneEvidence(scene);
+  return {
+    name: `scenario:${scenario.name}`,
+    severity: 'error',
+    ok: false,
+    summary: t().execute.auditEntrypointFailed(probe.command),
+    detail: sceneEvidence.join('\n'),
+    scene,
+    finding: {
+      category: 'product-defect',
+      summary: `Real entrypoint scenario failed: ${probe.command}`,
+      evidence: sceneEvidence,
+      target: 'code',
+      dependencyPackages: [],
+      scene,
+    },
+  };
+}
+
+function renderSceneEvidence(scene: DeliveryGateScene): string[] {
+  return [
+    `scenario=${scene.scenario.name}`,
+    `operation=${scene.scenario.operation}`,
+    `environment=${scene.scenario.environment}`,
+    `expected=${scene.scenario.expected}`,
+    `command=${scene.command}`,
+    `capturedAt=${scene.capturedAt}`,
+    `exit=${scene.exitCode}; timedOut=${scene.timedOut}`,
+    ...(scene.stderrTail ? [`stderr:\n${scene.stderrTail}`] : []),
+    ...(scene.stdoutTail ? [`stdout:\n${scene.stdoutTail}`] : []),
+  ];
 }
 
 async function runTypeScriptAudit(ws: Workspace, sandbox: Sandbox): Promise<ProjectAuditCheck[]> {
   const pkg = await readPackageJson(ws);
   if (!pkg) {
-    return [{ name: 'package-json', severity: 'error', ok: false, summary: t().execute.auditPackageJsonMissing }];
+    return [{
+      name: 'package-json',
+      severity: 'error',
+      ok: false,
+      summary: t().execute.auditPackageJsonMissing,
+      finding: {
+        category: 'deliverable-defect',
+        summary: 'TypeScript delivery is missing package.json.',
+        evidence: ['Phase audit could not load package.json.'],
+        target: 'high-level-design',
+        dependencyPackages: [],
+      },
+    }];
   }
   const scripts =
     pkg.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)
@@ -237,6 +359,13 @@ function toExecCheck(
     detail: networkFailure
       ? tailText(`${networkFailure.evidence}\n${result.stderr}\n${result.stdout}`)
       : tailText(result.stderr || result.stdout),
+    finding: {
+      category: 'product-defect',
+      summary: `${name} delivery check failed.`,
+      evidence: [tailText(result.stderr || result.stdout) || `exit=${result.exitCode}`],
+      target: 'code',
+      dependencyPackages: [],
+    },
   };
 }
 

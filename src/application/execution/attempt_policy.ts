@@ -9,9 +9,17 @@ import {
 import type { Plan, Step } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
 import { defaultQualityGateForPhase } from '../../core/quality_gate.js';
-import { pairedTestAssetPaths } from '../../core/test_assets.js';
+import {
+  developmentBaselineTestAssetPaths,
+  pairedTestAssetPaths,
+} from '../../core/test_assets.js';
 import type { DomainLog } from '../../domain/observability/records.js';
+import type { AttemptFailure } from './failure_classification.js';
 import { workStepId, type Ticket } from '../../domain/tickets/ticket.js';
+import {
+  directCorrectionOrigin,
+  type CorrectionOrigin,
+} from './correction_provenance.js';
 
 export type AttemptMode = 'normal' | 'debug' | 'enhancement' | 'change-request';
 
@@ -26,6 +34,77 @@ export interface AttemptVerificationScope {
   deferredToChangeRequest?: boolean;
   verificationStepId?: string;
   verificationPhase?: Step['phase'];
+}
+
+export type BaselineGateExecution =
+  | {
+      mode: 'execute';
+      reason: 'code-step' | 'post-code-correction';
+      originStepId?: string;
+      originPhase?: Step['phase'];
+    }
+  | {
+      mode: 'defer';
+      reason: 'initial-pre-code' | 'pre-code-correction';
+      originStepId?: string;
+      originPhase?: Step['phase'];
+    }
+  | {
+      mode: 'not-applicable';
+      reason: 'verification-step';
+    };
+
+const DEVELOPMENT_PHASE_ORDER: Record<string, number> = {
+  REQUIREMENT_ANALYSIS: 0,
+  HIGH_LEVEL_DESIGN: 1,
+  DETAILED_DESIGN: 2,
+  CODE: 3,
+  UNIT_TEST: 4,
+  INTEGRATION_TEST: 5,
+  MODULE_TEST: 6,
+  FUNCTIONAL_TEST: 7,
+};
+
+/**
+ * Decide whether a left-side Step can execute its baseline tests.
+ *
+ * S1-S3 always author and statically validate their tests. Only the initial pre-CODE path defers
+ * execution. A correction discovered by S4 or any right-side Step proves a product baseline exists,
+ * so the routed source Step must execute its baseline gate before redelivering.
+ */
+export function resolveBaselineGateExecution(
+  plan: Plan,
+  executionStep: Step,
+  ticket: Ticket,
+  chainOrigin?: CorrectionOrigin,
+): BaselineGateExecution {
+  const declaredPolicy = executionStep.deliveryGate?.baselineExecutionPolicy;
+  if (
+    isVerificationPhase(executionStep.phase) ||
+    declaredPolicy === 'freeze-then-required' ||
+    declaredPolicy === 'phase-aggregate'
+  ) {
+    return { mode: 'not-applicable', reason: 'verification-step' };
+  }
+  if (executionStep.phase === 'CODE' || declaredPolicy === 'required') {
+    return { mode: 'execute', reason: 'code-step' };
+  }
+  const origin = chainOrigin ?? directCorrectionOrigin(plan, ticket);
+  if (!origin) return { mode: 'defer', reason: 'initial-pre-code' };
+  const reachesCode = (DEVELOPMENT_PHASE_ORDER[origin.phase] ?? -1) >= DEVELOPMENT_PHASE_ORDER.CODE!;
+  return reachesCode
+    ? {
+        mode: 'execute',
+        reason: 'post-code-correction',
+        originStepId: origin.id,
+        originPhase: origin.phase,
+      }
+    : {
+        mode: 'defer',
+        reason: 'pre-code-correction',
+        originStepId: origin.id,
+        originPhase: origin.phase,
+      };
 }
 
 export function resolveAttemptTestArgs(
@@ -154,13 +233,30 @@ export function renderAttemptRetryFeedback(log: DomainLog, phase: Step['phase'])
     maxChars: 2600,
     maxLines: 36,
   });
+  const candidatePreserved = log.data.workspaceDisposition === 'candidate-preserved';
   return [
     '## latest failed attempt',
-    'The previous attempt for this same Ticket failed and its file changes were rolled back.',
-    'Continue from the accepted baseline, diagnose this evidence, and do not repeat the failed approach unchanged.',
+    candidatePreserved
+      ? 'The previous attempt for this same Ticket failed, but its candidate files were committed and preserved for incremental correction.'
+      : 'The previous attempt for this same Ticket failed and its file changes were rolled back.',
+    candidatePreserved
+      ? 'Inspect and patch the preserved candidate; do not restart the work or repeat the failed approach unchanged.'
+      : 'Continue from the accepted baseline, diagnose this evidence, and do not repeat the failed approach unchanged.',
     renderDebugBriefForPrompt(brief),
     ...(evidence ? ['## compact failure evidence', '```text', evidence, '```'] : []),
   ].join('\n');
+}
+
+/**
+ * Project defects keep the exact failed candidate so the routed role can repair it incrementally.
+ * Conditions outside the project and incomplete agent turns return to the clean attempt baseline.
+ */
+export function shouldPreserveFailedCandidate(
+  failure: AttemptFailure,
+  hasDependencyRequest = false,
+): boolean {
+  if (hasDependencyRequest || failure.kind !== 'execution') return false;
+  return ['tool', 'test', 'quality', 'contract'].includes(failure.category);
 }
 
 export function prioritizeAttemptFailureEvidence(
@@ -213,7 +309,9 @@ export function resolveAttemptVerificationScope(
   executionStep: Step,
   ticket: Ticket,
 ): AttemptVerificationScope {
-  const currentTestArgs = pairedTestAssetPaths(plan.steps, executionStep, plan.language);
+  const currentTestArgs = isVerificationPhase(executionStep.phase)
+    ? pairedTestAssetPaths(plan.steps, executionStep, plan.language)
+    : developmentBaselineTestAssetPaths(executionStep, plan.language);
   const verificationStepId = ticket.type === 'bug'
     ? ticket.failure.verificationStepId
     : ticket.type === 'enhancement'
@@ -231,15 +329,11 @@ export function resolveAttemptVerificationScope(
   if (routedToUpstreamSource) {
     const verificationStep = plan.steps.find((step) => step.id === verificationStepId);
     return {
-      // S1-S4 author their paired tests, but a corrective attempt in an upstream source phase cannot
-      // prove the failed gate until downstream CRs have applied the accepted contract. The exact
-      // selectors are still retained as a safety boundary: if the Debugger voluntarily verifies a
-      // local test-asset repair, run_tests must not widen into the full project suite.
-      testArgs: verificationStep
-        ? pairedTestAssetPaths(plan.steps, verificationStep, plan.language)
-        : currentTestArgs,
-      inheritedFromTicket: false,
-      deferredToChangeRequest: true,
+      // A right-side failure routed back to its source Step reruns that source Step's own baseline
+      // suite. Downstream CR propagation verifies the resulting contract again, but no longer
+      // substitutes for the source delivery gate itself.
+      testArgs: currentTestArgs,
+      inheritedFromTicket: true,
       verificationStepId: verificationStep?.id,
       verificationPhase: verificationStep?.phase,
     };

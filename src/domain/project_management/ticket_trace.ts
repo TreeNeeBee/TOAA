@@ -11,6 +11,7 @@ export const TICKET_TRACE_EVENT_TYPES = [
   'submitted',
   'registration_rejected',
   'registered',
+  'queued',
   'routed',
   'assignment_proposed',
   'accepted',

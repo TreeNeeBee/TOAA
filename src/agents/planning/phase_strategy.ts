@@ -10,6 +10,7 @@ import {
   type Step,
 } from '../../core/plan.js';
 import { analyzeArchitectureDemand } from '../../core/architecture.js';
+import { phaseDeliveryGate } from '../../domain/quality/delivery_gate.js';
 
 export function parseComplexityAssessment(value: unknown): ComplexityAssessment | undefined {
   const result = ComplexityAssessmentSchema.safeParse(value);
@@ -52,6 +53,19 @@ export function validateImplementationPhaseDraft(
   }
   if (assessment.splitRecommended && executable.filter((phase) => phase.id !== 'P1').length === 0) {
     return 'splitRecommended=true requires at least one planned executable iteration after P1';
+  }
+  for (const phase of executable) {
+    if (!phase.deliveryGate) {
+      return `${phase.id} must define a Phase deliveryGate with executable real-user scenarios`;
+    }
+    const liveScenarios = phase.deliveryGate.scenarios.filter((scenario) => scenario.environment === 'live');
+    if (liveScenarios.length === 0) {
+      return `${phase.id} deliveryGate must declare at least one live real-user scenario`;
+    }
+    const incomplete = liveScenarios.find((scenario) => !scenario.execution);
+    if (incomplete) {
+      return `${phase.id} deliveryGate scenario ${incomplete.name} must define concrete execution.command and execution.args`;
+    }
   }
   return undefined;
 }
@@ -165,6 +179,10 @@ export function normalizeImplementationPhases(
             : 'planned' as const,
       dependsOn: index === 0 ? [] : phase.dependsOn.length > 0 ? phase.dependsOn : [`P${index}`],
       verificationGate: phase.verificationGate ?? defaultVerificationGate(phase.id || `P${index + 1}`),
+      deliveryGate: phase.deliveryGate ?? phaseDeliveryGate(
+        phase.id || `P${index + 1}`,
+        phase.verificationGate?.checks ?? [],
+      ),
     }));
   if (sanitized.length > 0) {
     while (sanitized.filter((phase) => phase.status !== 'deferred').length < requiredCount) {
@@ -181,6 +199,7 @@ export function normalizeImplementationPhases(
     deliverables: ['Complete V-model iteration for the highest-priority core slice.'],
     dependsOn: [],
     verificationGate: defaultVerificationGate('P1'),
+    deliveryGate: phaseDeliveryGate('P1', defaultVerificationGate('P1').checks),
   }];
   while (initial.length < requiredCount) {
     initial.push(plannedIterationPhase(requirementDigest, initial.length + 1));
@@ -226,5 +245,9 @@ function plannedIterationPhase(requirementDigest: string, index: number): Implem
     deliverables: ['Complete V-model iteration with all eight canonical Steps.'],
     dependsOn: [`P${Math.max(1, index - 1)}`],
     verificationGate: defaultVerificationGate(`P${index}`),
+    deliveryGate: phaseDeliveryGate(
+      `P${index}`,
+      defaultVerificationGate(`P${index}`).checks,
+    ),
   };
 }

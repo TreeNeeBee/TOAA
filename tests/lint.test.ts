@@ -164,8 +164,8 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
         description: 'd',
         systemPrompt: '本 Step 专属提示词：明确范围、输入、产出、验收与禁令。',
         role: 'Tester',
-        tools: ['run_tests'],
-        inputs: ['src/app.py', 'tests/test_functional.py'],
+        tools: ['run_program'],
+        inputs: ['docs/01-requirement-analysis.md', 'src/app.py', 'tests/test_functional.py'],
         outputs: [...baseDeliveryDocs],
         dependsOn: ['S007'],
         acceptance: 'functional docs exist',
@@ -181,6 +181,14 @@ function makeTypeScriptPlan(): Plan {
     language: 'typescript',
     dependencies: ['vitest', 'zod'],
   });
+  plan.steps[0] = {
+    ...plan.steps[0]!,
+    outputs: [
+      'docs/01-requirement-analysis.md',
+      'docs/tests/functional-test-plan.md',
+      'tests/functional.test.ts',
+    ],
+  };
   plan.steps[1] = {
     ...plan.steps[1]!,
     outputs: [
@@ -188,14 +196,6 @@ function makeTypeScriptPlan(): Plan {
       'docs/tests/module-test-plan.md',
       'tests/module.test.ts',
       'package.json',
-    ],
-  };
-  plan.steps[0] = {
-    ...plan.steps[0]!,
-    outputs: [
-      'docs/01-requirement-analysis.md',
-      'docs/tests/functional-test-plan.md',
-      'tests/functional.test.ts',
     ],
   };
   plan.steps[2] = {
@@ -226,7 +226,7 @@ function makeTypeScriptPlan(): Plan {
   };
   plan.steps[7] = {
     ...plan.steps[7]!,
-    inputs: ['src/main.ts', 'tests/functional.test.ts'],
+    inputs: ['docs/01-requirement-analysis.md', 'src/main.ts', 'tests/functional.test.ts'],
   };
   return plan;
 }
@@ -367,18 +367,18 @@ describe('lintPlan', () => {
     expect(errs.some((e) => e.message.includes('must not output implementation'))).toBe(true);
   });
 
-  it('requires executable tests to be owned by paired left-side phases', () => {
+  it('keeps planned verification outputs separate from runtime-owned supplements', () => {
     const plan = makePlan();
     plan.steps[4]!.outputs.push('tests/late_unit.py');
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
-    expect(errs.some((e) => e.message.includes('UNIT_TEST is validation-only'))).toBe(true);
+    expect(errs.some((e) => e.message.includes('UNIT_TEST planned outputs cannot own baseline tests'))).toBe(true);
   });
 
   it('still bans FUNCTIONAL_TEST step from producing src/*.py', () => {
     const plan = makePlan();
     plan.steps[7]!.outputs = [...baseDeliveryDocs, 'src/leak.py'];
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
-    expect(errs.some((e) => e.message.includes('FUNCTIONAL_TEST is validation-only'))).toBe(true);
+    expect(errs.some((e) => e.message.includes('FUNCTIONAL_TEST planned outputs must not own'))).toBe(true);
   });
 
   it('requires paired test plans from left-side V-model phases', () => {
@@ -386,6 +386,14 @@ describe('lintPlan', () => {
     plan.steps[1]!.outputs = ['docs/02-high-level-design.md'];
     const errs = lintPlan(plan).filter((i) => i.level === 'error');
     expect(errs.some((e) => e.message.includes('MODULE_TEST plan'))).toBe(true);
+  });
+
+  it('requires REQUIREMENT_ANALYSIS to own the functional baseline', () => {
+    const plan = makePlan();
+    plan.steps[0]!.outputs = ['docs/01-requirement-analysis.md'];
+    const errs = lintPlan(plan).filter((i) => i.level === 'error');
+    expect(errs.some((error) => error.message.includes('paired FUNCTIONAL_TEST plan'))).toBe(true);
+    expect(errs.some((error) => error.message.includes('executable FUNCTIONAL_TEST test cases'))).toBe(true);
   });
 
   it('rejects empty / too-short systemPrompt', () => {

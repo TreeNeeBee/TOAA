@@ -1,9 +1,12 @@
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import type { Tool, ToolContext, ToolFailureCode } from './types.js';
 import type { StepType } from '../domain/steps/step.js';
 import { detectNetworkApiFailureInExec } from '../core/network_api_gate.js';
 import { normalizeTypeScriptTestArgs } from '../sandbox/test_args.js';
 import { resolveTypeScriptProgramCommand } from '../sandbox/program_args.js';
 import { resolveWorkspacePath } from './path_guard.js';
+import { isExecutableTestPath } from '../core/test_assets.js';
 
 /** 截取多行文本最后 N 行，用于在 ToolResult.summary 里给 LLM 直接看的失败上下文。
  * 仅在失败时调用——成功路径上 stdout 通常很长且无价值，没必要塞回 prompt。 */
@@ -120,7 +123,10 @@ export const runTestsTool: Tool<
     const requestedEffectiveArgs = ctx.language === 'typescript'
       ? normalizeTypeScriptTestArgs(requestedArgs)
       : requestedArgs;
-    const runArgs = mergeTestGateArgs(ctx.testGateArgs ?? [], requestedEffectiveArgs);
+    // Runtime owns the exact paired selectors. S005-S008 add only their isolated supplement root;
+    // neighbouring undeclared tests remain an incomplete-suite Enhancement instead of leaking in.
+    const gateArgs = await appendVerificationSupplements(ctx, ctx.testGateArgs ?? []);
+    const runArgs = mergeTestGateArgs(gateArgs, requestedEffectiveArgs);
     const r = await ctx.sandbox.runTests(runArgs, { cwd: cwd.abs, timeoutMs: args.timeoutMs });
     const networkFailure = detectNetworkApiFailureInExec(r);
     const passed = r.exitCode === 0 && !r.timedOut && !networkFailure;
@@ -147,6 +153,36 @@ export const runTestsTool: Tool<
     };
   },
 };
+
+async function appendVerificationSupplements(
+  ctx: ToolContext,
+  gateArgs: readonly string[],
+): Promise<string[]> {
+  if (!ctx.supplementalTestRoot) return [...gateArgs];
+  const supplements: string[] = [];
+  await walkTestFiles(
+    ctx.ws.abs(ctx.supplementalTestRoot),
+    ctx.supplementalTestRoot.replace(/\/$/u, ''),
+    ctx.language ?? 'python',
+    supplements,
+  );
+  return [...new Set([...gateArgs, ...supplements.sort()])];
+}
+
+async function walkTestFiles(
+  abs: string,
+  rel: string,
+  language: NonNullable<ToolContext['language']>,
+  out: string[],
+): Promise<void> {
+  const entries = await fs.readdir(abs, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const childAbs = path.join(abs, entry.name);
+    const childRel = `${rel}/${entry.name}`;
+    if (entry.isDirectory()) await walkTestFiles(childAbs, childRel, language, out);
+    else if (isExecutableTestPath(childRel, language)) out.push(childRel);
+  }
+}
 
 /**
  * Says why a run could not happen at all, rather than reporting it as a failing suite.
