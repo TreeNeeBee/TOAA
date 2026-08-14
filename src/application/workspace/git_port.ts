@@ -38,6 +38,8 @@ export class MergeConflictError extends Error {
 
 export interface GitWorktreePort {
   head(): Promise<string>;
+  /** Resolves a branch, tag, or commit to the revision recovery must pin. */
+  revision(ref: string): Promise<string>;
   addWorktree(request: WorktreeRequest): Promise<void>;
   listWorktrees(): Promise<WorktreeRecord[]>;
   pruneWorktrees(): Promise<void>;

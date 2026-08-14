@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { TestPhaseValidator } from '../src/application/execution/test_phase_validator.js';
 import type { Plan, Step } from '../src/core/plan.js';
 import { Workspace } from '../src/workspace/workspace.js';
+import {
+  verificationSupplementRoot,
+  verificationSupplementUpwardPrefix,
+} from '../src/core/test_assets.js';
 
 /** Hybrid ownership: S1-S4 author baselines; S5-S8 may add isolated risk supplements and run all. */
 describe('external boundary contract per V-model level', () => {
@@ -170,6 +174,24 @@ describe('external boundary contract per V-model level', () => {
     // Flags are passed through, not treated as paths.
     expect(ran).toContain('--coverage');
   });
+
+  // The root nests an iteration, a phase, and a Step id, so a supplement sits five directories down
+  // with a UUID in the middle. A live UNIT_TEST spent all seven of its attempts writing
+  // `../../../../src/...` — one level short — while every baseline case around it passed.
+  it('names the prefix back to the product rather than leaving the depth to be counted', () => {
+    const supplementRoot = verificationSupplementRoot({
+      id: '019ff13f-d607-7bcc-a4c1-7a9563cd50c1',
+      iterationId: 'P1',
+      phase: 'UNIT_TEST',
+    } as never);
+    expect(supplementRoot).toBe('tests/verification/p1/unit-test/019ff13f-d607-7bcc-a4c1-7a9563cd50c1/');
+
+    const prefix = verificationSupplementUpwardPrefix(supplementRoot);
+    // The invariant that broke: the root followed by the prefix has to land back at the repository
+    // root, whatever the segments happen to be.
+    expect(path.posix.normalize(`${supplementRoot}${prefix}src/aggregator/merge.ts`))
+      .toBe('src/aggregator/merge.ts');
+  });
 });
 
 function stepFor(phase: Step['phase']): Step {
@@ -239,3 +261,29 @@ function networkPlan(phase: Step['phase'], testPath: string): Plan {
     ],
   } as unknown as Plan;
 }
+
+// Naming the prefix in the delivery-gate entry inspection was not enough: a Step that writes a
+// supplement never sees that message, it sees the test-gate failure. Two live runs burned every
+// attempt a Ticket had on `../../../src/...` against a root needing `../../../../../`, with every
+// baseline case beside it passing.
+describe('executable test gate failure', () => {
+  it('names the prefix a supplement needs, on the message the authoring Step actually reads', async () => {
+    const { validationDefectFromTestFailure } = await import('../src/agents/executor.js');
+    const supplement =
+      'tests/verification/p1/unit-test/019ff69f-3feb-7f66-942b-fcf6188d6af5/supplement.test.ts';
+
+    const defect = validationDefectFromTestFailure(
+      'UNIT_TEST',
+      { ok: false, error: 'Failed to load url ../../../src/scrapers/baidu.ts', tool: 'run_tests' },
+      ['tests/unit/scrapers.test.ts', supplement],
+    );
+
+    expect(defect).toContain('../../../../../src/');
+    // A run whose cases are all baselines has no supplement to explain.
+    expect(validationDefectFromTestFailure(
+      'UNIT_TEST',
+      { ok: false, error: 'assertion failed', tool: 'run_tests' },
+      ['tests/unit/scrapers.test.ts'],
+    )).not.toContain('reach the product with');
+  });
+});

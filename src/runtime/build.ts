@@ -67,6 +67,8 @@ import {
   resolveClarificationAnswer,
   resolveCompileLanguage,
 } from '../application/planning/requirement_intake.js';
+import { buildRuntimeCapabilities } from '../application/capabilities/runtime_capabilities.js';
+import { validateImplementationPhaseDraft } from '../agents/planning/phase_strategy.js';
 
 export {
   formatClarificationQuestion,
@@ -119,6 +121,8 @@ export interface CompileOptions {
   recordReplayPath?: string;
   /** Cancels active planning/provider requests. */
   abortSignal?: AbortSignal;
+  /** Carried by evolve/append into their Run task; Build itself has no project tool permission loop. */
+  permissionMode?: import('./io.js').RuntimePermissionPolicy;
 }
 
 /** CLI 可映射为退出码、程序化调用方可捕获并安全收尾的编译终止。 */
@@ -161,7 +165,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   let scoreStore: ScoreStore | undefined;
   try {
   const M = t();
-  const audit = new AuditLogger({ root: ws.root, stateRoot: container.state.root, command: 'xcompiler_build' });
+  const audit = new AuditLogger({ root: container.root, stateRoot: container.state.root, command: 'xcompiler_build' });
   await audit.start({
     workspace: ws.root,
     config: opts.configPath ?? '(default)',
@@ -176,7 +180,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     strict: opts.pluginStrict,
     audit,
   });
-  await pluginHost.initialize();
+  const capabilities = await buildRuntimeCapabilities(pluginHost);
   if (opts.topicFile && opts.inputFile) {
     await runtimeLog(io, 'warning', M.compile.topicInputConflict);
   }
@@ -185,7 +189,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await pluginHost.emit('compile.start', { workspace: ws.root, intent, topicMode });
   scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
-  const recordReplay = createRuntimeRecordReplay(cfg, ws, {
+  const recordReplay = createRuntimeRecordReplay(cfg, container.control, {
     mode: opts.recordReplayMode,
     path: opts.recordReplayPath,
   });
@@ -219,7 +223,9 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   const baseline =
     isIncrementalIntent(intent)
-      ? await loadIncrementalBaseline(ws, container.state, { planPath: opts.baselinePlanFile })
+      ? await loadIncrementalBaseline(ws, container.state, {
+          planPath: opts.baselinePlanFile ?? container.phasePlanPath(),
+        })
       : { summary: '', sources: [] };
   if (isIncrementalIntent(intent) && !baseline.summary) {
     const msg = M.compile.baselineMissing(ws.root);
@@ -288,6 +294,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       initialLanguage.language,
       io.terminalOutput === true,
       opts.abortSignal,
+      capabilities.skills,
     );
     trace('ora.clarify.start');
     const spin = io.progress(M.compile.spinClarify, { animate: false });
@@ -349,19 +356,20 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   // 3. Draft topic.md + 确认门 1
   //   topic.md 是“需求澄清后的项目选题书”，作为后续 V 模型拆解的唯一输入。
   //   topic 模式下：rawRequirement 就是用户传入的 topic.md 全文，直接落盘，不再 render/Gate 1。
-  const draftDir = 'docs/.draft';
+  const draftWs = container.state;
+  const draftDir = 'drafts/build';
   const draftTopic = `${draftDir}/topic.md`;
-  trace('ws.ensure.draftDir');
-  await ws.ensure(draftDir);
+  trace('state.ensure.draftDir');
+  await draftWs.ensure(draftDir);
   let topicMd: string;
   if (topicMode) {
     topicMd = rawRequirement;
-    await ws.writeFile(draftTopic, topicMd);
+    await draftWs.writeFile(draftTopic, topicMd);
   } else {
     trace('renderTopicDraft');
     topicMd = renderTopicDraft(rawRequirement, clarifications, userAddenda);
     trace('ws.writeFile.draftTopic');
-    await ws.writeFile(draftTopic, topicMd);
+    await draftWs.writeFile(draftTopic, topicMd);
     trace('ws.writeFile.draftTopic.done');
 
     if (!opts.yes) {
@@ -379,7 +387,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       });
       await audit.userDecision(M.compile.gate1AuditLabel, decision);
       if (decision === 'cancel') {
-        await ws.remove(draftDir);
+        await draftWs.remove(draftDir);
         await runtimeLog(io, 'warning', M.compile.gate1Cancelled);
         await audit.end({ status: 'cancelled', gate: 1 });
         await runtimeResult(io, 'build', 'cancelled', { gate: 1 });
@@ -387,7 +395,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       }
       if (decision === 'edit') {
         const edited = await interaction.editor({ message: M.compile.editTopicMsg, default: topicMd, postfix: '.md' });
-        await ws.writeFile(draftTopic, edited);
+        await draftWs.writeFile(draftTopic, edited);
         await audit.userInput(M.compile.auditEditedTopic, edited);
       }
     }
@@ -397,7 +405,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   //   这样即使后续 decompose / lint 失败，已澄清的 topic 仍然落盘，
   //   下次可用 `xcompiler build --topic docs/topic.md` 直接重跑而不必再澄清一次。
   trace('ws.readFile.finalTopic');
-  const finalTopicMd = await ws.readFile(draftTopic);
+  const finalTopicMd = await draftWs.readFile(draftTopic);
   const languageResolution = resolveCompileLanguage({
     rawRequirement: finalTopicMd,
     clarifications,
@@ -412,7 +420,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     source: languageResolution.source,
     ambiguous: languageResolution.ambiguous,
   });
-  await archiveIfExists(ws, DOC_NAMES.topic, audit);
+  await archiveIfExists(ws, DOC_NAMES.topic, audit, container.state);
   await ws.writeFile(DOC_NAMES.topic, finalTopicMd);
   await audit.event('topic.persist', M.compile.auditTopicPersisted(ws.abs(DOC_NAMES.topic)), {
     messageId: 'compile.topic_persisted',
@@ -423,8 +431,8 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
 
   // 4. Decompose — with topic.md as the V-model input
   const phasePlanPath = opts.outputFile
-    ? path.resolve(opts.outputFile)
-    : defaultPhasePlanPath(ws.root);
+    ? assertControlFilePath(container, path.resolve(opts.outputFile), 'PhasePlan')
+    : defaultPhasePlanPath(container.control.root);
   const phasePlanSourceDigest = buildPhasePlanSourceDigest({
     topic: finalTopicMd,
     language,
@@ -445,6 +453,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       language,
       io.terminalOutput === true,
       opts.abortSignal,
+      capabilities.skills,
     );
     const plannerInput: PlannerInput = {
       rawRequirement: finalTopicMd,
@@ -455,11 +464,29 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     };
     const decomposeContext = { input: plannerInput };
     await pluginHost.emit('compile.beforeDecompose', decomposeContext);
+    const checkpointValidationIssue = existingPhasePlan
+      ? validateImplementationPhaseDraft(
+          existingPhasePlan.phases.map(({ planPath: _planPath, ...phase }) => phase),
+          existingPhasePlan.complexityAssessment,
+          {
+            language,
+            expectedCurrentPhaseId: existingPhasePlan.currentPhaseId,
+          },
+        )
+      : undefined;
     const reusableCheckpoint =
       !opts.force &&
       existingPhasePlan?.sourceDigest === phasePlanSourceDigest &&
       existingPhasePlan.language === language &&
-      existingPhasePlan.intent === intent;
+      existingPhasePlan.intent === intent &&
+      !checkpointValidationIssue;
+    if (checkpointValidationIssue && existingPhasePlan) {
+      await audit.event('note', `rejecting invalid PhasePlan checkpoint: ${checkpointValidationIssue}`, {
+        messageId: 'compile.phase_plan_checkpoint_rejected',
+        phasePlanPath,
+        reason: checkpointValidationIssue,
+      });
+    }
     let draftPhasePlan: DraftPhasePlan;
     if (reusableCheckpoint && existingPhasePlan) {
       draftPhasePlan = {
@@ -529,15 +556,17 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     intent,
     baselineSummary: baseline.summary,
   });
+  capabilities.skills.validateRefs(plan.steps.flatMap((step) => step.tools));
   const planContext = { plan };
   await pluginHost.emit('compile.afterPlan', planContext);
   plan = planContext.plan;
+  capabilities.skills.validateRefs(plan.steps.flatMap((step) => step.tools));
   const parsed = PlanSchema.safeParse(plan);
   if (!parsed.success) {
     await runtimeLog(io, 'error', M.compile.schemaFail);
     await runtimeLog(io, 'raw', JSON.stringify(parsed.error.format(), null, 2));
-    await ws.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
-    await runtimeLog(io, 'dim', M.compile.schemaInvalidSavedAt(ws.abs(`${draftDir}/plan.invalid.json`)));
+    await draftWs.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
+    await runtimeLog(io, 'dim', M.compile.schemaInvalidSavedAt(draftWs.abs(`${draftDir}/plan.invalid.json`)));
     throw new CompileExitError(2, M.compile.schemaFail);
   }
   const issues = lintPlan(parsed.data).filter((i) => i.level === 'error');
@@ -545,7 +574,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     await runtimeLog(io, 'error', M.compile.lintFail(issues.length));
     for (const i of issues) await runtimeLog(io, 'raw', M.compile.lintIssue(i.stepId ?? '*', i.message));
     // 落到 draft 便于排查
-    await ws.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
+    await draftWs.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
     throw new CompileExitError(3, M.compile.lintFail(issues.length));
   }
 
@@ -581,7 +610,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   }
 
   const planMd = renderPlanMarkdown(persistedPlan);
-  await ws.writeFile(`${draftDir}/plan.md`, planMd);
+  await draftWs.writeFile(`${draftDir}/plan.md`, planMd);
 
   // 6. 确认门 2
   if (!opts.yes) {
@@ -596,7 +625,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     });
     await audit.userDecision(M.compile.gate2AuditLabel, ok ? 'confirm' : 'reject');
     if (!ok) {
-      await ws.remove(draftDir);
+      await draftWs.remove(draftDir);
       await runtimeLog(io, 'warning', M.compile.gate2Rejected);
       await audit.end({ status: 'rejected', gate: 2 });
       await runtimeResult(io, 'build', 'rejected', { gate: 2 });
@@ -617,14 +646,14 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   });
   await savePhasePlan(phasePlanPath, phasePlan);
   // 归档上一版本（如有），再写入新版本。topic.md 已在第 3.5 步落盘，这里只处理 plan.
-  await archiveIfExists(ws, DOC_NAMES.plan, audit);
+  await archiveIfExists(ws, DOC_NAMES.plan, audit, container.state);
   await ws.writeFile(DOC_NAMES.plan, planMd);
   await refreshProjectMemory(ws, container.state, {
     planPath,
     language: persistedPlan.language,
     intent: persistedPlan.intent,
   });
-  await ws.remove(draftDir);
+  await draftWs.remove(draftDir);
   await audit.event('plan.persist', M.compile.auditPlanPersisted(planPath), {
     messageId: 'compile.plan_persisted',
     planPath,
@@ -752,6 +781,13 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     try { await scoreStore?.flush(); } catch { /* never block release */ }
     await lock.release();
   }
+}
+
+function assertControlFilePath(container: ProjectContainer, target: string, label: string): string {
+  if (path.dirname(target) !== container.control.root) {
+    throw new Error(`${label} must be stored in the project root ${container.control.root}: ${target}`);
+  }
+  return target;
 }
 
 function buildPhasePlanSourceDigest(input: {

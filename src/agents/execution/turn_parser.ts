@@ -82,6 +82,20 @@ const EXECUTION_TURN_ROOT_KEYS = new Set([
   'id',
 ]);
 
+const PROVIDER_ENVELOPE_ROOT_KEYS = new Set([
+  'messages',
+  'choices',
+  'model',
+  'usage',
+  'object',
+  'created',
+  'system_fingerprint',
+  'request',
+  'input',
+  'response',
+  'output',
+]);
+
 export function parseTurn(text: string): LLMTurn {
   const cleaned = stripFence(text).trim();
   const direct = tryParseTurnCandidate(cleaned);
@@ -115,16 +129,21 @@ export function isCompleteTurnJson(text: string): boolean {
 }
 
 /**
- * Returns an impossible top-level key as soon as a streamed JSON object exposes it.
- * This lets the provider router stop request-envelope echoes and switch models without
- * waiting for the entire invalid payload to be generated.
+ * Returns a known provider/request envelope key as soon as a streamed JSON object exposes it.
+ * Unknown keys are ordinary invalid model content and must reach the caller's validation hook so
+ * the same provider receives actionable repair feedback. Only known envelopes are stopped early
+ * because an echoed request can otherwise reproduce the entire prompt before validation runs.
  */
 export function rejectedExecutionTurnEnvelopeKey(text: string): string | undefined {
   const cleaned = stripFence(text).trimStart();
   const match = /^\{\s*"((?:\\.|[^"\\])*)"\s*:/u.exec(cleaned);
   if (!match?.[1]) return undefined;
   const key = parseJsonStringLiteral(match[1]);
-  return key && !EXECUTION_TURN_ROOT_KEYS.has(key) ? key : undefined;
+  return key &&
+    !EXECUTION_TURN_ROOT_KEYS.has(key) &&
+    PROVIDER_ENVELOPE_ROOT_KEYS.has(key)
+    ? key
+    : undefined;
 }
 
 export function extractBugResolutionPlan(turn: LLMTurn): string | undefined {

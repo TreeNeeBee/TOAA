@@ -2,7 +2,7 @@ import type { ClarifyQuestion, PlannerInput } from '../agents/planner.js';
 import type { AuditLogger } from '../audit/audit.js';
 import type { Plan, PlanIntent, Role, Step } from '../core/plan.js';
 import type { ChatMessage, ChatOptions } from '../llm/types.js';
-import type { Skill } from '../skills/skill.js';
+import type { AgentSkillMetadata, SkillSource } from '../skills/types.js';
 import type { Tool, ToolContext, ToolResult } from '../tools/types.js';
 
 export interface EngineRunSummary {
@@ -152,7 +152,8 @@ export interface PluginApi {
     options?: HookRegistrationOptions,
   ): () => void;
   registerTool(tool: Tool): void;
-  registerSkill(skill: Skill): void;
+  /** Register an Agent Skills Specification directory containing SKILL.md files. */
+  registerSkillDirectory(directory: string): void;
 }
 
 /** 可序列化的插件清单；后续 registry / marketplace 不需要加载插件代码即可读取。 */
@@ -171,6 +172,8 @@ export interface XCompilerPluginManifest {
   license?: string;
   homepage?: string;
   keywords?: string[];
+  /** Agent Skills Specification directories, resolved relative to the plugin entry module. */
+  skills?: string[];
 }
 
 export type PluginCompatibilityCode =
@@ -205,6 +208,8 @@ export interface PluginSource {
   entryPath: string;
   /** 模块导出名，默认 `default`。 */
   exportName?: string;
+  /** Plugin root used to resolve manifest-declared Skill directories. Defaults to entry directory. */
+  rootPath?: string;
 }
 
 export interface PluginLoadOptions {
@@ -231,7 +236,7 @@ export interface PluginExtensionTarget {
     register(tool: Tool): void;
   };
   skills: {
-    get(name: string): Skill | undefined;
-    register(skill: Skill): void;
+    get(name: string): AgentSkillMetadata | undefined;
+    registerDirectory(directory: string, source: SkillSource): AgentSkillMetadata[];
   };
 }

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
-import type { Ticket } from '../../domain/tickets/ticket.js';
+import type { Ticket, TicketWorkspaceBinding } from '../../domain/tickets/ticket.js';
 import type { ContextRecord } from '../../domain/context/context_record.js';
 import type { DebugBrief } from '../../core/debug_brief.js';
 import type { DebugWikiMatch } from '../../core/debug_wiki.js';
@@ -62,6 +62,7 @@ export interface TicketContextView {
   constraints: string[];
   acceptance: string[];
   acceptedDecisions: string[];
+  workspace?: TicketWorkspaceBinding;
 }
 
 export interface ContextSnapshot {
@@ -208,6 +209,7 @@ function viewOf(ticket: Ticket, record?: ContextRecord): TicketContextView {
     acceptedDecisions: (record?.decisions ?? [])
       .filter((decision) => decision.status === 'accepted')
       .map((decision) => decision.decision),
+    workspace: ticket.workspaceBinding,
   };
 }
 
@@ -247,6 +249,14 @@ function renderContext(
     sections.push(['## Ticket Hierarchy', ...parts.ticketChain.map((view, index) => [
       `### ${index === parts.ticketChain.length - 1 ? 'Current' : 'Parent'} ${view.name}`,
       `objective: ${view.objective}`,
+      ...(view.workspace
+        ? [
+            `workspace: ${view.workspace.kind} ${view.workspace.relativePath}`,
+            `branch: ${view.workspace.branch}`,
+            `workspace revision: ${view.workspace.revision}`,
+            'tool path rule: every file-tool path is relative to this workspace root; never include the workspace prefix',
+          ]
+        : []),
       ...view.constraints.map((item) => `constraint: ${item}`),
       ...view.acceptance.map((item) => `acceptance: ${item}`),
       ...view.acceptedDecisions.map((item) => `decision: ${item}`),

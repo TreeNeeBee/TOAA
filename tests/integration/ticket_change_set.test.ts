@@ -13,7 +13,11 @@ import { compileProjectGraph } from '../../src/domain/planning/compiler.js';
 import { ProjectGraphPersistenceService } from '../../src/application/planning/project_graph_persistence_service.js';
 import { PLAN_VERSION, type Plan } from '../../src/core/plan.js';
 import { STEP_TYPES } from '../../src/domain/steps/step.js';
-import { TicketSchema, type Ticket } from '../../src/domain/tickets/ticket.js';
+import {
+  TicketSchema,
+  bindTicketWorkspace,
+  type Ticket,
+} from '../../src/domain/tickets/ticket.js';
 import { transitionChangeSet } from '../../src/domain/workspace/change_set.js';
 
 function samplePlan(): Plan {
@@ -73,10 +77,11 @@ async function fixture() {
     projectName: 'fixture',
   });
   await new ProjectGraphPersistenceService(repository).persistGraph(graph);
+  const gitRepository = new GitRepositoryService(canonical);
   const service = new TicketChangeSetService(
     repository,
     projectContainer,
-    new GitRepositoryService(canonical),
+    gitRepository,
   );
   // CODE is the only Step that develops in isolation, so it is the only one with a ChangeSet.
   const coding = graph.steps.find((step) => step.type === 'CODE')!;
@@ -90,7 +95,10 @@ async function fixture() {
       candidate.type === 'story' &&
       candidate.stepId === design.id,
   )!;
-  return { container, canonical, repository, service, projectContainer, graph, story, coding, design, designStory };
+  return {
+    container, canonical, repository, service, projectContainer, gitRepository,
+    graph, story, coding, design, designStory,
+  };
 }
 
 describe('TicketChangeSetService', () => {
@@ -104,6 +112,47 @@ describe('TicketChangeSetService', () => {
     expect(resolved.root).toBe(canonical);
     expect(resolved.changeSet).toBeUndefined();
     expect(await repository.list({ objectType: 'ticket-change-set' })).toEqual([]);
+  });
+
+  it('promotes a rejected canonical commit into the corrective worktree before mainline rollback', async () => {
+    const {
+      service, canonical, repository, gitRepository, design, designStory,
+    } = await fixture();
+    const baseRevision = await gitRepository.head();
+    const canonicalGit = simpleGit({ baseDir: canonical });
+    const rejectedPath = path.join(canonical, 'docs', 'high-level-design.md');
+    await fs.mkdir(path.dirname(rejectedPath), { recursive: true });
+    await fs.writeFile(rejectedPath, '# rejected candidate\n');
+    await canonicalGit.add('.');
+    await canonicalGit.commit('[xcompiler] rejected candidate');
+    const candidateRevision = await gitRepository.head();
+
+    const promoted = await service.preserveRejectedCandidate({
+      ticketId: designStory.id,
+      candidateRevision,
+      baseRevision,
+    });
+    await canonicalGit.raw(['reset', '--hard', baseRevision]);
+
+    expect(promoted.changeSet).toMatchObject({
+      rootTicketId: designStory.id,
+      baseRevision,
+      currentRevision: candidateRevision,
+      state: 'developing',
+    });
+    expect(promoted.ticket.workspaceBinding).toMatchObject({
+      kind: 'ticket',
+      revision: candidateRevision,
+      changeSetId: promoted.changeSet?.id,
+    });
+    expect(await fs.readFile(path.join(promoted.root, 'docs', 'high-level-design.md'), 'utf8'))
+      .toBe('# rejected candidate\n');
+    await expect(fs.stat(rejectedPath)).rejects.toThrow();
+
+    const correction = await registerChangeRequest(repository, promoted.ticket);
+    const inherited = await service.ensureFor(correction, design);
+    expect(inherited.changeSet?.id).toBe(promoted.changeSet?.id);
+    expect(inherited.root).toBe(promoted.root);
   });
 
   it('creates one branch and worktree for a root Ticket', async () => {
@@ -147,6 +196,70 @@ describe('TicketChangeSetService', () => {
 
     const all = await repository.list({ objectType: 'ticket-change-set', projectId: story.projectId });
     expect(all).toHaveLength(1);
+  });
+
+  it('keeps a correction in its discovery worktree when PM routes it back to design', async () => {
+    const { service, repository, story, coding, design } = await fixture();
+    const candidate = await service.ensureFor(story, coding);
+    // Shape of a Ticket persisted before workspace binding existed: its CR source still points to
+    // the CODE Story, but the Ticket itself carries no workspace fields yet.
+    const request = await registerChangeRequest(repository, story);
+
+    const rollback = await service.ensureFor(request, design);
+
+    expect(rollback.root).toBe(candidate.root);
+    expect(rollback.changeSet?.id).toBe(candidate.changeSet?.id);
+    expect(rollback.ticket.workspaceBinding?.relativePath)
+      .toBe(candidate.ticket.workspaceBinding?.relativePath);
+    expect(rollback.ticket.workspaceBindingHistory).toHaveLength(1);
+  });
+
+  it('promotes a failed gate candidate into the ChangeSet correction worktree', async () => {
+    const {
+      service, repository, projectContainer, gitRepository, story, coding, design,
+    } = await fixture();
+    const original = await service.ensureFor(story, coding);
+    const runId = createObjectId();
+    const gateBranch = `xcompiler/gate/${runId}`;
+    const gate = projectContainer.gate(createObjectId(), runId, gateBranch);
+    await gitRepository.addWorktree({
+      path: gate.workspace.root,
+      branch: gateBranch,
+      startPoint: original.changeSet!.currentRevision,
+    });
+    const candidateRevision = await new GitRepositoryService(gate.workspace.root).head();
+    const boundStory = await repository.read(story.id);
+    if (boundStory.objectType !== 'ticket') throw new Error('fixture Story is missing');
+    const queuedBeforePromotion = await registerChangeRequest(repository, boundStory);
+    let bug = await registerBug(repository, boundStory);
+    bug = bindTicketWorkspace(bug, {
+      kind: 'gate',
+      relativePath: path.relative(projectContainer.root, gate.workspace.root).split(path.sep).join('/'),
+      branch: gateBranch,
+      revision: candidateRevision,
+      changeSetId: original.changeSet!.id,
+      mergeGateRunId: runId,
+      reason: 'merge-gate',
+      boundAt: new Date().toISOString(),
+    });
+    await repository.update(bug, bug.state);
+
+    const promoted = await service.ensureFor(bug, coding);
+
+    expect(promoted.root).toBe(gate.workspace.root);
+    expect(promoted.workspace?.kind).toBe('gate');
+    expect(promoted.changeSet?.sourceBranch).toBe(gateBranch);
+    expect(promoted.changeSet?.workspaceId).toBe(promoted.workspace?.id);
+    expect(promoted.ticket.workspaceBinding?.workspaceId).toBe(promoted.workspace?.id);
+    await expect(fs.stat(original.root)).rejects.toThrow();
+
+    const recovered = await service.ensureFor(queuedBeforePromotion, design);
+    expect(recovered.root).toBe(gate.workspace.root);
+    expect(recovered.ticket.workspaceBinding).toMatchObject({
+      kind: 'gate',
+      workspaceId: promoted.workspace?.id,
+      changeSetId: promoted.changeSet?.id,
+    });
   });
 
   it('is idempotent, so an interrupted run does not open a second branch', async () => {

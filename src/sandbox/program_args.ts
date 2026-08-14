@@ -25,8 +25,15 @@ export function resolveTypeScriptProgramCommand(args: string[]): TypeScriptProgr
   if (first === 'tsc') {
     return { cmd: 'npx', argv: ['tsc', ...rest], display: formatCommand('npx', ['tsc', ...rest]) };
   }
+  if (isWorkspaceBinary(first)) {
+    return { cmd: first, argv: rest, display: formatCommand(first, rest) };
+  }
 
   return { cmd: 'npx', argv: ['tsx', ...args], display: formatCommand('npx', ['tsx', ...args]) };
+}
+
+function isWorkspaceBinary(value: string): boolean {
+  return /^(?:\.\/)?node_modules[\\/]\.bin[\\/][^\\/]+$/u.test(value);
 }
 
 function formatCommand(cmd: string, argv: string[]): string {

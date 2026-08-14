@@ -25,8 +25,9 @@ export function parseImplementationPhases(value: unknown): ImplementationPhase[]
 export function validateImplementationPhaseDraft(
   phases: ImplementationPhase[],
   assessment: ComplexityAssessment,
-  expectedCurrentPhaseId = 'P1',
+  context: { language: Language; expectedCurrentPhaseId?: string },
 ): string | undefined {
+  const expectedCurrentPhaseId = context.expectedCurrentPhaseId ?? 'P1';
   const requiredCount = requiredImplementationPhaseCount(assessment);
   const executable = phases.filter((phase) => phase.status !== 'deferred');
   if (executable.length < requiredCount) {
@@ -66,8 +67,65 @@ export function validateImplementationPhaseDraft(
     if (incomplete) {
       return `${phase.id} deliveryGate scenario ${incomplete.name} must define concrete execution.command and execution.args`;
     }
+    for (const scenario of liveScenarios) {
+      const executionIssue = validateDeliveryExecution(
+        scenario.execution!,
+        context.language,
+      );
+      if (executionIssue) {
+        return `${phase.id} deliveryGate scenario ${scenario.name} ${executionIssue}`;
+      }
+    }
   }
   return undefined;
+}
+
+export function validateCurrentPhaseDeliveryEntrypoints(
+  phase: ImplementationPhase,
+  steps: Step[],
+  language: Language,
+): string | undefined {
+  const codeOutputs = new Set(
+    steps
+      .filter((step) => step.phase === 'CODE')
+      .flatMap((step) => step.outputs)
+      .map(normalizePlanPath),
+  );
+  const extensions = language === 'typescript' ? /\.tsx?$/iu : /\.py$/iu;
+  for (const scenario of phase.deliveryGate?.scenarios ?? []) {
+    if (scenario.environment !== 'live' || !scenario.execution) continue;
+    const entrypaths = scenario.execution.args
+      .map(normalizePlanPath)
+      .filter((arg) => extensions.test(arg));
+    const missing = entrypaths.filter((entrypath) => !codeOutputs.has(entrypath));
+    if (missing.length > 0) {
+      return `${phase.id} deliveryGate scenario ${scenario.name} references entry file(s) not delivered by ` +
+        `the current phase CODE Step: ${missing.join(', ')}`;
+    }
+  }
+  return undefined;
+}
+
+function validateDeliveryExecution(
+  execution: { command: string; args: string[] },
+  language: Language,
+): string | undefined {
+  const command = execution.command.trim();
+  if (/\s/u.test(command)) {
+    return 'execution.command must contain one executable only; move every argument into execution.args';
+  }
+  if (language !== 'typescript') return undefined;
+
+  const toolchain = [command, ...execution.args].map((token) => token.toLowerCase());
+  const forbidden = toolchain.find((token) => /^(?:ts-node|nodemon|jest|ts-jest)(?:$|\/)/u.test(token));
+  if (forbidden) {
+    return `uses forbidden TypeScript runner ${forbidden}; use Node 24, npx tsx, npm, or Vitest as appropriate`;
+  }
+  return undefined;
+}
+
+function normalizePlanPath(value: string): string {
+  return value.trim().replace(/^\.\//u, '').replace(/\\/gu, '/');
 }
 
 export function validateIterationVModelDraft(

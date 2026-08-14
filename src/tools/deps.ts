@@ -1,4 +1,9 @@
 import { promises as fs } from 'node:fs';
+import {
+  removeWorkspaceFile,
+  writeWorkspaceFile,
+  type FileTreeSink,
+} from './workspace_write.js';
 import type { Tool, ToolContext } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import { DEPENDENCY_MANIFEST_OWNER } from '../domain/steps/step.js';
@@ -96,7 +101,7 @@ export const addDependencyTool: Tool<
       if (Object.keys(devDependencies).length > 0) {
         pkg.devDependencies = sortedDependencySection(devDependencies);
       }
-      await fs.writeFile(abs, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
+      await writeWorkspaceFile(abs, JSON.stringify(pkg, null, 2) + '\n', { tree: ctx.fileTree, root: ctx.ws.root });
     } else {
       let existing = '';
       try {
@@ -118,14 +123,16 @@ export const addDependencyTool: Tool<
       if (added.length === 0) {
         return unchangedDependencyResult(ctx, manifestPath, final);
       }
-      await fs.writeFile(abs, final.join('\n') + '\n', 'utf8');
+      await writeWorkspaceFile(abs, final.join('\n') + '\n', { tree: ctx.fileTree, root: ctx.ws.root });
     }
     try {
       await ctx.sandbox.build(manifestPath, {
         refreshLockfile: ctx.language === 'typescript',
       });
     } catch (err) {
-      const rollbackErrors = await restoreWorkspaceFiles(snapshots);
+      const rollbackErrors = await restoreWorkspaceFiles(snapshots, {
+        tree: ctx.fileTree, root: ctx.ws.root,
+      });
       const rollbackSummary = rollbackErrors.length === 0
         ? `${manifestPath} and related lockfiles were restored`
         : `rollback was incomplete: ${rollbackErrors.join('; ')}`;
@@ -163,16 +170,24 @@ async function snapshotWorkspaceFile(abs: string): Promise<WorkspaceFileSnapshot
   }
 }
 
+/**
+ * Puts the manifest back when the environment refuses the change.
+ *
+ * The index is threaded through because a rollback is a file change like any other: leaving it out
+ * would leave the tree describing a dependency set the project does not have, which is exactly the
+ * state the rollback exists to undo.
+ */
 async function restoreWorkspaceFiles(
   snapshots: WorkspaceFileSnapshot[],
+  index: { tree?: FileTreeSink; root?: string },
 ): Promise<string[]> {
   const errors: string[] = [];
   for (const snapshot of snapshots) {
     try {
       if (snapshot.existed) {
-        await fs.writeFile(snapshot.abs, snapshot.content!);
+        await writeWorkspaceFile(snapshot.abs, snapshot.content!, index);
       } else {
-        await fs.rm(snapshot.abs, { force: true });
+        await removeWorkspaceFile(snapshot.abs, index);
       }
     } catch (err) {
       errors.push(`${snapshot.abs}: ${(err as Error).message}`);

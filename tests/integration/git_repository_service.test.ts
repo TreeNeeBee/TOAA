@@ -141,6 +141,6 @@ describe('GitService inside a linked worktree', () => {
     await new GitService(new Workspace(linked)).ensureRepo();
 
     const exclude = await new GitRepositoryService(linked).gitPath('info/exclude');
-    expect(await fs.readFile(exclude, 'utf8')).toContain('.xcompiler/*');
+    expect(await fs.readFile(exclude, 'utf8')).toContain('.xcw/');
   });
 });

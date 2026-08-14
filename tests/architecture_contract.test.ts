@@ -363,9 +363,14 @@ describe('V-model architecture contract', () => {
       .filter((item) => !['S004', 'S005'].includes(item.id))
       .map((item) => ({
         ...item,
-        outputs: item.id === 'S006'
-          ? [...item.outputs, 'docs/tests/unit-test-plan.md', 'tests/test_unit.py']
-          : item.outputs,
+        inputs: item.id === 'S012'
+          ? item.inputs.filter((input) => !['src/main.py', 'src/domain.py', 'tests/test_main.py', 'tests/test_domain.py'].includes(input))
+          : item.inputs,
+        outputs: item.id === 'S002'
+          ? item.outputs.filter((output) => !['tests/test_main.py', 'tests/test_domain.py'].includes(output))
+          : item.id === 'S006'
+            ? [...item.outputs, 'docs/tests/unit-test-plan.md', 'tests/test_unit.py']
+            : item.outputs,
         dependsOn: item.dependsOn.filter((dependency) => !['S004', 'S005'].includes(dependency)),
       }));
 

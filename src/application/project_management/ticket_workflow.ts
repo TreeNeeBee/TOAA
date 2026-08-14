@@ -1,6 +1,6 @@
 import { createObjectEnvelope, reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
-import type { Step, StepType } from '../../domain/steps/step.js';
+import { stepDependsOn, stepSatisfiesDependency, type Step, type StepType } from '../../domain/steps/step.js';
 import {
   TICKET_PRIORITY,
   TicketSchema,
@@ -12,12 +12,13 @@ import {
   type Ticket,
   type TicketSource,
   type TicketSolution,
+  type TicketWorkspaceBinding,
   type WorkTicket,
 } from '../../domain/tickets/ticket.js';
 import { ChangelistSchema, type Changelist } from '../../domain/evidence/evidence.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import { capabilitiesForStep } from '../../domain/workflow/role_profile.js';
-import { TicketLifecycleService } from './ticket_lifecycle_service.js';
+import { TicketLifecycleService, releaseCapacityFor } from './ticket_lifecycle_service.js';
 import { TicketTraceService } from './ticket_trace_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 import type { ActorRegistration } from '../../domain/project_management/index.js';
@@ -70,6 +71,7 @@ export class TicketWorkflow {
     routingObjects?: readonly PersistedDomainObject[];
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<BugTicket> {
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
@@ -78,6 +80,9 @@ export class TicketWorkflow {
     if (parentChangeRequest && parentChangeRequest.type !== 'change-request') {
       throw new Error(`Bug parent ${parentChangeRequest.id} is not a Change Request`);
     }
+    const causationTicket = input.causationId
+      ? await this.ticketIfPresent(input.causationId)
+      : undefined;
     const existing = (await this.list()).find((ticket): ticket is BugTicket =>
       ticket.type === 'bug' &&
       ticket.state !== 'closed' &&
@@ -95,6 +100,11 @@ export class TicketWorkflow {
       objectType: 'ticket',
       projectId: input.targetStep.projectId,
     });
+    const workspaceBinding = inheritedWorkspaceBinding(
+      input.workspaceBinding ?? parentChangeRequest?.workspaceBinding ??
+        causationTicket?.workspaceBinding ?? targetStory.workspaceBinding,
+      envelope.createdAt,
+    );
     const bug = TicketSchema.parse({
       ...envelope,
       type: 'bug',
@@ -114,6 +124,9 @@ export class TicketWorkflow {
         'Persist the verified solution to debug-wiki.',
       ],
       relatedTicketIds: [targetStory.id, ...(parentChangeRequest ? [parentChangeRequest.id] : [])],
+      ...(workspaceBinding
+        ? { workspaceBinding, workspaceBindingHistory: [workspaceBinding] }
+        : {}),
       state: 'created',
       submittedAt: envelope.createdAt,
       source: {
@@ -175,6 +188,7 @@ export class TicketWorkflow {
     verificationStep: Step;
     kind: EnhancementTicket['enhancementKind'];
     finding: string;
+    affectedArtifacts?: string[];
     sourceQualityAssessmentId?: ObjectId;
     sourceBugTicketId?: ObjectId;
     parentChangeRequestId?: ObjectId;
@@ -183,6 +197,7 @@ export class TicketWorkflow {
     routingObjects?: readonly PersistedDomainObject[];
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<EnhancementTicket> {
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
@@ -191,6 +206,9 @@ export class TicketWorkflow {
     if (parentChangeRequest && parentChangeRequest.type !== 'change-request') {
       throw new Error(`Enhancement parent ${parentChangeRequest.id} is not a Change Request`);
     }
+    const causationTicket = input.causationId
+      ? await this.ticketIfPresent(input.causationId)
+      : undefined;
     const existing = (await this.list()).find((ticket): ticket is EnhancementTicket =>
       ticket.type === 'enhancement' &&
       ticket.state !== 'closed' &&
@@ -209,6 +227,11 @@ export class TicketWorkflow {
       objectType: 'ticket',
       projectId: input.targetStep.projectId,
     });
+    const workspaceBinding = inheritedWorkspaceBinding(
+      input.workspaceBinding ?? parentChangeRequest?.workspaceBinding ??
+        causationTicket?.workspaceBinding ?? targetStory.workspaceBinding,
+      envelope.createdAt,
+    );
     const enhancement = TicketSchema.parse({
       ...envelope,
       type: 'enhancement',
@@ -224,6 +247,9 @@ export class TicketWorkflow {
       description: input.finding,
       acceptance: [input.finding, `Pass ${input.verificationStep.name}.`],
       relatedTicketIds: [targetStory.id, ...(parentChangeRequest ? [parentChangeRequest.id] : [])],
+      ...(workspaceBinding
+        ? { workspaceBinding, workspaceBindingHistory: [workspaceBinding] }
+        : {}),
       maxAttempts: input.targetStep.maxAttempts,
       state: 'created',
       submittedAt: envelope.createdAt,
@@ -235,6 +261,7 @@ export class TicketWorkflow {
       },
       enhancementKind: input.kind,
       finding: input.finding,
+      affectedArtifacts: input.affectedArtifacts ?? [],
       sourceQualityAssessmentId: input.sourceQualityAssessmentId,
       sourceBugTicketId: input.sourceBugTicketId,
       targetStepId: input.targetStep.id,
@@ -281,18 +308,31 @@ export class TicketWorkflow {
     correlationId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    /** Previous downstream re-check in the same dependency-change chain. */
+    parentChangeRequestId?: ObjectId;
   }): Promise<ChangeRequestTicket> {
-    const existing = await this.findOpenDependencyRequest(input.targetStep, input.packages);
+    const existing = await this.findOpenDependencyRequest(
+      input.targetStep,
+      input.packages,
+      input.requestingStepId,
+    );
     if (existing) return existing;
     // The work that discovered the need is the source; the request stands on its own rather than
     // descending from a defect, so it is also the root of its own thread.
     const requester = await this.storyForStep(input.requestingStepId);
+    const requestingTicket = input.requestingTicket
+      ? await this.requireTicket(input.requestingTicket.id)
+      : undefined;
     const envelope = createObjectEnvelope({
       name: await this.nextName('DEP', input.targetStep.name.split('-')[0] ?? 'P'),
       objectType: 'ticket',
       projectId: input.targetStep.projectId,
     });
     const summary = `Dependencies required downstream: ${input.packages.join(', ')}`;
+    const workspaceBinding = inheritedWorkspaceBinding(
+      requestingTicket?.workspaceBinding ?? requester.workspaceBinding,
+      envelope.createdAt,
+    );
     const request = TicketSchema.parse({
       ...envelope,
       type: 'change-request',
@@ -303,6 +343,7 @@ export class TicketWorkflow {
       creatorActorId: input.creatorActorId,
       requiredCapabilities: capabilitiesForStep(input.targetStep.type, 'change-request'),
       priority: TICKET_PRIORITY.high,
+      parentTicketId: requester.id,
       description: `${summary}. ${input.reason}`,
       acceptance: input.kind === 'recheck'
         ? [
@@ -322,9 +363,13 @@ export class TicketWorkflow {
         causationId: requester.id,
         externalId: input.sourceExternalId,
       },
-      rootTicketId: envelope.id,
+      rootTicketId: requester.rootTicketId,
       relatedTicketIds: [requester.id],
+      ...(workspaceBinding
+        ? { workspaceBinding, workspaceBindingHistory: [workspaceBinding] }
+        : {}),
       sourceTicketId: requester.id,
+      parentChangeRequestId: input.parentChangeRequestId,
       triggerStepId: input.requestingStepId,
       sourceStepId: input.requestingStepId,
       targetStepId: input.targetStep.id,
@@ -353,9 +398,9 @@ export class TicketWorkflow {
     // cannot proceed must not hold its role's capacity. A CODE Bug left `in_progress` here kept the
     // developer's only slot, and the re-check Change Request the answer arrives as targets that same
     // Step — so the run aborted with no actor able to take it.
-    if (input.requestingTicket) {
+    if (requestingTicket) {
       await this.repository.commit(
-        await this.blockers.prepare(input.requestingTicket, request.id, 'dependency'),
+        await this.blockers.prepare(requestingTicket, request.id, 'dependency'),
       );
     }
     return request;
@@ -364,6 +409,7 @@ export class TicketWorkflow {
   private async findOpenDependencyRequest(
     target: Step,
     packages: readonly string[],
+    requestingStepId: ObjectId,
   ): Promise<ChangeRequestTicket | undefined> {
     const wanted = new Set(packages);
     const objects = await this.repository.list({ objectType: 'ticket', projectId: target.projectId });
@@ -371,6 +417,7 @@ export class TicketWorkflow {
       object.objectType === 'ticket' &&
       object.type === 'change-request' &&
       object.targetStepId === target.id &&
+      object.sourceStepId === requestingStepId &&
       object.state !== 'closed' &&
       object.state !== 'cancelled' &&
       object.contractDelta.after.every((line) => wanted.has(line.split(' ')[0] ?? '')) &&
@@ -416,6 +463,7 @@ export class TicketWorkflow {
       objectType: 'ticket',
       projectId: source.projectId,
     });
+    const workspaceBinding = inheritedWorkspaceBinding(source.workspaceBinding, envelope.createdAt);
     const request = TicketSchema.parse({
       ...envelope,
       type: 'change-request',
@@ -435,6 +483,9 @@ export class TicketWorkflow {
       /** Source linkage is causal, not a scheduling dependency: the source waits for this CR. */
       dependencyTicketIds: [],
       relatedTicketIds: [source.id],
+      ...(workspaceBinding
+        ? { workspaceBinding, workspaceBindingHistory: [workspaceBinding] }
+        : {}),
       state: 'created',
       submittedAt: envelope.createdAt,
       source: {
@@ -757,6 +808,113 @@ export class TicketWorkflow {
     return ticket;
   }
 
+  /**
+   * Hands back work the scheduler can no longer reach.
+   *
+   * Work left `in_progress` is not by itself a problem: a deferred infrastructure failure leaves its
+   * Ticket exactly there so the next run resumes it. What cannot recover is a Ticket whose parent
+   * has since been blocked or parked — the scheduler will not start work it believes is already
+   * running, and will not descend into a parent it cannot work. A run killed mid-attempt left three
+   * tasks in that position; every later pass then saw active work it could not advance, and the
+   * phase stopped for lack of semantic progress with every actor idle.
+   */
+  async reclaimUnreachableWork(projectId: ObjectId): Promise<number> {
+    const objects = await this.repository.list({ objectType: 'ticket', projectId });
+    const byId = new Map(objects
+      .filter((object): object is Ticket => object.objectType === 'ticket')
+      .map((ticket) => [ticket.id, ticket]));
+    let reclaimed = 0;
+    for (const ticket of byId.values()) {
+      if (ticket.state !== 'in_progress' || !ticket.parentTicketId) continue;
+      const parent = byId.get(ticket.parentTicketId);
+      const parentBlocked = parent !== undefined &&
+        (parent.state === 'pending' || parent.blockedByTicketIds.length > 0);
+      if (!parentBlocked) continue;
+      const prepared = await this.lifecycle.prepareTransition(ticket, 'pending', {
+        pendingReason: 'interrupted',
+      });
+      const released = await releaseCapacityFor(this.repository, ticket);
+      await this.repository.commit([...prepared.objects, ...(released ? [released] : [])]);
+      reclaimed += 1;
+    }
+    return reclaimed;
+  }
+
+  /**
+   * Releases a Ticket parked behind a corrective hop that is itself waiting on that Ticket's Step.
+   *
+   * A repair chain that propagates a change forward opens hops on downstream Steps, and those Steps
+   * cannot become ready until the Step that discovered the defect delivers. While its Story stays
+   * parked, neither side can move: the Phase reports no semantic progress with every actor idle.
+   * Prevention lives where the hop is opened; this reclaims the runs that already recorded one.
+   */
+  async releaseCyclicCorrectiveBlockers(projectId: ObjectId): Promise<number> {
+    const objects = await this.repository.list({ projectId });
+    const tickets = objects.filter((object): object is Ticket => object.objectType === 'ticket');
+    const steps = new Map(objects
+      .filter((object): object is Step => object.objectType === 'step')
+      .map((step) => [step.id, step]));
+    const byId = new Map(tickets.map((ticket) => [ticket.id, ticket]));
+    // Unparking is capacity-bounded. A Ticket that resumes takes its role's slot back, so a role
+    // with one slot cannot take back two at once: the live run unparked a Story and a Change
+    // Request that both needed system-engineer, and routing then refused the second at 2/1 and
+    // aborted. What is left parked is released by a later pass, once the first one finishes.
+    const assignments = new Map(objects
+      .filter((object) => object.objectType === 'ticket-assignment')
+      .map((assignment) => [assignment.id, assignment]));
+    const headroom = new Map(objects
+      .filter((object) => object.objectType === 'actor-registration')
+      .map((actor) => [actor.id, actor.capacity - actor.activeAssignmentIds.length]));
+    let released = 0;
+    for (const ticket of tickets) {
+      if (ticket.blockedByTicketIds.length === 0 || !ticket.stepId) continue;
+      const own = steps.get(ticket.stepId);
+      // A Step that already delivered satisfies its dependants, so a hop downstream of it is
+      // reachable and the parking is the ordinary mid-repair hold.
+      if (!own || stepSatisfiesDependency(own)) continue;
+      for (const blockerId of ticket.blockedByTicketIds) {
+        const blocker = byId.get(blockerId);
+        if (!blocker) continue;
+        // A Bug holds its Story directly and advances through Change Requests, so the hop that
+        // cannot be reached is one edge further out than the blocker itself. Releasing only the
+        // direct Story-to-hop edge left the same Phase idle: the Story was still parked behind the
+        // Bug, and the Bug was still waiting for the hop that needed the Story.
+        // Hops are found through each Change Request's own `sourceTicketId`, the direction the
+        // closure cascade already trusts. The back-reference on the source is a denormalized copy
+        // and had drifted in the live run: the hop holding the Phase was absent from it.
+        const hops = blocker.type === 'change-request'
+          ? [blocker]
+          : tickets.filter((hop): hop is ChangeRequestTicket =>
+            hop.type === 'change-request' && hop.sourceTicketId === blocker.id);
+        const unreachable = hops.some((hop) => {
+          if (hop.state === 'closed' || hop.state === 'cancelled') return false;
+          const target = steps.get(hop.targetStepId);
+          return target !== undefined &&
+            target.id !== ticket.stepId &&
+            stepDependsOn(target, ticket.stepId!, steps);
+        });
+        if (!unreachable) continue;
+        // Re-read: releasing commits a revision, so a Ticket parked behind two such hops would
+        // offer a stale copy on the second pass.
+        const current = await this.requireTicket(ticket.id);
+        const resumes = current.state === 'pending' && current.blockedByTicketIds.length === 1;
+        const assignment = current.activeAssignmentId
+          ? assignments.get(current.activeAssignmentId)
+          : undefined;
+        const owner = assignment?.objectType === 'ticket-assignment' && assignment.capacityConsumed
+          ? assignment.assigneeActorId
+          : undefined;
+        if (resumes && owner !== undefined) {
+          if ((headroom.get(owner) ?? 0) <= 0) continue;
+          headroom.set(owner, (headroom.get(owner) ?? 0) - 1);
+        }
+        await this.blockers.releaseFrom(current, blockerId);
+        released += 1;
+      }
+    }
+    return released;
+  }
+
   async reconcileClosedCorrectiveTickets(projectId: ObjectId): Promise<void> {
     const closed = (await this.list()).filter((ticket) =>
       ticket.projectId === projectId &&
@@ -781,6 +939,15 @@ export class TicketWorkflow {
 
   private async requireTicket(id: ObjectId): Promise<Ticket> {
     return this.catalog.require(id);
+  }
+
+  private async ticketIfPresent(id: ObjectId): Promise<Ticket | undefined> {
+    try {
+      const object = await this.repository.read(id);
+      return object.objectType === 'ticket' ? object : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async findEquivalentChangelist(
@@ -889,6 +1056,13 @@ function severityPriority(severity: BugTicket['severity']): number {
   if (severity === 'high') return TICKET_PRIORITY.high;
   if (severity === 'medium') return TICKET_PRIORITY.normal;
   return TICKET_PRIORITY.low;
+}
+
+function inheritedWorkspaceBinding(
+  binding: TicketWorkspaceBinding | undefined,
+  boundAt: string,
+): TicketWorkspaceBinding | undefined {
+  return binding ? { ...binding, reason: 'inherited', boundAt } : undefined;
 }
 
 function replaceTicket(

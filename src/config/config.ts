@@ -229,14 +229,20 @@ const RecordReplaySchema = z.object({
   mode: z.enum(['off', 'record', 'replay', 'auto', 'refresh']).default('off'),
   /** Workspace-relative recording root. */
   path: z.string().min(1).default('.xcompiler/record-replay'),
-  channels: z.array(z.enum(['http', 'llm', 'subprocess', 'tool'])).default(['http', 'llm', 'subprocess']),
+  channels: z.array(z.enum(['http', 'llm', 'subprocess', 'tool'])).default(['http', 'llm']),
   redacted_fields: z.array(z.string().min(1)).default([]),
 }).strict().default({
   mode: 'off',
   path: '.xcompiler/record-replay',
-  channels: ['http', 'llm', 'subprocess'],
+  channels: ['http', 'llm'],
   redacted_fields: [],
 });
+
+const PermissionsSchema = z.object({
+  mode: z.enum(['request', 'auto', 'deny']).default('request'),
+  /** 0 means an interactive permission request waits until the user answers or cancels the task. */
+  timeout_ms: z.number().int().nonnegative().default(0),
+}).strict().default({ mode: 'request', timeout_ms: 0 });
 
 const ConfigSchema = z.object({
   /** CLI / prompt locale. Accepts 'en' (default) or 'zh'. */
@@ -244,6 +250,7 @@ const ConfigSchema = z.object({
   llm: LlmSchema,
   agent: AgentSchema,
   record_replay: RecordReplaySchema,
+  permissions: PermissionsSchema,
 }).strict();
 
 export type XCompilerConfig = z.infer<typeof ConfigSchema>;

@@ -93,6 +93,7 @@ export class ProjectManagerIntakeService {
             details: {
               reportOrigin: input.origin,
               findingTarget: report.target,
+              affectedArtifacts: report.affectedArtifacts ?? [],
               evidence: report.evidence,
               scene: report.scene,
             },
@@ -107,6 +108,7 @@ export class ProjectManagerIntakeService {
           sourceStepId: target.id,
           targetStepId: target.id,
           finding: reportText,
+          affectedArtifacts: report.affectedArtifacts ?? [],
           kind: report.category === 'test-incomplete'
             ? 'test-incomplete'
             : report.category === 'deliverable-defect'
@@ -167,6 +169,7 @@ function deduplicateReports(reports: readonly DeliveryGateFinding[]): DeliveryGa
       category: report.category,
       summary: report.summary,
       target: report.target,
+      affectedArtifacts: [...(report.affectedArtifacts ?? [])].sort(),
       packages: [...report.dependencyPackages].sort(),
       scenario: report.scene?.scenario.name,
     });

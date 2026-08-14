@@ -5,7 +5,7 @@
 ```json
 {
   "version": "0.3.0",
-  "xcompiler": { "pluginApiVersion": 2 }
+  "xcompiler": { "pluginApiVersion": 3 }
 }
 ```
 
@@ -40,6 +40,6 @@ git push origin <tag>
 
 如果上一次本地 tag 创建错了但还没有推送远端，可使用 `npm run release:local -- v0.1.4 --replace-local-tag` 删除并重建本地 tag；该选项不会删除远端 tag。离线环境可加 `--skip-audit` 跳过本地 `npm audit`，但 GitHub Release workflow 仍会执行审计。
 
-Plugin API 版本独立于核心版本，只在插件公共接口出现不兼容修改时递增整数主版本。插件自身使用 SemVer，并在 manifest 中强制声明 `apiVersion` 和 `minXCompilerVersion`；详细规则见 [plugin_api.md](plugin_api.md)。
+Plugin API 版本独立于核心版本，只在插件公共接口出现不兼容修改时递增整数主版本。Plugin API 3 移除了旧的内存 Skill 对象注册接口，改为 Agent Skills Specification 目录和 `registerSkillDirectory()`；不提供旧接口兼容层。插件自身使用 SemVer，并在 manifest 中强制声明 `apiVersion` 和 `minXCompilerVersion`；详细规则见 [plugin_api.md](plugin_api.md)。
 
-审计内容默认使用 `redacted` 模式遮蔽 API key、token、密码等凭据。需要最小化留存时设置 `XC_AUDIT_CONTENT_MODE=metadata`（只保留长度和 SHA-256）；只有在受控环境确实需要完整回放时才使用 `full`。
+审计内容默认使用 `redacted` 模式：完整保留事件与正文，只遮蔽 API key、token、密码等凭据；受控环境可设置 `XC_AUDIT_CONTENT_MODE=full` 保留未脱敏正文。原始 `audit.jsonl` 与 `process_log.md` 不做内容瘦身，轻量检索使用可重建的 `audit/summary.md`，其中保留原始行号和领域对象 revision 链接。

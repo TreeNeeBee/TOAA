@@ -141,7 +141,7 @@ export interface RuntimeInteraction {
   pauseStdin?(): void;
 }
 
-export type RuntimePermissionPolicy = 'request' | 'allow' | 'deny';
+export type RuntimePermissionPolicy = 'request' | 'auto' | 'deny';
 
 export interface RuntimeIO {
   /** Enables human-oriented lower-level stream rendering. Runtime adapters default to false. */
@@ -167,24 +167,30 @@ export const silentRuntimeIO: RuntimeIO = {
   progress: () => noopProgress,
 };
 
-export function runtimePermissionAuthorizer(io: RuntimeIO): ToolPermissionRequester {
-  const policy = io.permissionPolicy ?? 'request';
+export function runtimePermissionAuthorizer(
+  io: RuntimeIO,
+  configuredPolicy: RuntimePermissionPolicy = 'request',
+): ToolPermissionRequester {
+  const policy = io.permissionPolicy ?? configuredPolicy;
   return async (request) => {
-    if (policy === 'allow') {
+    if (policy === 'auto') {
       return {
         approved: true,
-        reason: `Explicit Runtime permission policy allowed ${request.operationType}.`,
+        outcome: 'approved',
+        reason: `Runtime auto permission mode allowed ${request.operationType} for this run.`,
       };
     }
     if (policy === 'deny') {
       return {
         approved: false,
+        outcome: 'denied',
         reason: `Runtime permission policy denied ${request.operationType}.`,
       };
     }
     if (io.requestPermission) return io.requestPermission(request);
     return {
       approved: false,
+      outcome: 'denied',
       reason: `No permission requester is configured for ${request.operationType}.`,
     };
   };

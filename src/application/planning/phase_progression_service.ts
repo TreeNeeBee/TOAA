@@ -8,8 +8,10 @@ import type { Plan } from '../../core/plan.js';
 import { refreshProjectMemory } from '../../core/project_memory.js';
 import { renderPlanMarkdown } from '../../core/render.js';
 import { savePhasePlan, savePlan } from '../../core/storage.js';
+import { archiveIfExists } from '../../workspace/doc_archive.js';
 import type { LLMRouter } from '../../llm/router.js';
 import type { Workspace } from '../../workspace/workspace.js';
+import type { SkillRegistry } from '../../skills/index.js';
 
 export interface PhaseProgressionResult {
   completedPhaseId: string;
@@ -22,10 +24,13 @@ export class PhaseProgressionService {
     private readonly workspace: Workspace,
     /** The container state root. Derived project memory belongs here, never inside a worktree. */
     private readonly state: Workspace,
+    /** Project-root control plane. Phase plans never belong to the generated product worktree. */
+    private readonly control: Workspace,
     private readonly router: LLMRouter,
     private readonly audit: AuditLogger,
     private readonly terminalOutput: boolean,
     private readonly signal?: AbortSignal,
+    private readonly skills?: SkillRegistry,
   ) {}
 
   async completeAndPrepareNext(input: {
@@ -54,7 +59,7 @@ export class PhaseProgressionService {
 
     next.planPath ??= phasePlanFileName(next.id);
     const nextPlanPath = path.resolve(path.dirname(input.phasePlanPath), next.planPath);
-    assertWorkspacePath(this.workspace.root, nextPlanPath);
+    assertWorkspacePath(this.control.root, nextPlanPath);
     const topic = await this.workspace.exists(DOC_NAMES.topic)
       ? await this.workspace.readFile(DOC_NAMES.topic)
       : transition.phasePlan.requirementDigest;
@@ -86,6 +91,7 @@ export class PhaseProgressionService {
       transition.phasePlan.language,
       this.terminalOutput,
       this.signal,
+      this.skills,
     );
     const draft = await planner.decomposePhase(
       {
@@ -112,6 +118,7 @@ export class PhaseProgressionService {
     // Publish the concrete plan before phasePlan references it.
     await savePlan(nextPlanPath, nextPlan);
     await savePhasePlan(input.phasePlanPath, transition.phasePlan);
+    await archiveIfExists(this.workspace, DOC_NAMES.plan, this.audit, this.state);
     await this.workspace.writeFile(DOC_NAMES.plan, renderPlanMarkdown(nextPlan));
     await refreshProjectMemory(this.workspace, this.state, {
       planPath: nextPlanPath,

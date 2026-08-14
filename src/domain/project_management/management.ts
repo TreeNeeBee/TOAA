@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { ObjectIdSchema } from '../identity/object_id.js';
 import { assertStateTransition, type StateTransitions } from '../../util/state_machine.js';
+import { FileTreePolicySchema } from '../workspace/file_tree.js';
 
 export const PROJECT_MANAGEMENT_PLAN_STATES = [
   'draft',
@@ -33,6 +34,10 @@ export const ProjectManagementPlanSchema = ObjectEnvelopeSchema.extend({
   riskRecordIds: z.array(ObjectIdSchema).default([]),
   decisionRecordIds: z.array(ObjectIdSchema).default([]),
   interactionRequestIds: z.array(ObjectIdSchema).default([]),
+  // The tree is referenced, not embedded, for the same reason risks and decisions are: it is
+  // rewritten on every file a Step writes, and a plan carrying that state would take a revision per
+  // write on the object the orchestrator is also writing. Ownership stays here; the churn does not.
+  fileTree: FileTreePolicySchema.optional(),
   scheduleToleranceMs: z.number().int().nonnegative().default(0),
   tokenBudget: z.number().int().positive().optional(),
   costBudget: z.number().nonnegative().optional(),

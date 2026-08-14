@@ -42,6 +42,7 @@ import {
   calibrateLanguageStepOwnership,
   calibrateArchitectureModuleDependencies,
   calibrateArchitectureModulePaths,
+  calibrateProducedInputGlobs,
 } from './calibration.js';
 import {
   hasExternalApiOrUrlRequirement,
@@ -62,9 +63,11 @@ import {
   parseImplementationPhases,
   parseProjectType,
   validateImplementationPhaseDraft,
+  validateCurrentPhaseDeliveryEntrypoints,
   validateIterationVModelDraft,
 } from './planning/phase_strategy.js';
 import { parsePlannerJson } from './planning/json.js';
+import { buildDefaultSkills, renderSkillCatalog, type SkillRegistry } from '../skills/index.js';
 
 export {
   CLARIFICATION_CATEGORIES,
@@ -118,13 +121,18 @@ export interface DraftPhasePlan {
 }
 
 export class Planner {
+  private readonly skills: SkillRegistry;
+
   constructor(
     private readonly llm: LLMClient,
     private readonly audit?: AuditLogger,
     private readonly language: Language = 'python',
     private readonly streamOutput = false,
     private readonly signal?: AbortSignal,
-  ) {}
+    skills?: SkillRegistry,
+  ) {
+    this.skills = skills ?? buildDefaultSkills();
+  }
 
   async clarify(
     rawRequirement: string,
@@ -278,12 +286,14 @@ export class Planner {
           role: 'system',
           content:
             t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile(this.language)) +
+            `\n\n${renderSkillCatalog(this.skills.list())}` +
             (intent === 'self' ? `\n\n${t().prompts.plannerSelfMode}` : ''),
         },
         { role: 'user', content: prompt + feedback },
       ],
       validate: (t) => {
         const candidate = parsePhaseStepPlanJson(t, parseContext, phasePlan, currentPhase);
+        this.skills.validateRefs(candidate.steps.flatMap((step) => step.tools));
         assertPlanRulesSatisfied(candidate, parseContext);
       },
     });
@@ -292,7 +302,9 @@ export class Planner {
       provider,
       phaseId: currentPhase.id,
     });
-    return parsePhaseStepPlanJson(text, parseContext, phasePlan, currentPhase);
+    const result = parsePhaseStepPlanJson(text, parseContext, phasePlan, currentPhase);
+    this.skills.validateRefs(result.steps.flatMap((step) => step.tools));
+    return result;
   }
 
   private async chatWithStructuredValidationRetry(input: {
@@ -437,9 +449,9 @@ export function buildPlan(
   const draftDependencies = architectureDependencyCalibration.dependencies;
   const iterated = normalizeStepIterations(draft.steps, implementationPhases);
   const shaped = calibrateLanguageStepOwnership(
-    calibrateVModelDependencies(
+    calibrateProducedInputGlobs(calibrateVModelDependencies(
       calibrateDocPaths(calibrateStepShape(calibrateStepIds(iterated)), projectType),
-    ),
+    )),
     {
       language,
       intent: opts.intent ?? 'greenfield',
@@ -571,7 +583,9 @@ function parsePhasePlanJson(text: string, context: DraftParseContext): DraftPhas
   if (!parsedImplementationPhases || parsedImplementationPhases.length === 0) {
     throw new Error('Planner PhasePlan missing valid implementationPhases; P1 current phase must be explicit.');
   }
-  const phaseIssue = validateImplementationPhaseDraft(parsedImplementationPhases, complexityAssessment);
+  const phaseIssue = validateImplementationPhaseDraft(parsedImplementationPhases, complexityAssessment, {
+    language: context.language,
+  });
   if (phaseIssue) {
     throw new Error(`Planner PhasePlan implementationPhases invalid: ${phaseIssue}`);
   }
@@ -655,6 +669,14 @@ function parsePhaseStepPlanJson(
       `${wrongIteration.id} references ${wrongIteration.iterationId ?? 'P1'}. ` +
       'Future planned phases must stay in PhasePlan until they are loaded as the current phase.',
     );
+  }
+  const deliveryEntrypointIssue = validateCurrentPhaseDeliveryEntrypoints(
+    currentPhase,
+    parsed.steps,
+    context.language,
+  );
+  if (deliveryEntrypointIssue) {
+    throw new Error(`Planner phase StepPlan delivery contract invalid: ${deliveryEntrypointIssue}`);
   }
   return parsed;
 }
@@ -779,7 +801,10 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     ? validateImplementationPhaseDraft(
         parsedImplementationPhases,
         complexityAssessment,
-        context?.currentPhaseId ?? 'P1',
+        {
+          language: context?.language ?? 'python',
+          expectedCurrentPhaseId: context?.currentPhaseId ?? 'P1',
+        },
       )
     : undefined;
   if (context && phaseIssue) {

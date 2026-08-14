@@ -5,11 +5,13 @@ import {
   prioritizeAttemptFailureEvidence,
   renderAttemptRetryFeedback,
   renderExecutorFailure,
+  renderQualityAssessmentFailure,
   resolveAttemptRoundLimit,
   selectActionableAttemptFailure,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
   resolveBaselineGateExecution,
+  sandboxPreparationFailure,
   shouldPreserveFailedCandidate,
   shouldPreserveExistingFiles,
   deliveredManifest,
@@ -19,6 +21,55 @@ import type { DomainLog } from '../src/domain/observability/records.js';
 import { classifyAttemptFailure, classifyFailure } from '../src/application/execution/failure_classification.js';
 import type { Plan, Step } from '../src/core/plan.js';
 import type { Ticket } from '../src/domain/tickets/ticket.js';
+import { getLanguageProfile } from '../src/core/language.js';
+import { computeIncrementalAllowedWrites } from '../src/application/execution/execution_context.js';
+
+describe('corrective write scope', () => {
+  it('limits a focused Enhancement to its structured affected test artifact', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: [
+        'docs/02-high-level-design.md',
+        'package.json',
+        'tests/modules/domain.test.ts',
+      ],
+    };
+    const allowed = computeIncrementalAllowedWrites(
+      plan,
+      design,
+      getLanguageProfile('typescript'),
+      {
+        type: 'enhancement',
+        affectedArtifacts: ['tests/modules/domain.test.ts'],
+      } as Ticket,
+    );
+
+    expect(allowed).toEqual(['tests/modules/domain.test.ts']);
+    expect(allowed).not.toContain('package.json');
+  });
+
+  it('keeps a downstream CR inside the current Step outputs when its delta is upstream-owned', () => {
+    const plan = fixturePlan();
+    const detail = {
+      ...plan.steps[0]!,
+      phase: 'DETAILED_DESIGN' as const,
+      outputs: ['docs/03-detailed-design.md', 'tests/integration/contracts.test.ts'],
+    };
+    const allowed = computeIncrementalAllowedWrites(
+      plan,
+      detail,
+      getLanguageProfile('typescript'),
+      {
+        type: 'change-request',
+        contractDelta: { affectedArtifacts: ['docs/02-high-level-design.md'] },
+      } as Ticket,
+    );
+    expect(allowed).toEqual(expect.arrayContaining(detail.outputs));
+    expect(allowed).not.toContain('package.json');
+  });
+});
 
 describe('attempt verification scope', () => {
   it('reruns the source baseline gate when a verification Bug returns upstream', () => {
@@ -167,7 +218,46 @@ describe('attempt verification scope', () => {
   });
 });
 
+describe('quality failure evidence', () => {
+  it('preserves finding details when a failed assessment has no KPI gaps', () => {
+    const rendered = renderQualityAssessmentFailure({
+      gaps: [],
+      findings: [{
+        category: 'test-incomplete',
+        summary: 'tests/acceptance.test.ts does not import src/main.ts',
+        evidence: [
+          'exercises 0/1 required product sources',
+          'Import and exercise the planned product entrypoint before CODE.',
+        ],
+        target: 'current-step',
+        dependencyPackages: [],
+      }],
+    });
+
+    expect(rendered.summary).toContain('tests/acceptance.test.ts');
+    expect(rendered.detail).toContain('exercises 0/1 required product sources');
+    expect(rendered.detail).toContain('Import and exercise the planned product entrypoint');
+  });
+
+  it('uses a non-empty fallback when an invalid failed assessment carries no evidence', () => {
+    const rendered = renderQualityAssessmentFailure({ gaps: [], findings: [] });
+    expect(rendered.summary).not.toBe('');
+    expect(rendered.detail).toBe(rendered.summary);
+  });
+});
+
 describe('attempt failure classification', () => {
+  it('keeps sandbox preparation outside generated-project defect routing', () => {
+    expect(sandboxPreparationFailure('P1-S004', 'npm install timed out')).toEqual({
+      kind: 'infrastructure',
+      category: 'internal',
+      code: 'sandbox_not_ready',
+      message: 'sandbox is not ready for P1-S004: npm install timed out',
+      retryable: true,
+      switchProvider: false,
+    });
+  });
+
   it('separates LLM provider failures from generated-project execution failures', () => {
     expect(classifyAttemptFailure(
       'all LLM providers failed for role Tester: OpenAI-compatible provider request failed status=429',

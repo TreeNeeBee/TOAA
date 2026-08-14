@@ -5,6 +5,7 @@ import { ObjectIdSchema, type ObjectId } from '../identity/object_id.js';
 import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import { STEP_TYPES } from '../steps/step.js';
+import { WORKSPACE_KINDS } from '../workspace/change_set.js';
 
 export const TICKET_TYPES = [
   'epic',
@@ -46,8 +47,8 @@ export type TicketCommitKind = (typeof TICKET_COMMIT_KINDS)[number];
 export const TicketCommitSchema = z.object({
   revision: GitRevisionSchema,
   /**
-   * `baseline` marks where an attempt started, and is therefore the target that attempt rolls back
-   * to. `attempt` is a rejected candidate preserved for diagnosis and incremental correction.
+   * `baseline` records the existing branch head where an attempt started; recording it must not
+   * create a new commit. `attempt` is a rejected candidate preserved for diagnosis and correction.
    * `verified` survived its gate.
    */
   kind: z.enum(TICKET_COMMIT_KINDS),
@@ -89,6 +90,38 @@ export const TicketSourceSchema = z.object({
 
 export type TicketSource = z.infer<typeof TicketSourceSchema>;
 
+export const TICKET_WORKSPACE_BINDING_REASONS = [
+  'initial',
+  'inherited',
+  'change-set',
+  'merge-gate',
+  'recovered',
+] as const;
+
+/**
+ * The working copy in which this Ticket must be executed.
+ *
+ * Paths are relative to the Project container so the state remains valid when a container moves.
+ * A revision pins recovery to evidence Git can reconstruct after a process restart. The current
+ * binding may advance, while `workspaceBindingHistory` retains every prior binding append-only.
+ */
+export const TicketWorkspaceBindingSchema = z.object({
+  kind: z.enum(WORKSPACE_KINDS),
+  relativePath: z.string().min(1).refine(
+    (value) => !value.startsWith('/') && !value.split('/').includes('..'),
+    'Ticket workspace path must be relative to the Project container',
+  ),
+  branch: z.string().min(1),
+  revision: GitRevisionSchema,
+  workspaceId: ObjectIdSchema.optional(),
+  changeSetId: ObjectIdSchema.optional(),
+  mergeGateRunId: ObjectIdSchema.optional(),
+  reason: z.enum(TICKET_WORKSPACE_BINDING_REASONS),
+  boundAt: z.string().datetime({ offset: true }),
+}).strict();
+
+export type TicketWorkspaceBinding = z.infer<typeof TicketWorkspaceBindingSchema>;
+
 const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   objectType: z.literal('ticket'),
   type: z.enum(TICKET_TYPES),
@@ -115,6 +148,10 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   traceLastEventId: ObjectIdSchema.optional(),
   traceEventCount: z.number().int().nonnegative().default(0),
   traceChainHash: z.string().regex(/^sha256:[a-f0-9]{64}$/u).optional(),
+  /** Current execution worktree. It is assigned before the Ticket's first attempt. */
+  workspaceBinding: TicketWorkspaceBindingSchema.optional(),
+  /** Append-only worktree lineage used to reconstruct where the Ticket was discovered and repaired. */
+  workspaceBindingHistory: z.array(TicketWorkspaceBindingSchema).default([]),
   /**
    * Commit this Ticket's work started from, and the append-only record of every commit made under
    * it. Rollback used to depend on a baseline held only in memory for the duration of one attempt,
@@ -191,6 +228,8 @@ export const EnhancementTicketSchema = TicketBaseSchema.extend({
   stepId: ObjectIdSchema,
   enhancementKind: z.enum(['functional-gap', 'test-incomplete', 'quality-shortfall']),
   finding: z.string().min(1),
+  /** Exact target-owned artifacts this focused correction may modify. */
+  affectedArtifacts: z.array(z.string().min(1)).default([]),
   sourceBugTicketId: ObjectIdSchema.optional(),
   sourceQualityAssessmentId: ObjectIdSchema.optional(),
   targetStepId: ObjectIdSchema,
@@ -257,6 +296,35 @@ export type BugTicket = z.infer<typeof BugTicketSchema>;
 export type EnhancementTicket = z.infer<typeof EnhancementTicketSchema>;
 export type ChangeRequestTicket = z.infer<typeof ChangeRequestTicketSchema>;
 export type ChangeRequestApplicationDecision = z.infer<typeof ChangeRequestApplicationDecisionSchema>;
+
+/** Assigns a Ticket's current worktree without erasing any previous location. */
+export function bindTicketWorkspace<T extends Ticket>(
+  ticket: T,
+  binding: TicketWorkspaceBinding,
+  now = new Date().toISOString(),
+): T {
+  const parsed = TicketWorkspaceBindingSchema.parse(binding);
+  if (ticket.workspaceBinding && sameWorkspaceBinding(ticket.workspaceBinding, parsed)) return ticket;
+  return TicketSchema.parse({
+    ...ticket,
+    ...reviseObjectEnvelope(ticket, { now }),
+    workspaceBinding: parsed,
+    workspaceBindingHistory: [...ticket.workspaceBindingHistory, parsed],
+  }) as T;
+}
+
+function sameWorkspaceBinding(
+  left: TicketWorkspaceBinding,
+  right: TicketWorkspaceBinding,
+): boolean {
+  return left.kind === right.kind &&
+    left.relativePath === right.relativePath &&
+    left.branch === right.branch &&
+    left.revision === right.revision &&
+    left.workspaceId === right.workspaceId &&
+    left.changeSetId === right.changeSetId &&
+    left.mergeGateRunId === right.mergeGateRunId;
+}
 
 export function transitionTicket(
   ticket: Ticket,

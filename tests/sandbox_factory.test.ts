@@ -1,3 +1,5 @@
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { Workspace } from '../src/workspace/workspace.js';
 
@@ -124,5 +126,34 @@ describe('sandbox package registry', () => {
     });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(((unset as any).baseEnvironment() as NodeJS.ProcessEnv).NPM_CONFIG_REGISTRY).toBeUndefined();
+  });
+
+  // A Unix domain socket path is capped at 104 bytes. The environment root already carries a
+  // project id, a phase id, and a role, so `npx tsx` binding `$TMPDIR/tsx-<uid>/<pid>.pipe` reached
+  // 142 bytes and died with `listen EINVAL` before the generated product ever started.
+  it('keeps TMPDIR short enough to bind a socket under a deeply nested environment root', async () => {
+    const deep = [
+      '/tmp/xcompiler-tmpdir-probe/.xcompiler/sandboxes',
+      '019ff13f-d605-7d9c-a861-5b5640d637e0',
+      '019ff13f-d606-7bf3-969e-52b5cad743d0',
+      'dev/developer',
+    ].join('/');
+    const sandbox = new SubprocessSandbox({
+      ws: new Workspace('/tmp/xcompiler-tmpdir-probe'),
+      limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'download-only' },
+      environmentRoot: deep,
+      language: 'typescript',
+    });
+    expect(path.join(deep, 'tmp', 'tsx-501', '35765.pipe').length).toBeGreaterThan(104);
+
+    await fs.mkdir(path.join(deep, 'tmp'), { recursive: true });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (sandbox as any).linkShortTmp();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const env = (sandbox as any).baseEnvironment() as NodeJS.ProcessEnv;
+    expect(path.join(env.TMPDIR!, 'tsx-501', '35765.pipe').length).toBeLessThan(104);
+    // The link still leads into the sandbox, so isolation and cleanup are unchanged.
+    expect(await fs.realpath(env.TMPDIR!)).toBe(await fs.realpath(path.join(deep, 'tmp')));
+    await fs.rm('/tmp/xcompiler-tmpdir-probe', { recursive: true, force: true });
   });
 });

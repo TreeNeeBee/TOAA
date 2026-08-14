@@ -1,12 +1,18 @@
 locale: zh  # CLI / prompt 语言：en 或 zh
 
+# 当前 Runtime task 对外部系统资源的授权策略。工程内部文件、测试和 sandbox 程序执行
+# 由 Step/Tool/Gate 自身约束，不逐次弹窗；工程目录外文件访问始终硬拒绝。
+permissions:
+  mode: request  # request | auto | deny
+  timeout_ms: 0  # 0 = 不超时，等待用户回答或取消当前 task
+
 # 通用外部交互记录/重放。replay 模式禁止实时访问；找不到或记录冲突会明确失败。
 # 记录文件会脱敏并进行完整性校验，默认存放在当前工程的 .xcompiler 目录。
 record_replay:
   mode: off  # off | record | replay | auto | refresh
   path: .xcompiler/record-replay
-  # subprocess must stay enabled when verification Steps are prepared for offline replay.
-  channels: [http, llm, subprocess]
+  # Replay external data, never an old build/test exit code for the current source tree.
+  channels: [http, llm]
   redacted_fields: []
 
 llm:

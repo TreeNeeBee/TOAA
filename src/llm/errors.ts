@@ -38,6 +38,20 @@ export function isLLMRequestError(error: unknown): error is LLMRequestError {
   return error instanceof LLMRequestError;
 }
 
+/**
+ * Whether every provider refused the model's content rather than failing itself.
+ *
+ * The caller's own turn contract runs as provider-side validation, so a turn nobody would accept
+ * exhausts the chain and arrives looking exactly like an outage. It is not one: the round can still
+ * be fed back to the model, and treating it as infrastructure stopped a live run twice with every
+ * provider healthy.
+ */
+export function isContentRejectionExhausted(error: unknown): error is LLMRequestError {
+  return isLLMRequestError(error) &&
+    error.failure.code === 'all_providers_failed' &&
+    error.failure.details?.contentRejectedOnly === true;
+}
+
 export function llmFailureCodeForStatus(status: number): LLMFailureCode {
   if (status === 401) return 'authentication_failed';
   if (status === 403) return 'permission_denied';

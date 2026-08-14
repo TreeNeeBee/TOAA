@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MergeIntegrationService } from '../src/application/workspace/merge_integration_service.js';
+import {
+  MergeIntegrationService,
+  mergeGateScopeForStep,
+} from '../src/application/workspace/merge_integration_service.js';
 import type { GateCheckResult, MergeGateRun } from '../src/domain/workspace/merge_request.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { MergeConflictError } from '../src/application/workspace/git_port.js';
@@ -11,6 +14,7 @@ const correctiveTicketId = createObjectId();
 const mergeRequestId = createObjectId();
 const workspaceId = createObjectId();
 const phaseId = createObjectId();
+const stepId = createObjectId();
 
 const now = new Date(0).toISOString();
 
@@ -52,7 +56,9 @@ function harness(options: {
   const releaseChangeSet = vi.fn(async () => undefined);
   const committed: unknown[][] = [];
   const gateRun = (status: MergeGateRun['status']) => ({
-    id: createObjectId(), objectType: 'merge-gate-run', status, targetRevision: 'd'.repeat(40),
+    id: createObjectId(), objectType: 'merge-gate-run', status,
+    targetRevision: 'd'.repeat(40), candidateRevision: 'e'.repeat(40),
+    worktreePath: `worktrees/gates/${mergeRequestId}/candidate`,
   } as unknown as MergeGateRun);
   const status = options.checks.some((c) => !c.ok && c.kind === 'infrastructure')
     ? 'infrastructure-failed'
@@ -75,7 +81,9 @@ function harness(options: {
     repository: {
       list: async () => [stored.get(changeSetId)],
       read: async (id: string) => id === rootTicketId
-        ? { objectType: 'ticket', id: rootTicketId, phaseId }
+        ? { objectType: 'ticket', id: rootTicketId, phaseId, stepId }
+        : id === stepId
+          ? { objectType: 'step', id: stepId, type: 'CODE' }
         : stored.get(id) ?? mergeRequest,
       commit: async (objects: unknown[]) => {
         if (rejectMergedState && objects.some((object) =>
@@ -169,6 +177,11 @@ describe('merge integration', () => {
 
     expect(outcome.status).toBe('failed');
     expect(outcome.failureLog).toContain('tests broke');
+    expect(outcome.workspaceBinding).toMatchObject({
+      kind: 'gate',
+      changeSetId,
+      revision: 'e'.repeat(40),
+    });
     expect(squashMerge).not.toHaveBeenCalled();
   });
 
@@ -302,7 +315,7 @@ describe('merge at Ticket delivery', () => {
     expect(outcome.mergedRevisions).toEqual(['c'.repeat(40)]);
     expect(squashMerge).toHaveBeenCalledOnce();
     expect(releaseChangeSet).toHaveBeenCalledWith(changeSetId);
-    expect(checkScopes).toEqual(['ticket']);
+    expect(checkScopes).toEqual(['ticket-code']);
   });
 
   it('lands the branch for a corrective Ticket recorded against it', async () => {
@@ -325,5 +338,16 @@ describe('merge at Ticket delivery', () => {
     expect(outcome.status).toBe('nothing-to-merge');
     expect(outcome.mergedRevisions).toEqual([]);
     expect(squashMerge).not.toHaveBeenCalled();
+  });
+});
+
+describe('ticket merge gate scope', () => {
+  it('uses artifact assembly before CODE and executable gates from CODE onward', () => {
+    expect(mergeGateScopeForStep('REQUIREMENT_ANALYSIS')).toBe('ticket-artifact');
+    expect(mergeGateScopeForStep('HIGH_LEVEL_DESIGN')).toBe('ticket-artifact');
+    expect(mergeGateScopeForStep('DETAILED_DESIGN')).toBe('ticket-artifact');
+    expect(mergeGateScopeForStep('CODE')).toBe('ticket-code');
+    expect(mergeGateScopeForStep('UNIT_TEST')).toBe('ticket-verification');
+    expect(mergeGateScopeForStep('FUNCTIONAL_TEST')).toBe('ticket-verification');
   });
 });

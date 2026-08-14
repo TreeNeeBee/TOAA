@@ -5,6 +5,10 @@ import { FileRecordReplayStore } from '../infrastructure/record_replay/file_stor
 import type { RuntimeIO } from './io.js';
 import { runRunCommand, type RuntimeRunCommandOptions } from './commands.js';
 import { resolveRuntimeRecordReplayRoot } from './record_replay.js';
+import {
+  ContainerLayoutError,
+  findProjectContainer,
+} from '../workspace/project_container.js';
 
 export type FixtureAction = 'prepare' | 'inspect' | 'verify' | 'refresh';
 
@@ -27,11 +31,17 @@ export interface RuntimeFixtureResult {
 
 export async function runFixtureCommand(options: RuntimeFixtureOptions): Promise<RuntimeFixtureResult> {
   const workspace = path.resolve(options.workspace);
+  const container = await findProjectContainer(workspace);
+  if (!container) throw new ContainerLayoutError(workspace, 'no enclosing project container was found');
   const { config } = await loadConfigWithPath(options.configPath);
-  const fixturePath = resolveRuntimeRecordReplayRoot(config, workspace, options.path);
+  const fixturePath = resolveRuntimeRecordReplayRoot(
+    config,
+    container.control.root,
+    options.path,
+  );
   if (options.action === 'prepare' || options.action === 'refresh') {
     const executionOptions: RuntimeRunCommandOptions = {
-      workspace,
+      workspace: container.root,
       planArg: options.planArg,
       configPath: options.configPath,
       force: options.force,

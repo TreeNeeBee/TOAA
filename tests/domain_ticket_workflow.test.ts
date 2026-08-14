@@ -8,7 +8,7 @@ import { TicketWorkflow } from '../src/application/project_management/ticket_wor
 import { CorrectiveWorkflowService } from '../src/application/project_management/corrective_workflow_service.js';
 import { ProjectStateService } from '../src/application/project_management/project_state_service.js';
 import { createObjectEnvelope } from '../src/domain/objects/object_envelope.js';
-import { TicketSchema, type Ticket } from '../src/domain/tickets/ticket.js';
+import { TicketSchema, bindTicketWorkspace, type Ticket } from '../src/domain/tickets/ticket.js';
 import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
 import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
 import { QualityAssessmentService } from '../src/application/execution/quality_assessment_service.js';
@@ -18,6 +18,49 @@ import { Workspace } from '../src/workspace/workspace.js';
 import type { Plan } from '../src/core/plan.js';
 
 describe('TicketWorkflow', () => {
+  it('inherits the discovering Ticket worktree when opening a corrective Ticket', async () => {
+    const { graph, repository, workflow } = await setup();
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
+    const detailed = graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
+    const integration = graph.steps.find((step) => step.type === 'INTEGRATION_TEST')!;
+    const codeStory = await workflow.storyForStep(coding.id);
+    const boundStory = bindTicketWorkspace(codeStory, {
+      kind: 'ticket',
+      relativePath: `worktrees/tickets/${codeStory.id}`,
+      branch: `xcompiler/ticket/${codeStory.id}`,
+      revision: 'a'.repeat(40),
+      workspaceId: createObjectId(),
+      changeSetId: createObjectId(),
+      reason: 'change-set',
+      boundAt: new Date().toISOString(),
+    });
+    await repository.update(boundStory, boundStory.state);
+
+    const bug = await workflow.openBug({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'developer')!.id,
+      failedStep: integration,
+      targetStep: detailed,
+      verificationStep: integration,
+      kind: 'test-failure',
+      severity: 'high',
+      message: 'candidate-only failure',
+      summary: 'candidate-only failure',
+      category: 'test',
+      code: 'candidate_failure',
+      retryable: true,
+      switchProvider: false,
+      correlationId: createObjectId(),
+      causationId: boundStory.id,
+    });
+
+    expect(bug.workspaceBinding).toMatchObject({
+      kind: 'ticket',
+      relativePath: `worktrees/tickets/${codeStory.id}`,
+      reason: 'inherited',
+    });
+    expect(bug.workspaceBindingHistory).toEqual([bug.workspaceBinding]);
+  });
+
   it('keeps a Bug open until its linked Change Request is implemented and verified', async () => {
     const { graph, repository, workflow, registration } = await setup();
     const integration = graph.steps.find((step) => step.type === 'INTEGRATION_TEST')!;
@@ -256,6 +299,149 @@ describe('TicketWorkflow', () => {
   // stayed `in_progress` holding the developer's one capacity slot. The answer arrives as a re-check
   // Change Request targeting that same Step, so nothing could take it and the run stopped with
   // "No registered actor can process DEP-P1-003".
+  // A run killed mid-attempt left three tasks `in_progress` under a Story that had since been
+  // blocked. The scheduler will not restart work it believes is running, and will not descend into a
+  // parent it cannot work, so every later pass saw active work it could not advance and the phase
+  // stopped for lack of progress with every actor idle. Work in progress under a *workable* parent
+  // is untouched — a deferred infrastructure failure resumes exactly that way.
+  it('hands back in-progress work whose parent the scheduler can no longer reach', async () => {
+    const reclaimedFor = async (parent: Record<string, unknown>) => {
+      const child = {
+        objectType: 'ticket', id: 'task-1', projectId: 'p1', type: 'task',
+        state: 'in_progress', parentTicketId: 'story-1', blockedByTicketIds: [],
+      };
+      const committed: unknown[][] = [];
+      const workflow = new TicketWorkflow({
+        list: async () => [child, { objectType: 'ticket', id: 'story-1', projectId: 'p1', ...parent }],
+        read: async () => undefined,
+        commit: async (objects: unknown[]) => { committed.push(objects); },
+      } as never);
+      const internals = workflow as unknown as {
+        lifecycle: { prepareTransition: (t: unknown, s: string, o: unknown) => Promise<{ objects: unknown[] }> };
+      };
+      internals.lifecycle.prepareTransition = async () => ({ objects: [] });
+      return workflow.reclaimUnreachableWork('p1' as never);
+    };
+
+    // Parent parked, or holding a blocker: the child can never be reached again.
+    expect(await reclaimedFor({ type: 'story', state: 'pending', blockedByTicketIds: [] })).toBe(1);
+    expect(await reclaimedFor({ type: 'story', state: 'created', blockedByTicketIds: ['bug-1'] })).toBe(1);
+    // Parent workable: the child is legitimately in flight and must be left alone.
+    expect(await reclaimedFor({ type: 'story', state: 'in_progress', blockedByTicketIds: [] })).toBe(0);
+  });
+
+  // A repair chain that propagates a change forward opens hops on downstream Steps. Those Steps
+  // cannot become ready until the Step whose Story discovered the defect delivers — so parking that
+  // Story leaves each side waiting on the other. A live run deadlocked exactly there: a Bug found at
+  // DETAILED_DESIGN hopped to CODE and then to UNIT_TEST, and UNIT_TEST could not be scheduled while
+  // DETAILED_DESIGN stayed parked behind it. A hop aimed *upstream* is the ordinary case and must
+  // still hold its Story, or a verification Step would re-run and re-declare success mid-repair.
+  it('unparks a Story held by a repair hop that is itself waiting on that Story', async () => {
+    const releasedFor = async (targetDependsOn: string, discoveringState = 'reopened') => {
+      const step = (id: string, dependencyStepIds: string[], state = 'pending') =>
+        ({ objectType: 'step', id, projectId: 'p1', dependencyStepIds, state });
+      const story = {
+        objectType: 'ticket', id: 'story-1', projectId: 'p1', type: 'story',
+        state: 'pending', stepId: 'step-design', blockedByTicketIds: ['cr-1'],
+      };
+      const released: string[] = [];
+      const workflow = new TicketWorkflow({
+        list: async () => [
+          story,
+          {
+            objectType: 'ticket', id: 'cr-1', projectId: 'p1', type: 'change-request',
+            state: 'created', targetStepId: 'step-unit', blockedByTicketIds: [],
+          },
+          step('step-design', [], discoveringState),
+          step('step-unit', [targetDependsOn]),
+          step('step-code', ['step-design']),
+        ],
+        read: async () => story,
+        commit: async () => {},
+      } as never);
+      (workflow as unknown as { blockers: { releaseFrom: unknown } }).blockers = {
+        releaseFrom: async (_t: unknown, id: string) => { released.push(id); },
+      };
+      return { count: await workflow.releaseCyclicCorrectiveBlockers('p1' as never), released };
+    };
+
+    // The hop's Step depends on the parked Story's Step, transitively, and that Step has not
+    // delivered: neither side can move.
+    expect(await releasedFor('step-code')).toEqual({ count: 1, released: ['cr-1'] });
+    // The hop's Step is independent of it: the Story is legitimately waiting and stays parked.
+    expect(await releasedFor('step-other')).toEqual({ count: 0, released: [] });
+    // Downstream, but the discovering Step already delivered, so the hop is reachable. This is the
+    // ordinary mid-repair hold — a verification Story must not re-run and re-declare success.
+    expect(await releasedFor('step-code', 'delivered')).toEqual({ count: 0, released: [] });
+
+    // A Bug holds its Story directly and advances through hops, so the unreachable hop is one edge
+    // further out. Releasing only the direct Story-to-hop edge left this Phase idle for the same
+    // reason: the Story was parked behind the Bug, and the Bug waited on the hop needing the Story.
+    const story = {
+      objectType: 'ticket', id: 'story-1', projectId: 'p1', type: 'story',
+      state: 'pending', stepId: 'step-design', blockedByTicketIds: ['bug-1'],
+    };
+    const released: string[] = [];
+    const workflow = new TicketWorkflow({
+      list: async () => [
+        story,
+        {
+          objectType: 'ticket', id: 'bug-1', projectId: 'p1', type: 'bug',
+          state: 'pending', blockedByTicketIds: [],
+        },
+        {
+          objectType: 'ticket', id: 'cr-1', projectId: 'p1', type: 'change-request',
+          state: 'created', targetStepId: 'step-unit', sourceTicketId: 'bug-1', blockedByTicketIds: [],
+        },
+        { objectType: 'step', id: 'step-design', projectId: 'p1', state: 'reopened', dependencyStepIds: [] },
+        { objectType: 'step', id: 'step-unit', projectId: 'p1', state: 'pending', dependencyStepIds: ['step-design'] },
+      ],
+      read: async () => story,
+      commit: async () => {},
+    } as never);
+    (workflow as unknown as { blockers: { releaseFrom: unknown } }).blockers = {
+      releaseFrom: async (_t: unknown, id: string) => { released.push(id); },
+    };
+    expect(await workflow.releaseCyclicCorrectiveBlockers('p1' as never)).toBe(1);
+    expect(released).toEqual(['bug-1']);
+
+    // Resuming takes the role's slot back, so a role with no headroom cannot take one back now. The
+    // live run unparked two Tickets that both needed system-engineer, and routing then refused the
+    // second at 2/1 and aborted; a later pass releases this one once the slot frees.
+    const parked = { ...story, activeAssignmentId: 'asg-1' };
+    const skipped: string[] = [];
+    const bounded = new TicketWorkflow({
+      list: async () => [
+        parked,
+        {
+          objectType: 'ticket', id: 'bug-1', projectId: 'p1', type: 'bug',
+          state: 'pending', blockedByTicketIds: [],
+        },
+        {
+          objectType: 'ticket', id: 'cr-1', projectId: 'p1', type: 'change-request',
+          state: 'created', targetStepId: 'step-unit', sourceTicketId: 'bug-1', blockedByTicketIds: [],
+        },
+        { objectType: 'step', id: 'step-design', projectId: 'p1', state: 'reopened', dependencyStepIds: [] },
+        { objectType: 'step', id: 'step-unit', projectId: 'p1', state: 'pending', dependencyStepIds: ['step-design'] },
+        {
+          objectType: 'ticket-assignment', id: 'asg-1', projectId: 'p1',
+          assigneeActorId: 'actor-1', capacityConsumed: true,
+        },
+        {
+          objectType: 'actor-registration', id: 'actor-1', projectId: 'p1',
+          capacity: 1, activeAssignmentIds: ['asg-other'],
+        },
+      ],
+      read: async () => parked,
+      commit: async () => {},
+    } as never);
+    (bounded as unknown as { blockers: { releaseFrom: unknown } }).blockers = {
+      releaseFrom: async (_t: unknown, id: string) => { skipped.push(id); },
+    };
+    expect(await bounded.releaseCyclicCorrectiveBlockers('p1' as never)).toBe(0);
+    expect(skipped).toEqual([]);
+  });
+
   it('frees the requesting role, so the answer can be assigned back to it', async () => {
     const { graph, repository, workflow, registration } = await setup();
     const state = new ProjectStateService(repository);
@@ -358,6 +544,9 @@ describe('TicketWorkflow', () => {
       .not.toContain('Add zod after');
     expect(afterDesign[0]!.type === 'change-request' && afterDesign[0]!.targetStepId)
       .toBe(byType('DETAILED_DESIGN').id);
+    expect(recheck.type === 'change-request' && recheck.parentChangeRequestId).toBe(request.id);
+    expect(recheck.parentTicketId).toBe(request.parentTicketId);
+    expect(recheck.rootTicketId).toBe(request.rootTicketId);
   });
 
   it('frees the capacity a blocked Ticket reserved before it ever started', async () => {

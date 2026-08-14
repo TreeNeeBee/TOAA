@@ -91,8 +91,14 @@ export const runProgramTool: Tool<
     const cwd = await resolveSandboxCwd(ctx, args.cwd, 'run_program.cwd');
     if (!cwd.ok) return { ok: false, error: cwd.error };
     const r = await ctx.sandbox.runProgram(args.args, { cwd: cwd.abs, timeoutMs: args.timeoutMs });
-    const networkFailure = detectNetworkApiFailureInExec(r);
-    const ok = r.exitCode === 0 && !r.timedOut && !networkFailure;
+    // What was executed decides, not which tool executed it. A Step that wants a specific invocation
+    // runs the test runner through run_program, and a suite covering "the dependency is unreachable"
+    // prints network-failure text on its way to passing — the same false failure `run_tests` was
+    // fixed for, arriving by the other door because that fix keyed on the tool.
+    const ranTests = isTestRunnerInvocation(args.args);
+    const failed = r.exitCode !== 0 || r.timedOut;
+    const networkFailure = ranTests && !failed ? null : detectNetworkApiFailureInExec(r);
+    const ok = !failed && !networkFailure;
     const command = ctx.language === 'typescript' ? resolveTypeScriptProgramCommand(args.args).display : `python ${args.args.join(' ')}`.trim();
     const base = `${command} exit=${r.exitCode} ${r.timedOut ? '(timeout)' : ''}`.trim();
     return {
@@ -128,8 +134,18 @@ export const runTestsTool: Tool<
     const gateArgs = await appendVerificationSupplements(ctx, ctx.testGateArgs ?? []);
     const runArgs = mergeTestGateArgs(gateArgs, requestedEffectiveArgs);
     const r = await ctx.sandbox.runTests(runArgs, { cwd: cwd.abs, timeoutMs: args.timeoutMs });
-    const networkFailure = detectNetworkApiFailureInExec(r);
-    const passed = r.exitCode === 0 && !r.timedOut && !networkFailure;
+    // A test runner's verdict is its exit code. Network text inside a passing suite is the suite's
+    // own subject matter — a project whose tests cover "the source is unreachable" prints exactly
+    // that on the way to passing. The detector only explains a run that already failed.
+    //
+    // It used to override a green suite, and the guard meant to prevent that — skipping lines vitest
+    // labels `stderr | ` as captured test output — does not apply under `--reporter=json`, where the
+    // same content arrives inside the JSON payload unlabelled. A UNIT_TEST Step was failed five
+    // times on `exit=0`, had nothing to repair, and each rejection carried a slightly different
+    // signature, so the recurrence breaker never saw it as the same failure.
+    const failed = r.exitCode !== 0 || r.timedOut;
+    const networkFailure = failed ? detectNetworkApiFailureInExec(r) : null;
+    const passed = !failed;
     const cmd = ctx.language === 'typescript' ? 'npm test' : 'pytest';
     const base = [
       `${cmd} exit=${r.exitCode}`,
@@ -252,6 +268,20 @@ function isProductAuthoringPending(phase: StepType | undefined): boolean {
   return phase === 'REQUIREMENT_ANALYSIS' ||
     phase === 'HIGH_LEVEL_DESIGN' ||
     phase === 'DETAILED_DESIGN';
+}
+
+/**
+ * Whether this command hands the verdict to a test runner.
+ *
+ * A runner reports its own result in its exit code, and everything it prints on the way is the
+ * suite's subject matter. Running the product is different: there, output describing a failed
+ * request describes the product's own behaviour, which is what the network detector exists for.
+ */
+function isTestRunnerInvocation(args: readonly string[]): boolean {
+  const flat = args.join(' ');
+  return /\b(?:vitest|jest|mocha|pytest|ava|tap)\b/u.test(flat) ||
+    /\bnpm\s+(?:run\s+)?test\b/u.test(flat) ||
+    /\b(?:python\s+)?-m\s+(?:pytest|unittest)\b/u.test(flat);
 }
 
 function isCoverageArgument(arg: string): boolean {

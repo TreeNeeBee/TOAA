@@ -9,6 +9,7 @@ import {
 import { replaceInFileTool, codeSearchTool, analyzeErrorTool } from './edit.js';
 import { addDependencyTool } from './deps.js';
 import { httpFetchTool } from './net.js';
+import { skillResourceTool } from './skill_resource.js';
 
 export { ToolRegistry, isAllowedWrite } from './types.js';
 export type {
@@ -47,5 +48,7 @@ export function buildDefaultRegistry(): ToolRegistry {
   reg.register(httpFetchTool);
   // 分析
   reg.register(analyzeErrorTool);
+  // Agent Skills progressive-disclosure resources (read-only; activation-scoped).
+  reg.register(skillResourceTool);
   return reg;
 }

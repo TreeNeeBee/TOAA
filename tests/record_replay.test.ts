@@ -9,6 +9,8 @@ import {
   verifyEntryChain,
 } from '../src/application/record_replay/controller.js';
 import { FileRecordReplayStore } from '../src/infrastructure/record_replay/file_store.js';
+import { RecordReplaySandbox } from '../src/infrastructure/record_replay/sandbox.js';
+import type { Sandbox } from '../src/sandbox/types.js';
 
 describe('generic record/replay', () => {
   it('records redacted external interactions and replays without live access', async () => {
@@ -98,5 +100,42 @@ describe('generic record/replay', () => {
     const off = new RecordReplayController({ mode: 'off', store: new FileRecordReplayStore(root) });
     expect(off.enabled('llm')).toBe(false);
     expect(off.evidence()).toMatchObject({ mode: 'off', managedChannels: [] });
+  });
+
+  it('never replays sandbox preparation, dependency installation, or delivery checks', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-record-replay-sandbox-'));
+    const controller = new RecordReplayController({
+      mode: 'replay',
+      store: new FileRecordReplayStore(root),
+      enabledChannels: ['subprocess'],
+    });
+    const calls: string[] = [];
+    const result = {
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      durationMs: 1,
+    };
+    const delegate = {
+      kind: 'subprocess',
+      async build() { calls.push('build'); return { rebuilt: true, reason: 'live' }; },
+      async exec() { calls.push('exec'); return result; },
+      async runProgram() { calls.push('program'); return result; },
+      async runTests() { calls.push('tests'); return result; },
+      async installDeps() { calls.push('install'); return result; },
+    } satisfies Sandbox;
+    const sandbox = new RecordReplaySandbox(delegate, controller);
+
+    await sandbox.build('package.json');
+    await sandbox.exec('npm', ['run', 'build']);
+    await sandbox.installDeps(['vitest']);
+    await sandbox.runProgram(['npm', 'run', 'build']);
+    await sandbox.runTests();
+
+    expect(calls).toEqual(['build', 'exec', 'install', 'program', 'tests']);
+    expect(await controller.evidence()).toMatchObject({
+      usage: { subprocess: { replayed: 0, recorded: 0, live: 0 } },
+    });
   });
 });

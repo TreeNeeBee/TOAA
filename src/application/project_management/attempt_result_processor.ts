@@ -4,6 +4,7 @@ import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
 import {
   VALIDATION_CONTRACT_DEFECT_CODE,
   type TicketSolution,
+  type TicketWorkspaceBinding,
 } from '../../domain/tickets/ticket.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import type { AuditLogger } from '../../audit/audit.js';
@@ -187,9 +188,13 @@ export class AttemptResultProcessor {
     }
     if (result.failureKind === 'infrastructure') {
       const reason = result.reason ?? 'LLM infrastructure request failed.';
-      await this.options.controller.deferInfrastructureFailure(work, reason);
+      const permissionBlocked = result.failure?.code === 'permission_blocked';
+      if (permissionBlocked) await this.options.controller.deferPermissionBlocked(work, reason);
+      else await this.options.controller.deferInfrastructureFailure(work, reason);
       await this.options.audit.event('note', `${work.step.name} infrastructure failure deferred`, {
-        messageId: 'domain.infrastructure_failure_deferred',
+        messageId: permissionBlocked
+          ? 'domain.permission_blocked_deferred'
+          : 'domain.infrastructure_failure_deferred',
         projectId: work.step.projectId,
         phaseId: phase.id,
         stepId: work.step.id,
@@ -200,7 +205,9 @@ export class AttemptResultProcessor {
       });
       return {
         action: 'stop',
-        reason: `LLM infrastructure failure; ${work.ticket.name} remains active for retry: ${result.failureLog ?? reason}`,
+        reason: permissionBlocked
+          ? `Permission blocked; ${work.ticket.name} is pending without a defect Ticket: ${result.failureLog ?? reason}`
+          : `LLM infrastructure failure; ${work.ticket.name} is pending for retry: ${result.failureLog ?? reason}`,
       };
     }
     if (isAgentExecutionStall(result)) {
@@ -216,10 +223,13 @@ export class AttemptResultProcessor {
         workMode: work.mode,
         reason,
       });
-      return {
-        action: 'stop',
-        reason: `Agent execution stalled; ${work.ticket.name} remains active and no Bug was created: ${result.failureLog ?? reason}`,
-      };
+      // The attempt fails; the run does not. A stall is a degenerate model turn, not a project
+      // defect — which is why no Bug is opened — and it is transient: a live Step returned an empty
+      // round, recovered on the next one and wrote 12KB of real work, then stalled again and took
+      // the whole run down with it. Retrying inside the run is bounded by the Ticket's attempt
+      // budget and by the no-semantic-progress guard; exiting the process instead turned a model
+      // hiccup into an operator action, and the Step's work was already complete on disk.
+      return { action: 'continue' };
     }
     const gateFindings = deduplicateGateFindings([
       ...(result.gateFindings ?? []),
@@ -237,7 +247,8 @@ export class AttemptResultProcessor {
       work.mode === 'change-request' &&
       work.ticket.type === 'change-request' &&
       result.executor?.validationDefect &&
-      work.ticket.originFailure
+      work.ticket.originFailure &&
+      !await this.alreadyContradicted(work.ticket)
     ) {
       const routed = await this.options.controller.routeFailure({
         creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
@@ -267,6 +278,7 @@ export class AttemptResultProcessor {
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.ticket.id,
+        workspaceBinding: result.workspaceBinding,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
@@ -283,10 +295,12 @@ export class AttemptResultProcessor {
         sourceStepId: work.step.id,
         finding: result.failureLog ?? result.executor?.validationDefect ?? result.reason ??
           'The paired test suite is incomplete.',
+        affectedArtifacts: result.changedFiles,
         kind: 'test-incomplete',
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        workspaceBinding: result.workspaceBinding,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
@@ -304,11 +318,13 @@ export class AttemptResultProcessor {
           creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
           sourceStepId: work.step.id,
           finding: [gap, ...result.assessment.evidence].filter(Boolean).join('\n'),
+          affectedArtifacts: result.changedFiles,
           kind: qualityGapKind(work.step),
           qualityAssessmentId: result.assessment.id,
           correlationId: work.ticket.source.correlationId,
           causationId: work.ticket.id,
           parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+          workspaceBinding: result.workspaceBinding,
         });
         await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       }
@@ -319,10 +335,12 @@ export class AttemptResultProcessor {
         creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
         sourceStepId: work.step.id,
         finding: result.failure.message,
+        affectedArtifacts: result.changedFiles,
         kind: 'test-incomplete',
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        workspaceBinding: result.workspaceBinding,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
@@ -337,6 +355,7 @@ export class AttemptResultProcessor {
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.ticket.id,
+        workspaceBinding: result.workspaceBinding,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
@@ -349,6 +368,8 @@ export class AttemptResultProcessor {
       summary: result.reason ?? 'Step execution failed.',
       failure: result.failure ?? fallbackExecutionFailure(result.reason),
       correlationId: createObjectId(),
+      causationId: work.ticket.id,
+      workspaceBinding: result.workspaceBinding,
     });
     await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
     return { action: 'continue' };
@@ -378,12 +399,13 @@ export class AttemptResultProcessor {
         continue;
       }
       if (finding.category === 'test-defect' || finding.category === 'product-defect') {
+        const findingMessage = renderFindingMessage(finding.summary, finding.evidence);
         const routed = await this.options.controller.routeFailure({
           creatorActorId,
           failedStepId: work.step.id,
           targetStepId: target.id,
           discoveringStepId: work.step.id,
-          message: [finding.summary, ...finding.evidence].join('\n'),
+          message: findingMessage,
           summary: finding.summary,
           failure: {
             kind: 'execution',
@@ -391,7 +413,7 @@ export class AttemptResultProcessor {
             code: finding.category === 'test-defect'
               ? VALIDATION_CONTRACT_DEFECT_CODE
               : 'delivery_gate_product_defect',
-            message: [finding.summary, ...finding.evidence].join('\n'),
+            message: findingMessage,
             retryable: true,
             switchProvider: false,
             details: { findingCategory: finding.category, findingTarget: finding.target },
@@ -399,6 +421,7 @@ export class AttemptResultProcessor {
           correlationId: work.ticket.source.correlationId,
           causationId: work.ticket.id,
           parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+          workspaceBinding: result.workspaceBinding,
         });
         queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
         continue;
@@ -407,7 +430,8 @@ export class AttemptResultProcessor {
         creatorActorId,
         sourceStepId: work.step.id,
         targetStepId: target.id,
-        finding: [finding.summary, ...finding.evidence].join('\n'),
+        finding: renderFindingMessage(finding.summary, finding.evidence),
+        affectedArtifacts: finding.affectedArtifacts ?? [],
         kind: finding.category === 'test-incomplete'
           ? 'test-incomplete'
           : finding.category === 'deliverable-defect'
@@ -417,6 +441,7 @@ export class AttemptResultProcessor {
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        workspaceBinding: result.workspaceBinding,
       });
       queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
     }
@@ -441,6 +466,7 @@ export class AttemptResultProcessor {
     work: ScheduledWork;
     reason: string;
     failureLog?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<AttemptDisposition> {
     const { phase, work } = input;
     await this.options.audit.event('note', `${work.step.name} merge gate rejected the change`, {
@@ -452,6 +478,7 @@ export class AttemptResultProcessor {
       ticketId: work.ticket.id,
       reason: input.reason,
       failureLog: input.failureLog,
+      workspaceBinding: input.workspaceBinding,
     });
     // Without a paired Step there is no Step to route the repair to, and inventing one would attach
     // the defect to whatever happened to be nearby.
@@ -466,9 +493,32 @@ export class AttemptResultProcessor {
       correlationId: work.ticket.source.correlationId,
       causationId: work.ticket.id,
       creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
+      workspaceBinding: input.workspaceBinding,
     });
     await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
     return { action: 'continue' };
+  }
+
+  /**
+   * Whether this Change Request's diagnosis has already been disproved once.
+   *
+   * The first contradiction is a finding: the verifier disproved the diagnosis and the original
+   * failed gate still needs repair, so it escalates. A second contradiction of the *same* CR is not
+   * a new fact — it is the same verifier disproving the same premise again, and escalating it opens
+   * another Bug that resolves nothing. A live run produced six of them against one Change Request
+   * that never closed, each carrying slightly different evidence text so the recurrence breaker
+   * never recognised them.
+   */
+  private async alreadyContradicted(ticket: ScheduledWork['ticket']): Promise<boolean> {
+    const objects = await this.options.repository.list({
+      objectType: 'ticket',
+      projectId: ticket.projectId,
+    });
+    return objects.some((object) =>
+      object.objectType === 'ticket' &&
+      object.type === 'bug' &&
+      object.failure.code === VALIDATION_CONTRACT_DEFECT_CODE &&
+      object.parentTicketId === ticket.id);
   }
 
   private async routeTicket(
@@ -529,12 +579,26 @@ function deduplicateGateFindings(findings: readonly DeliveryGateFinding[]): Deli
       category: finding.category,
       summary: finding.summary,
       target: finding.target,
+      affectedArtifacts: [...(finding.affectedArtifacts ?? [])].sort(),
       dependencyPackages: [...finding.dependencyPackages].sort(),
     });
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+}
+
+/** Keeps Ticket evidence complete without repeating detail already embedded in the summary. */
+export function renderFindingMessage(summary: string, evidence: readonly string[]): string {
+  const parts: string[] = [];
+  for (const candidate of [summary, ...evidence]) {
+    const value = candidate.trim();
+    if (!value) continue;
+    const normalized = value.replace(/\s+/gu, ' ');
+    if (parts.some((part) => part.replace(/\s+/gu, ' ').includes(normalized))) continue;
+    parts.push(value);
+  }
+  return parts.join('\n');
 }
 
 /** Uses changed files, or an explicitly validated deferred disposition, as the CR's exact scope. */

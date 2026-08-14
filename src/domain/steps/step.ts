@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { assertStateTransition, type StateTransitions } from '../../util/state_machine.js';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
-import { ObjectIdSchema } from '../identity/object_id.js';
+import { ObjectIdSchema, type ObjectId } from '../identity/object_id.js';
 import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import {
@@ -113,6 +113,39 @@ export function resolveStepDeliveryGate(
   return (DEVELOPMENT_STEP_TYPES as readonly string[]).includes(step.type)
     ? baselineDeliveryGate(step.name, step.type as DevelopmentStepType)
     : verificationDeliveryGate(step.name);
+}
+
+/** Whether a Step has gone far enough for the Steps that depend on it to become ready. */
+export function stepSatisfiesDependency(step: Pick<Step, 'state'>): boolean {
+  return step.state === 'delivered' || step.state === 'closed';
+}
+
+/**
+ * Whether `step` can only run after `ancestorId` has run — following the same `dependencyStepIds`
+ * edges the scheduler reads when it decides a Step is ready.
+ *
+ * This exists so that "downstream of" is decided once. A corrective hop aimed at a Step downstream
+ * of the Step whose Story discovered the defect must not park that Story: the hop is waiting for
+ * the Story to finish, so parking the Story makes each wait for the other and the Phase stops with
+ * every actor idle. Keying that check on the V-model type order instead would be a second opinion
+ * about the same fact, and the scheduler's opinion is the one that deadlocks.
+ */
+export function stepDependsOn(
+  step: Step,
+  ancestorId: ObjectId,
+  byId: ReadonlyMap<ObjectId, Step>,
+): boolean {
+  const seen = new Set<ObjectId>([step.id]);
+  const frontier = [...step.dependencyStepIds];
+  while (frontier.length > 0) {
+    const id = frontier.pop()!;
+    if (id === ancestorId) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const dependency = byId.get(id);
+    if (dependency) frontier.push(...dependency.dependencyStepIds);
+  }
+  return false;
 }
 
 export function transitionStep(

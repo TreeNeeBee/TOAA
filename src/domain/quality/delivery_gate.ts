@@ -114,6 +114,8 @@ export const DeliveryGateFindingSchema = z.object({
   summary: z.string().min(1),
   evidence: z.array(z.string().min(1)).min(1),
   target: z.enum(DELIVERY_GATE_FINDING_TARGETS),
+  /** Workspace artifacts the correction is allowed to modify. */
+  affectedArtifacts: z.array(z.string().min(1)).default([]),
   dependencyPackages: z.array(z.string().min(1)).default([]),
   /** Immutable execution scene supplied to PM; this is evidence, not a Ticket. */
   scene: DeliveryGateSceneSchema.optional(),

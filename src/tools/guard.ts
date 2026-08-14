@@ -6,7 +6,7 @@ import type { Tool, ToolContext, ToolResult } from './types.js';
 /**
  * EditGuard 给写类工具加一层守门：
  *  - 累计行数上限（保护免被失控大改写）
- *  - 写操作落审计日志：`logs/edits-<stepId>.jsonl`
+ *  - 写操作落审计日志
  *
  * 接口与 Tool 一致，可通过 wrap() 包裹任意工具。
  */
@@ -32,7 +32,9 @@ export interface EditGuardOptions {
   maxLines?: number | 'auto';
   /** 用于 auto 行数预算的 Step/工具上下文。 */
   budgetContext?: EditGuardBudgetContext;
-  /** edits 日志相对 workspace 的路径，默认 logs/edits-<stepId>.jsonl */
+  /** edits 日志绝对路径；优先用于把运行证据放在产品树之外。 */
+  logPath?: string;
+  /** edits 日志相对 workspace 的路径，独立使用时默认 logs/edits-<stepId>.jsonl。 */
   logRelPath?: string;
 }
 
@@ -107,7 +109,7 @@ export class EditGuard {
 
   constructor(private readonly opts: EditGuardOptions) {
     this.maxLines = resolveEditGuardMaxLines(opts.maxLines, opts.budgetContext);
-    this.logAbs = opts.ws.abs(opts.logRelPath ?? `logs/edits-${opts.stepId}.jsonl`);
+    this.logAbs = opts.logPath ?? opts.ws.abs(opts.logRelPath ?? `logs/edits-${opts.stepId}.jsonl`);
   }
 
   get totalLines(): number {

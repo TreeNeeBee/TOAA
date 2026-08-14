@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { calibrateDocPaths, calibrateStepShape, ensureEssentialToolRefs } from '../src/agents/calibration.js';
+import {
+  calibrateDocPaths,
+  calibrateProducedInputGlobs,
+  calibrateStepShape,
+  ensureEssentialToolRefs,
+} from '../src/agents/calibration.js';
 import type { Step } from '../src/core/plan.js';
 
 describe('calibrateStepShape', () => {
@@ -20,7 +25,13 @@ describe('calibrateStepShape', () => {
     expect(s!.role).toBe('Tester');
     expect(s!.acceptance.length).toBeGreaterThan(0);
     expect(s!.systemPrompt.length).toBeGreaterThanOrEqual(20);
-    expect(s!.tools).toEqual(['skill:tester', 'read_file', 'list_dir']);
+    expect(s!.tools).toEqual([
+      'skill:test-execution',
+      'skill:record-replay-fixtures',
+      'skill:verification-before-delivery',
+      'read_file',
+      'list_dir',
+    ]);
     expect(s!.dependsOn).toEqual([]);
     expect(s!.maxAttempts).toBe(3);
   });
@@ -32,10 +43,22 @@ describe('calibrateStepShape', () => {
       { id: 'S003', phase: 'CODE', title: '实现代码', description: '编写实现', systemPrompt: 'x'.repeat(30), role: 'Coder', outputs: ['src/app.py'] },
     ] as unknown as Step[];
     const out = calibrateStepShape(raw);
-    expect(out[0]!.tools).toEqual(['skill:author', 'read_file', 'list_dir']);
-    expect(out[1]!.tools).toEqual(['skill:tester', 'read_file', 'list_dir']);
+    expect(out[0]!.tools).toEqual([
+      'skill:artifact-authoring',
+      'skill:test-design',
+      'read_file',
+      'list_dir',
+      'run_tests',
+    ]);
+    expect(out[1]!.tools).toEqual([
+      'skill:test-execution',
+      'skill:record-replay-fixtures',
+      'read_file',
+      'list_dir',
+    ]);
     expect(out[2]!.tools).toEqual([
-      'skill:author',
+      'skill:artifact-authoring',
+      'skill:test-design',
       'run_program',
       'run_tests',
       'read_file',
@@ -50,20 +73,38 @@ describe('calibrateStepShape', () => {
       outputs: ['tests/test_app.py', 'docs/05-unit-test.md'],
     });
 
-    expect(tools).toEqual(expect.arrayContaining(['write_file', 'skill:tester']));
+    expect(tools).toEqual(expect.arrayContaining(['write_file', 'skill:test-execution']));
   });
 
   // From a live run: CODE needed a package, `add_dependency` refused because HIGH_LEVEL_DESIGN owns
   // the manifest, the Change Request routed there and the flow rolled back — and HIGH_LEVEL_DESIGN
-  // had `skill:author`, which carries no `add_dependency`. Every dependency Change Request ended at
-  // a Step told to do something it had no tool to do. `skill:dep_resolver` existed, wired to nobody.
+  // had only authoring tools, which carry no `add_dependency`. Every dependency Change Request ended
+  // at a Step told to do something it had no tool to do. The dependency Skill was wired to nobody.
   // A planner that declared only write tools left three of the four development phases unable to
   // read anything. The Change Request disposition contract requires inspecting the affected
   // artifacts before recording an outcome, so a Step that cannot read produces no valid completion
   // and spends its whole round budget — how a downstream dependency re-check stalled without making
   // a single tool call.
+  // The delivery gate requires S1-S3 to execute their baseline suites once a correction routed back
+  // from CODE proves a product baseline exists. The runner is injected automatically at that point,
+  // but only if the Step has it — and none of the three did, so the requirement passed silently
+  // without a single test being executed.
+  it('gives a baseline-owning phase the runner its delivery gate can require', async () => {
+    const { buildDefaultSkills } = await import('../src/skills/index.js');
+    for (const phase of [
+      'REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE',
+    ] as const) {
+      const refs = ensureEssentialToolRefs({
+        phase,
+        tools: ['write_file', 'append_file'],
+        outputs: ['docs/x.md', 'tests/unit/a.test.ts'],
+      });
+      expect(buildDefaultSkills().resolve(refs).resolvedToolNames, phase).toContain('run_tests');
+    }
+  });
+
   it('gives every Step the ability to read what it is judged on', async () => {
-    const { buildDefaultSkills } = await import('../src/skills/skill.js');
+    const { buildDefaultSkills } = await import('../src/skills/index.js');
     for (const phase of [
       'REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE',
       'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST',
@@ -85,16 +126,16 @@ describe('calibrateStepShape', () => {
       tools: ['write_file', 'append_file'],
       outputs: ['docs/02-high-level-design.md', 'package.json'],
     });
-    expect(tools).toEqual(expect.arrayContaining(['skill:dep_resolver']));
+    expect(tools).toEqual(expect.arrayContaining(['skill:dependency-resolution']));
 
     // What matters is the tool the Step can actually call once skills are expanded.
-    const { buildDefaultSkills } = await import('../src/skills/skill.js');
+    const { buildDefaultSkills } = await import('../src/skills/index.js');
     expect(buildDefaultSkills().resolve(tools).resolvedToolNames)
       .toEqual(expect.arrayContaining(['add_dependency']));
   });
 
   it('gives it to no other design phase, because the ownership is exclusive', async () => {
-    const { buildDefaultSkills } = await import('../src/skills/skill.js');
+    const { buildDefaultSkills } = await import('../src/skills/index.js');
     for (const phase of ['REQUIREMENT_ANALYSIS', 'DETAILED_DESIGN'] as const) {
       const tools = ensureEssentialToolRefs({
         phase,
@@ -105,14 +146,15 @@ describe('calibrateStepShape', () => {
     }
   });
 
-  it('pairs explicit write_file and append_file so chunked authoring is available in old plans', () => {
+  it('pairs explicit write_file and append_file for context-sized authoring', () => {
     expect(ensureEssentialToolRefs({
       phase: 'CODE',
       tools: ['write_file'],
       outputs: ['src/app.ts'],
     })).toEqual([
       'write_file',
-      'skill:author',
+      'skill:artifact-authoring',
+      'skill:test-design',
       'run_program',
       'run_tests',
       'append_file',
@@ -126,7 +168,8 @@ describe('calibrateStepShape', () => {
       outputs: ['src/app.ts'],
     })).toEqual([
       'append_file',
-      'skill:author',
+      'skill:artifact-authoring',
+      'skill:test-design',
       'run_program',
       'run_tests',
       'write_file',
@@ -299,5 +342,28 @@ describe('calibrateStepShape', () => {
     expect(out[0]!.outputs).not.toContain('docs/04-unit-test-plan.md');
     expect(out[0]!.outputs).not.toContain('docs/unit_test_plan.md');
     expect(out[1]!.outputs).toEqual(['docs/05-unit-test.md', 'tests/app.test.ts']);
+  });
+});
+
+describe('calibrateProducedInputGlobs', () => {
+  it('expands a produced glob to exact Step outputs and leaves an unmatched glob rejectable', () => {
+    const steps = [
+      {
+        id: 'S004',
+        inputs: [],
+        outputs: ['src/main.ts', 'src/services/news.ts', 'src/schema.json'],
+      },
+      {
+        id: 'S005',
+        inputs: ['src/**/*.ts', 'tests/missing/**/*.ts'],
+        outputs: ['docs/05-unit-test.md'],
+      },
+    ] as Step[];
+
+    expect(calibrateProducedInputGlobs(steps)[1]!.inputs).toEqual([
+      'src/main.ts',
+      'src/services/news.ts',
+      'tests/missing/**/*.ts',
+    ]);
   });
 });

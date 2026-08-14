@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import type { Workspace } from '../workspace/workspace.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
@@ -68,6 +69,7 @@ export class SubprocessSandbox implements Sandbox {
   private readonly venvAbs: string;
   private readonly cacheFile: string;
   private pyBin: string | null = null;
+  private tmpDirEnv: string | undefined;
 
   constructor(private readonly opts: SubprocessSandboxOptions) {
     this.language = opts.language ?? 'python';
@@ -131,6 +133,7 @@ export class SubprocessSandbox implements Sandbox {
         fs.mkdir(path.join(this.downloadCacheAbs, 'npm-cache'), { recursive: true }),
         fs.mkdir(path.join(this.downloadCacheAbs, 'pip-cache'), { recursive: true }),
       ]);
+      await this.linkShortTmp();
     }
     if (this.language === 'typescript') {
       return this.buildNode(manifestFile ?? 'package.json', options);
@@ -345,12 +348,41 @@ export class SubprocessSandbox implements Sandbox {
    * decision, and an endpoint picked up silently from the host is one nobody chose. Unset leaves the
    * tool's own default in place.
    */
+  /**
+   * Points `TMPDIR` at a short path that leads back into the sandbox's own tmp directory.
+   *
+   * A Unix domain socket path is capped at 104 bytes, and the sandbox tree alone is longer than
+   * that: `npx tsx` binds `$TMPDIR/tsx-<uid>/<pid>.pipe`, which came to 142 bytes and failed with
+   * `listen EINVAL` before the generated product ever started. The link keeps every temporary file
+   * inside the sandbox, so isolation and cleanup are unchanged — only the string handed to bind(2)
+   * gets shorter. If the link cannot be made, the long path still works for everything that does
+   * not open a socket, so this degrades rather than fails the build.
+   */
+  private async linkShortTmp(): Promise<void> {
+    const target = path.join(this.sandboxAbs, 'tmp');
+    const root = process.platform === 'win32' ? os.tmpdir() : '/tmp';
+    const key = crypto.createHash('sha1').update(this.sandboxAbs).digest('hex').slice(0, 12);
+    const link = path.join(root, `xc-tmp-${key}`);
+    try {
+      const existing = await fs.readlink(link).catch(() => undefined);
+      if (existing === target) {
+        this.tmpDirEnv = link;
+        return;
+      }
+      if (existing !== undefined) await fs.unlink(link);
+      await fs.symlink(target, link, 'dir');
+      this.tmpDirEnv = link;
+    } catch {
+      this.tmpDirEnv = undefined;
+    }
+  }
+
   private baseEnvironment(): NodeJS.ProcessEnv {
     if (this.opts.inheritEnv === true) return { ...process.env };
     return {
       PATH: process.env.PATH ?? '',
       HOME: path.join(this.sandboxAbs, 'home'),
-      TMPDIR: path.join(this.sandboxAbs, 'tmp'),
+      TMPDIR: this.tmpDirEnv ?? path.join(this.sandboxAbs, 'tmp'),
       CI: '1',
       NO_COLOR: '1',
       NPM_CONFIG_CACHE: path.join(this.downloadCacheAbs, 'npm-cache'),

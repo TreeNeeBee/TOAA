@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 import type { Plan } from '../src/core/plan.js';
 import { QualityAssessmentService } from '../src/application/execution/quality_assessment_service.js';
 import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
+import { TicketWorkflow } from '../src/application/project_management/ticket_workflow.js';
+import { ProjectStateService } from '../src/application/project_management/project_state_service.js';
 import { ProjectController, type ScheduledWork } from '../src/application/project_management/project_controller.js';
 import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
@@ -13,7 +15,6 @@ import { compileProjectGraph } from '../src/domain/planning/compiler.js';
 import { TicketSchema } from '../src/domain/tickets/ticket.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../src/workspace/workspace.js';
-import { ProjectStateService } from '../src/application/project_management/project_state_service.js';
 
 describe('PM WorkScheduler', () => {
   it('keeps a source Step delivered until its paired verification closes it', async () => {
@@ -146,6 +147,81 @@ describe('PM WorkScheduler', () => {
     expect(result.projectDelivered).toBe(true);
     expect((await fixture.repository.read(fixture.graph.phases[0]!.id)).state).toBe('closed');
     expect((await fixture.repository.read(fixture.graph.phases[0]!.epicTicketId)).state).toBe('closed');
+  });
+
+  // The manifest has to be produced when every Step has closed — so every ChangeSet has merged and
+  // the files are final — and before the delivery Ticket closes, so it is part of what is delivered
+  // rather than an edit made to a delivered artifact afterwards.
+  it('publishes the delivery manifest after the last Step closes and before delivery does', async () => {
+    const fixture = await setup();
+    const seen: { deliveryState?: string; closedSteps: number }[] = [];
+    const controller = new ProjectController(fixture.repository, {
+      onStepsClosed: async (phaseId) => {
+        const tickets = await new TicketWorkflow(fixture.repository).list();
+        const delivery = tickets.find((ticket) =>
+          ticket.phaseId === phaseId && ticket.type === 'story' && ticket.workKind === 'delivery');
+        seen.push({
+          deliveryState: delivery?.state,
+          closedSteps: tickets.filter((ticket) =>
+            ticket.workKind === 'v-model-step' && ticket.state === 'closed').length,
+        });
+      },
+    });
+    for (let index = 0; index < 8; index += 1) await deliverPassing(fixture, await startNext(fixture));
+    const phase = await fixture.repository.read(fixture.graph.phases[0]!.id);
+    if (phase.objectType !== 'phase') throw new Error('expected Phase');
+    const assessment = await new QualityAssessmentService(fixture.repository).assessPhase({
+      phase,
+      passed: true,
+      evidence: ['deliverables complete', 'integrated tests pass', 'live scenario passes'],
+    });
+    await controller.attachPhaseQuality(phase.id, assessment.id);
+    await controller.completePhase(phase.id);
+
+    expect(seen).toHaveLength(1);
+    // Every V-model Step is closed by then: nothing more will be written.
+    expect(seen[0]!.closedSteps).toBe(8);
+    // And delivery is still open, so the manifest is part of the delivered record.
+    expect(seen[0]!.deliveryState).not.toBe('closed');
+  });
+
+  // A repair queued on a downstream Step is often the one thing able to clear the upstream Step
+  // that is holding it. A live Phase stopped with every actor idle for exactly that: a Bug at
+  // MODULE_TEST had no blockers and a full attempt budget, and the scheduler never looked at it
+  // because HIGH_LEVEL_DESIGN was reopened four Steps earlier.
+  it('considers corrective work on a Step whose dependencies are not ready', async () => {
+    const fixture = await setup();
+    // Everything else is finished, so the Bug is the only work left to find.
+    for (let index = 0; index < 8; index += 1) await deliverPassing(fixture, await startNext(fixture));
+    const steps = fixture.graph.steps;
+    const design = steps.find((step) => step.type === 'HIGH_LEVEL_DESIGN')!;
+    const late = steps.find((step) => step.type === 'MODULE_TEST')!;
+    // The Step the repair targets — upstream of where it was found, and behind the reopening.
+    const repaired = steps.find((step) => step.type === 'DETAILED_DESIGN')!;
+    const state = new ProjectStateService(fixture.repository);
+
+    // The upstream Step is reopened, so nothing behind it has ready dependencies.
+    await state.transitionStep(await state.requireStep(design.id), 'reopened');
+
+    const bug = await new TicketWorkflow(fixture.repository).openBug({
+      creatorActorId: fixture.graph.actors.find((actor) => actor.role === 'tester')!.id,
+      failedStep: await state.requireStep(late.id),
+      targetStep: await state.requireStep(repaired.id),
+      verificationStep: await state.requireStep(late.id),
+      kind: 'test-failure',
+      severity: 'high',
+      message: 'the module suite disagrees with the contract',
+      summary: 'module contract mismatch',
+      category: 'test',
+      code: 'module_contract_mismatch',
+      retryable: true,
+      switchProvider: false,
+      correlationId: createObjectId(),
+    });
+    await new TicketRegistrationService(fixture.repository).routeAndAssign(bug.id);
+
+    const work = await fixture.controller.next(fixture.graph.phases[0]!.id);
+    expect(work?.ticket.id).toBe(bug.id);
   });
 
   it('never updates immutable Checkpoints', async () => {

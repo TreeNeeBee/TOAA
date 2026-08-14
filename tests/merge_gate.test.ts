@@ -13,6 +13,7 @@ import { createObjectId } from '../src/domain/identity/object_id.js';
 import { MergeGateService } from '../src/application/workspace/merge_gate_service.js';
 import { ProjectContainer } from '../src/workspace/project_container.js';
 import { MergeConflictError } from '../src/application/workspace/git_port.js';
+import { TicketChangeSetSchema } from '../src/domain/workspace/change_set.js';
 
 function run(overrides: Partial<MergeGateRun> = {}): MergeGateRun {
   return {
@@ -63,6 +64,95 @@ describe('merge gate verdicts', () => {
 });
 
 describe('merge gate lifecycle', () => {
+  it('retargets the existing merge request after a failed candidate takes over the ChangeSet', async () => {
+    const projectId = createObjectId();
+    const changeSetId = createObjectId();
+    const request = MergeRequestSchema.parse({
+      ...createObjectEnvelope({ name: 'mr-retarget', objectType: 'merge-request', projectId }),
+      changeSetId,
+      rootTicketId: createObjectId(),
+      sourceBranch: 'xcompiler/ticket/T0',
+      targetBranch: 'master',
+      baseRevision: 'a'.repeat(40),
+      sourceRevision: 'b'.repeat(40),
+      gateRunIds: [],
+      state: 'changes-requested',
+    });
+    const changeSet = TicketChangeSetSchema.parse({
+      ...createObjectEnvelope({ name: 'changeset-retarget', objectType: 'ticket-change-set', projectId }),
+      id: changeSetId,
+      rootTicketId: request.rootTicketId,
+      generation: 1,
+      sourceBranch: 'xcompiler/gate/repaired',
+      workspaceId: createObjectId(),
+      baseRevision: 'a'.repeat(40),
+      currentRevision: 'c'.repeat(40),
+      state: 'reviewing',
+    });
+    let updated: unknown;
+    const service = new MergeGateService(
+      {
+        list: async () => [request],
+        read: async () => changeSet,
+        update: async (object: unknown) => { updated = object; },
+      } as never,
+      new ProjectContainer('/tmp/xcompiler-gate-retarget'),
+      {} as never,
+      'master',
+    );
+
+    const refreshed = await service.open(changeSet);
+
+    expect(refreshed.sourceBranch).toBe('xcompiler/gate/repaired');
+    expect(refreshed.sourceRevision).toBe('c'.repeat(40));
+    expect(updated).toEqual(refreshed);
+  });
+
+  it('retains a failed candidate so the routed Bug can debug the exact tree', async () => {
+    const projectId = createObjectId();
+    const request = MergeRequestSchema.parse({
+      ...createObjectEnvelope({ name: 'mr-failed', objectType: 'merge-request', projectId }),
+      changeSetId: createObjectId(),
+      rootTicketId: createObjectId(),
+      sourceBranch: 'xcompiler/ticket/T0',
+      targetBranch: 'master',
+      baseRevision: 'a'.repeat(40),
+      sourceRevision: 'b'.repeat(40),
+      gateRunIds: [],
+      state: 'validating',
+    });
+    const running = {
+      ...createObjectEnvelope({ name: 'gate-failed', objectType: 'merge-gate-run', projectId }),
+      mergeRequestId: request.id,
+      sourceRevision: 'b'.repeat(40),
+      targetRevision: 'a'.repeat(40),
+      candidateRevision: 'c'.repeat(40),
+      worktreePath: `worktrees/gates/${request.id}/run`,
+      status: 'running',
+      checkResults: [],
+      startedAt: new Date().toISOString(),
+    } as MergeGateRun;
+    const removeWorktree = vi.fn(async () => undefined);
+    const deleteBranch = vi.fn(async () => undefined);
+    const committed: unknown[][] = [];
+    const service = new MergeGateService(
+      {
+        read: async (id: string) => id === running.id ? running : request,
+        commit: async (objects: unknown[]) => { committed.push(objects); },
+      } as never,
+      new ProjectContainer('/tmp/xcompiler-gate-failed'),
+      { removeWorktree, deleteBranch } as never,
+      'master',
+    );
+
+    const finished = await service.complete(running.id, [check({ ok: false, summary: 'tests broke' })]);
+
+    expect(finished.status).toBe('failed');
+    expect(committed).toHaveLength(1);
+    expect(removeWorktree).not.toHaveBeenCalled();
+    expect(deleteBranch).not.toHaveBeenCalled();
+  });
+
   it('removes the disposable worktree and branch when candidate creation conflicts', async () => {
     const projectId = createObjectId();
     const request = MergeRequestSchema.parse({

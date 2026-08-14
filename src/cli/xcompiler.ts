@@ -19,6 +19,7 @@ import {
   parseLocale,
   parseNonNegativeInteger,
   parseRecordReplayMode,
+  parsePermissionMode,
   parseStepId,
 } from './arguments.js';
 
@@ -58,6 +59,7 @@ program
   .option('--project-file <file>', t().cli.optProjectFile)
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (opts) => {
@@ -76,6 +78,7 @@ program
       projectCommand: 'build',
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
     });
@@ -98,6 +101,7 @@ program
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (opts) => {
@@ -116,6 +120,7 @@ program
       debugWikiPath: opts.debugWikiPath,
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
       cwd: process.cwd(),
@@ -133,6 +138,7 @@ program
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .action(async (projectArg, opts) => {
     const result = await runtime.loadCommand({
       io: createCliRuntimeIO(),
@@ -143,6 +149,7 @@ program
       debugWikiPath: opts.debugWikiPath,
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
     });
     applyExecuteExitCode(result);
   });
@@ -159,6 +166,7 @@ program
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (projectArg, opts) => {
@@ -172,6 +180,7 @@ program
       debugWikiPath: opts.debugWikiPath,
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
     });
@@ -218,9 +227,10 @@ program
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
   .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
   .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .action(async (planArg, opts) => {
     const result = await runCliAbortable((abortSignal) => runtime.runCommand({
-      io: createCliRuntimeIO(),
+      io: createCliRuntimeIO({ permissionPolicy: opts.permissionMode }),
       planArg,
       output: opts.output,
       workspace: opts.workspace,
@@ -231,6 +241,7 @@ program
       debugWikiPath: opts.debugWikiPath,
       recordReplayMode: opts.recordReplay,
       recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       abortSignal,
       cwd: process.cwd(),
     }));

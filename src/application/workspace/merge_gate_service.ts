@@ -9,6 +9,7 @@ import {
   gateOutcome,
   gateValidationPath,
   isGateCurrent,
+  reviseMergeRequest,
   type GateCheckResult,
   type MergeGateRun,
   type MergeRequest,
@@ -48,7 +49,24 @@ export class MergeGateService {
   /** Opens the merge request for a ChangeSet, or returns the one already open for it. */
   async open(changeSet: TicketChangeSet): Promise<MergeRequest> {
     const existing = await this.findOpen(changeSet);
-    if (existing) return existing;
+    if (existing) {
+      const current = await this.requireChangeSet(changeSet.id);
+      if (
+        existing.sourceBranch === current.sourceBranch &&
+        existing.sourceRevision === current.currentRevision
+      ) {
+        return existing;
+      }
+      // A failed gate can be promoted into the correction branch. Keep the existing MR and its
+      // evidence, but point the next validation at the branch that now owns the ChangeSet.
+      const refreshed = reviseMergeRequest(existing, {
+        sourceBranch: current.sourceBranch,
+        sourceRevision: current.currentRevision,
+        baseRevision: current.baseRevision,
+      });
+      await this.repository.update(refreshed, refreshed.state);
+      return refreshed;
+    }
     // Re-read rather than write through the caller's copy. Opening an MR naturally follows commits
     // on the branch, each of which advanced this ChangeSet, so the argument is routinely a stale
     // revision and linking through it would be rejected by the registry.
@@ -135,7 +153,7 @@ export class MergeGateService {
     return { run, root: handle.workspace.root };
   }
 
-  /** Records the checks and disposes of the gate worktree, which exists only for this run. */
+  /** Records the checks; a failed candidate is retained so the resulting Bug can repair it. */
   async complete(runId: ObjectId, checks: readonly GateCheckResult[]): Promise<MergeGateRun> {
     const run = await this.requireRun(runId);
     const status = gateOutcome(checks);
@@ -167,7 +185,11 @@ export class MergeGateService {
     const gateRoot = run.worktreePath
       ? path.join(this.container.root, run.worktreePath)
       : this.container.gate(request.id, run.id, request.sourceBranch).workspace.root;
-    await this.cleanupGate(gateRoot, gateBranch, persistenceError);
+    // A product failure must be debugged against the exact candidate that failed. Passing and
+    // infrastructure-only candidates carry no corrective work and remain disposable.
+    if (status !== 'failed' || persistenceError) {
+      await this.cleanupGate(gateRoot, gateBranch, persistenceError);
+    }
     if (persistenceError) {
       throw persistenceError;
     }

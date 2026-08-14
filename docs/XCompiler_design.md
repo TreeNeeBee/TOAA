@@ -103,6 +103,20 @@ Project
 
 `append/evolve` 保留现有 Project 和 ProjectPlan ID，把新需求重编号为后续 Phase。首个新增 Phase/Epic 依赖原末尾 Phase/Epic，不会替换或孤立已有 Ticket、报告和审计。
 
+### 4.1 Agent Skills 能力层
+
+`src/skills` 按 [Agent Skills Specification](https://agentskills.io/specification) 加载
+`skills/<name>/SKILL.md`。Build 只把 `name + description` 元数据目录交给 Planner；Step 通过
+`skill:<name>` 选择能力后，Run 才加载 Markdown 正文；`references/`、`scripts/` 和 `assets/`
+由激活态只读 `skill_resource` 按需读取。未知 Skill、重复名称、目录/名称不一致、未知 Tool
+引用或资源越界均明确失败。
+
+Runtime 为 Build、Run 和后续 Phase 展开创建同一份能力图：内置 Tools/Skills 先注册，Plugin
+API 3 再合并目录，最后统一校验引用。Skill 只组合 Tool 和工作方法，不拥有 PM/Ticket/V 模型、
+权限、Git、质量门禁、Record/Replay 或 Debug Wiki 状态。Record/Replay 与 Debug Wiki 采用
+“Skill 工作流指导 + Runtime 权威服务”组合，避免把持久化、脱敏、哈希链、检索和审计降为提示词。
+完整目录和扩展合同见 [Agent Skills](agent_skills.md)。
+
 ## 5. 迭代式 V 模型
 
 每个 Phase 固定八个 Step：
@@ -277,8 +291,9 @@ plan.P<N>.json                         current Planner execution spec
 .xcompiler/objects/<type>/<uuid>/r<N>.json  canonical domain objects, immutable per revision
 .xcompiler/cache/pm/project-status.json    rebuildable PM status projection
 .xcompiler/record-replay/              redacted external-interaction fixtures
-.xcompiler/audit.jsonl                 detailed operational audit
-docs/process_log.md                    human-readable process log
+.xcompiler/audit/audit.jsonl           complete append-only operational audit
+.xcompiler/audit/process_log.md        complete human-readable process log
+.xcompiler/audit/summary.md            rebuildable index with raw/object links
 docs/project-development-report.md     delivery projection
 ```
 
@@ -292,9 +307,18 @@ Git 合并使用可恢复的领域事务：门禁通过后先把 Merge Request �
 标记和最近一次通过的 Gate；证据一致时补交领域状态并清理 worktree，证据不一致时明确阻塞，
 不会重复合并或伪造完成。
 
+每个进入执行的 Ticket 都持久化当前 worktree 绑定，包括容器相对路径、分支、Git revision、
+Workspace/ChangeSet/GateRun 标识和追加式绑定历史。首次 S1-S3 在 canonical `master` 工作；其
+候选被门禁拒绝时，Runtime 在回滚 `master` 前将 rejected commit 提升为临时纠正 ChangeSet。
+CODE 首次创建隔离 ChangeSet。Bug、Enhancement 和 CR 继承发现它们的 Ticket worktree，因此从 CODE
+回退到 HIGH_LEVEL_DESIGN 或 DETAILED_DESIGN 时仍能读取候选源码。产品门禁失败时保留精确的
+Gate candidate，并将其提升为 ChangeSet 的纠正来源；通过或仅基础设施失败的 Gate 仍立即清理。
+纠正 finding 和 Enhancement 持久化结构化 `affectedArtifacts`；工具层按该范围收紧 Enhancement
+写入，CR 只写当前 Step 所有产物，避免测试缺陷重写依赖清单或重新生成整阶段。
+
 ## 13. Record/Replay
 
-HTTP、LLM 和 subprocess 外部交互通过统一端口记录；测试逻辑不内嵌特定 API 的 fixture 规则。S1-S4 可为基线测试使用 `record`/`refresh`，S5-S8 的外部数据补充与冻结执行使用 Record/Replay；只有 Phase 交付门禁声明的真实用户场景强制 `off`。缺失、歧义、哈希链损坏或未脱敏 fixture 都明确失败；`refresh` 追加 supersession 关系，不覆盖历史证据。
+HTTP、LLM 和 Tool 外部数据通过统一端口记录；测试逻辑不内嵌特定 API 的 fixture 规则。当前源码的 build、program 和 test 子进程始终执行，Record/Replay 只替换它们访问的外部数据，禁止用历史退出码冒充当前门禁证据。S1-S4 可为基线测试使用 `record`/`refresh`，S5-S8 的外部数据补充与冻结执行使用 Record/Replay；只有 Phase 交付门禁声明的真实用户场景强制 `off`。缺失、歧义、哈希链损坏或未脱敏 fixture 都明确失败；`refresh` 追加 supersession 关系，不覆盖历史证据。
 
 ## 14. Runtime 事件与权限
 

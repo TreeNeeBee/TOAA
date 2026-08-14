@@ -5,10 +5,7 @@ import { GitRepositoryService } from '../infrastructure/git/git_repository_servi
 import type { Workspace } from './workspace.js';
 
 const RUNTIME_EXCLUDE_PATTERNS = [
-  '.xcompiler/*',
-  'logs/',
-  'docs/process_log.md',
-  '*.xc',
+  '.xcw/',
   '.sandbox/',
   '.pytest_cache/',
   '**/__pycache__/',
@@ -134,10 +131,7 @@ function isRuntimeArtifactPath(file: string): boolean {
   const normalized = file.replace(/\\/g, '/');
   if (!normalized) return false;
   return (
-    normalized.startsWith('.xcompiler/') ||
-    normalized.startsWith('logs/') ||
-    normalized === 'docs/process_log.md' ||
-    normalized.endsWith('.xc') ||
+    normalized.startsWith('.xcw/') ||
     normalized === '.coverage' ||
     normalized.startsWith('.sandbox/') ||
     normalized.startsWith('.pytest_cache/') ||

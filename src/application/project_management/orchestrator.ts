@@ -1,4 +1,7 @@
 import type { Plan } from '../../core/plan.js';
+import { resolveFileTreeService } from '../workspace/file_tree_resolver.js';
+import { renderFileManifest, upsertFileManifest } from '../workspace/file_manifest.js';
+import { DOC_NAMES } from '../../core/docs.js';
 import { createObjectId, type ObjectId } from '../../domain/identity/object_id.js';
 import type { Phase } from '../../domain/phases/phase.js';
 import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
@@ -27,12 +30,14 @@ import { AttemptResultProcessor } from './attempt_result_processor.js';
 import { ProjectProgressGuard } from './progress_guard.js';
 import { isCancellationError } from '../../core/cancellation.js';
 import type { DeliveryGateFinding } from '../../domain/quality/delivery_gate.js';
+import type { TicketWorkspaceBinding } from '../../domain/tickets/ticket.js';
 import { QualityAssessmentService } from '../execution/quality_assessment_service.js';
 
 interface MergeIntegrationResult {
   status: 'merged' | 'nothing-to-merge' | 'failed' | 'blocked' | 'awaiting-authorization';
   reason?: string;
   failureLog?: string;
+  workspaceBinding?: TicketWorkspaceBinding;
 }
 
 export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, 'repository' | 'plugins'> {
@@ -68,6 +73,8 @@ export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, '
   integrateTicket?: (rootTicketId: ObjectId) => Promise<MergeIntegrationResult>;
   integratePhase?: (phaseId: ObjectId) => Promise<MergeIntegrationResult>;
   integratePendingAuthorization?: (phaseId: ObjectId) => Promise<MergeIntegrationResult>;
+  /** Commits a Runtime-authored delivery artifact before its revision is indexed. */
+  commitCanonicalArtifact?: (stepId: ObjectId, summary: string) => Promise<string>;
   onTransition?: (event: {
     event: 'phase_started' | 'step_started' | 'ticket_started' | 'ticket_routed' | 'step_delivered' | 'phase_delivered' | 'project_delivered';
     projectId: ObjectId;
@@ -109,7 +116,9 @@ export class ProjectOrchestrator {
   private readonly quality: QualityAssessmentService;
 
   constructor(private readonly options: ProjectOrchestratorOptions, private readonly draft: Plan) {
-    this.scheduler = new ProjectController(options.repository);
+    this.scheduler = new ProjectController(options.repository, {
+      onStepsClosed: (phaseId) => this.publishFileManifest(phaseId),
+    });
     this.runner = options.attemptRunner ?? new DomainAttemptRunner(options, draft.language);
     this.tickets = new TicketRegistrationService(options.repository);
     this.projection = new ProjectStatusProjectionService(options.repository, options.projectionWriter);
@@ -130,6 +139,53 @@ export class ProjectOrchestrator {
     this.quality = new QualityAssessmentService(options.repository);
   }
 
+  /**
+   * Writes the file manifest into the delivery document.
+   *
+   * Called when every V-model Step has closed and the delivery Ticket has not: every ChangeSet has
+   * merged so the files are final, and delivery is still open so the manifest is part of what is
+   * delivered rather than an edit made to a delivered artifact.
+   *
+   * The tree is reconciled before rendering. Incremental updates only cover writes this process performed, and
+   * a squash merge lands the whole of CODE's work without passing through a tool at all — a
+   * manifest built from the incremental index would omit exactly the files the project consists of.
+   *
+   * Failure propagates. The manifest is a delivery artifact by the same rule as the documents
+   * beside it, and a Phase that could not produce one has not delivered what it claims.
+   */
+  private async publishFileManifest(phaseId: ObjectId): Promise<void> {
+    const phase = await this.options.repository.read(phaseId);
+    if (phase.objectType !== 'phase') return;
+    const plans = await this.options.repository.list({
+      objectType: 'project-management-plan',
+      projectId: phase.projectId,
+    });
+    const plan = plans.find((object) => object.objectType === 'project-management-plan');
+    if (plan?.objectType === 'project-management-plan' && plan.fileTree?.publishManifestOnDelivery === false) {
+      return;
+    }
+    const tree = await resolveFileTreeService(
+      this.options.repository,
+      phase.projectId,
+      this.options.workspace.root,
+    );
+    await tree.rescan();
+    const document = await this.options.workspace.readFile(DOC_NAMES.delivery).catch(() => '');
+    const section = renderFileManifest(await tree.entries(), { scannedAt: new Date().toISOString() });
+    await this.options.workspace.writeFile(DOC_NAMES.delivery, upsertFileManifest(document, section));
+    const finalRevision = this.options.commitCanonicalArtifact
+      ? await this.options.commitCanonicalArtifact(phase.id, 'publish delivery file manifest')
+      : undefined;
+    // The manifest write is itself part of the delivered tree. Reconcile after its commit so the
+    // indexed revision and the canonical working copy cannot diverge at the delivery boundary.
+    await tree.rescan(finalRevision);
+    await this.options.audit.event('note', `published the file manifest into ${DOC_NAMES.delivery}`, {
+      messageId: 'domain.file_manifest_published',
+      projectId: phase.projectId,
+      phaseId,
+    });
+  }
+
   async run(phaseId: ObjectId): Promise<ProjectOrchestratorResult> {
     this.throwIfAborted();
     await this.options.plugins.initialize();
@@ -138,6 +194,26 @@ export class ProjectOrchestrator {
     await this.outbox.dispatchPending(phase.projectId);
     await this.projection.current(phase.projectId);
     await this.tickets.registerProjectTickets(phase.projectId);
+    // Before anything is scheduled: a run starts with nothing in flight, so work still marked
+    // in-progress belongs to a run that died mid-attempt and must be handed back.
+    const reclaimed = await this.scheduler.reclaimUnreachableWork(phase.projectId);
+    if (reclaimed > 0) {
+      await this.options.audit.event('note', `reclaimed ${reclaimed} Ticket(s) from an interrupted run`, {
+        messageId: 'domain.interrupted_work_reclaimed',
+        projectId: phase.projectId,
+        phaseId: phase.id,
+        reclaimed,
+      });
+    }
+    const unparked = await this.scheduler.releaseCyclicCorrectiveBlockers(phase.projectId);
+    if (unparked > 0) {
+      await this.options.audit.event('note', `released ${unparked} Ticket(s) parked behind a downstream repair hop`, {
+        messageId: 'domain.cyclic_blocker_released',
+        projectId: phase.projectId,
+        phaseId: phase.id,
+        released: unparked,
+      });
+    }
     await this.scheduler.reconcileClosedCorrectiveTickets(phase.projectId);
     await this.runner.synchronizeVerifiedBugResolutions?.(phase.projectId);
     await this.transition({
@@ -171,11 +247,11 @@ export class ProjectOrchestrator {
     const profileManifest = this.draft.language === 'python' ? 'requirements.txt' : 'package.json';
     if (await this.options.workspace.exists(profileManifest)) {
       await this.requirePermission({
-        operationType: 'build_command',
+        operationType: 'install_dependency',
         target: `sandbox build ${profileManifest}`,
         reason: 'Prepare project dependencies before executing the V-model.',
         risk: 'The configured package manager executes inside the selected sandbox.',
-        scope: 'current workspace sandbox',
+        scope: 'configured dependency registry',
         skippable: false,
         denyBehavior: 'Stop because downstream Steps cannot be verified.',
       });
@@ -386,6 +462,10 @@ export class ProjectOrchestrator {
 
       const disposition = await this.results.process({ phase, work, steps, result });
       if (disposition.action === 'stop') {
+        // Result processing can park the active Step/Ticket before asking the Runtime to stop.
+        // Keep PM's derived cache aligned with those authoritative transitions at the session
+        // boundary; no subsequent lifecycle event exists to refresh it for a stopped run.
+        await this.projection.refresh(phase.projectId);
         return this.failure(phase.id, steps.length, executed, work.step, disposition.reason);
       }
       if (result.ok && this.options.integrateTicket) {
@@ -403,6 +483,7 @@ export class ProjectOrchestrator {
             work,
             reason: landed.reason ?? 'merge gate rejected the change',
             failureLog: landed.failureLog,
+            workspaceBinding: landed.workspaceBinding,
           });
           if (gate.action === 'stop') {
             return this.failure(phase.id, steps.length, executed, work.step, gate.reason);

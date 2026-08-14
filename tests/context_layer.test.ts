@@ -18,7 +18,7 @@ import { DomainObjectRepository } from '../src/infrastructure/repository/domain_
 import { ProjectContainer } from '../src/workspace/project_container.js';
 import { PLAN_VERSION, type Plan } from '../src/core/plan.js';
 import { STEP_TYPES } from '../src/domain/steps/step.js';
-import type { Ticket } from '../src/domain/tickets/ticket.js';
+import { bindTicketWorkspace, type Ticket } from '../src/domain/tickets/ticket.js';
 import { TicketWorkflow } from '../src/application/project_management/ticket_workflow.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 
@@ -127,6 +127,29 @@ describe('context assembly', () => {
     expect(names.length).toBeGreaterThan(1);
     expect(assembled.snapshot.ticketContextRevisions[story.id]).toBeGreaterThan(0);
     expect(assembled.snapshot.assembledContextHash).toMatch(/^sha256:[a-f0-9]{64}$/u);
+  });
+
+  it('tells the active role which Ticket worktree owns relative tool paths', async () => {
+    const { assembler, repository, graph, story } = await fixture();
+    const bound = bindTicketWorkspace(story, {
+      kind: 'ticket',
+      relativePath: `worktrees/tickets/${story.id}`,
+      branch: `xcompiler/ticket/${story.id}`,
+      revision: 'a'.repeat(40),
+      workspaceId: createObjectId(),
+      changeSetId: createObjectId(),
+      reason: 'change-set',
+      boundAt: new Date().toISOString(),
+    });
+    await repository.update(bound, bound.state);
+
+    const assembled = await assembler.assemble({
+      projectId: graph.project.id,
+      ticketId: story.id,
+    });
+
+    expect(assembled.text).toContain(`workspace: ticket worktrees/tickets/${story.id}`);
+    expect(assembled.text).toContain('every file-tool path is relative to this workspace root');
   });
 
   it('retrieves Debug Wiki entries only when a Bug is the Ticket in scope', async () => {

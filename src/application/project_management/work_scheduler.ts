@@ -1,7 +1,7 @@
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { Phase } from '../../domain/phases/phase.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
-import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
+import { STEP_TYPE_ORDER, stepSatisfiesDependency, type Step } from '../../domain/steps/step.js';
 import { isActiveTicket, workStepId, type Ticket, type WorkTicket } from '../../domain/tickets/ticket.js';
 import { TicketWorkflow } from './ticket_workflow.js';
 
@@ -28,14 +28,19 @@ export class WorkScheduler {
     const resumed = await this.inProgressWork(phase, steps, tickets);
     if (resumed) return resumed;
     for (const step of steps) {
-      if (!(await this.stepDependenciesReady(step))) continue;
       const corrective = await this.readyCorrectiveTicket(step, tickets);
       if (corrective) {
         return { phase, step, ticket: corrective, mode: modeFor(corrective) };
       }
       // Closed Steps suppress their ordinary Story only. A queued corrective Ticket is allowed to
-      // reopen one, and was therefore considered above.
+      // reopen one, and was therefore considered above — and unready dependencies suppress it the
+      // same way, for the same reason. A corrective Ticket is matched against the Step it repairs,
+      // which is routinely upstream of where the defect was found, so gating it on that Step's
+      // dependencies hid every repair queued behind a reopened Step. A live Phase stopped with
+      // every actor idle and seven such repairs waiting, none of them blocked and none of them
+      // out of attempts.
       if (step.state === 'closed') continue;
+      if (!(await this.stepDependenciesReady(step))) continue;
       const story = tickets.find(
         (ticket): ticket is WorkTicket =>
           ticket.type === 'story' &&
@@ -44,7 +49,8 @@ export class WorkScheduler {
       );
       if (
         story &&
-        (story.state === 'created' || story.state === 'reopened' || story.state === 'in_progress') &&
+        (story.state === 'created' || story.state === 'pending' ||
+          story.state === 'reopened' || story.state === 'in_progress') &&
         story.blockedByTicketIds.length === 0 &&
         await this.ticketDependenciesReady(story, tickets)
       ) {
@@ -132,8 +138,7 @@ export class WorkScheduler {
   private async stepDependenciesReady(step: Step): Promise<boolean> {
     const dependencies = await Promise.all(step.dependencyStepIds.map((id) => this.repository.read(id)));
     return dependencies.every((object) =>
-      object.objectType === 'step' &&
-      (object.state === 'delivered' || object.state === 'closed'));
+      object.objectType === 'step' && stepSatisfiesDependency(object));
   }
 
   private async ticketDependenciesReady(ticket: Ticket, tickets: readonly Ticket[]): Promise<boolean> {

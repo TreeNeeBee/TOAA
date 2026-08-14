@@ -28,11 +28,39 @@ function sandbox(): Sandbox {
 describe('merge gate checks', () => {
   it('uses dependency and static checks for a Ticket merge without running later V-model tests', async () => {
     const target = sandbox();
-    const checks = await runMergeGateChecks(target, 'typescript', undefined, 'ticket');
+    const checks = await runMergeGateChecks(target, 'typescript', undefined, 'ticket-code');
 
     expect(checks.map((check) => check.name)).toEqual(['dependencies', 'typecheck']);
     expect(target.runProgram).toHaveBeenCalledWith(['tsc', '--noEmit']);
     expect(target.runTests).not.toHaveBeenCalled();
+  });
+
+  it('uses the locked candidate assembly as the pre-CODE correction merge gate', async () => {
+    const target = sandbox();
+    const checks = await runMergeGateChecks(
+      target,
+      'typescript',
+      undefined,
+      'ticket-artifact',
+    );
+
+    expect(checks).toEqual([expect.objectContaining({ name: 'candidate-assembly', ok: true })]);
+    expect(target.build).not.toHaveBeenCalled();
+    expect(target.runProgram).not.toHaveBeenCalled();
+    expect(target.runTests).not.toHaveBeenCalled();
+  });
+
+  it('runs the project tests for verification Ticket corrections', async () => {
+    const target = sandbox();
+    const checks = await runMergeGateChecks(
+      target,
+      'typescript',
+      undefined,
+      'ticket-verification',
+    );
+
+    expect(checks.map((check) => check.name)).toEqual(['dependencies', 'tests']);
+    expect(target.runTests).toHaveBeenCalledOnce();
   });
 
   it('keeps the full project test gate for phase integration', async () => {

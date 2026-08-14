@@ -1,6 +1,7 @@
 import { RECORDED_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
 import { isTestFilePath, normalizeGitPath } from './v_model_policy.js';
 import type { LanguageProfile } from '../../core/language.js';
+import type { Ticket } from '../../domain/tickets/ticket.js';
 import {
   PHASE_ORDER,
   V_MODEL_TEST_PHASES,
@@ -68,6 +69,30 @@ export function computeDebugAllowedWrites(
   return [...outputs];
 }
 
+/**
+ * Resolves the mutation scope for corrective work without granting every upstream deliverable.
+ *
+ * Enhancements carry the gate's exact affected artifacts. A CR carries the accepted upstream delta
+ * for inspection, so it writes only matching target artifacts when they exist and otherwise stays
+ * within the current Step's declared outputs. Bugs retain the broader debug scope because their
+ * failure evidence, not a quality finding, determines the root cause.
+ */
+export function computeIncrementalAllowedWrites(
+  plan: Plan,
+  step: Step,
+  profile: LanguageProfile,
+  ticket: Ticket,
+): string[] {
+  if (ticket.type === 'enhancement' && ticket.affectedArtifacts.length > 0) {
+    return ownedAffectedArtifacts(step, ticket.affectedArtifacts);
+  }
+  if (ticket.type === 'change-request') {
+    const owned = ownedAffectedArtifacts(step, ticket.contractDelta.affectedArtifacts);
+    return owned.length > 0 ? owned : computeStepAllowedWrites(step);
+  }
+  return computeDebugAllowedWrites(plan, step, profile);
+}
+
 export function computeStepAllowedWrites(step: Step): string[] {
   const outputs = [...new Set(step.outputs)];
   // A Step that owns paired tests may also write the responses those tests replay. The rule that
@@ -113,4 +138,16 @@ function transitivelyDependsOn(
 
 function isVerification(step: Step): boolean {
   return (V_MODEL_TEST_PHASES as readonly string[]).includes(step.phase);
+}
+
+function ownedAffectedArtifacts(step: Step, artifacts: readonly string[]): string[] {
+  return [...new Set(artifacts.map(normalizeGitPath))].filter((artifact) =>
+    step.outputs.some((output) => pathsOverlap(output, artifact))
+  );
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const a = normalizeGitPath(left);
+  const b = normalizeGitPath(right);
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }

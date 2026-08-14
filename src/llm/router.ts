@@ -245,6 +245,11 @@ class FallbackClient implements LLMClient {
   async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
     let lastErr: unknown;
     const failures: string[] = [];
+    // Whether each recorded failure was the provider itself failing, or the model's content being
+    // refused by the caller's own contract. A run must not stop because every provider returned a
+    // turn the contract rejected: that is a round the Step can still be told to correct, and it
+    // reached the orchestrator as an infrastructure failure that aborted the whole run.
+    const failureKinds: ('content' | 'transport')[] = [];
     for (let i = 0; i < this.chain.length; i++) {
       const c = this.chain[i]!;
       // 冷启动 / 切换时的可用性检查（规则 1 / 2）。
@@ -267,6 +272,7 @@ class FallbackClient implements LLMClient {
         );
         if (isSwitch && i < this.chain.length - 1) {
           failures.push(`${c.name}/${c.client.name}: availability check failed: ${health.detail}`);
+          failureKinds.push('transport');
           continue;
         }
       }
@@ -372,6 +378,7 @@ class FallbackClient implements LLMClient {
           }
           this.scores?.decay(c.name, `chat threw in role ${this.role}: ${errorMessage(err).slice(0, 120)}`);
           failures.push(formatProviderFailure(c.name, c.client.name, err));
+          failureKinds.push('transport');
           await this.audit?.event(
             'llm.error',
             t().llm.providerCallFailed(this.role, c.client.name),
@@ -437,6 +444,7 @@ class FallbackClient implements LLMClient {
             this.scores?.decay(c.name, `validate failed in role ${this.role}`);
             lastErr = vErr;
             failures.push(formatProviderFailure(c.name, c.client.name, vErr));
+            failureKinds.push('content');
             break;
           }
         }
@@ -455,7 +463,11 @@ class FallbackClient implements LLMClient {
           mode: 'router',
           retryable: true,
           switchProvider: true,
-          details: { role: this.role, failures },
+          details: {
+            role: this.role,
+            failures,
+            contentRejectedOnly: failureKinds.every((kind) => kind === 'content'),
+          },
         },
         { cause: lastErr },
       );

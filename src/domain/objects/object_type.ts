@@ -9,6 +9,7 @@ export const OBJECT_TYPES = [
   'ticket-assignment',
   'ticket-trace-event',
   'workspace-handle',
+  'file-tree',
   'ticket-change-set',
   'merge-request',
   'merge-gate-run',

@@ -322,7 +322,7 @@ function vModelSteps(iterationId = 'P1'): Step[] {
       systemPrompt: `Implement ${phase} deliverables.`,
       role: phase.endsWith('TEST') ? 'Tester' : phase === 'CODE' ? 'Coder' : 'Planner',
       tools: ['write_file'],
-      inputs: index === 0 ? [] : [`docs/${String(index).padStart(2, '0')}.md`],
+      inputs: index === 0 ? [] : stepOutputs(phases[index - 1]!, index - 1),
       outputs: stepOutputs(phase, index),
       dependsOn: index === 0 ? [] : [`S${String(index).padStart(3, '0')}`],
       acceptance: `${phase} output exists.`,
@@ -334,6 +334,5 @@ function vModelSteps(iterationId = 'P1'): Step[] {
 function stepOutputs(phase: Phase, index: number): string[] {
   if (phase === 'HIGH_LEVEL_DESIGN') return ['docs/02.md', 'package.json'];
   if (phase === 'CODE') return ['src/main.ts'];
-  if (phase === 'UNIT_TEST') return ['tests/main.test.ts'];
   return [`docs/${String(index + 1).padStart(2, '0')}.md`];
 }

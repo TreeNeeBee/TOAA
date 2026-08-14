@@ -64,6 +64,7 @@ export async function runEvolveCommand(opts: RuntimeEvolveCommandOptions): Promi
     debugWikiPath: opts.debugWikiPath,
     recordReplayMode: opts.recordReplayMode,
     recordReplayPath: opts.recordReplayPath,
+    permissionMode: opts.permissionMode,
     io: opts.io,
     plugins: opts.plugins,
     pluginStrict: opts.pluginStrict,
@@ -82,8 +83,8 @@ export type RuntimeRunCommandOptions =
 export async function runRunCommand(opts: RuntimeRunCommandOptions): Promise<ExecuteResult> {
   const cwd = opts.cwd ?? process.cwd();
   const explicit = opts.output ?? opts.workspace;
-  // Any of these may name the container, a worktree inside it, or a file within one — `-w` is
-  // documented as the container, but the plan path printed by `build` points into the working copy.
+  // Any of these may name the container, a worktree inside it, or a file within one. Executable plans
+  // are control-plane files at the container root, never product files in the canonical worktree.
   // Resolving through the layout accepts all three instead of assuming one.
   const start = explicit
     ? path.resolve(explicit)
@@ -96,7 +97,7 @@ export async function runRunCommand(opts: RuntimeRunCommandOptions): Promise<Exe
   }
   const planPath = opts.planArg
     ? path.resolve(opts.planArg)
-    : path.join(container.canonical().workspace.root, DEFAULT_PHASE_PLAN_FILE);
+    : path.join(container.control.root, DEFAULT_PHASE_PLAN_FILE);
   return runExecute({
     ...opts,
     workspace: container.root,
@@ -161,10 +162,10 @@ export async function runAppendCommand(opts: RuntimeAppendCommandOptions): Promi
     debugWikiPath: opts.debugWikiPath,
     recordReplayMode: opts.recordReplayMode,
     recordReplayPath: opts.recordReplayPath,
+    permissionMode: opts.permissionMode,
     io: opts.io,
     plugins: opts.plugins,
     pluginStrict: opts.pluginStrict,
   });
   return { workspace: project.workspace, planPath: compiled.planPath, execution };
 }
-

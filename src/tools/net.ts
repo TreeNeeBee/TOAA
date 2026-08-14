@@ -1,6 +1,5 @@
 import type { Tool, ToolResult } from './types.js';
-import { promises as fs } from 'node:fs';
-import path from 'node:path';
+import { writeWorkspaceFile } from './workspace_write.js';
 import { t } from '../i18n/index.js';
 import { resolveWorkspacePath } from './path_guard.js';
 
@@ -189,8 +188,7 @@ export const httpFetchTool: Tool<HttpFetchArgs, HttpFetchData> = {
 
     if (args.saveAs && saveAsAbs && result.data?._recordedBodyBase64) {
       const body = Buffer.from(result.data._recordedBodyBase64, 'base64');
-      await fs.mkdir(path.dirname(saveAsAbs), { recursive: true });
-      await fs.writeFile(saveAsAbs, body);
+      await writeWorkspaceFile(saveAsAbs, body, { tree: ctx.fileTree, root: ctx.ws.root });
       delete result.data._recordedBodyBase64;
     }
     return result;

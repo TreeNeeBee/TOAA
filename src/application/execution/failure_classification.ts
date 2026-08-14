@@ -65,6 +65,16 @@ export function classifyFailure(
     };
   }
   const message = reason instanceof Error ? reason.message : String(reason ?? '');
+  if (/^permission_blocked:/iu.test(message)) {
+    return {
+      kind: 'infrastructure',
+      category: 'internal',
+      code: 'permission_blocked',
+      message,
+      retryable: false,
+      switchProvider: false,
+    };
+  }
   if (options.trustProviderText === true && PROVIDER_FAILURE_TEXT.test(message)) {
     return {
       kind: 'infrastructure',

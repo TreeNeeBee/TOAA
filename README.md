@@ -88,10 +88,10 @@ Layer responsibilities:
 - **Runtime**: Runtime API, Build Service, Run Service, Event Stream, and Permission Broker; the only business entry point.
 - **Application / PM**: requirement planning, Ticket registration and capability routing, Project/Phase/V-model scheduling, correction and CR propagation, permission governance, quality gates, delivery, projections, and exact-state resume.
 - **State policy**: canonical domain objects are the only runtime source of truth. Ticket types are `epic`, `story`, `task`, `bug`, `enhancement`, and `change-request`; Planner files contain no execution state.
-- **Agents / Skills**: role-specific prompts plus allowed tools for each stage.
+- **Agents / Skills**: Agent Skills Specification directories with metadata-first planning, activation-time instructions, on-demand resources, and Runtime-constrained Tools.
 - **Tools**: guarded file edits, program/test execution, API fetches, dependency edits, git snapshots.
 - **LLM Router**: role chains, provider scores, cluster fallbacks, OpenAI-compatible/Ollama clients, audit.
-- **Workspace**: `phasePlan.json` and `plan.P<N>.json` planning artifacts, `<name>.xc` manifest, `.xcompiler/registry/` identity index/events, `.xcompiler/objects/<type>/<uuid>/r<N>.json` canonical objects (immutable per revision), human audit logs, debug wiki, project memory, and delivery reports.
+- **Project container**: the root `control` space owns `<name>.xc`, `phasePlan.json`, and `plan.P<N>.json`; `.xcompiler/` owns shared PM state, immutable object revisions, Record/Replay, Debug Wiki, and complete audit records; `worktrees/master/` is the only authoritative product tree and release source. Ticket/Gate worktrees are temporary candidates and never become a second project tree.
 
 The append-only object-registry event stream is the recovery source; its snapshot index and PM status cache are rebuildable. Each registry entry maps `id` to `objectType`, object path, parent, revision, content hash, and lifecycle state. Multi-object lifecycle changes commit through one repository unit of work with optimistic revision checks and a transactional event outbox. Adapters and agents cannot mutate these files directly.
 
@@ -190,10 +190,11 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **LLM routing**: role-specific provider chains, XCompiler-maintained dynamic scores, user overrides from `llm_scores_user.yaml`, and `tags: [cluster]` fallback score bands for aggregated routes such as `openrouter/free`.
 - **Languages**: Python and TypeScript project generation, testing, execution, and entry checks.
 - **Sandbox**: `subprocess` by default with an isolated environment (`inherit_env: false`); optional `docker` mode for enforceable network/resource isolation. `network: off` is rejected in subprocess mode because a host child process cannot enforce it.
-- **Audit**: every run writes human-readable process logs plus first-class domain AuditEvent/Log objects with correlation and causation IDs.
+- **Audit**: every run appends complete records to `.xcompiler/audit/audit.jsonl` and `.xcompiler/audit/process_log.md`. A separate, rebuildable `.xcompiler/audit/summary.md` indexes high-signal events and links to raw lines and immutable object revisions; it never replaces or truncates the source records.
 - **Debug wiki**: Bug Ticket repairs retrieve LLM-wiki style prior fixes by compact `DebugBrief`. The wiki is a layered Markdown knowledge base: bundled `wiki/system` policy pages, bundled `wiki/agent` calibration pages, and local `wiki/external` resolved-Bug knowledge. Runtime regenerates `index.md` for review, `index.json` for retrieval, and `log.md` for append-only operations. By default it is copied to the XCompiler path (`$XC_PATH/.xcompiler/debug-wiki` when `XC_PATH` is set, otherwise the package/repo root); use `--debug-wiki-path <dir>` to share a different root. A Bug closes only after its `bugResolutionPlan` and evidence are persisted; failed reused fixes are marked `needs_review`.
-- **Security gates**: project file access is guarded, write tools are scoped to declared outputs, and every sensitive action requires an explicit Adapter permission policy. Missing handlers fail closed.
-- **Record/replay**: HTTP, LLM, and subprocess interactions support `off`, `record`, `replay`, `auto`, and `refresh`. S1-S4 may capture controlled data for baseline tests; S5-S8 use Record/Replay for deterministic supplements and frozen execution. The Phase delivery gate alone disables Replay for declared real-user scenarios. Fixture inspection validates hash chains and redaction and fails explicitly on missing, ambiguous, or corrupt records.
+- **Security gates**: internal project operations are governed by Step outputs, tool allowlists, EditGuard, Ticket, sandbox, and Git gates without repeated external prompts. External resources are authorized once per Runtime task with `permissions.mode: request|auto|deny`; paths outside the project container are always denied, including in `auto` mode.
+- **Record/replay**: external HTTP, LLM, and tool data support `off`, `record`, `replay`, `auto`, and `refresh`. Current project code, builds, and tests always execute; Replay supplies their external fixtures rather than reusing an old process exit code. S1-S4 may capture controlled data for baseline tests; S5-S8 use Record/Replay for deterministic supplements and frozen execution. The Phase delivery gate alone disables Replay for declared real-user scenarios. Fixture inspection validates hash chains and redaction and fails explicitly on missing, ambiguous, or corrupt records.
+- **Agent Skills**: bundled file, web, test, debug, Record/Replay, Debug Wiki, dependency, review, security, profiling, CR, and delivery workflows follow the Agent Skills Specification. Planner sees metadata only; Run loads instructions and resources only for selected Skills. Plugin API 3 can add standard Skill directories without bypassing Runtime gates.
 
 ---
 
@@ -214,6 +215,8 @@ LLM routing is configured under `config.yaml -> llm.*`.
 | `max_debug_rounds_per_step` | `max(8, 2 * max_rounds_per_step)` | Debugger round cap |
 | Planner `Step.maxAttempts` | complexity-adaptive | Transactional Step attempts; minimum grows from simple to moderate/complex and with Phase count |
 | `--debug-wiki-path <dir>` | XCompiler path `.xcompiler/debug-wiki` | Shared layered debug wiki root |
+| `permissions.mode` / `--permission-mode` | `request` | External-resource authorization for this Runtime task: `request`, `auto`, or `deny`; internal project operations do not prompt |
+| `permissions.timeout_ms` | `0` | Permission wait timeout; `0` waits until the user answers or cancels |
 | `max_edit_lines_per_step` | `auto` | Adaptive EditGuard cumulative write-line budget |
 | `agent.sandboxes.<language>.<local\|docker>.limits.network` | `download-only` | Docker supports enforceable `off`; subprocess rejects `off` instead of claiming isolation it cannot provide |
 
@@ -225,6 +228,7 @@ LLM routing is configured under `config.yaml -> llm.*`.
 |---|---|
 | [docs/openrouter.md](docs/openrouter.md) | OpenRouter Free-mode setup and OpenAI-compatible provider notes |
 | [docs/acp.md](docs/acp.md) | ACP code-agent adapter protocol notes |
+| [docs/agent_skills.md](docs/agent_skills.md) | Agent Skills contract, built-in catalog, security boundaries, and Plugin API 3 |
 | [docs/XCompiler_design.md](docs/XCompiler_design.md) | Core design and V-model concepts |
 | [docs/plugin_api.md](docs/plugin_api.md) | Plugin API, lifecycle hooks, tools, skills |
 | [docs/versioning.md](docs/versioning.md) | Version sources, release script, tag policy |

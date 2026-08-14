@@ -1,5 +1,7 @@
 import type { ObjectId } from '../../domain/identity/object_id.js';
+import type { StepType } from '../../domain/steps/step.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
+import type { TicketWorkspaceBinding } from '../../domain/tickets/ticket.js';
 import {
   transitionChangeSet,
   type TicketChangeSet,
@@ -25,10 +27,16 @@ export interface IntegrationOutcome {
   reason?: string;
   failureLog?: string;
   mergedRevisions: string[];
+  /** Exact candidate workspace that a corrective Ticket must inherit. */
+  workspaceBinding?: TicketWorkspaceBinding;
 }
 
 /** Runs the project's own gates against a merge candidate checked out at `root`. */
-export type MergeGateScope = 'ticket' | 'phase';
+export type MergeGateScope =
+  | 'ticket-artifact'
+  | 'ticket-code'
+  | 'ticket-verification'
+  | 'phase';
 export type GateCheckRunner = (
   root: string,
   scope: MergeGateScope,
@@ -56,6 +64,8 @@ export interface MergeIntegrationOptions {
   authorizeMerge?: MergeAuthorizer;
   /** Releases the Ticket worktree after the generation has been durably marked merged. */
   releaseChangeSet: (changeSetId: ObjectId) => Promise<void>;
+  /** Reconciles the canonical file index after the domain merge state is durable. */
+  reconcileCanonicalTree?: (revision: string) => Promise<void>;
 }
 
 /**
@@ -86,12 +96,17 @@ export class MergeIntegrationService {
       (object.rootTicketId === ticketId || object.correctiveTicketIds.includes(ticketId)) &&
       object.state !== 'merged' &&
       object.state !== 'abandoned');
-    // Every Step but CODE works in the canonical copy, so most deliveries have nothing to merge.
+    // Normal S1-S3 work is canonical, but a rejected canonical candidate can create a temporary
+    // corrective ChangeSet. Deliveries without either that correction or CODE work have no merge.
     if (!changeSet || changeSet.objectType !== 'ticket-change-set') {
       return { status: 'nothing-to-merge', mergedRevisions: [] };
     }
     const mergedRevisions: string[] = [];
-    const outcome = await this.integrate(changeSet, mergedRevisions, 'ticket');
+    const outcome = await this.integrate(
+      changeSet,
+      mergedRevisions,
+      await this.ticketGateScope(changeSet),
+    );
     return outcome ?? { status: 'merged', mergedRevisions };
   }
 
@@ -137,6 +152,7 @@ export class MergeIntegrationService {
           status: 'failed',
           reason: verdict.reason ?? 'the previous merge gate is no longer current',
           mergedRevisions,
+          workspaceBinding: await this.changeSetWorkspaceBinding(changeSet),
         };
       }
       const outcome = await this.mergeGatePassed(changeSet, request, verdict.run, mergedRevisions);
@@ -175,6 +191,7 @@ export class MergeIntegrationService {
           reason: `merge candidate conflicts with ${this.options.targetBranch}`,
           failureLog: error.message,
           mergedRevisions,
+          workspaceBinding: await this.changeSetWorkspaceBinding(changeSet),
         };
       }
       return blockedOutcome('merge gate candidate could not be created', error, mergedRevisions);
@@ -212,6 +229,7 @@ export class MergeIntegrationService {
         reason: `merge gate failed for ${changeSet.sourceBranch}`,
         failureLog: failedSummary(checks),
         mergedRevisions,
+        workspaceBinding: gateWorkspaceBinding(changeSet, run),
       };
     }
 
@@ -225,7 +243,12 @@ export class MergeIntegrationService {
 
     const verdict = await this.options.gates.currentVerdict(request.id);
     if (!verdict.ok || !verdict.run) {
-      return { status: 'failed', reason: verdict.reason, mergedRevisions };
+      return {
+        status: 'failed',
+        reason: verdict.reason,
+        mergedRevisions,
+        workspaceBinding: await this.changeSetWorkspaceBinding(changeSet),
+      };
     }
     return this.mergeGatePassed(
       await this.freshChangeSet(changeSet.id),
@@ -299,6 +322,7 @@ export class MergeIntegrationService {
 
     try {
       await this.persistMergedState(changeSet.id, mergeable, merged);
+      await this.options.reconcileCanonicalTree?.(merged);
     } catch (error) {
       return {
         status: 'blocked',
@@ -359,6 +383,7 @@ export class MergeIntegrationService {
       };
     }
     await this.persistMergedState(changeSet.id, request, head.revision);
+    await this.options.reconcileCanonicalTree?.(head.revision);
     mergedRevisions.push(head.revision);
     try {
       await this.options.releaseChangeSet(changeSet.id);
@@ -402,6 +427,18 @@ export class MergeIntegrationService {
     return pending;
   }
 
+  private async ticketGateScope(changeSet: TicketChangeSet): Promise<MergeGateScope> {
+    const root = await this.options.repository.read(changeSet.rootTicketId);
+    if (root.objectType !== 'ticket' || !root.stepId) {
+      throw new Error(`ChangeSet ${changeSet.name} has no Step-bound root Ticket`);
+    }
+    const step = await this.options.repository.read(root.stepId);
+    if (step.objectType !== 'step') {
+      throw new Error(`ChangeSet ${changeSet.name} root references non-Step ${root.stepId}`);
+    }
+    return mergeGateScopeForStep(step.type);
+  }
+
   private async freshChangeSet(id: ObjectId): Promise<TicketChangeSet> {
     const object = await this.options.repository.read(id);
     if (object.objectType !== 'ticket-change-set') {
@@ -415,6 +452,31 @@ export class MergeIntegrationService {
     if (object.objectType !== 'merge-request') throw new Error(`Object ${id} is not a Merge Request`);
     return object;
   }
+
+  private async changeSetWorkspaceBinding(
+    changeSet: TicketChangeSet,
+  ): Promise<TicketWorkspaceBinding | undefined> {
+    const object = await this.options.repository.read(changeSet.workspaceId);
+    if (object.objectType !== 'workspace-handle' || object.state !== 'active') return undefined;
+    return {
+      kind: object.kind,
+      relativePath: object.relativePath,
+      branch: changeSet.sourceBranch,
+      revision: changeSet.currentRevision,
+      workspaceId: object.id,
+      changeSetId: changeSet.id,
+      reason: 'change-set',
+      boundAt: new Date().toISOString(),
+    };
+  }
+}
+
+export function mergeGateScopeForStep(type: StepType): MergeGateScope {
+  if (type === 'CODE') return 'ticket-code';
+  if (type === 'REQUIREMENT_ANALYSIS' || type === 'HIGH_LEVEL_DESIGN' || type === 'DETAILED_DESIGN') {
+    return 'ticket-artifact';
+  }
+  return 'ticket-verification';
 }
 
 function blockedOutcome(
@@ -441,4 +503,21 @@ function failedSummary(checks: readonly GateCheckResult[]): string {
 
 function mergeCommitMarker(changeSetId: ObjectId): string {
   return `[xcompiler:${changeSetId}]`;
+}
+
+function gateWorkspaceBinding(
+  changeSet: TicketChangeSet,
+  run: MergeGateRun,
+): TicketWorkspaceBinding | undefined {
+  if (!run.worktreePath || !run.candidateRevision) return undefined;
+  return {
+    kind: 'gate',
+    relativePath: run.worktreePath,
+    branch: `xcompiler/gate/${run.id}`,
+    revision: run.candidateRevision,
+    changeSetId: changeSet.id,
+    mergeGateRunId: run.id,
+    reason: 'merge-gate',
+    boundAt: new Date().toISOString(),
+  };
 }

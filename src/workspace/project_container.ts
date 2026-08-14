@@ -44,12 +44,15 @@ export interface WorkspaceHandle {
 
 export class ProjectContainer {
   readonly root: string;
+  /** Control plane rooted at the container: `.xc` and executable plan JSON live here. */
+  readonly control: Workspace;
   /** Shared project state, rooted at `<container>/.xcompiler`. */
   readonly state: Workspace;
   readonly worktreesRoot: string;
 
   constructor(containerRoot: string, readonly canonicalBranch: string = DEFAULT_CANONICAL_BRANCH) {
     this.root = path.resolve(containerRoot);
+    this.control = new Workspace(this.root);
     this.state = new Workspace(path.join(this.root, CONTAINER_STATE_DIR));
     this.worktreesRoot = path.join(this.root, CONTAINER_WORKTREES_DIR);
   }
@@ -57,6 +60,14 @@ export class ProjectContainer {
   /** The canonical working copy: `<container>/worktrees/<canonicalBranch>`. */
   canonical(): WorkspaceHandle {
     return this.handle('canonical', path.join(this.worktreesRoot, this.canonicalBranch), this.canonicalBranch);
+  }
+
+  phasePlanPath(): string {
+    return this.control.abs('phasePlan.json');
+  }
+
+  phaseStepPlanPath(phaseId: string): string {
+    return this.control.abs(`plan.${phaseId}.json`);
   }
 
   ticket(ticketId: string, branch: string, generation = 1): WorkspaceHandle {

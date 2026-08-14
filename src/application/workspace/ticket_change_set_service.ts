@@ -3,7 +3,11 @@ import path from 'node:path';
 import { createObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
-import type { Ticket } from '../../domain/tickets/ticket.js';
+import {
+  bindTicketWorkspace,
+  type Ticket,
+  type TicketWorkspaceBinding,
+} from '../../domain/tickets/ticket.js';
 import type { Step } from '../../domain/steps/step.js';
 import {
   TicketChangeSetSchema,
@@ -18,25 +22,22 @@ import type { GitWorktreePort } from './git_port.js';
 import type { ProjectContainer } from '../../workspace/project_container.js';
 
 export interface TicketWorkspace {
-  /**
-   * Absent when the Step works directly in the canonical copy, which is every Step except CODE.
-   *
-   * A Step with no ChangeSet has nothing to merge: its commits are already on the mainline.
-   */
+  /** Absent when the Ticket works directly in the canonical copy. */
   changeSet?: TicketChangeSet;
-  /** The registered handle, present only alongside a ChangeSet. */
+  /** The registered handle, present for Ticket and promoted gate worktrees. */
   workspace?: WorkspaceHandle;
   /** Absolute path of the working copy this Ticket executes in. */
   root: string;
+  /** Fresh persisted Ticket carrying the binding used by this scope. */
+  ticket: Ticket;
 }
 
 /**
  * Owns the branch, worktree, and ChangeSet that a root Ticket develops in.
  *
- * Only CODE develops in isolation. V-model Steps are sequentially dependent — DETAILED_DESIGN reads
- * the high-level design, CODE reads both and the manifest — so isolating every Step branched them
- * all from the same mainline commit and each one worked blind. CODE is also the only Step with
- * concurrent workers, which is what isolation exists for.
+ * CODE opens an isolated candidate. A rejected canonical S1-S3 commit is also promoted into a
+ * temporary candidate before mainline rollback. Once a Ticket is bound, corrective work follows
+ * that binding across V-model Steps instead of being silently moved back to mainline.
  *
  * Corrective Tickets deliberately get no independent ownership branch. Before a generation merges,
  * they repair that generation in place. A defect found by a downstream V-model Step after the merge
@@ -58,20 +59,113 @@ export class TicketChangeSetService {
    * opening a second branch for the same work.
    */
   async ensureFor(ticket: Ticket, step: Step): Promise<TicketWorkspace> {
-    // Decided by the Step being executed, not by the Ticket's root. A Change Request propagates
-    // across downstream Steps, so the same CR writes design one moment and product code the next;
-    // its root stays wherever it was opened and says nothing about the work in hand.
-    if (step.type !== 'CODE') {
-      return { root: this.container.canonical().workspace.root };
+    const current = await this.requireTicket(ticket.id);
+    const bound = await this.resolveBinding(current, step);
+    if (bound) return bound;
+
+    const inherited = await this.findLineageChangeSet(current);
+    if (inherited) {
+      const workspace = await this.requireWorkspace(inherited.workspaceId);
+      const resolved = await this.reconcileWorktree(inherited, workspace);
+      const tracked = await this.trackCorrective(inherited, current, inherited.rootTicketId);
+      const revision = await this.gitRevision(tracked.sourceBranch, tracked.currentRevision);
+      const boundTicket = await this.saveBinding(
+        current,
+        { ...this.changeSetBinding(tracked, workspace, 'inherited'), revision },
+      );
+      return { ...resolved, changeSet: tracked, ticket: boundTicket };
     }
-    const rootTicketId = await this.codeStoryId(step, ticket);
-    const existing = await this.findActiveChangeSet(ticket.projectId, rootTicketId);
+
+    if (step.type !== 'CODE') {
+      return this.bindCanonical(current, current.workspaceBinding ? 'recovered' : 'initial');
+    }
+    const rootTicketId = await this.codeStoryId(step, current);
+    const existing = await this.findActiveChangeSet(current.projectId, rootTicketId);
     if (existing) {
       const workspace = await this.requireWorkspace(existing.workspaceId);
       const resolved = await this.reconcileWorktree(existing, workspace);
-      return { ...resolved, changeSet: await this.trackCorrective(existing, ticket, rootTicketId) };
+      const tracked = await this.trackCorrective(existing, current, rootTicketId);
+      const boundTicket = await this.saveBinding(
+        current,
+        this.changeSetBinding(tracked, workspace, 'change-set'),
+      );
+      return { ...resolved, changeSet: tracked, ticket: boundTicket };
     }
-    return this.create(ticket, rootTicketId);
+    return this.create(current, rootTicketId);
+  }
+
+  /**
+   * Turns a rejected commit made on canonical into a temporary corrective candidate.
+   *
+   * The attempt records the rejected commit before restoring canonical to `baseRevision`. Without
+   * this promotion the commit is only audit evidence: the corrective Ticket inherits canonical and
+   * has to regenerate every rejected artifact. Pinning a branch and worktree to the commit makes the
+   * exact failed state recoverable while canonical remains the sole authoritative product tree.
+   */
+  async preserveRejectedCandidate(input: {
+    ticketId: ObjectId;
+    candidateRevision: string;
+    baseRevision: string;
+  }): Promise<TicketWorkspace> {
+    const ticket = await this.requireTicket(input.ticketId);
+    const active = await this.findActiveChangeSet(ticket.projectId, ticket.id);
+    if (active) {
+      const branchRevision = await this.git.revision(active.sourceBranch);
+      if (branchRevision !== input.candidateRevision) {
+        throw new Error(
+          `Active ChangeSet ${active.name} points to ${branchRevision}, not rejected candidate ` +
+          input.candidateRevision,
+        );
+      }
+      const tracked = active.currentRevision === branchRevision
+        ? active
+        : await this.recordRevision(active.id, branchRevision);
+      const workspace = await this.requireWorkspace(tracked.workspaceId);
+      const resolved = await this.reconcileWorktree(tracked, workspace);
+      const boundTicket = await this.saveBinding(
+        ticket,
+        this.changeSetBinding(tracked, workspace, 'recovered'),
+      );
+      return { ...resolved, changeSet: tracked, ticket: boundTicket };
+    }
+    return this.create(ticket, ticket.id, {
+      baseRevision: input.baseRevision,
+      currentRevision: input.candidateRevision,
+    });
+  }
+
+  private async resolveBinding(ticket: Ticket, step: Step): Promise<TicketWorkspace | undefined> {
+    const binding = ticket.workspaceBinding;
+    if (!binding) return undefined;
+    if (binding.kind === 'canonical') {
+      // A correction routed from canonical into CODE opens a new isolated generation. All other
+      // Steps continue on canonical and refresh the pinned head before execution.
+      return step.type === 'CODE' ? undefined : this.bindCanonical(ticket, 'recovered');
+    }
+    if (!binding.changeSetId || !binding.workspaceId) {
+      return binding.kind === 'gate' ? this.promoteGateBinding(ticket, binding) : undefined;
+    }
+    const changeSet = await this.requireChangeSet(binding.changeSetId);
+    // ChangeSet is authoritative after a failed gate is promoted. Other Tickets may still carry
+    // the previous workspaceId until they are scheduled; following that stale handle would either
+    // recreate a released tree or send a non-CODE correction back to canonical.
+    const workspace = await this.requireWorkspace(changeSet.workspaceId);
+    if (
+      changeSet.state === 'merged' ||
+      changeSet.state === 'abandoned' ||
+      workspace.state === 'released'
+    ) {
+      return undefined;
+    }
+    const resolved = await this.reconcileWorktree(changeSet, workspace);
+    const tracked = await this.trackCorrective(changeSet, ticket, changeSet.rootTicketId);
+    const revision = await this.gitRevision(tracked.sourceBranch, tracked.currentRevision);
+    const boundTicket = await this.saveBinding(ticket, {
+      ...this.changeSetBinding(tracked, workspace, 'recovered'),
+      revision,
+      mergeGateRunId: workspace.kind === 'gate' ? binding.mergeGateRunId : undefined,
+    });
+    return { ...resolved, changeSet: tracked, ticket: boundTicket };
   }
 
   /**
@@ -92,12 +186,21 @@ export class TicketChangeSetService {
     return story.id;
   }
 
-  private async create(ticket: Ticket, rootTicketId: ObjectId): Promise<TicketWorkspace> {
+  private async create(
+    ticket: Ticket,
+    rootTicketId: ObjectId,
+    revisions?: { baseRevision: string; currentRevision: string },
+  ): Promise<TicketWorkspace> {
     const generation = await this.nextGeneration(ticket.projectId, rootTicketId);
     const branch = ticketBranchName(rootTicketId, generation);
     const handle = this.container.ticket(rootTicketId, branch, generation);
-    const baseRevision = await this.git.head();
-    await this.git.addWorktree({ path: handle.workspace.root, branch, startPoint: baseRevision });
+    const baseRevision = revisions?.baseRevision ?? await this.git.head();
+    const currentRevision = revisions?.currentRevision ?? baseRevision;
+    await this.git.addWorktree({
+      path: handle.workspace.root,
+      branch,
+      startPoint: currentRevision,
+    });
 
     const now = new Date().toISOString();
     const workspace = WorkspaceHandleSchema.parse({
@@ -112,7 +215,7 @@ export class TicketChangeSetService {
       branch,
       ownerTicketId: rootTicketId,
       state: 'active',
-      createdRevision: baseRevision,
+      createdRevision: currentRevision,
     });
     const changeSet = TicketChangeSetSchema.parse({
       ...createObjectEnvelope({
@@ -127,11 +230,22 @@ export class TicketChangeSetService {
       sourceBranch: branch,
       workspaceId: workspace.id,
       baseRevision,
-      currentRevision: baseRevision,
+      currentRevision,
       state: 'developing',
     });
-    await this.repository.commit([workspace, changeSet]);
-    return { changeSet, workspace, root: handle.workspace.root };
+    const binding = this.changeSetBinding(changeSet, workspace, 'change-set');
+    const rootTicket = ticket.id === rootTicketId ? ticket : await this.requireTicket(rootTicketId);
+    const boundRoot = bindTicketWorkspace(rootTicket, binding);
+    const boundTicket = ticket.id === rootTicketId
+      ? boundRoot
+      : bindTicketWorkspace(ticket, { ...binding, reason: 'inherited' });
+    await this.repository.commit([
+      workspace,
+      changeSet,
+      boundRoot,
+      ...(boundTicket.id === boundRoot.id ? [] : [boundTicket]),
+    ]);
+    return { changeSet, workspace, root: handle.workspace.root, ticket: boundTicket };
   }
 
   /**
@@ -146,20 +260,92 @@ export class TicketChangeSetService {
     workspace: WorkspaceHandle,
   ): Promise<TicketWorkspace> {
     const root = path.join(this.container.root, workspace.relativePath);
+    await this.reconcilePhysicalWorktree(root, changeSet.sourceBranch, changeSet.currentRevision);
+    return { changeSet, workspace, root, ticket: await this.requireTicket(changeSet.rootTicketId) };
+  }
+
+  private async reconcilePhysicalWorktree(
+    root: string,
+    branch: string,
+    revision: string,
+  ): Promise<void> {
     // `listWorktrees` reports canonical paths, so the computed path must be canonicalized too or a
     // symlinked container root (macOS `/var` -> `/private/var`) never matches and the worktree is
     // recreated on every call.
     const canonicalRoot = await fs.realpath(root).catch(() => root);
     const known = await this.git.listWorktrees();
-    if (!known.some((entry) => entry.path === canonicalRoot)) {
-      await this.git.pruneWorktrees();
-      await this.git.addWorktree({
-        path: root,
-        branch: changeSet.sourceBranch,
-        startPoint: changeSet.currentRevision,
-      });
+    if (known.some((entry) => entry.path === canonicalRoot)) return;
+    await this.git.pruneWorktrees();
+    await this.git.addWorktree({ path: root, branch, startPoint: revision });
+  }
+
+  /**
+   * A failed merge gate becomes the correction worktree for its ChangeSet.
+   *
+   * The candidate already contains both the Ticket branch and the target branch. Keeping it avoids
+   * debugging a different tree from the one that failed; changing the ChangeSet source ensures the
+   * eventual merge includes the repair rather than re-validating the old source branch.
+   */
+  private async promoteGateBinding(
+    ticket: Ticket,
+    binding: TicketWorkspaceBinding,
+  ): Promise<TicketWorkspace | undefined> {
+    if (!binding.changeSetId || !binding.mergeGateRunId) {
+      throw new Error(`Gate workspace binding on ${ticket.name} lacks ChangeSet or GateRun identity`);
     }
-    return { changeSet, workspace, root };
+    let changeSet = await this.requireChangeSet(binding.changeSetId);
+    if (changeSet.state === 'merged' || changeSet.state === 'abandoned') return undefined;
+    const root = path.join(this.container.root, binding.relativePath);
+    await this.reconcilePhysicalWorktree(root, binding.branch, binding.revision);
+
+    const now = new Date().toISOString();
+    const workspace = WorkspaceHandleSchema.parse({
+      ...createObjectEnvelope({
+        name: `workspace-gate-${binding.mergeGateRunId}`,
+        objectType: 'workspace-handle',
+        projectId: ticket.projectId,
+        now,
+      }),
+      kind: 'gate',
+      relativePath: binding.relativePath,
+      branch: binding.branch,
+      ownerTicketId: ticket.id,
+      state: 'active',
+      createdRevision: binding.revision,
+    });
+    const oldWorkspace = await this.requireWorkspace(changeSet.workspaceId);
+    if (oldWorkspace.state === 'active' && oldWorkspace.id !== workspace.id) {
+      const oldRoot = path.join(this.container.root, oldWorkspace.relativePath);
+      await this.git.removeWorktree(oldRoot, { force: true });
+    }
+    const released = oldWorkspace.state === 'active'
+      ? releaseWorkspaceHandle(oldWorkspace, now)
+      : undefined;
+    changeSet = reviseChangeSet(changeSet, {
+      sourceBranch: binding.branch,
+      workspaceId: workspace.id,
+      currentRevision: binding.revision,
+      correctiveTicketIds: [...new Set([...changeSet.correctiveTicketIds, ticket.id])],
+    }, now);
+    const promotedBinding: TicketWorkspaceBinding = {
+      ...binding,
+      workspaceId: workspace.id,
+      reason: 'merge-gate',
+      boundAt: now,
+    };
+    const rootTicket = await this.requireTicket(changeSet.rootTicketId);
+    const boundRoot = bindTicketWorkspace(rootTicket, promotedBinding, now);
+    const boundTicket = ticket.id === boundRoot.id
+      ? boundRoot
+      : bindTicketWorkspace(ticket, promotedBinding, now);
+    await this.repository.commit([
+      ...(released ? [released] : []),
+      workspace,
+      changeSet,
+      boundRoot,
+      ...(boundTicket.id === boundRoot.id ? [] : [boundTicket]),
+    ]);
+    return { changeSet, workspace, root, ticket: boundTicket };
   }
 
   private async trackCorrective(
@@ -225,6 +411,43 @@ export class TicketChangeSetService {
       .sort((left, right) => right.generation - left.generation)[0];
   }
 
+  /**
+   * Recovers an unbound corrective Ticket from its causal Ticket chain.
+   *
+   * This also covers Tickets already persisted when workspace binding was introduced: a dependency
+   * CR points at the CODE Story that discovered it, and a Bug raised while processing that CR points
+   * at the CR. Walking those explicit links finds the active candidate without guessing from Step.
+   */
+  private async findLineageChangeSet(ticket: Ticket): Promise<TicketChangeSet | undefined> {
+    const changeSets = (await this.repository.list({
+      objectType: 'ticket-change-set',
+      projectId: ticket.projectId,
+    })).filter((object): object is TicketChangeSet =>
+      object.objectType === 'ticket-change-set' &&
+      object.state !== 'merged' &&
+      object.state !== 'abandoned');
+    if (changeSets.length === 0) return undefined;
+
+    const seen = new Set<ObjectId>();
+    const queue: ObjectId[] = [ticket.id];
+    while (queue.length > 0 && seen.size < 32) {
+      const id = queue.shift()!;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const matched = changeSets
+        .filter((candidate) =>
+          candidate.rootTicketId === id || candidate.correctiveTicketIds.includes(id))
+        .sort((left, right) => right.generation - left.generation)[0];
+      if (matched) return matched;
+      const object = await this.repository.read(id).catch(() => undefined);
+      if (!object || object.objectType !== 'ticket') continue;
+      if (object.parentTicketId) queue.push(object.parentTicketId);
+      if (object.source.causationId) queue.push(object.source.causationId);
+      if (object.type === 'change-request') queue.push(object.sourceTicketId);
+    }
+    return undefined;
+  }
+
   private async nextGeneration(projectId: ObjectId, rootTicketId: ObjectId): Promise<number> {
     const objects = await this.repository.list({ objectType: 'ticket-change-set', projectId });
     return objects.reduce((highest, object) =>
@@ -243,6 +466,59 @@ export class TicketChangeSetService {
     const object = await this.repository.read(id);
     if (object.objectType !== 'workspace-handle') throw new Error(`Object ${id} is not a Workspace`);
     return object;
+  }
+
+  private async requireTicket(id: ObjectId): Promise<Ticket> {
+    const object = await this.repository.read(id);
+    if (object.objectType !== 'ticket') throw new Error(`Object ${id} is not a Ticket`);
+    return object;
+  }
+
+  private async bindCanonical(
+    ticket: Ticket,
+    reason: TicketWorkspaceBinding['reason'],
+  ): Promise<TicketWorkspace> {
+    const root = this.container.canonical().workspace.root;
+    const bound = await this.saveBinding(ticket, {
+      kind: 'canonical',
+      relativePath: this.relativePath(root),
+      branch: this.container.canonicalBranch,
+      revision: await this.git.head(),
+      reason,
+      boundAt: new Date().toISOString(),
+    });
+    return { root, ticket: bound };
+  }
+
+  private changeSetBinding(
+    changeSet: TicketChangeSet,
+    workspace: WorkspaceHandle,
+    reason: TicketWorkspaceBinding['reason'],
+  ): TicketWorkspaceBinding {
+    return {
+      kind: workspace.kind,
+      relativePath: workspace.relativePath,
+      branch: changeSet.sourceBranch,
+      revision: changeSet.currentRevision,
+      workspaceId: workspace.id,
+      changeSetId: changeSet.id,
+      reason,
+      boundAt: new Date().toISOString(),
+    };
+  }
+
+  private async saveBinding(
+    ticket: Ticket,
+    binding: TicketWorkspaceBinding,
+  ): Promise<Ticket> {
+    const bound = bindTicketWorkspace(ticket, binding);
+    if (bound === ticket) return ticket;
+    await this.repository.update(bound, bound.state);
+    return bound;
+  }
+
+  private async gitRevision(ref: string, fallback: string): Promise<string> {
+    return this.git.revision(ref).catch(() => fallback);
   }
 
   private relativePath(absolute: string): string {

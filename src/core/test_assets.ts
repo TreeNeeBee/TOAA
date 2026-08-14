@@ -91,7 +91,23 @@ export function verificationSupplementRoot(step: Pick<Step, 'id' | 'iterationId'
   const iteration = (step.iterationId ?? 'P1').toLowerCase().replace(/[^a-z0-9_-]+/gu, '-');
   const phase = step.phase.toLowerCase().replaceAll('_', '-');
   const id = step.id.toLowerCase().replace(/[^a-z0-9_-]+/gu, '-');
-  return `tests/verification/${iteration}/${phase}/${id}/`;
+  return `${VERIFICATION_SUPPLEMENT_DIR}/${iteration}/${phase}/${id}/`;
+}
+
+/** The one place the supplement namespace is spelled. */
+export const VERIFICATION_SUPPLEMENT_DIR = 'tests/verification';
+
+/**
+ * The relative prefix a file in the supplement root needs to reach the repository root.
+ *
+ * The root nests an iteration, a phase, and a Step id, so a supplement sits five directories down
+ * and one of those segments is a UUID. A Step asked to import the product from there has to count
+ * that depth by hand, and a live UNIT_TEST spent all seven of its attempts on the same off-by-one
+ * prefix — `../../../../src/...` instead of `../../../../../src/...` — while every baseline case
+ * around it passed.
+ */
+export function verificationSupplementUpwardPrefix(root: string): string {
+  return '../'.repeat(root.replace(/\/+$/u, '').split('/').length);
 }
 
 function normalizePath(path: string): string {

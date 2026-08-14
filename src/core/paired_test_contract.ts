@@ -37,6 +37,7 @@ export function mergePairedSourceTestQuality(
         summary: `Paired baseline test contract is incomplete: ${failure}`,
         evidence: [failure, remediation],
         target: 'current-step' as const,
+        affectedArtifacts: [failure.split(':', 1)[0] ?? failure],
         dependencyPackages: [],
       })),
     ],

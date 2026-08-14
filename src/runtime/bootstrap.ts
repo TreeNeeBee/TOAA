@@ -47,6 +47,9 @@ export interface BootstrapCheck {
 
 export interface BootstrapWorkspace {
   repository: string;
+  /** Temporary XCompiler project container used by Build/Run. */
+  container: string;
+  /** Candidate checkout at `<container>/worktrees/master`. */
   worktree: string;
   branch: string;
   baseCommit: string;
@@ -78,7 +81,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   let compiled;
   try {
     compiled = await runCompile({
-      workspace: prepared.worktree,
+      workspace: prepared.container,
       configPath,
       inputFile,
       topicFile,
@@ -104,7 +107,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   try {
     execution = await runExecute({
       planPath: compiled.planPath,
-      workspace: prepared.worktree,
+      workspace: prepared.container,
       configPath,
       force: !!opts.force,
       terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
@@ -232,14 +235,13 @@ export async function prepareBootstrapWorkspace(
   const runId = createRunId();
   const branch = `xcompiler/bootstrap/${runId}`;
   const baseCommit = await service.head();
-  // Worktrees live beside the container state, never inside it: state is shared by every worktree,
-  // so nesting one within the other makes the two lifetimes impossible to reason about.
-  const worktree = requestedWorktree
+  const container = requestedWorktree
     ? path.resolve(requestedWorktree)
-    : path.join(root, CONTAINER_WORKTREES_DIR, 'bootstrap', runId);
+    : path.join(root, '.xcompiler', 'bootstrap', 'containers', runId);
+  const worktree = path.join(container, CONTAINER_WORKTREES_DIR, 'master');
   await fs.mkdir(path.dirname(worktree), { recursive: true });
   await service.addWorktree({ path: worktree, branch, startPoint: baseCommit });
-  return { repository: root, worktree, branch, baseCommit, runId };
+  return { repository: root, container, worktree, branch, baseCommit, runId };
 }
 
 export async function qualifyBootstrapCandidate(
@@ -479,6 +481,7 @@ export function renderBootstrapReport(result: BootstrapResult): string {
     `- ${L.baseCommit}: \`${result.baseCommit}\``,
     `- ${L.candidateCommit}: \`${result.candidateCommit ?? ''}\``,
     `- ${L.branch}: \`${result.branch}\``,
+    `- Container: \`${result.container}\``,
     `- ${L.worktree}: \`${result.worktree}\``,
     `- ${L.createdAt}: ${new Date().toISOString()}`,
     '',

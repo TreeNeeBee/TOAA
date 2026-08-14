@@ -10,6 +10,7 @@ import { QualityAssessmentService } from '../src/application/execution/quality_a
 import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
 import type { Step } from '../src/domain/steps/step.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
+import { FileProjectProjectionWriter } from '../src/infrastructure/projections/file_project_projection.js';
 import { PluginHost } from '../src/plugins/host.js';
 import { Workspace } from '../src/workspace/workspace.js';
 import { reviseActor } from '../src/domain/project_management/index.js';
@@ -31,15 +32,16 @@ describe('ProjectOrchestrator', () => {
     const firstStep = await setup.repository.read(setup.graph.steps[0]!.id);
     const tickets = await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id });
     const story = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.stepId === firstStep.id);
-    expect(firstStep.objectType === 'step' && firstStep.state).toBe('in_progress');
+    expect(firstStep.objectType === 'step' && firstStep.state).toBe('pending');
     expect(firstStep.objectType === 'step' && firstStep.attempts).toBe(0);
-    expect(story?.objectType === 'ticket' && story.state).toBe('in_progress');
+    expect(story?.objectType === 'ticket' && story.state).toBe('pending');
     expect(story?.objectType === 'ticket' && story.attempts).toBe(0);
     expect(tickets.some((ticket) => ticket.objectType === 'ticket' && ticket.type === 'bug')).toBe(false);
   });
 
   it('keeps infrastructure failures on the same Ticket without opening a Bug', async () => {
     const setup = await fixture();
+    const projectionWriter = new FileProjectProjectionWriter(setup.workspace);
     let first = true;
     const runner = {
       initialize: async () => undefined,
@@ -59,18 +61,23 @@ describe('ProjectOrchestrator', () => {
         return passingAttempt(setup.repository, input.domainStep);
       },
     };
-    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
+    const engine = new ProjectOrchestrator({
+      ...options(setup.workspace, setup.repository, runner),
+      projectionWriter,
+    }, setup.plan);
     const failed = await engine.run(setup.graph.phases[0]!.id);
 
-    expect(failed.failureReason).toContain('remains active for retry');
+    expect(failed.failureReason).toContain('is pending for retry');
     const firstStep = await setup.repository.read(setup.graph.steps[0]!.id);
     const tickets = await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id });
     const story = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.stepId === firstStep.id);
-    expect(firstStep.objectType === 'step' && firstStep.state).toBe('in_progress');
+    expect(firstStep.objectType === 'step' && firstStep.state).toBe('pending');
     expect(firstStep.objectType === 'step' && firstStep.attempts).toBe(0);
-    expect(story?.objectType === 'ticket' && story.state).toBe('in_progress');
+    expect(story?.objectType === 'ticket' && story.state).toBe('pending');
     expect(story?.objectType === 'ticket' && story.attempts).toBe(0);
     expect(tickets.some((ticket) => ticket.objectType === 'ticket' && ticket.type === 'bug')).toBe(false);
+    const projection = await projectionWriter.read(setup.graph.project.id);
+    expect(projection?.activeTickets.find((ticket) => ticket.id === story?.id)?.state).toBe('pending');
 
     const resumed = await engine.run(setup.graph.phases[0]!.id);
     expect(resumed.failedStepId, JSON.stringify(resumed)).toBeUndefined();
@@ -326,6 +333,49 @@ describe('ProjectOrchestrator', () => {
     expect(calls.findIndex((call) => call.startsWith('wiki:'))).toBeGreaterThan(
       calls.lastIndexOf('P1-S008:change-request'),
     );
+  });
+
+  // A live run produced six validation-contract Bugs against one Change Request that never closed.
+  // The first contradiction is a finding — the verifier disproved the diagnosis and the original
+  // failed gate still needs repair. A second contradiction of the same CR is the same verifier
+  // disproving the same premise again; escalating it opens another Bug that resolves nothing, and
+  // each carried slightly different evidence text so the recurrence breaker never saw a repeat.
+  it('escalates a contradicted diagnosis once, not on every re-application', async () => {
+    const { AttemptResultProcessor } = await import(
+      '../src/application/project_management/attempt_result_processor.js'
+    );
+    const { VALIDATION_CONTRACT_DEFECT_CODE } = await import('../src/domain/tickets/ticket.js');
+    const changeRequestId = 'cr-1';
+    const contradiction = {
+      objectType: 'ticket',
+      type: 'bug',
+      parentTicketId: changeRequestId,
+      failure: { code: VALIDATION_CONTRACT_DEFECT_CODE },
+    };
+    const build = (stored: unknown[]) => {
+      const processor = new AttemptResultProcessor({
+        repository: { list: async () => stored } as never,
+        controller: {} as never,
+        tickets: {} as never,
+        audit: { event: async () => undefined } as never,
+        onTransition: async () => undefined,
+      });
+      return processor as unknown as {
+        alreadyContradicted(ticket: { id: string; projectId: string }): Promise<boolean>;
+      };
+    };
+    const ticket = { id: changeRequestId, projectId: 'p1' };
+
+    // Nothing recorded yet: the first contradiction is a finding and must escalate.
+    expect(await build([]).alreadyContradicted(ticket)).toBe(false);
+    // A contradiction against a *different* Change Request says nothing about this one.
+    expect(await build([{ ...contradiction, parentTicketId: 'cr-2' }]).alreadyContradicted(ticket))
+      .toBe(false);
+    // An ordinary Bug on this CR is not a contradiction of its diagnosis.
+    expect(await build([{ ...contradiction, failure: { code: 'test_failure' } }])
+      .alreadyContradicted(ticket)).toBe(false);
+    // The same premise disproved a second time is evidence, not a new finding.
+    expect(await build([contradiction]).alreadyContradicted(ticket)).toBe(true);
   });
 
   it('turns a downstream CR failure into a linked Bug and resumes the parent CR after repair', async () => {

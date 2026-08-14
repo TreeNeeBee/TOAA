@@ -46,7 +46,7 @@ describe('calibratePlanCoverage', () => {
     ]));
     expect(out[3]!.outputs).toContain('tests/test_unit_s004.py');
     expect(out[4]!.outputs).toContain('tests/test_unit_s005.py');
-    expect(test.tools).toContain('skill:tester');
+    expect(test.tools).toContain('skill:test-execution');
   });
 
   it('is idempotent / no-op when every CODE step is already transitively covered', () => {

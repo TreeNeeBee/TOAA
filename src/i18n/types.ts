@@ -7,15 +7,6 @@ import type { LanguageProfile } from '../core/language.js';
  */
 export type Locale = 'en' | 'zh';
 
-export interface SkillPrompt {
-  patcher: string;
-  author: string;
-  tester: string;
-  dep_resolver: string;
-  debugger: string;
-  refactorer: string;
-}
-
 export interface Messages {
   // ───────── shared LLM role guidance ─────────
   llm: {
@@ -150,6 +141,7 @@ export interface Messages {
     optDebugWikiPath: string;
     optRecordReplay: string;
     optRecordReplayPath: string;
+    optPermissionMode: string;
     argPlan: string;
     argProjectFile: string;
     argStepId: string;
@@ -165,6 +157,7 @@ export interface Messages {
     invalidStepId: (value: string) => string;
     invalidNonNegativeInteger: (value: string) => string;
     invalidRecordReplayMode: (value: string, allowed: string) => string;
+    invalidPermissionMode: (value: string, allowed: string) => string;
     helpUsage: string;
     helpArguments: string;
     helpOptions: string;
@@ -423,9 +416,6 @@ export interface Messages {
     executorFeedbackPostMutationVerificationRequired: string;
   };
 
-  // ───────── Skill prompts ─────────
-  skills: SkillPrompt;
-
   // ───────── doctor (xcompiler doctor / startup env-check) ─────────
   doctor: {
     cliDescription: string;
@@ -473,6 +463,7 @@ export interface Messages {
     sandboxDockerDaemonDown: (msg: string) => string;
     sandboxInContainerWarn: string;
     skillToolMissing: (skill: string, tool: string) => string;
+    skillInvalid: (message: string) => string;
     skillOk: (n: number, tools: number) => string;
   };
 }

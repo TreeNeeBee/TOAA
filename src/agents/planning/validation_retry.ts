@@ -1,3 +1,5 @@
+import { isContentRejectionExhausted } from '../../llm/errors.js';
+
 export class PlannerContractViolation extends Error {
   readonly plannerContractViolation = true;
 
@@ -21,6 +23,7 @@ export function formatPlannerValidationFeedback(error: unknown): string {
     '- architectureModules.testPaths 是 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 消费的模块契约测试，不能同时出现在 CODE 的单元测试输出中。',
     '- 若一个 CODE 宏 Step 覆盖多个模块，必须在该 CODE Step 的 subTasks 中逐一列出对应模块。',
     '- 每个 output 文件在一次 V 流程中只能由一个 Step 产出；其它 Step 需要它就写进 inputs，不要重复声明为 outputs。',
+    '- Step inputs/outputs 必须是精确文件路径，禁止使用 src/**/*.ts、tests/** 等 glob 或目录选择器；需要多个文件时逐项列出上游 Step 的具体 outputs。',
     '- 不要删除标准 V 模型 8 个宏 Step。',
   ].join('\n');
 }
@@ -29,6 +32,10 @@ const PLANNER_CONTRACT_MESSAGE =
   /^Planner (?:architecture|phase|PhasePlan|JSON|draft|complexityAssessment|implementationPhases|iteration)/u;
 
 export function isPlannerStructuredValidationError(error: unknown): boolean {
+  // FallbackClient validates each candidate before accepting it. Once every candidate is rejected,
+  // it preserves that fact as structured failure metadata; do not infer transport from the
+  // aggregate message or depend on every parser/contract error sharing one text prefix.
+  if (isContentRejectionExhausted(error)) return true;
   if (isPlannerTransportFailure(errorMessage(error))) return false;
   let current: unknown = error;
   for (let depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {

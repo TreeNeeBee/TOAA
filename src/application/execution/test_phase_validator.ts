@@ -11,6 +11,7 @@ import { inspectPairedSourceTests } from '../../core/paired_test_contract.js';
 import {
   pairedTestAssetPaths,
   verificationSupplementRoot,
+  verificationSupplementUpwardPrefix,
 } from '../../core/test_assets.js';
 import {
   hasExecutableTestDeclaration,
@@ -114,6 +115,9 @@ export class TestPhaseValidator {
           ? `Existing verification supplements: ${supplementalTestArgs.join(', ')}`
           : '',
         `Supplement ownership root: ${supplementalRoot}`,
+        `From that root the product is ${verificationSupplementUpwardPrefix(supplementalRoot)}src/… ` +
+          '— use exactly that prefix rather than counting the directories, which is where a Step ' +
+          'spent every one of its attempts while the cases around it passed.',
         missing.length > 0 ? `Missing: ${missing.join(', ')}` : '',
         invalid.length > 0 ? `Invalid: ${invalid.join(' | ')}` : '',
         'Route each baseline incompleteness finding to its paired source owner. A verifier may only ' +

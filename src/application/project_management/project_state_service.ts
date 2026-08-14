@@ -346,7 +346,7 @@ export class ProjectStateService {
   async transitionTicket(
     ticket: Ticket,
     next: Parameters<TicketLifecycleService['transition']>[1],
-    pendingReason?: 'defect' | 'quality-gap',
+    pendingReason?: PendingReason,
   ): Promise<Ticket> {
     return this.lifecycle.transition(ticket, next, { pendingReason });
   }
@@ -354,7 +354,7 @@ export class ProjectStateService {
   async transitionTicketPath(
     ticket: Ticket,
     path: readonly Parameters<TicketLifecycleService['transition']>[1][],
-    pendingReason?: 'defect' | 'quality-gap',
+    pendingReason?: PendingReason,
   ): Promise<Ticket> {
     return this.lifecycle.transitionPath(ticket, path, { pendingReason });
   }

@@ -17,8 +17,9 @@ import { DebugWiki } from '../../src/core/debug_wiki.js';
 import { buildDebugBrief } from '../../src/core/debug_brief.js';
 import { ProjectContainer } from '../../src/workspace/project_container.js';
 import { createObjectId } from '../../src/domain/identity/object_id.js';
-import { TicketSchema, type Ticket } from '../../src/domain/tickets/ticket.js';
+import { TicketSchema, bindTicketWorkspace, type Ticket } from '../../src/domain/tickets/ticket.js';
 import type { GateCheckResult } from '../../src/domain/workspace/merge_request.js';
+import type { TicketChangeSet } from '../../src/domain/workspace/change_set.js';
 import { PLAN_VERSION, type Plan } from '../../src/core/plan.js';
 import { STEP_TYPES } from '../../src/domain/steps/step.js';
 
@@ -67,28 +68,41 @@ describe('ticket delivery loop', () => {
     expect(failing.root).not.toBe(opened.root);
     expect((await fs.stat(failing.root)).isDirectory()).toBe(true);
 
-    // 4. The gate fails, and its worktree is disposed of rather than left behind.
+    // 4. The gate fails, and its exact candidate remains available for corrective routing.
     const failedRun = await gates.complete(failing.run.id, FAILED_GATE);
     expect(failedRun.status).toBe('failed');
     // The Merge Request itself moved: draft → ready → validating → changes-requested. Asserting the
     // state, not just the run, is what catches a lifecycle that silently never advances.
     expect(await mergeRequestState(repository, request.id)).toBe('changes-requested');
-    await expect(fs.stat(failing.root)).rejects.toThrow();
+    expect((await fs.stat(failing.root)).isDirectory()).toBe(true);
     expect((await gates.currentVerdict(request.id)).ok).toBe(false);
 
-    // 5. The Bug is repaired in the original worktree, on the original branch: splitting the repair
-    //    onto its own branch would put a half-finished change on the mainline.
-    const bug = await openBug(world);
+    // 5. The Bug inherits the failing gate candidate. That candidate is promoted into the existing
+    //    ChangeSet so both the original source and the merge interaction are visible to Debugger.
+    let bug = await openBug(world);
+    bug = bindTicketWorkspace(bug, {
+      kind: 'gate',
+      relativePath: failing.run.worktreePath!,
+      branch: `xcompiler/gate/${failing.run.id}`,
+      revision: failing.run.candidateRevision!,
+      changeSetId: opened.changeSet.id,
+      mergeGateRunId: failing.run.id,
+      reason: 'merge-gate',
+      boundAt: new Date().toISOString(),
+    });
+    await repository.update(bug, bug.state);
     const repairing = await changeSets.ensureFor(bug, world.coding);
     expect(repairing.changeSet.id).toBe(opened.changeSet.id);
-    expect(repairing.root).toBe(opened.root);
+    expect(repairing.root).toBe(failing.root);
+    await expect(fs.stat(opened.root)).rejects.toThrow();
 
     // 6. A first gate that had passed would now be stale, because the source moved under it.
-    const repairRevision = await commit(opened.root, 'src/parser.ts', 'export const parse = () => ({ source: "x" });\n');
+    const repairRevision = await commit(repairing.root, 'src/parser.ts', 'export const parse = () => ({ source: "x" });\n');
     await changeSets.recordRevision(opened.changeSet.id, repairRevision);
     expect(repairRevision).not.toBe(firstRevision);
 
     // 7. The second gate runs against the repaired source and passes.
+    await gates.open(await requireChangeSet(repository, opened.changeSet.id));
     const passing = await gates.start(request.id);
     expect(passing.run.sourceRevision).toBe(repairRevision);
     const passedRun = await gates.complete(passing.run.id, PASSED_GATE);
@@ -98,7 +112,7 @@ describe('ticket delivery loop', () => {
     expect(verdict.ok, verdict.reason).toBe(true);
 
     // 8. A verdict is bound to what it judged: moving the source invalidates it.
-    const late = await commit(opened.root, 'src/late.ts', 'export const late = 1;\n');
+    const late = await commit(repairing.root, 'src/late.ts', 'export const late = 1;\n');
     const afterMove = await gates.currentVerdict(request.id);
     expect(afterMove.ok).toBe(false);
     expect(afterMove.reason).toMatch(/moved since the gate passed/u);
@@ -111,7 +125,7 @@ describe('ticket delivery loop', () => {
     const beforeMerge = await git.revision('master');
     const merged = await git.squashMerge({
       targetBranch: 'master',
-      sourceBranch: opened.changeSet.sourceBranch,
+      sourceBranch: repairing.changeSet.sourceBranch,
       expectedTargetRevision: finalRun.targetRevision,
       message: `[xcompiler] ${story.name}`,
     });
@@ -143,8 +157,8 @@ describe('ticket delivery loop', () => {
       },
     }));
 
-    await git.removeWorktree(opened.root, { force: true });
-    await expect(fs.stat(opened.root)).rejects.toThrow();
+    await git.removeWorktree(repairing.root, { force: true });
+    await expect(fs.stat(repairing.root)).rejects.toThrow();
 
     // Read back through fresh instances, so nothing is answered from memory left over from the run.
     const reread = new DomainObjectRepository(container.state);
@@ -345,6 +359,15 @@ async function fixture() {
       return (await fs.readdir(path.join(installRoot, 'system'))).sort();
     },
   };
+}
+
+async function requireChangeSet(
+  repository: DomainObjectRepository,
+  id: TicketChangeSet['id'],
+): Promise<TicketChangeSet> {
+  const object = await repository.read(id);
+  if (object.objectType !== 'ticket-change-set') throw new Error(`Object ${id} is not a ChangeSet`);
+  return object;
 }
 
 function plan(): Plan {

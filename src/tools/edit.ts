@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { writeWorkspaceFile } from './workspace_write.js';
 import { promises as fs } from 'node:fs';
 import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
@@ -99,8 +100,7 @@ export const replaceInFileTool: Tool<
       replacementBytes: Buffer.byteLength(next),
     });
     if (truncationError) return { ok: false, error: truncationError };
-    await fs.mkdir(path.dirname(abs), { recursive: true });
-    await fs.writeFile(abs, next, 'utf8');
+    await writeWorkspaceFile(abs, next, { tree: ctx.fileTree, root: ctx.ws.root });
     return {
       ok: true,
       data: { occurrences },

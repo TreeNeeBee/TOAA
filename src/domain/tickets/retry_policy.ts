@@ -1,6 +1,8 @@
 export interface AttemptFailureEvidence {
   signature?: string;
   category?: string;
+  /** The XCompiler build that produced this failure, when the run recorded one. */
+  toolchainBuildId?: string;
 }
 
 export interface AttemptExtensionDecision {
@@ -12,12 +14,34 @@ const REPEATED_FAILURE_LIMIT = 3;
 
 export function evaluateAttemptExtension(
   evidence: readonly AttemptFailureEvidence[],
+  currentBuildId?: string,
 ): AttemptExtensionDecision {
-  const latest = evidence.at(-1);
+  // Recurrence means "the corrective work is not converging" only while the toolchain holds still.
+  // Failures recorded by a build that no longer exists say nothing about whether the repair that
+  // replaced it works, and holding them against the Ticket makes a stopped Ticket permanent: fixing
+  // the defect that caused the recurrences changes nothing, because the evidence blocking the retry
+  // predates the fix. A live run reached exactly that, and the only way on was to abandon a
+  // workspace with three delivered Steps and sixteen landed merges.
+  // Unattributed evidence cannot support the claim being made. The guard asserts that a failure
+  // keeps coming back *under this toolchain*; a record that does not say which build produced it
+  // is not evidence of that. Counting it as current was the conservative-looking choice and the
+  // wrong one: every failure logged before builds were identified is unlabelled, which is exactly
+  // the case where the toolchain has demonstrably changed — a live Ticket stayed stopped through
+  // the repair that fixed it for precisely this reason.
+  const relevant = currentBuildId === undefined
+    ? evidence
+    : evidence.filter((item) => item.toolchainBuildId === currentBuildId);
+  if (evidence.length > 0 && relevant.length === 0) {
+    return {
+      extend: true,
+      reason: 'every recorded failure predates the running XCompiler build',
+    };
+  }
+  const latest = relevant.at(-1);
   if (latest?.category === 'tool_loop') {
     return { extend: false, reason: 'latest failure is an unproductive tool loop' };
   }
-  const signatures = evidence
+  const signatures = relevant
     .map((item) => item.signature)
     .filter((value): value is string => Boolean(value));
   // Counted, not required to be consecutive. A live run alternated between one functional-test

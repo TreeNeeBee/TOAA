@@ -4,6 +4,7 @@ import type { AuditLogger } from '../audit/audit.js';
 import type { Language } from '../core/plan.js';
 import type { StepType } from '../domain/steps/step.js';
 import type { RecordReplayController } from '../application/record_replay/controller.js';
+import type { FileTreeSink } from './workspace_write.js';
 
 export type ToolPermissionOperation =
   | 'shell_command'
@@ -35,6 +36,9 @@ export interface ToolPermissionRequest {
 export interface ToolPermissionDecision {
   approved: boolean;
   reason?: string;
+  outcome?: 'approved' | 'denied' | 'timed_out' | 'hard_denied';
+  capability?: string;
+  cached?: boolean;
 }
 
 export type ToolPermissionRequester = (request: ToolPermissionRequest) => Promise<ToolPermissionDecision>;
@@ -58,6 +62,18 @@ export interface ToolExecutionEvent {
 
 export type ToolExecutionReporter = (event: ToolExecutionEvent) => void | Promise<void>;
 
+export interface SkillResourceResult {
+  skill: string;
+  path: string;
+  content: string;
+  totalBytes: number;
+  truncated: boolean;
+}
+
+export interface SkillResourceReader {
+  read(skill: string, resourcePath: string, maxBytes: number): Promise<SkillResourceResult>;
+}
+
 /** 工具调用的统一上下文。 */
 export interface ToolContext {
   ws: Workspace;
@@ -65,6 +81,13 @@ export interface ToolContext {
   audit?: AuditLogger;
   /** 当前 Step 的 outputs 白名单（写操作必须落在白名单内）。 */
   allowedWrites: string[];
+  /**
+   * The shared project file tree, when Runtime has one.
+   *
+   * Optional so a tool exercised without the domain still writes; an unindexed write is a gap in
+   * the record, not a refused operation.
+   */
+  fileTree?: FileTreeSink;
   /** 当前 Step 的 id（仅用于审计）。 */
   stepId: string;
   /**
@@ -106,6 +129,8 @@ export interface ToolContext {
   onToolEvent?: ToolExecutionReporter;
   /** Generic external-interaction record/replay boundary. */
   recordReplay?: RecordReplayController;
+  /** Read-only access to resources owned by Agent Skills activated for this Step. */
+  skillResources?: SkillResourceReader;
 }
 
 /** Stable identifiers for failures other modules must recognise without reading the message. */

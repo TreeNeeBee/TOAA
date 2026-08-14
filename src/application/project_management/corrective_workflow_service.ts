@@ -1,7 +1,9 @@
 import type { Changelist } from '../../domain/evidence/evidence.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
-import { STEP_TYPE_ORDER, VERIFICATION_STEP_TYPES, type Step } from '../../domain/steps/step.js';
+import {
+  STEP_TYPE_ORDER, VERIFICATION_STEP_TYPES, stepDependsOn, stepSatisfiesDependency, type Step,
+} from '../../domain/steps/step.js';
 import type {
   BugTicket,
   ChangeRequestApplicationDecision,
@@ -10,6 +12,7 @@ import type {
   Ticket,
   TicketSource,
   TicketSolution,
+  TicketWorkspaceBinding,
   WorkTicket,
 } from '../../domain/tickets/ticket.js';
 import type { AttemptFailure } from '../execution/failure_classification.js';
@@ -113,6 +116,7 @@ export class CorrectiveWorkflowService {
     creatorActorId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<BugTicket> {
     let failed = await this.state.requireStep(input.failedStepId);
     if (!failed.pairedStepId) throw new Error(`Failure routing requires a paired Step: ${failed.name}`);
@@ -158,6 +162,7 @@ export class CorrectiveWorkflowService {
       routingObjects: [...routing.objects, ...(discovering?.objects ?? [])],
       sourceKind: input.sourceKind,
       sourceExternalId: input.sourceExternalId,
+      workspaceBinding: input.workspaceBinding,
     });
     await this.state.checkpoint(failed, `Failure routed to ${target.name} through ${bug.name}`);
     await this.state.checkpoint(target, `Reopened by ${bug.name}`);
@@ -172,6 +177,7 @@ export class CorrectiveWorkflowService {
     /** Explicit owner selected during gate triage; defaults to the paired source. */
     targetStepId?: ObjectId;
     finding: string;
+    affectedArtifacts?: string[];
     kind: EnhancementTicket['enhancementKind'];
     qualityAssessmentId?: ObjectId;
     correlationId: ObjectId;
@@ -180,6 +186,7 @@ export class CorrectiveWorkflowService {
     creatorActorId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<EnhancementTicket> {
     let source = await this.state.requireStep(input.sourceStepId);
     if (!source.pairedStepId) throw new Error(`Quality routing requires a paired Step: ${source.name}`);
@@ -203,6 +210,7 @@ export class CorrectiveWorkflowService {
       verificationStep: verification,
       kind: input.kind,
       finding: input.finding,
+      affectedArtifacts: input.affectedArtifacts,
       sourceQualityAssessmentId: input.qualityAssessmentId,
       correlationId: input.correlationId,
       causationId: input.causationId,
@@ -210,6 +218,7 @@ export class CorrectiveWorkflowService {
       routingObjects: routing.objects,
       sourceKind: input.sourceKind,
       sourceExternalId: input.sourceExternalId,
+      workspaceBinding: input.workspaceBinding,
     });
     await this.state.checkpoint(source, `Quality gap routed to ${reopenedTarget.name} through ${enhancement.name}`);
     return enhancement;
@@ -465,6 +474,7 @@ export class CorrectiveWorkflowService {
       correlationId: parent.source.correlationId,
       sourceKind: parent.source.kind,
       sourceExternalId: parent.source.externalId,
+      parentChangeRequestId: parent.id,
     });
     await this.registration.register(child.id);
   }
@@ -498,7 +508,8 @@ export class CorrectiveWorkflowService {
     if (
       story.state === 'closed' ||
       story.state === 'cancelled' ||
-      story.blockedByTicketIds.includes(request.id)
+      story.blockedByTicketIds.includes(request.id) ||
+      await this.hopWaitsOnDiscoveringStep(request, stepId)
     ) return;
     const objects = await this.blockers.prepare(
       story,
@@ -506,6 +517,31 @@ export class CorrectiveWorkflowService {
       source.type === 'bug' ? 'defect' : 'quality-gap',
     );
     await this.repository.commit(objects);
+  }
+
+  /**
+   * Whether this hop is aimed downstream of a discovering Step that has not delivered yet.
+   *
+   * Parking the discovering Story is right when the repair lands upstream: FUNCTIONAL_TEST finds a
+   * defect, CODE repairs it, and the test must not re-run and re-declare success in between. It is
+   * also right for a hop aimed downstream of a Step that already delivered — the hop is reachable,
+   * and only the Story waits. The deadlock is the remaining case: the hop's Step cannot become
+   * ready until the discovering Step delivers, so parking that Story leaves each waiting on the
+   * other, and the Phase stops with every actor idle.
+   */
+  private async hopWaitsOnDiscoveringStep(
+    request: ChangeRequestTicket,
+    discoveringStepId: ObjectId,
+  ): Promise<boolean> {
+    const discovering = await this.state.requireStep(discoveringStepId);
+    if (stepSatisfiesDependency(discovering)) return false;
+    const target = await this.state.requireStep(request.targetStepId);
+    if (target.id === discoveringStepId) return false;
+    const steps = await this.repository.list({ objectType: 'step', projectId: request.projectId });
+    const byId = new Map(steps
+      .filter((object): object is Step => object.objectType === 'step')
+      .map((step) => [step.id, step]));
+    return stepDependsOn(target, discoveringStepId, byId);
   }
 
   /**

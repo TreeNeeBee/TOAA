@@ -104,6 +104,12 @@ export class TicketBlockerService {
     for (const ticket of blocked) await this.unblock(ticket, blocker.id);
   }
 
+  /** Drops one blocker from one Ticket, for a blocker that is still open but must not hold it. */
+  async releaseFrom(blocked: Ticket, blockerId: ObjectId): Promise<void> {
+    if (!blocked.blockedByTicketIds.includes(blockerId)) return;
+    await this.unblock(blocked, blockerId);
+  }
+
   private async unblock(blocked: Ticket, blockerId: ObjectId): Promise<void> {
     const blockers = blocked.blockedByTicketIds.filter((id) => id !== blockerId);
     if (blockers.length === 0 && blocked.state === 'pending') {

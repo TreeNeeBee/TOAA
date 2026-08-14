@@ -11,49 +11,33 @@ export class RecordReplaySandbox implements Sandbox {
 
   constructor(
     private readonly delegate: Sandbox,
-    private readonly controller: RecordReplayController,
+    _controller: RecordReplayController,
   ) {
     this.kind = delegate.kind;
   }
 
   build(manifestFile?: string, options?: SandboxBuildOptions): Promise<{ rebuilt: boolean; reason: string }> {
-    return this.controller.execute({
-      channel: 'subprocess',
-      operation: 'sandbox.build',
-      request: { sandbox: this.kind, manifestFile, options },
-    }, () => this.delegate.build(manifestFile, options));
+    // Environment preparation has local side effects. Replaying only its return value leaves a
+    // fresh worktree without node_modules/venv while claiming that the sandbox is ready.
+    return this.delegate.build(manifestFile, options);
   }
 
   exec(cmd: string, argv: string[], extra?: ExecExtra): Promise<ExecResult> {
-    return this.controller.execute({
-      channel: 'subprocess',
-      operation: 'sandbox.exec',
-      request: { sandbox: this.kind, cmd, argv, extra: safeExtra(extra) },
-    }, () => this.delegate.exec(cmd, argv, extra));
+    return this.delegate.exec(cmd, argv, extra);
   }
 
   runProgram(args: string[], extra?: ExecExtra): Promise<ExecResult> {
-    return this.controller.execute({
-      channel: 'subprocess',
-      operation: 'sandbox.run_program',
-      request: { sandbox: this.kind, args, extra: safeExtra(extra) },
-    }, () => this.delegate.runProgram(args, extra));
+    // Product checks must execute against the current tree. A recorded exit code is evidence about
+    // an older tree, not verification of the candidate being delivered.
+    return this.delegate.runProgram(args, extra);
   }
 
   runTests(args?: string[], extra?: ExecExtra): Promise<ExecResult> {
-    return this.controller.execute({
-      channel: 'subprocess',
-      operation: 'sandbox.run_tests',
-      request: { sandbox: this.kind, args: args ?? [], extra: safeExtra(extra) },
-    }, () => this.delegate.runTests(args, extra));
+    return this.delegate.runTests(args, extra);
   }
 
   installDeps(packages: string[]): Promise<ExecResult> {
-    return this.controller.execute({
-      channel: 'subprocess',
-      operation: 'sandbox.install_dependencies',
-      request: { sandbox: this.kind, packages },
-    }, () => this.delegate.installDeps(packages));
+    return this.delegate.installDeps(packages);
   }
 }
 
@@ -64,13 +48,4 @@ export function withRecordReplaySandbox(
   return controller.enabled('subprocess')
     ? new RecordReplaySandbox(sandbox, controller)
     : sandbox;
-}
-
-function safeExtra(extra: ExecExtra | undefined): Omit<ExecExtra, 'env'> & { envKeys?: string[] } | undefined {
-  if (!extra) return undefined;
-  const { env, ...rest } = extra;
-  return {
-    ...rest,
-    envKeys: env ? Object.keys(env).sort() : undefined,
-  };
 }

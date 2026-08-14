@@ -76,12 +76,12 @@ describe('CLI permission adapters', () => {
     output.mockRestore();
   });
 
-  it('allows trusted hosts to opt in explicitly', async () => {
+  it('allows trusted hosts to opt into automatic authorization explicitly', async () => {
     const decision = await runtimePermissionAuthorizer({
       ...silentRuntimeIO,
-      permissionPolicy: 'allow',
+      permissionPolicy: 'auto',
     })(request);
     expect(decision.approved).toBe(true);
-    expect(decision.reason).toMatch(/Explicit Runtime permission policy/u);
+    expect(decision.reason).toMatch(/Runtime auto permission mode/u);
   });
 });

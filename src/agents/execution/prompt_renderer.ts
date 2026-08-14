@@ -155,11 +155,12 @@ export function renderExecutionUserPrompt(
         `id: ${input.enhancement.id}`,
         `kind: ${input.enhancement.enhancementKind}`,
         `finding: ${input.enhancement.finding}`,
+        `affected artifacts: ${input.enhancement.affectedArtifacts.join(', ') || '(none declared)'}`,
         `verification step: ${input.enhancement.verificationStepId}`,
         'This finding is already registered and assigned. Implement it now; do not report the same finding again in qualityAssessment.findings.',
         'Completion requires a focused successful mutation of an artifact owned by this Step, followed by the gate evidence Runtime permits. ' +
           'If current workspace evidence proves the finding itself is invalid, return a concrete blocker instead of duplicating or silently closing it.',
-        'Append or patch only the missing, incomplete, or below-threshold content.',
+        'Append or patch only the missing, incomplete, or below-threshold content in the affected artifacts listed above.',
         'Preserve accepted baseline behavior and artifacts. Do not regenerate the whole phase or project.',
         'For coverage gaps, use measured coverage evidence to add focused tests around uncovered production behavior. ' +
           'Do not rewrite accepted production code merely to inflate a metric.',

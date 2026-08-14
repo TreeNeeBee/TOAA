@@ -577,6 +577,16 @@ describe('runTestsTool / runPythonTool summary', () => {
       argv: ['tsx', 'src/index.ts', '--help'],
       display: 'npx tsx src/index.ts --help',
     });
+    expect(resolveTypeScriptProgramCommand(['node_modules/.bin/tsc', '--noEmit'])).toEqual({
+      cmd: 'node_modules/.bin/tsc',
+      argv: ['--noEmit'],
+      display: 'node_modules/.bin/tsc --noEmit',
+    });
+    expect(resolveTypeScriptProgramCommand(['./node_modules/.bin/vitest', 'run'])).toEqual({
+      cmd: './node_modules/.bin/vitest',
+      argv: ['run'],
+      display: './node_modules/.bin/vitest run',
+    });
   });
 
   it('embeds stderr/stdout tail in summary on failure (so LLM can see the real error)', async () => {
@@ -833,6 +843,94 @@ describe('runTestsTool / runPythonTool summary', () => {
   });
 });
 
+describe('a passing suite is passing', () => {
+  // A live run failed a UNIT_TEST Step five times on `npm test exit=0`. The project's tests cover
+  // "the source is unreachable", so the suite prints network-failure text on its way to passing, and
+  // the network detector overrode the green result. The guard meant to prevent that skips lines
+  // vitest labels `stderr | `, which does not happen under `--reporter=json`. The Step had nothing
+  // to repair, and each rejection carried a slightly different signature so the recurrence breaker
+  // never recognised it.
+  it('is not failed by network text its own tests produced', async () => {
+    const { runTestsTool } = await import('../src/tools/sandbox.js');
+    const result = await runTestsTool.run({}, {
+      ...ctx,
+      language: 'typescript' as const,
+      sandbox: {
+        runTests: async () => ({
+          exitCode: 0,
+          stdout: '{"testResults":[{"message":"[warn] source baidu failed: Network error: unreachable"}]}',
+          stderr: '',
+          timedOut: false,
+        }),
+      },
+    } as unknown as typeof ctx);
+
+    expect(result.ok).toBe(true);
+  });
+
+  // The same false failure arrived through run_program: a Step that wants a specific invocation runs
+  // the test runner itself. Keying the earlier fix on the tool rather than on what was executed left
+  // that door open, and a CR stalled on `npx vitest ... exit=0`.
+  it('is not failed by network text when run_program invoked the test runner', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    const result = await runProgramTool.run(
+      { args: ['npx', 'vitest', 'run', 'tests/unit/scrapers.unit.test.ts', '--reporter=json'] },
+      {
+        ...ctx,
+        language: 'typescript' as const,
+        sandbox: {
+          runProgram: async () => ({
+            exitCode: 0,
+            stdout: '{"message":"[warn] source baidu failed: Network error: unreachable"}',
+            stderr: '',
+            timedOut: false,
+          }),
+        },
+      } as unknown as typeof ctx,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it('still judges the product itself by what its output shows', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    const result = await runProgramTool.run(
+      { args: ['npx', 'tsx', 'src/cli.ts'] },
+      {
+        ...ctx,
+        language: 'typescript' as const,
+        sandbox: {
+          runProgram: async () => ({
+            exitCode: 0,
+            stdout: '',
+            stderr: 'FetchError: request to https://api.example.com failed, reason: ECONNREFUSED',
+            timedOut: false,
+          }),
+        },
+      } as unknown as typeof ctx,
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it('still explains a failing run that hit the network', async () => {
+    const { runTestsTool } = await import('../src/tools/sandbox.js');
+    const result = await runTestsTool.run({}, {
+      ...ctx,
+      language: 'typescript' as const,
+      sandbox: {
+        runTests: async () => ({
+          exitCode: 1,
+          stdout: '',
+          stderr: 'FetchError: request to https://api.example.com failed, reason: ECONNREFUSED',
+          timedOut: false,
+        }),
+      },
+    } as unknown as typeof ctx);
+
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain('Network API failure detected');
+  });
+});
+
 describe('run_program missing-manifest diagnosis', () => {
   it('gives a Step reaching for the runner directly the same diagnosis run_tests gets', async () => {
     // From a live run: a Debugger at REQUIREMENT_ANALYSIS ran `npx vitest` through run_program, got
@@ -1021,5 +1119,67 @@ describe('dependency manifest ownership', () => {
       expect(r.error, phase).toContain('HIGH_LEVEL_DESIGN');
       expect(r.error, phase).toContain('left-pad');
     }
+  });
+});
+
+// Before the gateway existed, five tools across five files each called fs.writeFile themselves, so
+// "a file changed" was decided in five places and recorded in none. These assertions run through
+// the real tools rather than the gateway, because the gateway working while a tool bypasses it is
+// exactly the failure the funnel exists to prevent.
+describe('file tree indexing through the tools', () => {
+  const recorded: [string, string][] = [];
+
+  beforeEach(() => {
+    recorded.length = 0;
+    ctx.allowedWrites = ['src/', 'docs/'];
+    ctx.fileTree = { record: async (rel, kind) => { recorded.push([rel, kind]); } };
+  });
+
+  it('indexes a write as created, and the same path again as modified', async () => {
+    await writeFileTool.run({ path: 'src/a.py', content: 'a = 1\n' }, ctx);
+    await writeFileTool.run({ path: 'src/a.py', content: 'a = 2\n' }, ctx);
+    expect(recorded).toEqual([['src/a.py', 'created'], ['src/a.py', 'modified']]);
+  });
+
+  it('indexes an append, which cannot go through the replacing write', async () => {
+    await writeFileTool.run({ path: 'docs/log.md', content: '# log\n' }, ctx);
+    recorded.length = 0;
+    await appendFileTool.run({ path: 'docs/log.md', content: 'entry\n' }, ctx);
+    expect(recorded).toEqual([['docs/log.md', 'modified']]);
+  });
+
+  it('indexes a patched file', async () => {
+    await writeFileTool.run({ path: 'src/b.py', content: 'x = 1\n' }, ctx);
+    recorded.length = 0;
+    await applyPatchTool.run({
+      patch: [
+        '--- a/src/b.py',
+        '+++ b/src/b.py',
+        '@@ -1 +1 @@',
+        '-x = 1',
+        '+x = 2',
+      ].join('\n'),
+    }, ctx);
+    expect(recorded).toEqual([['src/b.py', 'modified']]);
+  });
+
+  // The dependency manifest is a delivered file. It was the one mutation site left outside the
+  // gateway, so the project's own manifest was missing from the record of what the project is.
+  it('indexes the dependency manifest', async () => {
+    ctx.allowedWrites = ['requirements.txt'];
+    ctx.language = 'python';
+    ctx.phase = 'HIGH_LEVEL_DESIGN';
+    ctx.sandbox = { build: async () => ({ rebuilt: true, reason: 'ok' }) } as never;
+    await addDependencyTool.run({ packages: ['requests==2.32.3'] }, ctx);
+    expect(recorded.map(([path]) => path)).toContain('requirements.txt');
+  });
+
+  // Indexing must never fail a write that already landed: the bytes are on disk, and a tool
+  // reporting failure would send a Step to repair something that is not broken.
+  it('reports success when indexing fails', async () => {
+    ctx.fileTree = { record: async () => { throw new Error('registry unavailable'); } };
+    const result = await writeFileTool.run({ path: 'src/c.py', content: 'c = 1\n' }, ctx);
+    expect(result.ok).toBe(true);
+    expect(await fs.readFile(path.join(tmp, 'src/c.py'), 'utf8')).toBe('c = 1\n');
   });
 });

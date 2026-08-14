@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Planner } from '../src/agents/planner.js';
+import { LLMRequestError } from '../src/llm/errors.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 
 function fakeLLM(reply: string | string[]): LLMClient {
@@ -13,6 +14,17 @@ function fakeLLM(reply: string | string[]): LLMClient {
       // 模拟 router/Fallback 的行为：先跑 validate，失败立即抛出（让 FallbackClient 切换 provider）。
       if (options?.validate) options.validate(current);
       return current;
+    },
+  };
+}
+
+function observingLLM(reply: string, seen: ChatMessage[][]): LLMClient {
+  return {
+    name: 'observing',
+    async chat(messages, options): Promise<string> {
+      seen.push(messages);
+      if (options?.validate) options.validate(reply);
+      return reply;
     },
   };
 }
@@ -35,8 +47,15 @@ function routedLLM(reply: string[]): LLMClient {
         try {
           options.validate(current);
         } catch (error) {
-          throw new Error(
+          throw new LLMRequestError(
             `all LLM providers failed for role Planner: primary: ${(error as Error).message}`,
+            {
+              code: 'all_providers_failed',
+              mode: 'router',
+              retryable: true,
+              switchProvider: true,
+              details: { contentRejectedOnly: true },
+            },
             { cause: error },
           );
         }
@@ -94,7 +113,7 @@ function testPhaseDeliveryGate(name: string) {
       operation: 'Run the primary fixture command.',
       environment: 'live' as const,
       expected: 'The command succeeds.',
-      execution: { command: 'python', args: ['src/main.py', '--fixture'] },
+      execution: { command: 'python', args: ['-c', 'print("ok")'] },
     }],
     freezeBeforeExecution: true,
     routeEachFinding: true as const,
@@ -518,6 +537,64 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       .rejects.toThrow(/deliveryGate with executable real-user scenarios/);
   });
 
+  it('拒绝把完整 shell 命令塞进 TypeScript Phase 交付场景的 command 字段', async () => {
+    const invalid = withDeliveryGates({
+      requirementDigest: 'Build a small TypeScript command.',
+      globalPrompt: '',
+      projectType: 'application',
+      complexityAssessment: planMetadata.complexityAssessment,
+      implementationPhases: planMetadata.implementationPhases,
+    });
+    invalid.implementationPhases[0]!.deliveryGate.scenarios[0]!.execution = {
+      command: 'npx ts-node src/main.ts',
+      args: [],
+    };
+    const planner = new Planner(fakeLLM(JSON.stringify(invalid)), undefined, 'typescript');
+
+    await expect(planner.planPhasePlan({
+      rawRequirement: 'Build a small TypeScript command.',
+      clarifications: [],
+    })).rejects.toThrow(/execution\.command must contain one executable only/);
+  });
+
+  it('拒绝 StepPlan 未交付 Phase 真实场景引用的 TypeScript 入口', async () => {
+    const phasePlan = withDeliveryGates({
+      requirementDigest: 'Build a small TypeScript command.',
+      globalPrompt: '',
+      projectType: 'application',
+      complexityAssessment: planMetadata.complexityAssessment,
+      implementationPhases: planMetadata.implementationPhases,
+    });
+    phasePlan.implementationPhases[0]!.deliveryGate.scenarios[0]!.execution = {
+      command: 'npx',
+      args: ['tsx', 'src/main.ts'],
+    };
+    const stepPlan = {
+      requirementDigest: phasePlan.requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'tsx', 'vitest'],
+      architectureModules: [{
+        id: 'M001',
+        name: 'CliEntrypoint',
+        responsibility: 'Own the complete command entrypoint and its observable behavior.',
+        sourcePaths: ['src/cli.ts'],
+        testPaths: ['tests/cli.test.ts'],
+        dependencies: [],
+      }],
+      steps: vModelSteps('P1', 1, 'src/cli.ts', 'tests/cli.test.ts'),
+    };
+    const planner = new Planner(
+      fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]),
+      undefined,
+      'typescript',
+    );
+
+    await expect(planner.decompose({
+      rawRequirement: phasePlan.requirementDigest,
+      clarifications: [],
+    })).rejects.toThrow(/src\/main\.ts.*not delivered|not delivered.*src\/main\.ts/);
+  });
+
   it('多阶段需求先生成 PhasePlan，再只展开当前 P1 的 V 模型 StepPlan', async () => {
     const requirementDigest = 'Build a staged number formatting utility. Phase 1 core, Phase 2 polish, Phase 3 scale.';
     const phasePlan = {
@@ -623,6 +700,32 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     expect(plan.implementationPhases?.map((phase) => `${phase.id}:${phase.status}`))
       .toEqual(['P1:complete', 'P2:current']);
     expect(plan.steps.every((step) => step.iterationId === 'P2')).toBe(true);
+  });
+
+  it('StepPlan receives Skill metadata but not inactive instructions', async () => {
+    const seen: ChatMessage[][] = [];
+    const stepPlan = {
+      requirementDigest: 'Build the core fixture.',
+      globalPrompt: '',
+      dependencies: ['pytest'],
+      steps: vModelSteps('P1', 1, 'src/main.py', 'tests/test_main.py'),
+    };
+    const planner = new Planner(observingLLM(JSON.stringify(stepPlan), seen));
+    await planner.decomposePhase(
+      { rawRequirement: 'Build the core fixture.', clarifications: [] },
+      withDeliveryGates({
+        requirementDigest: 'Build the core fixture.',
+        globalPrompt: '',
+        ...planMetadata,
+      }),
+      'P1',
+    );
+
+    const system = seen[0]?.find((message) => message.role === 'system')?.content ?? '';
+    expect(system).toContain('skill:systematic-debugging');
+    expect(system).toContain('Investigate and repair reproducible software failures');
+    expect(system).not.toContain('## 1. Establish Evidence');
+    expect(system).not.toContain('Treat Debug Wiki matches as hypotheses');
   });
 
   it('PhasePlan 校验失败时会把错误反馈给 Planner 并重试', async () => {
@@ -874,6 +977,64 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     );
 
     expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain('README.md');
+  });
+
+  it('router 聚合的不完整 JSON 仍会进入 Planner 外层结构修复', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = withDeliveryGates({
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'One compact CLI.',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [{
+        id: 'P1',
+        title: 'Core CLI',
+        objective: requirementDigest,
+        status: 'current' as const,
+        scope: ['CLI'],
+        deliverables: ['CLI'],
+        dependsOn: [],
+        verificationGate: {
+          summary: 'Run all gates.',
+          checks: ['npm test'],
+          failurePolicy: 'Repair through the paired V-model phase.',
+        },
+      }],
+    });
+    const moduleTestPath = 'tests/modules/main.test.ts';
+    const valid = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [{
+        id: 'M001',
+        name: 'main',
+        responsibility: 'Parse CLI arguments and start the application workflow.',
+        sourcePaths: ['src/main.ts'],
+        assetPaths: [],
+        testPaths: [moduleTestPath],
+        dependencies: [],
+      }],
+      steps: vModelSteps('P1', 1, 'src/main.ts', moduleTestPath),
+    };
+    const planner = new Planner(
+      routedLLM(['{"requirementDigest":"truncated"', JSON.stringify(valid)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      phasePlan,
+      'P1',
+    );
+
+    expect(plan.steps).toHaveLength(8);
   });
 
   it('当前 phase 的架构规模门禁不被后续 planned phase 的 surface 误伤', async () => {

@@ -32,7 +32,7 @@ export class PluginHost {
   private readonly pluginApiVersion: number;
   private readonly hooks = new Map<HookName, RegisteredHook[]>();
   private readonly contributedTools: Array<{ plugin: XCompilerPlugin; tool: Tool }> = [];
-  private readonly contributedSkills: Array<{ plugin: XCompilerPlugin; skill: Parameters<PluginApi['registerSkill']>[0] }> = [];
+  private readonly contributedSkillDirectories: Array<{ plugin: XCompilerPlugin; directory: string }> = [];
   private audit?: AuditLogger;
   private initialized = false;
   private registrationOrder = 0;
@@ -91,11 +91,13 @@ export class PluginHost {
       }
       target.tools.register(tool);
     }
-    for (const { plugin, skill } of this.contributedSkills) {
-      if (target.skills.get(skill.name)) {
-        throw new Error(t().plugins.extensionConflict(plugin.manifest.id, 'skill', skill.name));
+    for (const { plugin, directory } of this.contributedSkillDirectories) {
+      try {
+        target.skills.registerDirectory(directory, { kind: 'plugin', pluginId: plugin.manifest.id });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(t().plugins.extensionConflict(plugin.manifest.id, 'skill', detail), { cause: error });
       }
-      target.skills.register(skill);
     }
   }
 
@@ -207,7 +209,7 @@ export class PluginHost {
         };
       },
       registerTool: (tool) => this.contributedTools.push({ plugin, tool }),
-      registerSkill: (skill) => this.contributedSkills.push({ plugin, skill }),
+      registerSkillDirectory: (directory) => this.contributedSkillDirectories.push({ plugin, directory }),
     };
   }
 
@@ -248,5 +250,6 @@ function snapshotManifest(manifest: XCompilerPluginManifest | undefined): XCompi
   return {
     ...manifest,
     keywords: manifest.keywords ? [...manifest.keywords] : undefined,
+    skills: manifest.skills ? [...manifest.skills] : undefined,
   };
 }

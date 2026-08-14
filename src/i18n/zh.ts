@@ -79,7 +79,7 @@ P2+ 迭代把这些测试计划写到 \`docs/iterations/<iterationId>/tests/\`�
       "description": "string",
       "systemPrompt": "本 Step 专属提示：范围、输入、产出、验收、禁令",
       "role": "Planner",
-      "tools": ["write_file"],
+      "tools": ["skill:artifact-authoring", "skill:test-design"],
       "inputs": ["docs/topic.md"],
       "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"],
       "subTasks": [
@@ -272,6 +272,7 @@ PhasePlan 必须完成：
 2. 判定 complexityAssessment：simple / moderate / complex，并说明 rationale。
 3. 生成 implementationPhases：P1 status=current；后续 P2/P3 status=planned。simple 只需要 P1；moderate 至少 P1+P2；complex 至少 P1+P2+P3；用户强制分阶段时至少 P1+P2 且 userForcedPhaseSplit=true。
 4. 每个 phase 必须包含 objective、scope、deliverables、dependsOn、verificationGate 和 deliveryGate。deliveryGate 声明 validationTypes 和 baselineExecutionPolicy，拥有真实用户 live 场景并给出具体 command/args；任何 V 模型 Step 都不拥有真实网络验收。
+   execution.command 只能是一个可执行程序名，不能填写整条 shell 命令；所有参数必须分别放入 execution.args。${profile.id === 'typescript' ? 'TypeScript 源码例如使用 {"command":"npx","args":["tsx","src/main.ts",...]}、{"command":"node","args":["src/main.ts",...]} 或 npm script；禁止使用 ts-node、nodemon、Jest 或 ts-jest。args 引用的源码入口必须由当前 phase 的 CODE Step 交付。' : 'Python 源码例如使用 {"command":"python","args":["src/main.py",...]}。args 引用的源码入口必须由当前 phase 的 CODE Step 交付。'}
 5. planned phase 只记录目标和门禁，不能展开任何 Step。后续会基于单个 phase 另行生成完整 V 模型计划。
 
 只返回严格 JSON：
@@ -311,6 +312,7 @@ REQUIREMENT_ANALYSIS -> HIGH_LEVEL_DESIGN -> DETAILED_DESIGN -> CODE -> UNIT_TES
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 统一独立检查基线，只能在各自验证命名空间追加风险补充，冻结并使用确定性外部数据运行完整集合后写报告；真实用户网络场景只在 Phase 交付门禁运行。所有右侧阶段都不得改写基线测试或产品代码。
 
 严格产物归属：
+- Step 的 inputs/outputs 是可审计产物图，必须逐项填写精确文件路径；禁止使用 src/**/*.ts、tests/** 等 glob 或目录选择器。tsconfig 内容可以使用 glob，但 Planner JSON 不可以。
 - REQUIREMENT_ANALYSIS 拥有功能基线测试；HIGH_LEVEL_DESIGN 拥有模块基线测试和 architectureModules.testPaths；DETAILED_DESIGN 拥有集成基线测试；CODE 拥有单元基线测试及产品源码/运行时资产。
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST 把配对基线作为 inputs，并只拥有验证报告/交付文档。风险补充测试的精确 root 由 Runtime 在执行时分配，Planner JSON 的任何 Step inputs/outputs 都不得预先声明 supplement、supplemental 或 tests/verification 路径。
 - TypeScript greenfield 必须且只能有一个 HIGH_LEVEL_DESIGN Step 输出 package.json，包含 scripts、dependencies、devDependencies。CODE 不得输出 package.json。
@@ -333,7 +335,7 @@ architectureModules 只能描述当前 phase 的产品/业务源码模块：
     { "id": "M001", "name": "模块名", "responsibility": "单一明确职责", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
-    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxAttempts": 3 }
+    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "范围、输入、产出、验收、禁令", "role": "Planner", "tools": ["skill:artifact-authoring", "skill:test-design"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxAttempts": 3 }
   ]
 }
 
@@ -483,6 +485,7 @@ const messages: Messages = {
     optDebugWikiPath: 'debug wiki 根目录路径（默认 <XCompiler path>/.xcompiler/debug-wiki）',
     optRecordReplay: '外部交互模式：off、record、replay、auto 或 refresh',
     optRecordReplayPath: '工作区内的 record/replay fixture 相对目录',
+    optPermissionMode: '外部系统资源授权模式：request、auto 或 deny',
     argPlan: 'phasePlan.json 路径（默认 = <workspace>/phasePlan.json）',
     argProjectFile: 'XXX.xc 工程文件',
     argStepId: 'Step ID，如 S001',
@@ -498,6 +501,7 @@ const messages: Messages = {
     invalidStepId: (value) => `无效 Step ID“${value}”，格式应为 S 加至少三位数字。`,
     invalidNonNegativeInteger: (value) => `参数必须是非负整数，当前值为“${value}”。`,
     invalidRecordReplayMode: (value, allowed) => `无效的 record/replay 模式“${value}”；可选值：${allowed}。`,
+    invalidPermissionMode: (value, allowed) => `无效权限模式“${value}”；可选值：${allowed}。`,
     helpUsage: '用法：',
     helpArguments: '参数：',
     helpOptions: '选项：',
@@ -574,7 +578,7 @@ const messages: Messages = {
     decomposeFail: 'Planner 拆解失败',
     plannerInvalidPlan: 'Planner 无法生成有效 plan：',
     plannerInvalidPlanHint1: '  常见原因：LLM 输出未满足 XCompiler 计划 schema、V 模型骨架或架构契约；不能跳过该错误。',
-    plannerInvalidPlanHint2: '  排查：检查 .xcompiler/audit.jsonl 中的 llm.error / planner.thought 原文，按契约错误修正 Planner 输出。',
+    plannerInvalidPlanHint2: '  排查：检查 .xcompiler/audit/audit.jsonl 中的 llm.error / planner.thought 原文，按契约错误修正 Planner 输出。',
     plannerTransportFailureHint1: '  常见原因：LLM provider 连接失败、请求超时或服务端中断；这不是项目 plan/源码缺陷。',
     plannerTransportFailureHint2: '  排查：检查 OPENAI_BASE_URL / provider base_url、模型服务是否可达、网络权限和超时设置，然后重跑 build。',
     decomposeSucceed: (n) => `已生成 ${n} 个 Step`,
@@ -842,7 +846,7 @@ ${opts.phasePlan}
     executorStepBlock: (sp: string) =>
       `\n\n## 当前 Step 专属提示 (唯一使命，禁止跨 Step 发散)\n${sp}`,
     executorSkillBlock: (hints: string[]) =>
-      `\n\n## 可用 Skill 提示\n${hints.map((hint) => `- ${hint}`).join('\n')}`,
+      `\n\n## 已激活 Agent Skills\n${hints.join('\n\n')}`,
     executorUserPromptOutro: '现在按协议返回第一轮 JSON。',
     executorFeedbackHeader: '本轮工具结果：',
     executorFeedbackVerifyOk: 'outputs 校验通过。如已完成，请把 done 设为 true 且 actions=[]。',
@@ -862,30 +866,6 @@ ${opts.phasePlan}
       'DEBUG Bug Ticket 动作无效：首次修复或验证前必须提供 bugResolutionPlan。请在同一 JSON 中给出根因假设、修复目标、验证命令以及必要动作。',
     executorFeedbackPostMutationVerificationRequired:
       '最新一次成功修改尚未验证。保留当前文件，下一步直接运行最小相关编译/测试门禁；不要再用一轮只读检查或重复改写。',
-  },
-  skills: {
-    patcher:
-      '通过 apply_patch / replace_in_file 对已有文件做小改动，禁止整文件覆盖。' +
-      'replace_in_file 必须同时提供 args.path、args.find、args.replace；path 使用当前 Step writable allowlist 内的具体 workspace 相对文件路径，内容不确定时先 read_file 同一路径。',
-    author:
-      '通过 write_file 创建新文件；必须提供非空 args.path 和字符串 args.content，path 使用当前 Step outputs 或 writable allowlist 中的具体 workspace 相对路径。',
-    tester:
-      '编写并运行 pytest 测试，验证函数行为；失败时通过 analyze_error 解析。' +
-      '【路径契约】所有 read_file/write_file/append_file/replace_in_file 调用都必须提供具体的 workspace 相对 args.path，不得省略、使用项目外路径或把目录当文件。' +
-      '【fixture 自包含】测试**严禁**直接 open() 磁盘上不存在的样例文件。' +
-      '若被测函数需要文件输入，优先复用用户/工作区真实样例；没有样例时用 http_fetch 获取官方文档、上游仓库或公开标准中的小型参考样例，' +
-      '保存到 tests/fixtures/<name> 并记录来源；只有 CSV/JSON/INI 等简单文本格式才可在 pytest tmp_path 中构造最小样例并立刻 run_tests。' +
-      '测试阶段和 DEBUG 模式已默认放开 tests/fixtures/ 写权限，子目录自动 mkdir -p，**无需**提前把 fixture 路径登记到 outputs。' +
-      '生成测试时务必同时输出全部依赖资源，避免后续 Debugger 因 FileNotFoundError 反复重试。' +
-      '【fixture 迭代】若测试运行中被测函数报"Invalid syntax / Parse error / Malformed"等解析错误，' +
-      '说明你写出的 fixture 内容不合该格式 spec：read_file 看清后，优先使用用户样例或 http_fetch 拉取的权威参考样例重写，再 run_tests。' +
-      '复杂领域格式连续失败后必须停止凭记忆生成，改为请求用户样例或网络参考；严禁去改被测模块或断言。',
-    dep_resolver: '当出现 ModuleNotFoundError 时，用 add_dependency 写回 requirements.txt 并重建沙盒。',
-    debugger:
-      '没有具体失败日志时先用 run_tests/run_program 复现；已有明确错误和完整 debug repair packet 时直接执行最小范围 patch 或依赖修改，再重跑失败门禁。只有关键文件未注入、片段明确截断或替换连续失败两次时才补充读取当前内容。',
-    refactorer:
-      '重构必须保证行为不变；先跑回归测试 → 修改 → 再跑回归测试。' +
-      '所有文件工具必须提供具体的 workspace 相对 args.path；局部替换前先 read_file 确认同一路径和当前字节。',
   },
   doctor: {
     cliDescription: '检查 config / LLM / sandbox / skills 是否就绪',
@@ -939,6 +919,7 @@ ${opts.phasePlan}
     sandboxDockerDaemonDown: (msg) => `docker daemon 不可达：${msg}`,
     sandboxInContainerWarn: '检测到 XCompiler 运行在容器内，此模式不支持 sandbox=docker（请使用 subprocess）。',
     skillToolMissing: (skill, tool) => `skill "${skill}" 引用了未注册的工具 "${tool}"`,
+    skillInvalid: (message) => `Agent Skills 校验失败：${message}`,
     skillOk: (n, tools) => `已注册 ${n} 个 skill，对应 ${tools} 个底层工具`,
   },
 };

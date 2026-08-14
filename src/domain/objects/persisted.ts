@@ -43,6 +43,7 @@ import {
   type TicketChangeSet,
   type WorkspaceHandle,
 } from '../workspace/change_set.js';
+import { FileTreeSchema, type FileTree } from '../workspace/file_tree.js';
 import {
   MergeGateRunSchema,
   MergeRequestSchema,
@@ -62,6 +63,7 @@ export type PersistedDomainObject =
   | TicketAssignment
   | TicketTraceEvent
   | WorkspaceHandle
+  | FileTree
   | TicketChangeSet
   | MergeRequest
   | MergeGateRun
@@ -92,6 +94,7 @@ export const PersistedDomainObjectSchema: z.ZodType<PersistedDomainObject> = z.u
   TicketAssignmentSchema,
   TicketTraceEventSchema,
   WorkspaceHandleSchema,
+  FileTreeSchema,
   TicketChangeSetSchema,
   MergeRequestSchema,
   MergeGateRunSchema,

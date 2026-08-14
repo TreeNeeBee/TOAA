@@ -121,6 +121,11 @@ describe('config locale', () => {
     expect(config.agent.max_edit_lines_per_step).toBe('auto');
   });
 
+  it('defaults Record/Replay to external data channels, not process exit codes', async () => {
+    const { config } = await loadConfigWithPath(await writeConfig(baseConfig()));
+    expect(config.record_replay.channels).toEqual(['http', 'llm']);
+  });
+
   it('derives write chunk bytes from context_window instead of accepting a fixed config field', async () => {
     const cfgPath = await writeConfig(baseConfig());
     const { config } = await loadConfigWithPath(cfgPath);

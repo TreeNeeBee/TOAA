@@ -43,8 +43,10 @@
     "config.example.yaml",
     ".env.example",
     "debug-wiki",
+    "skills",
     "docs/assets",
     "docs/acp.md",
+    "docs/agent_skills.md",
     "docs/XCompiler_design.md",
     "docs/deploy.md",
     "docs/openrouter.md",
@@ -115,6 +117,6 @@
     "node": ">=24"
   },
   "xcompiler": {
-    "pluginApiVersion": 2
+    "pluginApiVersion": 3
   }
 }

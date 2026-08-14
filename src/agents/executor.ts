@@ -1,4 +1,8 @@
 import path from 'node:path';
+import {
+  VERIFICATION_SUPPLEMENT_DIR,
+  verificationSupplementUpwardPrefix,
+} from '../core/test_assets.js';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import type { ChatOptions, LLMClient } from '../llm/types.js';
@@ -26,6 +30,7 @@ import type {
   ToolContext,
   ToolResult,
 } from '../tools/types.js';
+import { isContentRejectionExhausted } from '../llm/errors.js';
 import { makeStreamReporter } from '../llm/stream.js';
 import { t } from '../i18n/index.js';
 import { updateOperationWindow } from '../llm/window.js';
@@ -68,7 +73,6 @@ export { verifyOutputs } from './execution/output_verifier.js';
 
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
 const INVALID_COMPLETION_ROUND_LIMIT = 2;
-const CONSECUTIVE_PERMISSION_DENIAL_LIMIT = 2;
 const RECOVERY_PROBE_ACTIONS_PER_ROUND = 4;
 const MAX_DIRECT_REPAIR_PROBE_ROUNDS = 4;
 
@@ -305,13 +309,19 @@ export class StepExecutor {
     const failedMutationAttempts = new Map<string, number>();
     let mutationGeneration = 0;
     let verifiedMutationGeneration = 0;
+    // A compiler check and a baseline test prove different gates. Tracking only one generic
+    // verification generation let an old run_tests result become current again after a later
+    // run_program succeeded. Keep the executable baseline generation independent.
+    let baselineTestVerifiedMutationGeneration = -1;
     let actualRounds = 0;
     let consecutiveReadOnlyRounds = 0;
     let consecutiveNoProgressRounds = 0;
     let consecutiveInvalidCompletionRounds = 0;
     let consecutiveMissingCrMutationRounds = 0;
     let failedTestRunRounds = 0;
-    let consecutivePermissionDenialRounds = 0;
+    let permissionAdaptationRound: number | undefined;
+    let permissionBlockedReason: string | undefined;
+    const deniedCapabilities = new Set<string>();
     let repairEvidence = false;
     const ownedChangeRequestArtifacts = currentStepAffectedArtifacts(inp);
     const changeRequestMutationRequired = ownedChangeRequestArtifacts.length > 0;
@@ -450,16 +460,21 @@ export class StepExecutor {
         rep.done('failed');
         const errMsg = (err as Error).message;
         actualRounds = round;
-        // 把部分流落盘到 .xcompiler/llm-stream/<step>-<role>-r<n>.txt
-        const dumpRel = `.xcompiler/llm-stream/${inp.step.id}-${role}-r${round}.txt`;
+        // Partial model output is diagnostic evidence, never a generated-project deliverable.
+        let partialDump: string | undefined;
         try {
-          const dumpAbs = inp.ctx.ws.abs(dumpRel);
-          await fs.mkdir(path.dirname(dumpAbs), { recursive: true });
-          await fs.writeFile(
-            dumpAbs,
-            `${t().audit.partialFailureHeader(errMsg)}\n${t().audit.streamLength(rawAggregate.length)}\n\n${rawAggregate}`,
-            'utf8',
-          );
+          if (inp.ctx.audit) {
+            const dumpAbs = inp.ctx.audit.artifactPath(
+              `llm-stream/${inp.step.id}-${role}-r${round}.txt`,
+            );
+            partialDump = dumpAbs;
+            await fs.mkdir(path.dirname(dumpAbs), { recursive: true });
+            await fs.writeFile(
+              dumpAbs,
+              `${t().audit.partialFailureHeader(errMsg)}\n${t().audit.streamLength(rawAggregate.length)}\n\n${rawAggregate}`,
+              'utf8',
+            );
+          }
         } catch {
           /* best-effort */
         }
@@ -478,11 +493,17 @@ export class StepExecutor {
             stepId: inp.step.id,
             role,
             round,
-            partialDump: dumpRel,
+            partialDump,
             partialBytes: rawAggregate.length,
           },
         );
-        if (isLowQualityLLMResponseError(errMsg)) {
+        // Structure first: the router reports whether every provider refused the model's content,
+        // which is true however the rejection happens to be worded. The prose test stays for a
+        // client called without the router, where there is no typed failure to read — it had been
+        // the only test, and it silently stopped matching: the contract says "low-quality Executor
+        // response" and the pattern allows only "low-quality response" or "low-quality debugger
+        // response", so this recovery never ran and the run aborted instead.
+        if (isContentRejectionExhausted(err) || isLowQualityLLMResponseError(errMsg)) {
           repeatedTurns++;
           consecutiveLowQualityRejections++;
           const verify = await verifyOutputs(inp);
@@ -654,6 +675,7 @@ export class StepExecutor {
         actions,
         phase: inp.step.phase,
         baselineTestExecution: inp.baselineTestExecution ?? 'execute',
+        baselineTestVerified: baselineTestVerifiedMutationGeneration === mutationGeneration,
         language: profile.id,
         toolMap,
         ctx: inp.ctx,
@@ -832,8 +854,7 @@ export class StepExecutor {
       for (const a of actions) {
         if (
           a.tool === 'run_tests' &&
-          mutationGeneration === verifiedMutationGeneration &&
-          calls.some((call) => call.tool === 'run_tests' && call.ok)
+          baselineTestVerifiedMutationGeneration === mutationGeneration
         ) {
           const summary =
             'run_tests reused: the current mutation generation already passed the mandatory executable gate';
@@ -899,13 +920,35 @@ export class StepExecutor {
           patch: a.tool === 'apply_patch' && typeof a.args.patch === 'string' ? a.args.patch : undefined,
         });
         if (permission && inp.ctx.requestPermission) {
-          const decision = await inp.ctx.requestPermission(permission);
+          const requestedCapability = `${permission.operationType}:${permission.target}`;
+          const decision = deniedCapabilities.has(requestedCapability)
+            ? {
+                approved: false,
+                outcome: 'denied' as const,
+                reason: 'capability was already denied during this run',
+                capability: requestedCapability,
+                cached: true,
+              }
+            : await inp.ctx.requestPermission(permission);
           if (!decision.approved) {
+            const capability = decision.capability ?? requestedCapability;
+            const repeatedAfterAdaptation = permissionAdaptationRound !== undefined && round > permissionAdaptationRound;
+            deniedCapabilities.add(capability);
+            permissionAdaptationRound ??= round;
+            // The permission wait and decision complete this round. Guarantee exactly one later
+            // model turn for C1 adaptation even when denial arrives at the nominal round limit.
+            if (round >= roundLimit && roundLimit < hardRoundLimit) {
+              roundLimit = Math.min(hardRoundLimit, roundLimit + 1);
+            }
             const r = {
               ok: false,
-              error: `permission denied for ${permission.operationType}: ${permission.target}` +
+              error: `permission ${decision.outcome ?? 'denied'} for ${permission.operationType}: ${permission.target}` +
                 (decision.reason ? ` (${decision.reason})` : ''),
             };
+            if (repeatedAfterAdaptation) {
+              permissionBlockedReason =
+                `permission_blocked: the one allowed adaptation still requires denied capability ${capability}`;
+            }
             updateUnresolvedToolFailures(unresolvedToolFailures, a, r, advisoryFailureTools, advisoryFailureRules);
             await inp.ctx.audit?.event('tool.result', t().audit.toolResult(a.tool, false, r.error), {
               messageId: 'audit.tool_result',
@@ -944,13 +987,18 @@ export class StepExecutor {
         const successfulMutation = didPerformSuccessfulMutation(a, r);
         if (successfulMutation) {
           const hadPendingVerification = mutationGeneration > verifiedMutationGeneration;
-          mutationGeneration++;
-          if (!hadPendingVerification && !mutationRequiresExecutionVerification(
+          const baselineWasVerified = baselineTestVerifiedMutationGeneration === mutationGeneration;
+          const requiresExecutionVerification = mutationRequiresExecutionVerification(
             a,
             r,
             inp.baselineTestExecution === 'defer',
-          )) {
+          );
+          mutationGeneration++;
+          if (!hadPendingVerification && !requiresExecutionVerification) {
             verifiedMutationGeneration = mutationGeneration;
+          }
+          if (baselineWasVerified && !requiresExecutionVerification) {
+            baselineTestVerifiedMutationGeneration = mutationGeneration;
           }
         }
         if (isOutputMutationTool(a.tool)) {
@@ -974,6 +1022,9 @@ export class StepExecutor {
             failedVerificationAttempts.delete(verificationKey);
             if (exactVerificationKey) failedExactVerificationAttempts.delete(exactVerificationKey);
             verifiedMutationGeneration = mutationGeneration;
+            if (a.tool === 'run_tests') {
+              baselineTestVerifiedMutationGeneration = mutationGeneration;
+            }
           } else if (isUnownedStepFailure(r.code)) {
             // Nothing the Step can do makes this command succeed: the manifest is another Step's
             // declared output. Counting the repeat as no-progress fails the attempt for a condition
@@ -1108,11 +1159,6 @@ export class StepExecutor {
       if (turnResults.some((r) => r.tool === 'run_tests' && !r.ok) && !advisoryFailureTools.has('run_tests')) {
         failedTestRunRounds++;
       }
-      const permissionDeniedThisRound = turnResults.some((result) =>
-        !result.ok && /permission denied for /iu.test(result.error ?? ''));
-      consecutivePermissionDenialRounds = permissionDeniedThisRound
-        ? consecutivePermissionDenialRounds + 1
-        : 0;
       if (repeatedMutationFailure) {
         const metrics = computeMetrics({
           rounds: actualRounds,
@@ -1305,6 +1351,7 @@ export class StepExecutor {
         : 0;
       const unresolvedFailuresOk =
         unresolvedToolFailures.size === 0 ||
+        hasOnlyPermissionControlFailures(unresolvedToolFailures) ||
         (outputCompletionRecovery && hasOnlyUntargetedToolContractFailures(unresolvedToolFailures)) ||
         supersededContractFailures ||
         nonBlockingPhaseVerificationFailures ||
@@ -1412,6 +1459,41 @@ export class StepExecutor {
           metrics,
         };
       }
+      if (
+        permissionAdaptationRound !== undefined &&
+        round > permissionAdaptationRound &&
+        actions.length === 0
+      ) {
+        permissionBlockedReason ??=
+          `permission_blocked: no permitted alternative was produced for ${[...deniedCapabilities].join(', ')}`;
+      }
+      if (permissionBlockedReason) {
+        const metrics = computeMetrics({
+          rounds: actualRounds,
+          parseFailures,
+          repeatedTurns,
+          calls,
+          initialMissing,
+          currentMissing: verify.missing.length,
+          providers: [...providers],
+        });
+        await inp.ctx.audit?.event('note', permissionBlockedReason, {
+          messageId: 'audit.executor_permission_blocked',
+          stepId: inp.step.id,
+          round,
+          deniedCapabilities: [...deniedCapabilities],
+          adaptationRound: permissionAdaptationRound,
+        });
+        return {
+          success: false,
+          rounds: round,
+          toolCalls: calls,
+          finalThought,
+          bugResolutionPlan,
+          error: permissionBlockedReason,
+          metrics,
+        };
+      }
       if (consecutiveMissingCrMutationRounds >= 2) {
         const error =
           `change-request completion rejected for ${inp.step.id}: the Step owns affected artifacts ` +
@@ -1496,28 +1578,6 @@ export class StepExecutor {
           round,
           failedTestRunRounds,
           maxFailedTestRuns: this.opts.maxFailedTestRuns,
-        });
-        return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
-      }
-      if (consecutivePermissionDenialRounds >= CONSECUTIVE_PERMISSION_DENIAL_LIMIT) {
-        const metrics = computeMetrics({
-          rounds: actualRounds,
-          parseFailures,
-          repeatedTurns,
-          calls,
-          initialMissing,
-          currentMissing: verify.missing.length,
-          providers: [...providers],
-        });
-        const error =
-          `sensitive operations were denied for ${consecutivePermissionDenialRounds} consecutive rounds; ` +
-          'stopping this attempt instead of repeatedly proposing unauthorized variants. ' +
-          'Resume with a materially different plan or explicit user guidance.';
-        await inp.ctx.audit?.event('note', error, {
-          messageId: 'audit.executor_permission_denial_guard',
-          stepId: inp.step.id,
-          round,
-          consecutivePermissionDenialRounds,
         });
         return { success: false, rounds: round, toolCalls: calls, finalThought, bugResolutionPlan, error, metrics };
       }
@@ -1788,6 +1848,9 @@ export class StepExecutor {
               : undefined,
           deferredVerification: inp.debugContext?.deferredVerificationScope,
           unsupportedValidationDefect,
+          permissionAdaptation: permissionAdaptationRound === round
+            ? { deniedCapabilities: [...deniedCapabilities] }
+            : undefined,
         }, {
           feedbackCharBudget: inp.ctx.feedbackCharBudget,
           readChunkBytes: inp.ctx.readChunkBytes,
@@ -2080,6 +2143,12 @@ function hasOnlyUntargetedToolContractFailures(unresolved: Map<string, string>):
   );
 }
 
+function hasOnlyPermissionControlFailures(unresolved: Map<string, string>): boolean {
+  return unresolved.size > 0 && [...unresolved.values()].every((detail) =>
+    /permission (?:denied|timed_out|hard_denied) for /iu.test(detail),
+  );
+}
+
 function hasOnlySupersededToolContractFailures(unresolved: Map<string, string>): boolean {
   if (unresolved.size === 0) return true;
   return [...unresolved.values()].every((detail) =>
@@ -2203,9 +2272,23 @@ export function validationDefectFromTestFailure(
   executedTests: readonly string[] = [],
 ): string {
   const evidence = [failure.summary, failure.error].filter((value): value is string => !!value?.trim()).join('\n');
+  // A supplement sits five directories down with a Step id in the middle, so the path back to the
+  // product has to be counted by hand — and the count is what keeps being got wrong. Two separate
+  // live runs burned every attempt a Ticket had on `../../../src/...` against a root needing
+  // `../../../../../`, with every baseline case beside it passing. Naming the prefix in the entry
+  // inspection was not enough: a Step that writes a supplement never sees that message, it sees
+  // this one.
+  const supplement = executedTests.find((candidate) => candidate.includes(`${VERIFICATION_SUPPLEMENT_DIR}/`));
+  const prefix = supplement
+    ? verificationSupplementUpwardPrefix(supplement.slice(0, supplement.lastIndexOf('/')))
+    : undefined;
   return [
     `${phase} executable test gate failed:`,
     executedTests.length > 0 ? `Cases under test: ${executedTests.join(', ')}` : '',
+    prefix
+      ? `Supplements under ${VERIFICATION_SUPPLEMENT_DIR}/ reach the product with exactly ` +
+        `${prefix}src/… — use that prefix rather than counting the directories.`
+      : '',
     truncate(evidence || 'run_tests failed without details', 4000),
   ].filter(Boolean).join('\n');
 }
@@ -2382,14 +2465,15 @@ async function automaticDevelopmentVerificationActions(input: {
   actions: LLMAction[];
   phase: Step['phase'];
   baselineTestExecution: 'execute' | 'defer';
+  baselineTestVerified: boolean;
   language: LanguageProfile['id'];
   toolMap: Map<string, Tool>;
   ctx: ToolContext;
 }): Promise<LLMAction[]> {
   if (!(V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(input.phase)) return [];
-  if (!input.actions.some((action) => isOutputMutationTool(action.tool))) return [];
   const automatic: LLMAction[] = [];
   const requestedTools = new Set(input.actions.map((action) => action.tool));
+  const hasOutputMutation = input.actions.some((action) => isOutputMutationTool(action.tool));
   const codeMutationTargeted = input.actions.some((action) =>
     actionTargetPaths(action.tool, action.args).some((target) =>
       normalizeRelPath(target).startsWith('src/')),
@@ -2397,6 +2481,7 @@ async function automaticDevelopmentVerificationActions(input: {
   const hasStaticPrerequisites =
     input.language === 'typescript' || codeMutationTargeted || await input.ctx.ws.exists('src');
   if (
+    hasOutputMutation &&
     input.phase === 'CODE' &&
     hasStaticPrerequisites &&
     input.toolMap.has('run_program') &&
@@ -2411,6 +2496,7 @@ async function automaticDevelopmentVerificationActions(input: {
   }
   if (
     input.baselineTestExecution === 'execute' &&
+    !input.baselineTestVerified &&
     (input.ctx.testGateArgs?.length ?? 0) > 0 &&
     input.toolMap.has('run_tests') &&
     !requestedTools.has('run_tests')

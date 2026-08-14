@@ -1,4 +1,5 @@
 import type { ObjectId } from '../../domain/identity/object_id.js';
+import { xcompilerBuildId } from '../../core/build_identity.js';
 import { reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { Checkpoint } from '../../domain/evidence/evidence.js';
 import type { Phase } from '../../domain/phases/phase.js';
@@ -18,9 +19,11 @@ import {
   type Ticket,
   type TicketSource,
   type TicketSolution,
+  type TicketWorkspaceBinding,
   type WorkTicket,
 } from '../../domain/tickets/ticket.js';
 import type { Changelist } from '../../domain/evidence/evidence.js';
+import type { PendingReason } from '../../domain/workflow/pending_reason.js';
 import { TicketWorkflow } from './ticket_workflow.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import { evaluateAttemptExtension } from '../../domain/tickets/retry_policy.js';
@@ -47,7 +50,17 @@ export class ProjectController {
   private readonly corrective: CorrectiveWorkflowService;
   private readonly intake: ProjectManagerIntakeService;
 
-  constructor(private readonly repository: DomainObjectRepositoryPort) {
+  constructor(
+    private readonly repository: DomainObjectRepositoryPort,
+    /**
+     * Called once every V-model Step of a Phase is closed and before the delivery Ticket is.
+     *
+     * That instant is the only correct one for anything that reads the finished files: every
+     * ChangeSet has merged, so nothing more will be written, and delivery has not closed, so what
+     * this produces is part of the delivered record rather than a change made to it afterwards.
+     */
+    private readonly hooks: { onStepsClosed?: (phaseId: ObjectId) => Promise<void> } = {},
+  ) {
     this.tickets = new TicketWorkflow(repository);
     this.registration = new TicketRegistrationService(repository);
     this.state = new ProjectStateService(repository);
@@ -110,9 +123,12 @@ export class ProjectController {
         category: typeof object.data.failureCategory === 'string'
           ? object.data.failureCategory
           : undefined,
+        toolchainBuildId: typeof object.data.toolchainBuildId === 'string'
+          ? object.data.toolchainBuildId
+          : undefined,
       });
     }
-    const decision = evaluateAttemptExtension(evidence);
+    const decision = evaluateAttemptExtension(evidence, xcompilerBuildId());
     if (!decision.extend) {
       throw new Error(
         `Ticket ${ticket.name} stopped after ${ticket.attempts} attempts: ${decision.reason}`,
@@ -168,11 +184,27 @@ export class ProjectController {
   }
 
   async deferInfrastructureFailure(work: ScheduledWork, reason: string): Promise<void> {
-    await this.deferNonProjectAttempt(work, `Infrastructure failure deferred without V-model routing: ${reason}`);
+    await this.deferNonProjectAttempt(
+      work,
+      'external-service',
+      `Infrastructure failure deferred without V-model routing: ${reason}`,
+    );
+  }
+
+  async deferPermissionBlocked(work: ScheduledWork, reason: string): Promise<void> {
+    await this.deferNonProjectAttempt(
+      work,
+      'permission',
+      `Permission blocked without V-model routing: ${reason}`,
+    );
   }
 
   async deferCancelledAttempt(work: ScheduledWork, reason: string): Promise<void> {
-    await this.deferNonProjectAttempt(work, `Cancelled attempt returned to PM without V-model routing: ${reason}`);
+    await this.deferNonProjectAttempt(
+      work,
+      'interrupted',
+      `Cancelled attempt returned to PM without V-model routing: ${reason}`,
+    );
   }
 
   async retainAgentExecutionFailure(work: ScheduledWork, reason: string): Promise<void> {
@@ -187,7 +219,11 @@ export class ProjectController {
     );
   }
 
-  private async deferNonProjectAttempt(work: ScheduledWork, checkpoint: string): Promise<void> {
+  private async deferNonProjectAttempt(
+    work: ScheduledWork,
+    pendingReason: PendingReason,
+    checkpoint: string,
+  ): Promise<void> {
     const step = await this.requireStep(work.step.id);
     const ticket = await this.requireTicket(work.ticket.id);
     if (step.state !== 'in_progress' || ticket.state !== 'in_progress') {
@@ -200,7 +236,17 @@ export class ProjectController {
       attempts: Math.max(0, ticket.attempts - 1),
     });
     await this.repository.commit([revisedStep, revisedTicket]);
-    await this.checkpoint(revisedStep, checkpoint);
+    for (const task of await this.ticketDescendants(revisedTicket.id)) {
+      if (task.state === 'in_progress') {
+        await this.state.transitionTicket(task, 'pending', pendingReason);
+      }
+    }
+    const parkedTicket = await this.state.transitionTicket(revisedTicket, 'pending', pendingReason);
+    const parkedStep = await this.state.transitionStep(revisedStep, 'pending', pendingReason);
+    await this.checkpoint(
+      parkedStep,
+      `${checkpoint}; ${parkedTicket.name} is pending (${pendingReason}) and actor capacity was released.`,
+    );
   }
 
   async deliverNormal(work: ScheduledWork, qualityAssessmentId: ObjectId): Promise<void> {
@@ -251,6 +297,7 @@ export class ProjectController {
     creatorActorId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<BugTicket> {
     return this.corrective.routeFailure(input);
   }
@@ -259,6 +306,7 @@ export class ProjectController {
     sourceStepId: ObjectId;
     targetStepId?: ObjectId;
     finding: string;
+    affectedArtifacts?: string[];
     kind: EnhancementTicket['enhancementKind'];
     qualityAssessmentId?: ObjectId;
     correlationId: ObjectId;
@@ -267,6 +315,7 @@ export class ProjectController {
     creatorActorId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
+    workspaceBinding?: TicketWorkspaceBinding;
   }): Promise<EnhancementTicket> {
     return this.corrective.routeQualityGap(input);
   }
@@ -316,6 +365,14 @@ export class ProjectController {
 
   async activateChangeRequest(ticketId: ObjectId): Promise<ChangeRequestTicket> {
     return this.corrective.activateChangeRequest(ticketId);
+  }
+
+  async reclaimUnreachableWork(projectId: ObjectId): Promise<number> {
+    return this.tickets.reclaimUnreachableWork(projectId);
+  }
+
+  async releaseCyclicCorrectiveBlockers(projectId: ObjectId): Promise<number> {
+    return this.tickets.releaseCyclicCorrectiveBlockers(projectId);
   }
 
   async reconcileClosedCorrectiveTickets(projectId: ObjectId): Promise<void> {
@@ -381,6 +438,7 @@ export class ProjectController {
     if (incompleteStories.length > 0) {
       throw new Error(`Cannot deliver ${phase.name}: incomplete Stories [${incompleteStories.map((ticket) => ticket.name).join(', ')}]`);
     }
+    await this.hooks.onStepsClosed?.(phase.id);
     let delivery = phaseTickets.find(
       (ticket): ticket is WorkTicket =>
         ticket.phaseId === phase.id && ticket.type === 'story' && ticket.workKind === 'delivery',
@@ -489,7 +547,7 @@ export class ProjectController {
   private async saveStepTransition(
     step: Step,
     next: Parameters<ProjectStateService['transitionStep']>[1],
-    pendingReason?: 'defect' | 'quality-gap',
+    pendingReason?: PendingReason,
   ): Promise<Step> {
     return this.state.transitionStep(step, next, pendingReason);
   }
@@ -511,7 +569,7 @@ export class ProjectController {
   private async saveTicketTransition(
     ticket: Ticket,
     next: Parameters<ProjectStateService['transitionTicket']>[1],
-    pendingReason?: 'defect' | 'quality-gap',
+    pendingReason?: PendingReason,
   ): Promise<Ticket> {
     return this.state.transitionTicket(ticket, next, pendingReason);
   }
@@ -519,7 +577,7 @@ export class ProjectController {
   private async saveTicketTransitionPath(
     ticket: Ticket,
     path: readonly Parameters<ProjectStateService['transitionTicket']>[1][],
-    pendingReason?: 'defect' | 'quality-gap',
+    pendingReason?: PendingReason,
   ): Promise<Ticket> {
     return this.state.transitionTicketPath(ticket, path, pendingReason);
   }

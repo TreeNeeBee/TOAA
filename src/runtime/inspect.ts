@@ -5,6 +5,7 @@ import { loadPlanTarget } from '../core/storage.js';
 import type { Step } from '../domain/steps/step.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../workspace/workspace.js';
+import { findProjectContainer } from '../workspace/project_container.js';
 
 export interface LsOptions {
   workspace: string;
@@ -43,7 +44,10 @@ export async function runLsCommand(opts: LsOptions): Promise<LsResult> {
     try {
       const loaded = await loadPlanTarget(file);
       const plan = loaded.plan;
-      const repository = new DomainObjectRepository(new Workspace(path.dirname(file)));
+      const container = await findProjectContainer(path.dirname(file));
+      const repository = new DomainObjectRepository(
+        container?.state ?? new Workspace(path.join(path.dirname(file), '.xcompiler')),
+      );
       await repository.load();
       const project = await repository.findProject();
       const digest = plan.requirementDigest?.split('\n')[0]?.slice(0, 100);
@@ -96,10 +100,14 @@ export interface ShowResult {
 
 export async function runShowCommand(opts: ShowOptions): Promise<ShowResult> {
   const root = path.resolve(opts.workspace);
-  const requestedPlanPath = opts.planPath ? path.resolve(opts.planPath) : await defaultInspectPlanPath(root);
+  const container = await findProjectContainer(root);
+  const controlRoot = container?.control.root ?? root;
+  const canonicalRoot = container?.canonical().workspace.root ?? root;
+  const stateRoot = container?.state.root ?? path.join(root, '.xcompiler');
+  const requestedPlanPath = opts.planPath ? path.resolve(opts.planPath) : await defaultInspectPlanPath(controlRoot);
   const loaded = await loadPlanTarget(requestedPlanPath);
   const planPath = loaded.planPath;
-  const repository = new DomainObjectRepository(new Workspace(root));
+  const repository = new DomainObjectRepository(new Workspace(stateRoot));
   await repository.load();
   const domainSteps = (await repository.list({ objectType: 'step' }))
     .filter((object): object is Step => object.objectType === 'step');
@@ -119,9 +127,9 @@ export async function runShowCommand(opts: ShowOptions): Promise<ShowResult> {
 
   const outputs: ShowOutputStatus[] = [];
   for (const out of step.outputs) {
-    outputs.push({ path: out, exists: await fileExists(path.join(root, out)) });
+    outputs.push({ path: out, exists: await fileExists(path.join(canonicalRoot, out)) });
   }
-  const auditFile = path.join(root, '.xcompiler', 'audit.jsonl');
+  const auditFile = path.join(stateRoot, 'audit', 'audit.jsonl');
   const auditEvents = (await Promise.all([
     readAuditFor(auditFile, step.id, opts.auditTail ?? 10),
     readAuditFor(auditFile, step.name, opts.auditTail ?? 10),
@@ -202,7 +210,11 @@ export async function readAuditFor(file: string, stepId: string, tail: number): 
       continue;
     }
     const data = ev.data as Record<string, unknown> | undefined;
-    const msg = typeof ev.msg === 'string' ? ev.msg : '';
+    const msg = typeof ev.message === 'string'
+      ? ev.message
+      : typeof ev.msg === 'string'
+        ? ev.msg
+        : '';
     const matches =
       msg.includes(stepId) ||
       (data && typeof data.stepId === 'string' && data.stepId === stepId) ||

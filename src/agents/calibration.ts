@@ -266,6 +266,57 @@ export function calibrateVModelDependencies(steps: Step[]): Step[] {
   return out;
 }
 
+/**
+ * Expands Planner globs only when they resolve to concrete outputs in the same StepPlan.
+ *
+ * Step inputs are an auditable artifact graph, not shell selectors. Models nevertheless copy
+ * patterns such as `src/**\/*.ts` from tsconfig conventions. Expanding a matched pattern preserves
+ * the intended dependency while keeping lint strict: an unmatched glob remains unchanged and is
+ * rejected as an unowned input instead of being silently accepted.
+ */
+export function calibrateProducedInputGlobs(steps: Step[]): Step[] {
+  const outputs = dedup(steps.flatMap((step) => step.outputs)).sort();
+  return steps.map((step) => ({
+    ...step,
+    inputs: dedup(step.inputs.flatMap((input) => {
+      if (!hasPathGlob(input)) return [input];
+      const matches = outputs.filter((output) => globPathMatches(input, output));
+      return matches.length > 0 ? matches : [input];
+    })),
+  }));
+}
+
+function hasPathGlob(value: string): boolean {
+  return /[*?]/u.test(value);
+}
+
+function globPathMatches(pattern: string, candidate: string): boolean {
+  let source = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!;
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        index += 1;
+        if (pattern[index + 1] === '/') {
+          index += 1;
+          source += '(?:.*/)?';
+        } else {
+          source += '.*';
+        }
+      } else {
+        source += '[^/]*';
+      }
+      continue;
+    }
+    if (char === '?') {
+      source += '[^/]';
+      continue;
+    }
+    source += char.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  }
+  return new RegExp(`${source}$`, 'u').test(candidate);
+}
+
 export function calibrateArchitectureModuleDependencies(
   modules: ArchitectureModule[] | undefined | null,
   dependencies: string[] | undefined | null,
@@ -551,27 +602,29 @@ const WRITE_CAPABLE_TOOL_REFS = new Set([
   'append_file',
   'apply_patch',
   'replace_in_file',
-  'skill:author',
-  'skill:patcher',
-  'skill:tester',
-  'skill:debugger',
-  'skill:refactorer',
+  'skill:artifact-authoring',
+  'skill:focused-file-editing',
+  'skill:file-operations',
+  'skill:test-design',
+  'skill:test-execution',
+  'skill:systematic-debugging',
+  'skill:behavior-preserving-refactoring',
 ]);
 
 import { DEPENDENCY_MANIFEST_OWNER } from '../domain/steps/step.js';
 
 const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
-  REQUIREMENT_ANALYSIS: ['skill:author'],
-  // The phase that owns the manifest is handed the tool for it. `skill:dep_resolver` existed and was
-  // wired to nobody, so the Step every dependency Change Request routes to could not act on one.
-  HIGH_LEVEL_DESIGN: ['skill:author', 'skill:dep_resolver'],
-  DETAILED_DESIGN: ['skill:author'],
+  REQUIREMENT_ANALYSIS: ['skill:artifact-authoring', 'skill:test-design'],
+  // The phase that owns the manifest is handed the dependency Skill. An earlier capability existed
+  // but was wired to nobody, so the Step every dependency Change Request routes to could not act.
+  HIGH_LEVEL_DESIGN: ['skill:artifact-authoring', 'skill:test-design', 'skill:dependency-resolution'],
+  DETAILED_DESIGN: ['skill:artifact-authoring', 'skill:test-design'],
   // CODE owns both build/static validation and the executable unit baseline gate.
-  CODE: ['skill:author', 'run_program', 'run_tests'],
-  UNIT_TEST: ['skill:tester'],
-  INTEGRATION_TEST: ['skill:tester'],
-  MODULE_TEST: ['skill:tester'],
-  FUNCTIONAL_TEST: ['skill:tester'],
+  CODE: ['skill:artifact-authoring', 'skill:test-design', 'run_program', 'run_tests'],
+  UNIT_TEST: ['skill:test-execution', 'skill:record-replay-fixtures'],
+  INTEGRATION_TEST: ['skill:test-execution', 'skill:record-replay-fixtures'],
+  MODULE_TEST: ['skill:test-execution', 'skill:record-replay-fixtures'],
+  FUNCTIONAL_TEST: ['skill:test-execution', 'skill:record-replay-fixtures', 'skill:verification-before-delivery'],
 };
 
 // Phases whose defaults are merged in rather than used only as a fallback. A verification phase
@@ -596,6 +649,21 @@ const PHASE_DEFAULT_TOOLS_REQUIRED = new Set([
  */
 const ALWAYS_AVAILABLE_TOOL_REFS = ['read_file', 'list_dir'] as const;
 
+/**
+ * Development phases own paired baseline suites, and their delivery gate can require executing them.
+ *
+ * S1-S3 defer that execution only on the initial pre-CODE pass; a correction routed back from CODE
+ * or any right-side Step proves a product baseline exists, and the gate then requires the run. The
+ * runner is injected automatically at that point — but only if the Step has it, and none of the
+ * three had it, so the requirement passed silently without a single test being executed.
+ */
+const BASELINE_OWNING_PHASES = new Set([
+  'REQUIREMENT_ANALYSIS',
+  'HIGH_LEVEL_DESIGN',
+  'DETAILED_DESIGN',
+  'CODE',
+]);
+
 export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'outputs'>): string[] {
   const tools = Array.isArray(step.tools) ? [...step.tools] : [];
   const outputs = Array.isArray(step.outputs) ? step.outputs : [];
@@ -606,9 +674,14 @@ export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'ou
     : tools;
   const hasWriteCapability = baseTools.some((tool) => WRITE_CAPABLE_TOOL_REFS.has(tool));
   const withChunkedWritePair = ensureChunkedWritePair(baseTools);
-  if (!needsWritableOutputs || hasWriteCapability) return withReadAccess(withChunkedWritePair);
-  return withReadAccess(
-    ensureChunkedWritePair([...baseTools, ...(phaseDefaults.length > 0 ? phaseDefaults : ['write_file'])]),
+  if (!needsWritableOutputs || hasWriteCapability) {
+    return withBaselineRunner(withReadAccess(withChunkedWritePair), step.phase);
+  }
+  return withBaselineRunner(
+    withReadAccess(
+      ensureChunkedWritePair([...baseTools, ...(phaseDefaults.length > 0 ? phaseDefaults : ['write_file'])]),
+    ),
+    step.phase,
   );
 }
 
@@ -616,6 +689,12 @@ export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'ou
 function withReadAccess(tools: string[]): string[] {
   const missing = ALWAYS_AVAILABLE_TOOL_REFS.filter((tool) => !tools.includes(tool));
   return missing.length === 0 ? tools : dedup([...tools, ...missing]);
+}
+
+/** Holding the runner does not run anything: the gate decides, and only `execute` injects a run. */
+function withBaselineRunner(tools: string[], phase: string): string[] {
+  if (!BASELINE_OWNING_PHASES.has(phase) || tools.includes('run_tests')) return tools;
+  return dedup([...tools, 'run_tests']);
 }
 
 function ensureChunkedWritePair(tools: string[]): string[] {
@@ -1028,7 +1107,7 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
         `禁止修改配对基线测试与 src/**。\n` +
         `验收：测试完整性检查通过，冻结集合在 ${tsMode ? 'npm test / Vitest' : 'pytest'} 下全部通过。`,
       role: 'Tester',
-      tools: ['skill:tester'],
+      tools: ['skill:test-execution', 'skill:record-replay-fixtures'],
       inputs: dedup(uncovered.flatMap((c) => c.outputs)),
       outputs: unitTestDoc ? [unitTestDoc] : [],
       dependsOn: uncovered.map((c) => c.id),

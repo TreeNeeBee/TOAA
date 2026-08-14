@@ -23,6 +23,14 @@ export async function runMergeGateChecks(
 ): Promise<GateCheckResult[]> {
   const execute = async (): Promise<GateCheckResult[]> => {
     const checks: GateCheckResult[] = [];
+    if (scope === 'ticket-artifact') {
+      return [{
+        name: 'candidate-assembly',
+        ok: true,
+        summary: 'candidate assembled at the locked target revision; Step deliverable gate already passed',
+        kind: 'execution',
+      }];
+    }
     const manifest = language === 'python' ? 'requirements.txt' : 'package.json';
 
     const build = await attempt('dependencies', () => sandbox.build(manifest));
@@ -31,7 +39,7 @@ export async function runMergeGateChecks(
     // would be worse than reporting only that the environment could not be prepared.
     if (!build.ok) return checks;
 
-    if (scope === 'ticket') {
+    if (scope === 'ticket-code') {
       checks.push(await attempt(
         language === 'typescript' ? 'typecheck' : 'compile',
         () => language === 'typescript'

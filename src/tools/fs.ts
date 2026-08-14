@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { recordWorkspaceWrite, writeWorkspaceFile } from './workspace_write.js';
 import { promises as fs } from 'node:fs';
 import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
@@ -218,8 +219,7 @@ export const writeFileTool: Tool<{ path: string; content: string }, WriteFileDat
         };
       }
 
-      await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, next);
+      await writeWorkspaceFile(abs, next, { tree: ctx.fileTree, root: ctx.ws.root });
       return {
         ok: true,
         data: { bytes: size, previousBytes, changed: true },
@@ -267,8 +267,12 @@ export const appendFileTool: Tool<{ path: string; content: string }, { bytes: nu
     }
     try {
       const abs = resolved.abs;
+      const existed = await fs.access(abs).then(() => true).catch(() => false);
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.appendFile(abs, args.content, 'utf8');
+      await recordWorkspaceWrite(abs, existed ? 'modified' : 'created', {
+        tree: ctx.fileTree, root: ctx.ws.root,
+      });
       let total = size;
       try {
         total = (await fs.stat(abs)).size;

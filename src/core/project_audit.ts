@@ -140,6 +140,7 @@ async function checkDocumentationBundle(
           summary: `Required delivery document is missing: ${doc}`,
           evidence: [`Phase audit could not find ${doc}.`],
           target: 'current-step' as const,
+          affectedArtifacts: [doc],
           dependencyPackages: [],
         },
       } : {}),
@@ -179,6 +180,7 @@ async function checkTestFiles(ws: Workspace): Promise<ProjectAuditCheck> {
       summary: 'The delivered project contains no executable test files.',
       evidence: ['Phase audit found no Python or TypeScript tests under tests/.'],
       target: 'paired-source',
+      affectedArtifacts: ['tests/'],
       dependencyPackages: [],
     },
   };
@@ -214,6 +216,7 @@ async function runEntrypointAudit(
       summary: `Entrypoint smoke check failed: ${probe.command}`,
       evidence: [tailText(probe.stderrTail || probe.stdoutTail) || `exit=${probe.exitCode}`],
       target: 'code',
+      affectedArtifacts: ['src/'],
       dependencyPackages: [],
     },
   };
@@ -268,6 +271,7 @@ async function runScenarioAudit(
       summary: `Real entrypoint scenario failed: ${probe.command}`,
       evidence: sceneEvidence,
       target: 'code',
+      affectedArtifacts: ['src/'],
       dependencyPackages: [],
       scene,
     },
@@ -301,6 +305,7 @@ async function runTypeScriptAudit(ws: Workspace, sandbox: Sandbox): Promise<Proj
         summary: 'TypeScript delivery is missing package.json.',
         evidence: ['Phase audit could not load package.json.'],
         target: 'high-level-design',
+        affectedArtifacts: ['package.json'],
         dependencyPackages: [],
       },
     }];
@@ -364,6 +369,7 @@ function toExecCheck(
       summary: `${name} delivery check failed.`,
       evidence: [tailText(result.stderr || result.stdout) || `exit=${result.exitCode}`],
       target: 'code',
+      affectedArtifacts: ['src/'],
       dependencyPackages: [],
     },
   };

@@ -1,4 +1,7 @@
 import type { AuditLogger } from '../../audit/audit.js';
+import path from 'node:path';
+import { xcompilerBuildId } from '../../core/build_identity.js';
+import { resolveFileTreeService } from '../workspace/file_tree_resolver.js';
 import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
 import { ensureEssentialToolRefs } from '../../agents/calibration.js';
 import { buildDebugBrief } from '../../core/debug_brief.js';
@@ -9,7 +12,7 @@ import {
 } from '../context/context_assembler.js';
 import {
   buildDownstreamContextSnippet,
-  computeDebugAllowedWrites,
+  computeIncrementalAllowedWrites,
   computeStepAllowedWrites,
   stepContextChars,
 } from './execution_context.js';
@@ -30,6 +33,7 @@ import {
   type BugTicket,
   type Ticket,
   type TicketCommit,
+  type TicketWorkspaceBinding,
 } from '../../domain/tickets/ticket.js';
 import { reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import { QualityAssessmentService } from './quality_assessment_service.js';
@@ -43,7 +47,8 @@ import type { RoutingActor } from '../project_management/role_registry.js';
 import { resolveSkillOperationWindow } from '../../llm/window.js';
 import type { PluginHost } from '../../plugins/host.js';
 import type { Sandbox } from '../../sandbox/types.js';
-import { buildDefaultSkills, type SkillRegistry } from '../../skills/skill.js';
+import { buildDefaultSkills, type SkillRegistry } from '../../skills/index.js';
+import { ActivatedSkillResources } from '../../skills/resources.js';
 import {
   buildDefaultRegistry,
   EditGuard,
@@ -100,6 +105,18 @@ export {
   shouldPreserveExistingFiles,
 } from './attempt_policy.js';
 
+export function sandboxPreparationFailure(stepName: string, detail: string): AttemptFailure {
+  const message = `sandbox is not ready for ${stepName}: ${detail}`;
+  return {
+    kind: 'infrastructure',
+    category: 'internal',
+    code: 'sandbox_not_ready',
+    message,
+    retryable: true,
+    switchProvider: false,
+  };
+}
+
 /**
  * The working copy an attempt actually runs in, together with the Git and sandbox bindings for it.
  *
@@ -110,6 +127,8 @@ export interface ExecutionScope {
   workspace: Workspace;
   git: GitService;
   sandbox: Sandbox;
+  /** Environment preparation failed before the model was invoked. */
+  preparationError?: string;
 }
 
 export interface AttemptRunnerOptions {
@@ -118,12 +137,23 @@ export interface AttemptRunnerOptions {
   sandbox: Sandbox;
   /** Resolves the scope for one attempt; defaults to the canonical workspace bindings. */
   resolveScope?: (input: AttemptInput) => Promise<ExecutionScope>;
+  /** Promotes a rejected canonical commit into a temporary corrective ChangeSet before rollback. */
+  preserveRejectedCandidate?: (input: {
+    ticketId: Ticket['id'];
+    stepId: Step['id'];
+    candidateRevision: string;
+    baseRevision: string;
+  }) => Promise<TicketWorkspaceBinding>;
+  /** Keeps ChangeSet recovery metadata aligned with commits made in its working copy. */
+  recordChangeSetRevision?: (ticketId: Ticket['id'], revision: string) => Promise<void>;
   router: LLMRouter;
   audit: AuditLogger;
   repository: DomainObjectRepositoryPort;
   plugins: PluginHost;
   registry?: ToolRegistry;
   skills?: SkillRegistry;
+  /** True when Runtime already merged Plugin extensions into registry and skills. */
+  capabilitiesPrepared?: boolean;
   maxRoundsPerStep?: number;
   maxDebugRoundsPerStep?: number;
   maxEditLinesPerStep?: number | 'auto';
@@ -174,6 +204,8 @@ export interface AttemptResult {
   changedFiles: string[];
   changes?: Changelist['entries'];
   commit?: string;
+  /** Candidate inherited by any corrective Ticket routed from this rejected attempt. */
+  workspaceBinding?: TicketWorkspaceBinding;
   solutionPlan?: string;
   bugResolutionDisposition?: ExecutorRunResult['bugResolutionDisposition'];
   changeRequestDisposition?: ExecutorRunResult['changeRequestDisposition'];
@@ -200,7 +232,7 @@ export class DomainAttemptRunner {
     this.quality = new QualityAssessmentService(options.repository);
     this.traces = new DomainAuditTrail(options.repository);
     this.wiki = new DebugWiki(
-      options.debugWikiPath ?? defaultDebugWikiPath(options.workspace.root),
+      options.debugWikiPath ?? defaultDebugWikiPath(),
       // Findings about this codebase go to the project tier; the installation tiers stay shared.
       { projectPath: options.projectDebugWikiPath },
     );
@@ -214,7 +246,10 @@ export class DomainAttemptRunner {
 
   async initialize(): Promise<void> {
     await this.wiki.load();
-    this.options.plugins.applyExtensions({ tools: this.registry, skills: this.skills });
+    if (!this.options.capabilitiesPrepared) {
+      this.options.plugins.applyExtensions({ tools: this.registry, skills: this.skills });
+    }
+    this.skills.validateTools(this.registry.list());
   }
 
   async synchronizeVerifiedBugResolutions(projectId: Step['projectId']): Promise<void> {
@@ -239,11 +274,33 @@ export class DomainAttemptRunner {
 
   private async runAttempt(input: AttemptInput): Promise<AttemptResult> {
     const scope = await this.options.resolveScope?.(input) ?? this.canonicalScope();
-    // Persist the baseline before doing any work. Project defects preserve a committed candidate
-    // for incremental correction; infrastructure and non-progress failures return here.
-    const baseline = await this.recordTicketCommit(scope, input, 'baseline', 'attempt baseline');
+    // Every scope starts at a committed branch head. Use that head as the rollback point without
+    // manufacturing an empty baseline commit on master for every attempted Step. Build-owned
+    // product documents or environment preparation may be dirty before the first Step; those are
+    // accepted baseline material and receive one real commit before the attempt begins.
+    await scope.git.ensureRepo();
+    const before = await scope.git.raw().status();
+    const baseline = before.isClean()
+      ? (await scope.git.raw().revparse(['HEAD'])).trim()
+      : await scope.git.snapshot(
+          input.domainStep.id,
+          input.domainStep.attempts,
+          'accepted pre-attempt baseline',
+        );
+    await this.recordTicketRevision(input, baseline, 'baseline', 'attempt baseline');
     let wikiMatches: DebugWikiMatch[] = [];
     try {
+      if (scope.preparationError) {
+        const preparationFailure = sandboxPreparationFailure(
+          input.domainStep.name,
+          scope.preparationError,
+        );
+        return await this.failAttempt(scope, baseline, input, {
+          reason: preparationFailure.message,
+          failureLog: preparationFailure.message,
+          failure: preparationFailure,
+        });
+      }
       if (isVerification(input.domainStep)) {
         const inspection = await this.testValidator(scope).inspect(input.plan, input.executionStep);
         if (!inspection.ok) {
@@ -264,6 +321,7 @@ export class DomainAttemptRunner {
                 summary: `Required baseline test asset is missing: ${file}`,
                 evidence: [inspection.failureLog],
                 target: 'paired-source',
+                affectedArtifacts: [file],
                 dependencyPackages: [],
               })),
               ...inspection.invalid.map((detail): DeliveryGateFinding => ({
@@ -271,6 +329,7 @@ export class DomainAttemptRunner {
                 summary: detail,
                 evidence: [inspection.failureLog],
                 target: 'paired-source',
+                affectedArtifacts: [detail.split(':', 1)[0] ?? detail],
                 dependencyPackages: [],
               })),
             ],
@@ -322,6 +381,7 @@ export class DomainAttemptRunner {
                 `Declared outputs: ${input.executionStep.outputs.join(', ') || '(none)'}`,
               ],
               target: 'current-step',
+              affectedArtifacts: input.executionStep.outputs,
               dependencyPackages: [],
             }],
           });
@@ -484,15 +544,16 @@ export class DomainAttemptRunner {
           : scopedAssessment,
       );
       if (!assessment.passed) {
+        const qualityFailure = renderQualityAssessmentFailure(assessment);
         return await this.failAttempt(scope, baseline, input, {
-          reason: `Quality gate failed: ${assessment.gaps.join('; ')}`,
-          failureLog: assessment.gaps.join('\n'),
+          reason: `Quality gate failed: ${qualityFailure.summary}`,
+          failureLog: qualityFailure.detail,
           assessment,
           failure: {
             kind: 'execution',
             category: 'quality',
             code: 'quality_gate_failed',
-            message: assessment.gaps.join('; '),
+            message: qualityFailure.detail,
             retryable: true,
             switchProvider: false,
           },
@@ -582,16 +643,18 @@ export class DomainAttemptRunner {
       correctionOrigin,
     );
     const refs = ensureEssentialToolRefs(input.executionStep);
-    const expanded = this.skills.resolve(incremental
-      ? [...refs, 'read_file', 'list_dir', 'code_search', 'replace_in_file', 'apply_patch']
-      : refs);
-    if (input.mode === 'debug') {
-      const debuggerSkill = this.skills.get('debugger');
-      if (debuggerSkill) {
-        expanded.resolvedToolNames.push(...debuggerSkill.tools);
-        expanded.hints.push(`[debugger] ${debuggerSkill.prompt}`);
-      }
-    }
+    const modeSkillRefs = input.mode === 'debug'
+      ? ['skill:systematic-debugging', 'skill:debug-wiki-knowledge']
+      : input.mode === 'change-request'
+        ? ['skill:change-request-implementation']
+        : [];
+    const expanded = this.skills.resolve([
+      ...(incremental
+        ? [...refs, 'read_file', 'list_dir', 'code_search', 'replace_in_file', 'apply_patch']
+        : refs),
+      ...modeSkillRefs,
+    ]);
+    const activeSkillNames = expanded.activatedSkills.map((skill) => skill.name);
     if (debugSuggestions) expanded.hints.push(`[debug-wiki] ${debugSuggestions}`);
     const resolvedToolNames = [...expanded.resolvedToolNames];
     if (
@@ -605,19 +668,18 @@ export class DomainAttemptRunner {
       baselineGateExecution.mode !== 'defer' || name !== 'run_tests'
     );
     const baseWrites = incremental
-      ? computeDebugAllowedWrites(input.plan, input.executionStep, this.profile)
-      : computeStepAllowedWrites(input.executionStep);
-    const affected = input.ticket.type === 'change-request' && !isVerification(input.domainStep)
-      ? input.ticket.contractDelta.affectedArtifacts.filter((artifact) =>
-          input.executionStep.outputs.some((output) => pathsOverlap(output, artifact))
+      ? computeIncrementalAllowedWrites(
+          input.plan,
+          input.executionStep,
+          this.profile,
+          input.ticket,
         )
-      : [];
+      : computeStepAllowedWrites(input.executionStep);
     const supplementalTestRoot = isVerification(input.domainStep)
       ? this.testValidator(scope).supplementalRoot(input.executionStep)
       : undefined;
     const allowedWrites = [...new Set([
       ...baseWrites,
-      ...affected,
       ...(supplementalTestRoot ? [supplementalTestRoot, `${RECORDED_FIXTURE_DIR}/`] : []),
     ])];
     const retryFeedback = await this.latestAttemptFailure(input);
@@ -643,6 +705,7 @@ export class DomainAttemptRunner {
     const guard = new EditGuard({
       ws: scope.workspace,
       stepId: input.domainStep.id,
+      logPath: this.options.audit.artifactPath(`edits/${input.domainStep.id}.jsonl`),
       maxLines: this.options.maxEditLinesPerStep ?? 'auto',
       budgetContext,
     });
@@ -670,6 +733,19 @@ export class DomainAttemptRunner {
       requestPermission: this.options.requestPermission,
       onToolEvent: this.options.onToolEvent,
       recordReplay: this.options.recordReplay,
+      skillResources: new ActivatedSkillResources(
+        this.skills,
+        [...new Set(activeSkillNames)],
+      ),
+      // Candidate worktrees are described by ChangeSets and diffs. Only writes directly on the
+      // canonical mainline update the persistent project file tree.
+      fileTree: path.resolve(scope.workspace.root) === path.resolve(this.options.workspace.root)
+        ? await resolveFileTreeService(
+            this.options.repository,
+            input.domainStep.projectId,
+            this.options.workspace.root,
+          )
+        : undefined,
     };
     const snippets = await this.contextSnippets(scope, input, retryFeedback);
     const rounds = resolveAttemptRoundLimit(
@@ -896,6 +972,17 @@ export class DomainAttemptRunner {
       input.domainStep.attempts,
       summary,
     );
+    await this.recordTicketRevision(input, revision, kind, summary);
+    await this.options.recordChangeSetRevision?.(input.ticket.id, revision);
+    return revision;
+  }
+
+  private async recordTicketRevision(
+    input: AttemptInput,
+    revision: string,
+    kind: TicketCommit['kind'],
+    summary: string,
+  ): Promise<void> {
     const current = await this.options.repository.read(input.ticket.id);
     if (current.objectType !== 'ticket') throw new Error(`Object ${input.ticket.id} is not a Ticket`);
     const updated = appendTicketCommit(current, {
@@ -910,7 +997,6 @@ export class DomainAttemptRunner {
       TicketSchema.parse({ ...updated, ...reviseObjectEnvelope(updated) }),
       updated.state,
     );
-    return revision;
   }
 
   private async failAttempt(
@@ -942,7 +1028,23 @@ export class DomainAttemptRunner {
     const commit = preserveCandidate
       ? await this.recordTicketCommit(scope, input, 'attempt', 'rejected candidate')
       : undefined;
-    if (!preserveCandidate) await scope.git.revertTo(baseline);
+    const isCanonical = path.resolve(scope.workspace.root) === path.resolve(this.options.workspace.root);
+    let workspaceBinding: TicketWorkspaceBinding | undefined;
+    // A rejected candidate commit is evidence, not mainline state. Any Ticket-bound candidate keeps
+    // it for correction. Canonical work first pins the commit to a corrective ChangeSet and only
+    // then returns the authoritative mainline to its baseline.
+    try {
+      if (preserveCandidate && isCanonical && commit && this.options.preserveRejectedCandidate) {
+        workspaceBinding = await this.options.preserveRejectedCandidate({
+          ticketId: input.ticket.id,
+          stepId: input.domainStep.id,
+          candidateRevision: commit,
+          baseRevision: baseline,
+        });
+      }
+    } finally {
+      if (!preserveCandidate || isCanonical) await scope.git.revertTo(baseline);
+    }
     const testOutcomes = failure.testOutcomes ?? collectTestOutcomes(
       failure.executor?.toolCalls ?? [],
       input.domainStep.type,
@@ -985,8 +1087,14 @@ export class DomainAttemptRunner {
         structuredFailure: classified,
         testOutcomes,
         failureSignature,
-        workspaceDisposition: preserveCandidate ? 'candidate-preserved' : 'rolled-back',
+        // Which build produced this failure. The retry policy uses it to tell "the same failure
+        // keeps coming back" from "the same failure was recorded by a toolchain since repaired".
+        toolchainBuildId: xcompilerBuildId(),
+        workspaceDisposition: preserveCandidate && (!isCanonical || workspaceBinding)
+          ? 'candidate-preserved'
+          : 'rolled-back',
         candidateRevision: commit,
+        workspaceBinding,
         changedFiles,
       },
       correlationId: input.ticket.source.correlationId,
@@ -999,8 +1107,11 @@ export class DomainAttemptRunner {
       failure: classified,
       testOutcomes,
       gateFindings: failure.gateFindings ?? failure.assessment?.findings ?? [],
-      workspaceDisposition: preserveCandidate ? 'candidate-preserved' : 'rolled-back',
+      workspaceDisposition: preserveCandidate && (!isCanonical || workspaceBinding)
+        ? 'candidate-preserved'
+        : 'rolled-back',
       candidateRevision: commit,
+      workspaceBinding,
       changedFiles,
     });
     return {
@@ -1008,6 +1119,7 @@ export class DomainAttemptRunner {
       changedFiles,
       changes,
       commit,
+      workspaceBinding,
       wikiEntryIds: [],
       ...failure,
       failure: classified,
@@ -1016,6 +1128,21 @@ export class DomainAttemptRunner {
       gateFindings: failure.gateFindings ?? failure.assessment?.findings ?? [],
     };
   }
+}
+
+export function renderQualityAssessmentFailure(
+  assessment: Pick<QualityAssessment, 'gaps' | 'findings'>,
+): { summary: string; detail: string } {
+  const findingDetails = assessment.findings.map((finding) =>
+    [finding.summary, ...finding.evidence.map((item) => `Evidence: ${item}`)].join('\n'),
+  );
+  const detail = [...assessment.gaps, ...findingDetails]
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  const summary = assessment.gaps[0]?.trim() || assessment.findings[0]?.summary.trim() ||
+    'Quality assessment did not pass without actionable gap details.';
+  return { summary, detail: detail || summary };
 }
 
 export function isAttemptCancellation(error: unknown, signal?: AbortSignal): boolean {
@@ -1079,12 +1206,6 @@ function gitChangeOperation(index: string, workingDirectory: string): Changelist
   if (status.includes('R')) return 'rename';
   if (status.includes('A') || status.includes('?')) return 'create';
   return 'update';
-}
-
-function pathsOverlap(left: string, right: string): boolean {
-  const a = normalizeGitPath(left);
-  const b = normalizeGitPath(right);
-  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
 function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {

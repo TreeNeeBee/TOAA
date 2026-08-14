@@ -1,7 +1,9 @@
 import chalk from 'chalk';
 import { confirm, editor, input, select } from '@inquirer/prompts';
 import { spinner as ora } from '../util/spinner.js';
-import type { RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimeProgress } from '../runtime.js';
+import type {
+  RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimePermissionPolicy, RuntimeProgress,
+} from '../runtime.js';
 import { isCancellationError } from '../core/cancellation.js';
 
 function renderLog(level: RuntimeLogLevel, message: string): void {
@@ -28,9 +30,16 @@ function renderLog(level: RuntimeLogLevel, message: string): void {
   }
 }
 
-export function createCliRuntimeIO(): RuntimeIO {
+/**
+ * @param options.permissionPolicy `auto` runs external capability checks unattended. `run` had no other way to proceed
+ * without a terminal, so a resumed validation stalled on the workspace-baseline prompt with
+ * nothing in its log to say it was waiting for an answer.
+ */
+export function createCliRuntimeIO(
+  options: { permissionPolicy?: RuntimePermissionPolicy } = {},
+): RuntimeIO {
   return {
-    permissionPolicy: 'request',
+    permissionPolicy: options.permissionPolicy ?? 'request',
     terminalOutput: true,
     emit(event) {
       if (event.type === 'log') renderLog(event.level, event.message);

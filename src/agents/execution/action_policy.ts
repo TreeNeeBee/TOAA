@@ -42,10 +42,10 @@ export function buildPermissionRequest(
       stepId, tool, stepLabel, redactLargeArgs(args));
   }
   if (tool === 'add_dependency') {
-    return permission('config_change', language === 'typescript' ? 'package.json' : 'requirements.txt',
-      `Step ${stepLabel} requested dependency manifest changes.`,
-      'This can alter project dependencies and may trigger sandbox rebuilds.',
-      'current workspace dependency manifest',
+    return permission('install_dependency', Array.isArray(values.packages) ? values.packages.join(', ') : '(packages)',
+      `Step ${stepLabel} requested dependency changes and sandbox synchronization.`,
+      'This can contact a dependency registry, download code, and execute installation scripts.',
+      'configured dependency registry',
       'The dependency change is skipped; later build or test steps may fail and report the missing dependency.',
       stepId, tool, stepLabel, args);
   }

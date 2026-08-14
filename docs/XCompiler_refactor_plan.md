@@ -1111,6 +1111,31 @@ project: a Bug held the developer's one slot while the Step it belonged to was p
 dependency, and the answer arrived as a Change Request aimed at that same Step. The rule that
 prevents it — capacity models work being carried, not ownership — was already written down and
 already implemented; it simply was not applied on the path that parks a Step for a dependency.
+**A predicate that reads prose fails silently, and its own test keeps passing.** This branch has now
+been bitten twice in exactly the same way. The planner's repair loop keyed on a message the provider
+router wraps, so it never fired in a real run. Then the executor's recovery for a refused turn keyed
+on `/low-quality (?:debugger )?response/`, while the contract it guards raises *"low-quality Executor
+response"* — the word in the middle was not in the pattern, so the recovery never ran, the error fell
+through to a rethrow, and a live run stopped twice with every provider healthy and a Step mid-repair.
+Both defects are invisible from the tests, because a test supplies the wording the pattern was
+written against. What made the second one findable was the run, not the suite. The rule is not "write
+a better regular expression": it is that a control decision needs a channel the producer sets
+deliberately — here, the router recording whether each failure was its own or the model's content.
+
+**A wait that runs against the dependency order is a deadlock, not a delay.** A Bug found at
+DETAILED_DESIGN propagated its repair forward, opening hops on CODE and then UNIT_TEST, while the
+rule that parks the discovering Story held DETAILED_DESIGN for the lifetime of every hop. Each hop
+needed the parked Step to deliver before it could be scheduled, so the Phase reported no semantic
+progress with every actor idle and nothing actually in flight. Blocking edges and dependency edges
+are two orderings over the same graph, and neither module knew about the other. Three separate
+attempts were needed to see the whole cycle, and each one moved it rather than closed it: releasing
+the direct Story-to-hop edge left the Story parked behind its Bug; following the Bug's
+`changeRequestTicketIds` missed the hop, because that back-reference is a denormalized copy and the
+hop holding the Phase was absent from it; and releasing every hold at once over-allocated a
+single-capacity role, which routing then refused at 2/1. **A deadlock is not fixed until the run
+moves** — each of the first two fixes passed its own falsified test and left the run exactly as
+stuck.
+
 - **Repository read performance.** Reads are cached per object revision, which removed the dominant
   cost (the PM orchestration suite went from ~52s to ~2.9s; its heaviest single V-model run from
   ~18s to ~0.9s). `list()` still walks the registry per call; if

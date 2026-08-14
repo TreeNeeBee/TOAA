@@ -3,6 +3,7 @@ import {
   type Step,
 } from '../../core/plan.js';
 import {
+  normalizeQualityAssessment,
   qualityAssessmentConsistencyIssues,
   resolveQualityGate,
   type StageQualityAssessment,
@@ -44,6 +45,7 @@ export interface TurnFeedbackContext {
     phase: Step['phase'];
   };
   unsupportedValidationDefect?: string;
+  permissionAdaptation?: { deniedCapabilities: string[] };
 }
 
 export function renderExecutionFeedback(
@@ -139,7 +141,18 @@ export function renderExecutionFeedback(
       (!verify.ok && verify.missing.length > 0
         ? `Create exactly the first missing output now: return one write_file action with path="${verify.missing[0]}" and its complete content. ` +
           'Do not merely describe the action or try to generate several remaining files in one response.'
-        : 'The next response must run a concrete tool action or return done=true only when completion is already verified.'),
+        // The condition this sentence used to defer to is exactly the branch it is in: the outputs
+        // verified. Restating it as something for the model to judge left it with nothing to do and
+        // no way to say so, and it answered with the same empty round until the guard stopped the
+        // attempt and the run with it.
+        // Naming done=true alone is still not an action the model can complete: the turn contract
+        // rejects actions=[] with done=true unless a complete qualityAssessment comes with it, so
+        // the first wording traded an unanswerable condition for an instruction that validation
+        // then refused.
+        : 'Every required output is present and verified, so the step is complete: return done=true ' +
+          'in the next response, with actions=[] and a complete qualityAssessment covering the ' +
+          'verified outputs. Run a concrete tool action instead only if you have specific work left ' +
+          'that the verified outputs do not yet cover.'),
     );
   }
   if (turn.bugResolutionPlanMissing) lines.push(messages.executorFeedbackBugResolutionPlanMissing);
@@ -212,6 +225,15 @@ export function renderExecutionFeedback(
       'or report measurable completeness/coverage shortcomings in qualityAssessment.gaps so Runtime can create an Enhancement.',
     );
   }
+  if (turn.permissionAdaptation) {
+    lines.push(
+      'Permission control outcome: the following capabilities are unavailable for this Runtime task: ' +
+      `${turn.permissionAdaptation.deniedCapabilities.join(', ')}. ` +
+      'You have exactly one adaptation round. Do not request any denied capability again. ' +
+      'Use a materially different permitted action, or return actions=[] and done=false so Runtime ' +
+      'can report permission_blocked to PM without opening a defect Ticket.',
+    );
+  }
   if (failureDetails.some((failure) => /path must be a non-empty string/i.test(failure))) {
     lines.push(
       'Tool contract violation: file write/read tools require args.path to be a non-empty relative workspace path. ' +
@@ -273,7 +295,21 @@ export function missingQualityAssessmentFields(
   context: { baselineExecutionDeferred?: boolean } = {},
 ): string[] {
   if (!step.qualityGate) return [];
-  if (!assessment) return ['qualityAssessment'];
+  // Naming only the absent object leaves the model nothing to build. Both providers answered a
+  // rejection that said `missing: qualityAssessment` with the same turn again, and the exhausted
+  // retries surfaced as an infrastructure failure that stopped the run. Enumerating what an empty
+  // assessment would still be missing turns the rejection into the field list to fill in.
+  if (!assessment) {
+    return [
+      'qualityAssessment',
+      ...missingQualityAssessmentFields(
+        step,
+        normalizeQualityAssessment({}),
+        freshAfterTools,
+        context,
+      ),
+    ];
+  }
   const missing: string[] = [];
   if (!freshAfterTools) missing.push('qualityAssessment.postToolEvidence');
   if ((V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase)) {

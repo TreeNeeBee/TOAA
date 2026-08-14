@@ -20,30 +20,30 @@ import { Workspace } from '../src/workspace/workspace.js';
 import { ProjectContainer } from '../src/workspace/project_container.js';
 
 describe('XCompiler project file', () => {
-  it('creates a workspace-local manifest that points to the canonical Project', async () => {
+  it('creates a container-root manifest that points to the canonical Project', async () => {
     const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
-      configPath: path.join(workspace, 'config.yaml'),
+      planPath: path.join(container, 'phasePlan.json'),
+      configPath: path.join(container, 'config.yaml'),
       command: 'build',
       intent: 'feature',
-      requirementFile: path.join(workspace, 'feature.md'),
+      requirementFile: path.join(container, 'feature.md'),
       recordHistory: true,
     });
 
-    // Named after the Project, not the directory: the directory is always the canonical branch.
-    expect(projectFile).toBe(defaultProjectFilePath(workspace, graph.project.name));
+    // Named after the Project and kept beside all other control-plane files.
+    expect(projectFile).toBe(defaultProjectFilePath(container, graph.project.name));
     expect(path.basename(projectFile)).toBe('sample.xc');
     const loaded = await loadXCompilerProject(projectFile);
     expect(loaded.data.kind).toBe(XCOMPILER_PROJECT_MANIFEST_KIND);
     expect(loaded.data.projectId).toBe(graph.project.id);
     expect(loaded.project.id).toBe(graph.project.id);
     expect(loaded.workspace).toBe(path.resolve(workspace));
-    expect(loaded.planPath).toBe(path.join(workspace, 'phasePlan.json'));
-    expect(loaded.configPath).toBe(path.join(workspace, 'config.yaml'));
+    expect(loaded.planPath).toBe(path.join(container, 'phasePlan.json'));
+    expect(loaded.configPath).toBe(path.join(container, 'config.yaml'));
     expect(loaded.data.progress?.status).toBe('planned');
     expect(loaded.data.progress?.steps[0]?.name).toBe('P1-S001');
     expect(loaded.data.history[0]?.command).toBe('build');
@@ -55,7 +55,7 @@ describe('XCompiler project file', () => {
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
+      planPath: path.join(container, 'phasePlan.json'),
       recordHistory: true,
     });
 
@@ -71,10 +71,7 @@ describe('XCompiler project file', () => {
     const loaded = await loadXCompilerProject(projectFile);
     expect(loaded.project.id).toBe(graph.project.id);
     expect(loaded.container).toBe(path.resolve(container));
-    // Absolute, like `workspace`: the container is always above the manifest, and `relativeFrom`
-    // refuses to write a `..` escape into the file. A moved container fails loudly on load rather
-    // than resolving to some other directory.
-    expect(loaded.data.container).toBe(path.resolve(container));
+    expect(loaded.data.container).toBe('.');
   });
 
   it('does not auto-discover legacy .toaa project files', async () => {
@@ -111,17 +108,17 @@ describe('XCompiler project file', () => {
     expect(progress.percent).toBe(33);
   });
 
-  it('stores the workspace as an absolute path', async () => {
+  it('stores relocatable control-plane paths relative to the container manifest', async () => {
     const { workspace, container, graph } = await canonicalWorkspace();
     const projectFile = await updateProjectFile({
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
+      planPath: path.join(container, 'phasePlan.json'),
       command: 'build',
     });
     const raw = JSON.parse(await fs.readFile(projectFile, 'utf8')) as { workspace: string };
-    expect(raw.workspace).toBe(path.resolve(workspace));
+    expect(raw.workspace).toBe('worktrees/master');
   });
 
   it('rejects a manifest pointing to an unknown Project', async () => {
@@ -130,7 +127,7 @@ describe('XCompiler project file', () => {
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
+      planPath: path.join(container, 'phasePlan.json'),
     });
     const data = JSON.parse(await fs.readFile(projectFile, 'utf8')) as Record<string, unknown>;
     data.projectId = '018f22ce-7e2a-7d51-8d89-abcdef123456';
@@ -144,12 +141,12 @@ describe('XCompiler project file', () => {
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
+      planPath: path.join(container, 'phasePlan.json'),
     });
     const data = JSON.parse(await fs.readFile(projectFile, 'utf8')) as Record<string, unknown>;
     data.workspace = path.join(workspace, 'moved-away');
     await fs.writeFile(projectFile, JSON.stringify(data));
-    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/does not exist/u);
+    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/must be canonical/u);
   });
 
   it('rejects a workspace that does not contain the manifest', async () => {
@@ -158,13 +155,13 @@ describe('XCompiler project file', () => {
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
+      planPath: path.join(container, 'phasePlan.json'),
     });
     const other = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-file-other-'));
     const data = JSON.parse(await fs.readFile(projectFile, 'utf8')) as Record<string, unknown>;
     data.workspace = other;
     await fs.writeFile(projectFile, JSON.stringify(data));
-    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/outside its declared workspace/u);
+    await expect(loadXCompilerProject(projectFile)).rejects.toThrow(/must be canonical/u);
   });
 
   it('rejects a workspace without write permission', async () => {
@@ -173,7 +170,7 @@ describe('XCompiler project file', () => {
       workspace,
       container,
       projectId: graph.project.id,
-      planPath: path.join(workspace, 'phasePlan.json'),
+      planPath: path.join(container, 'phasePlan.json'),
     });
     await fs.chmod(workspace, 0o555);
     try {

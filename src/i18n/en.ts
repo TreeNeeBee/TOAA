@@ -79,7 +79,7 @@ Output JSON shape:
       "description": "string",
       "systemPrompt": "Step-specific prompt: scope, inputs, outputs, acceptance, forbidden actions",
       "role": "Planner",
-      "tools": ["write_file"],
+      "tools": ["skill:artifact-authoring", "skill:test-design"],
       "inputs": ["docs/topic.md"],
       "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"],
       "subTasks": [
@@ -276,6 +276,7 @@ The PhasePlan must:
 2. Assess complexityAssessment: simple / moderate / complex with rationale.
 3. Produce implementationPhases: P1 status=current; later P2/P3 status=planned. simple uses P1 only; moderate uses at least P1+P2; complex uses at least P1+P2+P3; user-forced staging uses at least P1+P2 and userForcedPhaseSplit=true.
 4. Give each phase objective, scope, deliverables, dependsOn, verificationGate, and deliveryGate. The deliveryGate declares validationTypes and baselineExecutionPolicy, owns live real-user scenarios, and must include concrete command/args; no V-model Step owns live-network acceptance.
+   execution.command is exactly one executable token, never a complete shell command; put every argument in execution.args. ${profile.id === 'typescript' ? 'For TypeScript source use for example {"command":"npx","args":["tsx","src/main.ts",...]}, {"command":"node","args":["src/main.ts",...]}, or an npm script. Never use ts-node, nodemon, Jest, or ts-jest. Any source entry named in args must be delivered by the current phase CODE Step.' : 'For Python source use for example {"command":"python","args":["src/main.py",...]}. Any source entry named in args must be delivered by the current phase CODE Step.'}
 5. Keep planned phases as goals and gates only. Do not expand any Step for them; a separate pass will generate a full V-model plan for one phase at a time.
 
 Return strict JSON only:
@@ -316,6 +317,7 @@ Phase responsibilities:
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST uniformly inspect the baseline, may add risk-driven tests only under their verification-owned supplement root, freeze and run the combined set with deterministic external data, then write reports. Real-user live-network cases run only at the Phase delivery gate. None rewrites baseline tests or product code.
 
 Strict output ownership:
+- Step inputs/outputs form an auditable artifact graph and must list exact file paths. Do not use globs or directory selectors such as src/**/*.ts or tests/**. Globs may appear inside tsconfig content, never in Planner JSON.
 - REQUIREMENT_ANALYSIS owns functional baseline tests; HIGH_LEVEL_DESIGN owns module baseline tests and architectureModules.testPaths; DETAILED_DESIGN owns integration baseline tests; CODE owns unit baseline tests plus product source/runtime assets.
 - UNIT_TEST / INTEGRATION_TEST / MODULE_TEST / FUNCTIONAL_TEST consume paired baselines and own only validation reports/delivery docs. Runtime assigns the exact risk-supplement root when the Step executes; no Step inputs/outputs in Planner JSON may predeclare supplement, supplemental, or tests/verification paths.
 - For greenfield TypeScript, exactly one HIGH_LEVEL_DESIGN Step must output package.json with scripts, dependencies, and devDependencies. CODE must not output package.json.
@@ -338,7 +340,7 @@ Return strict JSON only:
     { "id": "M001", "name": "module name", "responsibility": "one clear responsibility", "sourcePaths": ["src/example.py"], "assetPaths": ["src/templates/example.txt"], "testPaths": ["tests/test_example.py"], "dependencies": [] }
   ],
   "steps": [
-    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["write_file"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxAttempts": 3 }
+    { "id": "S001", "iterationId": "P1", "phase": "REQUIREMENT_ANALYSIS", "title": "string", "description": "string", "systemPrompt": "scope, inputs, outputs, acceptance, forbidden actions", "role": "Planner", "tools": ["skill:artifact-authoring", "skill:test-design"], "inputs": ["docs/topic.md"], "outputs": ["docs/01-requirement-analysis.md", "docs/tests/functional-test-plan.md", "tests/test_functional_acceptance.py"], "subTasks": [], "dependsOn": [], "acceptance": "string", "maxAttempts": 3 }
   ]
 }
 
@@ -487,6 +489,7 @@ const messages: Messages = {
     optDebugWikiPath: 'debug wiki root directory path (default <XCompiler path>/.xcompiler/debug-wiki)',
     optRecordReplay: 'external interaction mode: off, record, replay, auto, or refresh',
     optRecordReplayPath: 'workspace-relative record/replay fixture directory',
+    optPermissionMode: 'external resource permission mode: request, auto, or deny',
     argPlan: 'phasePlan.json path (default = <workspace>/phasePlan.json)',
     argProjectFile: 'XXX.xc project file',
     argStepId: 'Step ID, e.g. S001',
@@ -502,6 +505,7 @@ const messages: Messages = {
     invalidStepId: (value) => `Invalid Step ID "${value}"; expected S followed by at least three digits.`,
     invalidNonNegativeInteger: (value) => `Expected a non-negative integer, received "${value}".`,
     invalidRecordReplayMode: (value, allowed) => `Invalid record/replay mode "${value}"; expected one of: ${allowed}.`,
+    invalidPermissionMode: (value, allowed) => `Invalid permission mode "${value}"; expected one of: ${allowed}.`,
     helpUsage: 'Usage:',
     helpArguments: 'Arguments:',
     helpOptions: 'Options:',
@@ -578,7 +582,7 @@ const messages: Messages = {
     decomposeFail: 'Planner decomposition failed',
     plannerInvalidPlan: 'Planner could not produce a valid plan:',
     plannerInvalidPlanHint1: '  Common cause: the LLM output did not satisfy the XCompiler plan schema, V-model skeleton, or architecture contract; this error must not be skipped.',
-    plannerInvalidPlanHint2: '  Investigate: check llm.error / planner.thought entries in .xcompiler/audit.jsonl and repair the Planner output against the contract.',
+    plannerInvalidPlanHint2: '  Investigate: check llm.error / planner.thought entries in .xcompiler/audit/audit.jsonl and repair the Planner output against the contract.',
     plannerTransportFailureHint1: '  Common cause: the LLM provider connection failed, timed out, or the server closed the request; this is not a project plan/source defect.',
     plannerTransportFailureHint2: '  Investigate: check OPENAI_BASE_URL / provider base_url, model service reachability, network permissions, and timeout settings, then rerun build.',
     decomposeSucceed: (n) => `generated ${n} Step(s)`,
@@ -847,7 +851,7 @@ Return strict JSON StepPlan for the current phase only.`,
     executorStepBlock: (sp: string) =>
       `\n\n## Current Step prompt (sole mission — do not drift across steps)\n${sp}`,
     executorSkillBlock: (hints: string[]) =>
-      `\n\n## Available skill guidance\n${hints.map((hint) => `- ${hint}`).join('\n')}`,
+      `\n\n## Active Agent Skills\n${hints.join('\n\n')}`,
     executorUserPromptOutro: 'Now return the first round of JSON per the protocol.',
     executorFeedbackHeader: 'Tool results this round:',
     executorFeedbackVerifyOk:
@@ -870,30 +874,6 @@ Return strict JSON StepPlan for the current phase only.`,
       'Invalid DEBUG Bug Ticket action: bugResolutionPlan is required before the first repair or verification action. Return JSON with the root-cause hypothesis, repair target, and validation command together with the needed action.',
     executorFeedbackPostMutationVerificationRequired:
       'The latest successful mutation is not verified. Preserve the current files and use the next action to run the smallest relevant compiler/test gate; do not spend another round only reading or rewriting.',
-  },
-  skills: {
-    patcher:
-      'Use apply_patch / replace_in_file for small in-place edits to existing files; never overwrite a whole file. ' +
-      'replace_in_file requires args.path, args.find, and args.replace together. path must be a concrete workspace-relative file in the current Step writable allowlist; read_file that same path first when its current bytes are uncertain.',
-    author:
-      'Use write_file to create new files. It requires a non-empty args.path and string args.content; path must be a concrete workspace-relative path from the current Step outputs or writable allowlist.',
-    tester:
-      'Write and run pytest tests verifying function behaviour; on failure parse with analyze_error. ' +
-      '[Path contract] Every read_file/write_file/append_file/replace_in_file call must include a concrete workspace-relative args.path; never omit it, use a path outside the project, or pass a directory as a file. ' +
-      '[Self-contained fixtures] Tests **must NOT** open() a sample file that does not exist on disk. ' +
-      'When the target function needs file input, first reuse a real user/workspace sample; if none exists, use http_fetch to get a small reference sample from official docs, the upstream repository, or a public standard/example, ' +
-      'save it under tests/fixtures/<name>, and record the source. Only for simple text formats such as CSV/JSON/INI may you construct a minimal pytest tmp_path sample and immediately run_tests. ' +
-      'Test phases and DEBUG mode already grant write permission to tests/fixtures/, sub-dirs are auto-mkdir\'d, and **fixture paths do NOT need to be pre-declared in outputs**. ' +
-      'When generating tests, always emit every dependent resource so the Debugger does not loop on FileNotFoundError. ' +
-      '[Fixture iteration] If a running test raises "Invalid syntax / Parse error / Malformed" from the target function, ' +
-      'your fixture content does not match the format spec: read_file to inspect, then prefer a user sample or authoritative http_fetch reference before rewriting and running tests. ' +
-      'After repeated failures on a complex domain format, stop inventing from memory and ask for a user sample or network reference. Never edit the implementation or assertions to "fix" a parse error.',
-    dep_resolver: 'On ModuleNotFoundError, use add_dependency to write the package back into requirements.txt and rebuild the sandbox.',
-    debugger:
-      'Reproduce with run_tests/run_program only when no concrete failure log exists. When the error and a complete debug repair packet are already present, apply the smallest scoped patch or dependency change directly, then rerun the failing gate. Read again only when a required file is absent, explicitly truncated, or two replacements on that file have failed.',
-    refactorer:
-      'Refactors must preserve behaviour: run regression tests → modify → run regression tests again. ' +
-      'Every file tool requires a concrete workspace-relative args.path; read_file the same target before a local replacement to confirm its current bytes.',
   },
   doctor: {
     cliDescription: 'check that config / LLM / sandbox / skills are ready',
@@ -949,6 +929,7 @@ Return strict JSON StepPlan for the current phase only.`,
     sandboxInContainerWarn:
       'XCompiler appears to be running inside a container; sandbox=docker is unsupported in this mode (use subprocess).',
     skillToolMissing: (skill, tool) => `skill "${skill}" references unknown tool "${tool}"`,
+    skillInvalid: (message) => `Agent Skills validation failed: ${message}`,
     skillOk: (n, tools) => `${n} skill(s) registered, ${tools} underlying tool(s)`,
   },
 };

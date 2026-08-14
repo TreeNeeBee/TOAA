@@ -16,8 +16,8 @@ describe('user-visible output i18n catalog', () => {
     expect(tFor('zh').audit.toolDenied('write_file')).toBe('拒绝调用工具 write_file');
     expect(tFor('en').llm.scoreFileHeader).toContain('score snapshot');
     expect(tFor('zh').llm.scoreFileHeader).toContain('评分快照');
-    expect(tFor('en').prompts.executorSkillBlock(['inspect'])).toContain('Available skill');
-    expect(tFor('zh').prompts.executorSkillBlock(['检查'])).toContain('可用 Skill');
+    expect(tFor('en').prompts.executorSkillBlock(['inspect'])).toContain('Active Agent Skills');
+    expect(tFor('zh').prompts.executorSkillBlock(['检查'])).toContain('已激活 Agent Skills');
   });
 
   it('localizes interactive Gate 1 labels', async () => {

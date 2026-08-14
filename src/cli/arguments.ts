@@ -6,6 +6,7 @@ import {
   type FixtureAction,
   type PlanIntent,
   type RecordReplayMode,
+  type RuntimePermissionPolicy,
 } from '../runtime.js';
 
 const FIXTURE_ACTIONS = ['prepare', 'inspect', 'verify', 'refresh'] as const;
@@ -82,6 +83,14 @@ export function parseRecordReplayMode(value: string): RecordReplayMode {
     throw new InvalidArgumentError(t().cli.invalidRecordReplayMode(value, RECORD_REPLAY_MODES.join(', ')));
   }
   return normalized as RecordReplayMode;
+}
+
+export function parsePermissionMode(value: string): RuntimePermissionPolicy {
+  const normalized = value.trim().toLowerCase();
+  if (!['request', 'auto', 'deny'].includes(normalized)) {
+    throw new InvalidArgumentError(t().cli.invalidPermissionMode(value, 'request, auto, deny'));
+  }
+  return normalized as RuntimePermissionPolicy;
 }
 
 export function parseFixtureAction(value: string): FixtureAction {

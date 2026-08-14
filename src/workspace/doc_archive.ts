@@ -5,7 +5,7 @@ import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
 
 /**
- * 文档历史归档：写入阶段产物前，把上一版本平移到 docs/history/ 下，
+ * 文档历史归档：写入阶段产物前，把上一版本复制到容器状态的 history/docs/ 下，
  * 文件名形如 `<base>-<YYYYMMDD-HHMMSS>.<ext>`。
  *
  * - 仅当目标文件已存在时归档；
@@ -18,6 +18,7 @@ export async function archiveIfExists(
   ws: Workspace,
   rel: string,
   audit?: AuditLogger,
+  state: Workspace = ws,
 ): Promise<string | null> {
   const norm = rel.replaceAll('\\', '/');
   if (!norm.startsWith('docs/')) return null;
@@ -27,10 +28,10 @@ export async function archiveIfExists(
   const ext = path.extname(norm);
   const base = path.basename(norm, ext);
   const ts = formatStamp(new Date());
-  const target = `docs/history/${base}-${ts}${ext}`;
+  const target = `history/docs/${base}-${ts}${ext}`;
   try {
-    await ws.ensure('docs/history');
-    await fs.rename(ws.abs(norm), ws.abs(target));
+    await state.ensure('history/docs');
+    await fs.copyFile(ws.abs(norm), state.abs(target));
     await audit?.event('plan.persist', t().audit.documentArchived(norm, target), {
       messageId: 'audit.document_archived',
       from: norm,
