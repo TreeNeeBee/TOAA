@@ -367,3 +367,40 @@ describe('calibrateProducedInputGlobs', () => {
     ]);
   });
 });
+
+// A delivered project passed 115 assertions of the form `expect(typeof item.title).toBe('string')`
+// while every one of its hundred records carried the same summary twice: every field present,
+// every type right, the content wrong. Whether an assertion examines a value or its type cannot be
+// told from source text with any reliability, so the acceptance level is told what it owes instead,
+// and the Phase delivery gate judges the same question against the run's real output.
+describe('acceptance level owes outcome assertions', () => {
+  it('requires the FUNCTIONAL_TEST Step to assert produced content, not shape', async () => {
+    const { calibrateDocPaths } = await import('../src/agents/calibration.js');
+    const steps = [
+      { id: 'S008', phase: 'FUNCTIONAL_TEST', acceptance: 'Acceptance suite passes.',
+        inputs: [], outputs: [] },
+      { id: 'S004', phase: 'CODE', acceptance: 'Product compiles.', inputs: [], outputs: [] },
+    ] as never;
+
+    const [acceptanceStep, codeStep] = calibrateDocPaths(steps, 'application');
+
+    expect(acceptanceStep!.acceptance).toContain('Acceptance suite passes.');
+    expect(acceptanceStep!.acceptance).toContain('assert what the produced result contains');
+    // Phrased without any domain vocabulary: the Step it instructs may be verifying a scraper, a
+    // compiler, a migration, or a report.
+    expect(acceptanceStep!.acceptance).not.toMatch(/news|scrape|http|markdown/iu);
+    // Only the acceptance level owes this; the levels that build the product are untouched.
+    expect(codeStep!.acceptance).toBe('Product compiles.');
+  });
+
+  it('does not restate the requirement when it is already there', async () => {
+    const { calibrateDocPaths } = await import('../src/agents/calibration.js');
+    const once = calibrateDocPaths(
+      [{ id: 'S008', phase: 'FUNCTIONAL_TEST', acceptance: 'a', inputs: [], outputs: [] }] as never,
+      'application',
+    );
+    const twice = calibrateDocPaths(once, 'application');
+    const occurrences = twice[0]!.acceptance.split('assert what the produced result contains').length - 1;
+    expect(occurrences).toBe(1);
+  });
+});

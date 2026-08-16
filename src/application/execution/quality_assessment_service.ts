@@ -50,8 +50,12 @@ export class QualityAssessmentService {
       })];
     });
     const result = calculateQuality(kpis, observations);
-    const missingMetrics = result.missingKpiIds.map((id) =>
-      `missing KPI observation: ${kpis.find((kpi) => kpi.id === id)?.metric ?? id}`,
+    const metricOf = (id: string) => kpis.find((kpi) => kpi.id === id)?.metric ?? id;
+    // A structural number nobody produced is recorded and skipped; a functional one is a gap, so
+    // the Step is asked for the measurement it never made rather than being let through on silence.
+    const unavailableMetrics = result.missingStructuralKpiIds.map(metricOf);
+    const missingFunctional = result.missingFunctionalKpiIds.map((id) =>
+      `missing KPI observation: ${metricOf(id)}`,
     );
     const failedMetrics = observations.filter((item) => !item.passed).map((item) =>
       `KPI below target: ${kpis.find((kpi) => kpi.id === item.kpiId)?.metric ?? item.kpiId}`,
@@ -67,7 +71,8 @@ export class QualityAssessmentService {
       observations,
       score: result.score,
       passed: result.passed && (input.gaps?.length ?? 0) === 0 && (input.findings?.length ?? 0) === 0,
-      gaps: [...missingMetrics, ...failedMetrics, ...(input.gaps ?? [])],
+      gaps: [...missingFunctional, ...failedMetrics, ...(input.gaps ?? [])],
+      unavailableMetrics,
       evidence: input.evidence ?? [],
       findings: input.findings ?? [],
     });

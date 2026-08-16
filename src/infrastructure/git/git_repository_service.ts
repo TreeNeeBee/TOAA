@@ -144,6 +144,17 @@ export class GitRepositoryService {
     return (await this.git.status()).isClean();
   }
 
+  /**
+   * The paths that make the working copy differ from HEAD.
+   *
+   * `isClean` answers whether provenance is intact; this answers why it is not. A file tree stamped
+   * with a revision it does not match is a claim nobody can check without the list, and "the tree is
+   * dirty" is not something a reader can act on.
+   */
+  async pendingChanges(): Promise<string[]> {
+    return [...new Set((await this.git.status()).files.map((file) => file.path))].sort();
+  }
+
   async branchExists(name: string): Promise<boolean> {
     // `--quiet` makes rev-parse exit 0 with empty output for a missing ref, so resolving without
     // throwing proves nothing; only a non-empty sha does.

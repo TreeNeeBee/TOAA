@@ -75,6 +75,14 @@ export interface ProjectOrchestratorOptions extends Omit<AttemptRunnerOptions, '
   integratePendingAuthorization?: (phaseId: ObjectId) => Promise<MergeIntegrationResult>;
   /** Commits a Runtime-authored delivery artifact before its revision is indexed. */
   commitCanonicalArtifact?: (stepId: ObjectId, summary: string) => Promise<string>;
+  /**
+   * What the canonical working copy currently is, for checking the delivered manifest against it.
+   *
+   * Read through a supplied probe rather than a Git service so the application layer keeps stating
+   * what it needs — the revision, and the paths that differ from it — without owning how either is
+   * obtained.
+   */
+  canonicalRevisionState?: () => Promise<{ head: string; pending: string[] }>;
   onTransition?: (event: {
     event: 'phase_started' | 'step_started' | 'ticket_started' | 'ticket_routed' | 'step_delivered' | 'phase_delivered' | 'project_delivered';
     projectId: ObjectId;
@@ -179,11 +187,88 @@ export class ProjectOrchestrator {
     // The manifest write is itself part of the delivered tree. Reconcile after its commit so the
     // indexed revision and the canonical working copy cannot diverge at the delivery boundary.
     await tree.rescan(finalRevision);
+    await this.verifyManifestProvenance(phase.projectId, phaseId, tree, finalRevision);
     await this.options.audit.event('note', `published the file manifest into ${DOC_NAMES.delivery}`, {
       messageId: 'domain.file_manifest_published',
       projectId: phase.projectId,
       phaseId,
     });
+  }
+
+  /**
+   * Checks that the manifest just delivered describes the commit that was just released.
+   *
+   * The tree asserts a correspondence to a revision; this is what makes that assertion checkable
+   * rather than merely stated. The two diverge whenever bytes reached the canonical copy without
+   * being committed — a run killed mid-write, an artifact written after the snapshot, a writer that
+   * does not pass through the tree — and the delivered file list then describes a state no commit
+   * holds. Anyone checking out the release gets a different set of files than the record claims,
+   * and a file that exists only in that working copy is gone at the next checkout while the
+   * delivery document still vouches for it.
+   *
+   * A mismatch is repaired rather than reported: the outstanding paths are committed and the tree
+   * re-indexed against the result. Only if it still does not line up is the tree marked unverified,
+   * with the paths recorded — delivery continues, because a manifest whose provenance is flagged is
+   * more use than a Phase that cannot deliver at all.
+   */
+  private async verifyManifestProvenance(
+    projectId: ObjectId,
+    phaseId: ObjectId,
+    tree: { rescan(revision?: string): Promise<number>; markDirty(): Promise<void> },
+    indexedRevision: string | undefined,
+  ): Promise<void> {
+    const probe = this.options.canonicalRevisionState;
+    if (!probe) return;
+    let state = await probe();
+    let matches = indexedRevision !== undefined &&
+      state.head === indexedRevision &&
+      state.pending.length === 0;
+    if (matches) return;
+
+    const cause = indexedRevision === undefined
+      ? 'the delivery artifact was never committed, so the tree has no revision to stand on'
+      : state.head !== indexedRevision
+        ? `HEAD ${state.head} is not the indexed revision ${indexedRevision}`
+        : `${state.pending.length} path(s) differ from the indexed revision`;
+
+    let repairedRevision: string | undefined;
+    if (this.options.commitCanonicalArtifact) {
+      repairedRevision = await this.options.commitCanonicalArtifact(
+        phaseId,
+        'reconcile delivery manifest provenance',
+      );
+      await tree.rescan(repairedRevision);
+      state = await probe();
+      matches = state.head === repairedRevision && state.pending.length === 0;
+    }
+
+    if (matches) {
+      await this.options.audit.event('note', `delivery manifest provenance repaired: ${cause}`, {
+        messageId: 'domain.file_manifest_provenance_repaired',
+        projectId,
+        phaseId,
+        cause,
+        indexedRevision,
+        repairedRevision,
+      });
+      return;
+    }
+
+    await tree.markDirty();
+    await this.options.audit.event(
+      'note',
+      `delivery manifest provenance unverified: ${cause}`,
+      {
+        messageId: 'domain.file_manifest_provenance_unverified',
+        projectId,
+        phaseId,
+        cause,
+        indexedRevision,
+        repairedRevision,
+        head: state.head,
+        pendingChanges: state.pending.slice(0, 50),
+      },
+    );
   }
 
   async run(phaseId: ObjectId): Promise<ProjectOrchestratorResult> {

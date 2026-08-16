@@ -50,6 +50,35 @@ describe('corrective write scope', () => {
     expect(allowed).not.toContain('package.json');
   });
 
+  // An artifact list naming nothing this Step owns narrows the allowlist to nothing, and a Step
+  // that may write no file cannot act on any instruction it is given — it spends its whole round
+  // budget reporting that. A live Enhancement raised at UNIT_TEST carried that Step's own documents
+  // and was routed to CODE, which owns none of them; the Change Request branch beside it already
+  // had this floor.
+  it('falls back to the Step outputs when an Enhancement names nothing it owns', () => {
+    const plan = fixturePlan();
+    const coding = {
+      ...plan.steps[0]!,
+      phase: 'CODE' as const,
+      outputs: ['src/cli.ts', 'src/scrapers/baidu.ts'],
+    };
+
+    const allowed = computeIncrementalAllowedWrites(
+      plan,
+      coding,
+      getLanguageProfile('typescript'),
+      {
+        type: 'enhancement',
+        affectedArtifacts: ['docs/05-unit-test.md', 'docs/reports/unit-test-report.md'],
+      } as Ticket,
+    );
+
+    expect(allowed).not.toEqual([]);
+    expect(allowed).toEqual(expect.arrayContaining(['src/cli.ts', 'src/scrapers/baidu.ts']));
+    // The floor is the Step's own outputs, never the artifacts it does not own.
+    expect(allowed).not.toContain('docs/05-unit-test.md');
+  });
+
   it('keeps a downstream CR inside the current Step outputs when its delta is upstream-owned', () => {
     const plan = fixturePlan();
     const detail = {

@@ -801,6 +801,8 @@ function defaultKpis(type: StepType): Array<{
     metric,
     comparator: 'gte' as const,
     target,
+    // The recorded band is the floor. Whether a structural metric gets more room is decided when
+    // the KPI is evaluated, so the policy applies to workspaces planned before it existed.
     tolerance: 0.02,
     weight: 1 / metrics[type]!.length,
   }));

@@ -1,5 +1,5 @@
 import type { AuditLogger } from '../../audit/audit.js';
-import path from 'node:path';
+import type { WorkspaceKind } from '../../domain/workspace/change_set.js';
 import { xcompilerBuildId } from '../../core/build_identity.js';
 import { resolveFileTreeService } from '../workspace/file_tree_resolver.js';
 import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
@@ -124,6 +124,16 @@ export function sandboxPreparationFailure(stepName: string, detail: string): Att
  * worktree: the canonical working copy is only the default for work that has no ChangeSet yet.
  */
 export interface ExecutionScope {
+  /**
+   * Which working copy this attempt runs in.
+   *
+   * Carried rather than re-derived. The resolver already knows — it is the binding that decided
+   * where the attempt runs — and comparing workspace roots downstream re-answers the question from
+   * weaker evidence: `path.resolve` does not follow symlinks, so on a host where the canonical root
+   * arrives as `/tmp/...` and the scope root as `/private/tmp/...` the mainline would be mistaken
+   * for a candidate worktree and the project file tree would silently stop being updated.
+   */
+  kind: WorkspaceKind;
   workspace: Workspace;
   git: GitService;
   sandbox: Sandbox;
@@ -266,6 +276,7 @@ export class DomainAttemptRunner {
 
   private canonicalScope(): ExecutionScope {
     return {
+      kind: 'canonical',
       workspace: this.options.workspace,
       git: this.options.git,
       sandbox: this.options.sandbox,
@@ -739,7 +750,7 @@ export class DomainAttemptRunner {
       ),
       // Candidate worktrees are described by ChangeSets and diffs. Only writes directly on the
       // canonical mainline update the persistent project file tree.
-      fileTree: path.resolve(scope.workspace.root) === path.resolve(this.options.workspace.root)
+      fileTree: scope.kind === 'canonical'
         ? await resolveFileTreeService(
             this.options.repository,
             input.domainStep.projectId,
@@ -1028,7 +1039,10 @@ export class DomainAttemptRunner {
     const commit = preserveCandidate
       ? await this.recordTicketCommit(scope, input, 'attempt', 'rejected candidate')
       : undefined;
-    const isCanonical = path.resolve(scope.workspace.root) === path.resolve(this.options.workspace.root);
+    // Same question as the file-tree gate, and it must have the same answer: the scope says which
+    // working copy it is, rather than two roots being compared through a resolver that does not
+    // follow symlinks.
+    const isCanonical = scope.kind === 'canonical';
     let workspaceBinding: TicketWorkspaceBinding | undefined;
     // A rejected candidate commit is evidence, not mainline state. Any Ticket-bound candidate keeps
     // it for correction. Canonical work first pins the commit to a corrective ChangeSet and only

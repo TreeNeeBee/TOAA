@@ -234,9 +234,35 @@ export function calibrateDocPaths(steps: Step[], projectType: ProjectType = 'app
     if (s.phase === 'FUNCTIONAL_TEST') {
       const requiredDocs = [...deliveryDocsForIteration(projectType, iterationId)];
       outputs = [...requiredDocs, ...outputs.filter((out) => !requiredDocs.includes(out))];
+      return { ...s, inputs, outputs, acceptance: withOutcomeAssertionRequirement(s.acceptance) };
     }
     return { ...s, inputs, outputs };
   });
+}
+
+/**
+ * Requires the acceptance level to check what the product produced, not merely its shape.
+ *
+ * Stated as a requirement rather than detected afterwards: whether an assertion examines a value or
+ * its type cannot be told apart from source text with any reliability. A delivered project passed
+ * 115 assertions of the form `expect(typeof item.title).toBe('string')` while every one of its
+ * hundred records carried the same summary twice — every field present, every type right, the
+ * content wrong. The Phase delivery gate judges the same question against the run's real output, so
+ * a suite that ignores this is caught there; saying it here is what gives the Step a chance to get
+ * it right the first time.
+ *
+ * Phrased without reference to any domain, because the Step it instructs may be verifying a
+ * scraper, a compiler, a migration, or a report.
+ */
+function withOutcomeAssertionRequirement(acceptance: string | undefined): string {
+  const requirement = 'Acceptance cases must assert what the produced result contains — exact ' +
+    'values, ranges, ordering, counts, or the absence of wrong content — not merely that a field ' +
+    'exists and has the expected type. A suite that only checks shape passes on output that is ' +
+    'duplicated, empty, or nonsense for the field it fills.';
+  const text = (acceptance ?? '').trim();
+  return text.includes('assert what the produced result contains') || text.includes(requirement)
+    ? text
+    : [text, requirement].filter(Boolean).join(' ');
 }
 
 /** 补齐同一 iteration 内标准 V 模型宏步骤的相邻顺序依赖。 */

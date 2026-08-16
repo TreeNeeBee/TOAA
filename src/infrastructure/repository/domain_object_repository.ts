@@ -195,6 +195,11 @@ function registryParentId(object: PersistedDomainObject): ObjectId | undefined {
       return object.projectId;
     case 'project-management-plan':
       return object.projectId;
+    case 'file-tree':
+      // The master tree belongs to the Project, not to any workspace or Phase. Falling off this
+      // switch registered it with no parent at all, so it hung outside the object graph that
+      // integrity checks and `childrenOf` traversals walk.
+      return object.projectId;
     case 'risk-record':
       return object.projectId;
     case 'decision-record':

@@ -96,8 +96,21 @@ export class FileTreeService {
       // and racing another actor's removal must not leave a phantom entry behind.
       const resolved = entry ?? { path: normalized, type: 'file' as const, size: 0, mtimeMs: 0, ctimeMs: 0 };
       const effective = entry === undefined && kind !== 'deleted' ? 'deleted' : kind;
-      const next = applyFileTreeChange(tree.entries, { kind: effective, entry: resolved });
-      await this.commit(tree, next);
+      // Directories the write brought into being are part of the same change. Without them the
+      // tree holds a file whose parents it has never heard of, and `list` — which answers the
+      // `readdir` question — reports an empty directory that demonstrably has contents. The tree
+      // would only become coherent again at the next full rescan.
+      let next = tree.entries;
+      if (effective !== 'deleted') {
+        for (const ancestor of await this.missingAncestors(tree.entries, normalized)) {
+          next = applyFileTreeChange(next, { kind: 'created', entry: ancestor });
+        }
+      }
+      next = applyFileTreeChange(next, { kind: effective, entry: resolved });
+      // An incremental write moves the tree off whatever revision it was reconciled against, so the
+      // provenance goes with it. Carrying the old revision forward would leave the tree asserting a
+      // correspondence to a commit it no longer has.
+      await this.commit(tree, next, { reconciledRevision: undefined });
     });
   }
 
@@ -129,8 +142,26 @@ export class FileTreeService {
     await this.lock.write(async () => {
       const tree = await this.load();
       if (tree.dirty) return;
-      await this.commit(tree, tree.entries, { dirty: true });
+      // Entries are untouched here, so the revision they were reconciled against still describes
+      // them; `dirty` is what says the index may have missed a write.
+      await this.commit(tree, tree.entries, { dirty: true, reconciledRevision: tree.reconciledRevision });
     });
+  }
+
+  /** The directories on the way to `rel` that the tree does not yet hold, outermost first. */
+  private async missingAncestors(
+    entries: readonly FileTreeEntry[],
+    rel: string,
+  ): Promise<FileTreeEntry[]> {
+    const segments = rel.split('/');
+    const found: FileTreeEntry[] = [];
+    for (let depth = 1; depth < segments.length; depth += 1) {
+      const dir = segments.slice(0, depth).join('/');
+      if (statTreePath(entries, dir)) continue;
+      const entry = await this.statOnDisk(dir);
+      if (entry?.type === 'directory') found.push(entry);
+    }
+    return found;
   }
 
   private async walk(rel: string, ignored: readonly string[], out: FileTreeEntry[]): Promise<void> {
@@ -196,7 +227,10 @@ export class FileTreeService {
       entries,
       ...(state.scannedAt ? { scannedAt: state.scannedAt } : {}),
       ...(state.dirty !== undefined ? { dirty: state.dirty } : {}),
-      ...(state.reconciledRevision ? { reconciledRevision: state.reconciledRevision } : {}),
+      // Written unconditionally, including when it is undefined. Spreading it in only when truthy
+      // let a rescan that could not name a revision keep the previous one, so the tree claimed a
+      // correspondence to a commit its freshly scanned entries no longer matched.
+      reconciledRevision: state.reconciledRevision,
     })]);
   }
 }

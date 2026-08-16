@@ -27,6 +27,7 @@ import { acquireLock, LockError } from '../core/lock.js';
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
 import { runProjectAudit } from '../core/project_audit.js';
+import { judgeScenarioOutcome } from '../application/execution/scenario_outcome_judge.js';
 import {
   generateProjectDevelopmentReport,
 } from '../core/project_report.js';
@@ -399,6 +400,9 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         : { scope: 'canonical', projectId: domainProject.id },
     );
     const scope: ExecutionScope = {
+      // The binding is what decided where this attempt runs, so it is also what says which working
+      // copy it is. Downstream must not re-derive this by comparing roots.
+      kind: binding?.kind ?? (isolated ? 'ticket' : 'canonical'),
       workspace: scopeWorkspace,
       git: new GitService(scopeWorkspace),
       sandbox: withRecordReplaySandbox(
@@ -443,7 +447,20 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     domainProject.id,
     ws.root,
   );
+  // The scan reads the working copy while the stamp names HEAD, and a run that died mid-write
+  // leaves those two describing different things. The revision is still the best account of where
+  // the tree came from, so it is kept and marked unverified rather than dropped — dropping it would
+  // leave delivery with nothing to check against.
   await canonicalFileTree.rescan(await repositoryGit.head());
+  const pendingAtStart = await repositoryGit.pendingChanges();
+  if (pendingAtStart.length > 0) {
+    await canonicalFileTree.markDirty();
+    await audit.event('note', `canonical file tree starts unverified: ${pendingAtStart.length} uncommitted path(s)`, {
+      messageId: 'domain.file_tree_dirty_at_start',
+      projectId: domainProject.id,
+      pendingChanges: pendingAtStart.slice(0, 50),
+    });
+  }
   const permissionService = new ProjectPermissionService(domainRepository, domainProject, {
     projectRoot: container.root,
     timeoutMs: cfg.permissions.timeout_ms,
@@ -559,6 +576,10 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     integratePhase: (phaseId) => mergeIntegration.integratePhase(domainProject.id, phaseId),
     integratePendingAuthorization: (phaseId) =>
       mergeIntegration.integratePendingAuthorization(domainProject.id, phaseId),
+    canonicalRevisionState: async () => ({
+      head: await repositoryGit.head(),
+      pending: await repositoryGit.pendingChanges(),
+    }),
     commitCanonicalArtifact: async (stepId, summary) => {
       const revision = await git.snapshot(stepId, 0, summary);
       await canonicalFileTree.rescan(revision);
@@ -667,6 +688,12 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           }
         }
       }
+      // What the workspace held before the scenario ran, so whatever it touches can be told apart
+      // from everything already there. Difference is what makes this work for any project: nothing
+      // here knows what kind of artifact the scenario is supposed to produce.
+      const beforeScenario = (await canonicalFileTree.entries())
+        .filter((entry) => entry.type === 'file')
+        .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
       finalProjectAudit = await runProjectAudit({
         ws,
         sandbox,
@@ -674,6 +701,24 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         profile,
         scenarios: phaseGate.scenarios,
         runLiveScenario: (operation) => recordReplay.runWithMode('off', operation),
+        judgeScenarioOutcome: ({ scenario, scene }) => judgeScenarioOutcome({
+          router,
+          before: beforeScenario,
+          scenario,
+          scene,
+          artifacts: {
+            snapshot: async () => {
+              await canonicalFileTree.rescan();
+              return (await canonicalFileTree.entries())
+                .filter((entry) => entry.type === 'file')
+                .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
+            },
+            read: async (relative, maxBytes) => {
+              const text = await ws.readFile(relative).catch(() => undefined);
+              return text === undefined ? undefined : text.slice(0, maxBytes);
+            },
+          },
+        }),
       });
       await audit.event('phase.delivery_gate', `${domainPhase.name} delivery gate evaluated`, {
         messageId: 'domain.phase_delivery_gate_evaluated',

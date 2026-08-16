@@ -20,6 +20,8 @@ import {
   upsertFileManifest,
 } from '../src/application/workspace/file_manifest.js';
 import type { PersistedDomainObject } from '../src/domain/objects/persisted.js';
+import { PLAN_VERSION } from '../src/core/plan.js';
+import { STEP_TYPES } from '../src/domain/steps/step.js';
 
 const entry = (over: Partial<FileTreeEntry> & { path: string }): FileTreeEntry => ({
   type: 'file', size: 1, mtimeMs: 1, ctimeMs: 1, ...over,
@@ -201,6 +203,57 @@ describe('FileTreeService', () => {
     expect(await service.stat('node_modules/pkg/index.js')).toBeUndefined();
   });
 
+  // Without the directories a write brought into being, the tree holds a file whose parents it has
+  // never heard of, and `list` — the `readdir` answer — reports an empty directory that
+  // demonstrably has contents. It would only agree with the filesystem again at the next rescan.
+  it('records the directories an incremental write created', async () => {
+    await fs.mkdir(path.join(root, 'src/deep'), { recursive: true });
+    await fs.writeFile(path.join(root, 'src/deep/a.ts'), 'export const a = 1;\n');
+    await service.record('src/deep/a.ts', 'created');
+
+    expect((await service.stat('src'))?.type).toBe('directory');
+    expect((await service.stat('src/deep'))?.type).toBe('directory');
+    expect((await service.list('src')).map((entry) => entry.path)).toEqual(['src/deep']);
+    expect((await service.list('src/deep')).map((entry) => entry.path)).toEqual(['src/deep/a.ts']);
+
+    // A second file in a directory the tree already holds adds nothing further.
+    await fs.writeFile(path.join(root, 'src/deep/b.ts'), 'export const b = 2;\n');
+    await service.record('src/deep/b.ts', 'created');
+    expect((await service.entries()).filter((entry) => entry.type === 'directory')).toHaveLength(2);
+  });
+
+  // `reconciledRevision` asserts "these entries are what git revision X holds". A rescan that cannot
+  // name a revision has no such assertion to make, and carrying the previous one forward left the
+  // tree claiming a correspondence its freshly scanned entries no longer had — the value a delivery
+  // HEAD check would be validated against.
+  it('drops the reconciled revision when the entries move off it', async () => {
+    await fs.writeFile(path.join(root, 'a.txt'), 'a\n');
+    await service.rescan('abc123');
+    const tree = () => [...objects.values()][0] as { reconciledRevision?: string };
+    expect(tree().reconciledRevision).toBe('abc123');
+
+    // An incremental write moves the tree off that commit.
+    await fs.writeFile(path.join(root, 'b.txt'), 'b\n');
+    await service.record('b.txt', 'created');
+    expect(tree().reconciledRevision).toBeUndefined();
+
+    // A rescan that names no revision cannot restore the claim either.
+    await service.rescan('def456');
+    await service.rescan();
+    expect(tree().reconciledRevision).toBeUndefined();
+  });
+
+  // Marking the index dirty does not touch the entries, so the revision that described them still
+  // does; `dirty` is what says a write may have been missed.
+  it('keeps the reconciled revision when only the dirty flag changes', async () => {
+    await fs.writeFile(path.join(root, 'a.txt'), 'a\n');
+    await service.rescan('abc123');
+    await service.markDirty();
+    const tree = [...objects.values()][0] as { reconciledRevision?: string; dirty?: boolean };
+    expect(tree.dirty).toBe(true);
+    expect(tree.reconciledRevision).toBe('abc123');
+  });
+
   // Every write is one revision step, which is why the tree is its own object and not a field on
   // the management plan the orchestrator is also writing.
   it('advances exactly one revision per mutation', async () => {
@@ -218,17 +271,22 @@ describe('delivered file manifest', () => {
     entry({ path: 'docs', type: 'directory', size: 0 }),
   ];
 
-  it('renders both timestamps and labels which is which', () => {
+  // This section is written into a file it lists, so any size or timestamp it printed would be
+  // wrong for that file the instant the write lands. The manifest scopes itself to the facts the
+  // write cannot invalidate, and says where the rest is kept.
+  it('carries path and type only, and says where the stat data lives', () => {
     const section = renderFileManifest(entries);
-    expect(section).toContain('Modified (mtime)');
-    // ctime is routinely misread as creation time; the header has to say what it is.
-    expect(section).toContain('Inode changed (ctime)');
     expect(section).toContain('`src/a.ts`');
-    expect(section).toContain('2.0 KiB');
-    // A directory has no meaningful size to deliver.
-    expect(section).toMatch(/`docs` \| directory \| —/u);
+    expect(section).toMatch(/\| `docs` \| directory \|/u);
     // Directories are not counted as delivered files.
     expect(section).toContain('1 files');
+
+    // Nothing the manifest write would falsify.
+    expect(section).not.toContain('KiB');
+    expect(section).not.toContain('mtime)');
+    expect(section).not.toMatch(/\d{4}-\d{2}-\d{2}T/u);
+    // And the reader is told where it did go.
+    expect(section).toContain('recorded on the project file tree');
   });
 
   // Appending on every delivery would grow one duplicate per run, each disagreeing with the others.
@@ -308,3 +366,54 @@ describe('file tree resolution', () => {
     expect(afterSecond.revision).toBe(afterFirst.revision);
   });
 });
+
+// The master tree belongs to the Project. Registered without a parent it hangs outside the object
+// graph that integrity checks and `childrenOf` traversals walk — seventeen such entries were
+// sitting parentless in a live workspace registry.
+describe('file tree registration', () => {
+  it('registers under the Project, like the other project-owned objects', async () => {
+    const { DomainObjectRepository } = await import(
+      '../src/infrastructure/repository/domain_object_repository.js');
+    const { ProjectContainer } = await import('../src/workspace/project_container.js');
+    const { compileProjectGraph } = await import('../src/domain/planning/compiler.js');
+    const { ProjectGraphPersistenceService } = await import(
+      '../src/application/planning/project_graph_persistence_service.js');
+
+    const containerRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'xc-file-tree-parent-'));
+    try {
+      const container = new ProjectContainer(containerRoot);
+      const repository = new DomainObjectRepository(container.state);
+      await repository.load();
+      const graph = compileProjectGraph({ draft: minimalPlan(), topic: 't', projectName: 'p' });
+      await new ProjectGraphPersistenceService(repository).persistGraph(graph);
+
+      const tree = FileTreeService.create({ projectId: graph.project.id });
+      await repository.commit([tree]);
+
+      const registry = (repository as unknown as {
+        registry: { childrenOf(id: string): { id: string }[] };
+      }).registry;
+      expect(registry.childrenOf(graph.project.id).map((entry) => entry.id)).toContain(tree.id);
+    } finally {
+      await fs.rm(containerRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+function minimalPlan() {
+  return {
+    version: PLAN_VERSION, language: 'typescript', intent: 'greenfield', phaseId: 'P1',
+    projectType: 'application', requirementDigest: 'ft',
+    complexityAssessment: { level: 'simple', rationale: 'x', splitRecommended: false, userForcedPhaseSplit: false },
+    implementationPhases: [{ id: 'P1', title: 'C', objective: 'D', status: 'current', scope: ['c'], deliverables: ['a'], dependsOn: [] }],
+    architectureModules: [], globalPrompt: '', baselineSummary: '', dependencies: [], userAddenda: '',
+    createdAt: new Date(0).toISOString(),
+    steps: STEP_TYPES.map((type, index) => ({
+      id: `S${String(index + 1).padStart(3, '0')}`, iterationId: 'P1', phase: type, title: type,
+      description: type, systemPrompt: type, role: 'Coder' as const, tools: ['write_file'],
+      inputs: [], outputs: [`docs/${index}.md`],
+      dependsOn: index === 0 ? [] : [`S${String(index).padStart(3, '0')}`],
+      acceptance: 'a', maxAttempts: 3,
+    })),
+  } as never;
+}

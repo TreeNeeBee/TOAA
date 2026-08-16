@@ -11,6 +11,7 @@ import { detectNetworkApiFailureInExec } from './network_api_gate.js';
 import {
   type DeliveryGateFinding,
   type DeliveryGateScenario,
+  type ScenarioOutcomeJudge,
   type DeliveryGateScene,
 } from '../domain/quality/delivery_gate.js';
 
@@ -66,6 +67,7 @@ export async function runProjectAudit(opts: {
   profile: LanguageProfile;
   scenarios?: readonly DeliveryGateScenario[];
   runLiveScenario?: <T>(operation: () => Promise<T>) => Promise<T>;
+  judgeScenarioOutcome?: ScenarioOutcomeJudge;
 }): Promise<ProjectAuditResult> {
   return runQualityAudit({ ...opts, scope: 'project' });
 }
@@ -89,6 +91,7 @@ async function runQualityAudit(opts: {
   iterationId?: string;
   scenarios?: readonly DeliveryGateScenario[];
   runLiveScenario?: <T>(operation: () => Promise<T>) => Promise<T>;
+  judgeScenarioOutcome?: ScenarioOutcomeJudge;
 }): Promise<ProjectAuditResult> {
   const checks: ProjectAuditCheck[] = [];
 
@@ -105,7 +108,7 @@ async function runQualityAudit(opts: {
 
   const scenarios = opts.scenarios ?? [];
   for (const scenario of scenarios) {
-    const operation = () => runScenarioAudit(opts.sandbox, scenario);
+    const operation = () => runScenarioAudit(opts.sandbox, scenario, opts.judgeScenarioOutcome);
     checks.push(await (opts.runLiveScenario ? opts.runLiveScenario(operation) : operation()));
   }
 
@@ -225,6 +228,7 @@ async function runEntrypointAudit(
 async function runScenarioAudit(
   sandbox: Sandbox,
   scenario: DeliveryGateScenario,
+  judge?: ScenarioOutcomeJudge,
 ): Promise<ProjectAuditCheck> {
   const capturedAt = new Date().toISOString();
   const execution = scenario.execution;
@@ -250,12 +254,34 @@ async function runScenarioAudit(
     ...(probe.stderrTail ? { stderrTail: tailText(probe.stderrTail) } : {}),
   };
   if (probe.ok) {
+    // Exiting zero answers a narrower question than the gate asks. The scenario states what the run
+    // was supposed to produce; until something reads that, a project can pass delivery having done
+    // the wrong thing successfully.
+    const verdict = judge ? await judge({ scenario, scene }) : undefined;
+    if (!verdict || verdict.ok) {
+      return {
+        name: `scenario:${scenario.name}`,
+        severity: 'info',
+        ok: true,
+        summary: t().execute.auditEntrypointOk(probe.command),
+        scene,
+      };
+    }
     return {
       name: `scenario:${scenario.name}`,
-      severity: 'info',
-      ok: true,
-      summary: t().execute.auditEntrypointOk(probe.command),
+      severity: 'error',
+      ok: false,
+      summary: `Real scenario ran but its result does not meet the declared expectation: ${probe.command}`,
+      detail: [verdict.reason, ...verdict.evidence].join('\n'),
       scene,
+      finding: {
+        category: 'product-defect',
+        summary: `Scenario ${scenario.name} produced a result that does not meet its expectation: ${verdict.reason}`,
+        evidence: [`expected: ${scenario.expected}`, ...verdict.evidence],
+        target: 'code',
+        affectedArtifacts: ['src/'],
+        dependencyPackages: [],
+      },
     };
   }
   const sceneEvidence = renderSceneEvidence(scene);

@@ -188,12 +188,22 @@ interface FileTreePolicy {
 
 ### 6.2 更新时机
 
-1. Runtime 冷启动：解析或创建 master 文件树并执行一次 rescan。
+1. Runtime 冷启动：解析或创建 master 文件树并执行一次 rescan，盖 HEAD 作为出处；
+   若工作副本不干净（上一次运行中断留下未提交改动），同时置 `dirty=true` 并记录路径 ——
+   保留出处以便交付时有值可比对，标记存疑以免它被当作已验证。
 2. master 内部工具写入：增量更新文件及其新建父目录。
 3. Ticket worktree 写入：不更新 master 文件树。
 4. squash/merge 成功：在 domain merge 状态落盘后立即 rescan master。
 5. Phase 交付前：强制 rescan，并校验 Git HEAD 与 `reconciledRevision` 一致。
+   校验失败时先诊断成因（未提交路径 / revision 已移动 / 交付物未提交），再尝试一次修复：
+   提交待定改动并按新 revision 重扫。复验通过则记录修复；仍不符则置 `dirty=true`、
+   把成因与路径写入审计后放行 —— 出处被标记的清单比无法交付的 Phase 更有用，
+   但绝不可在未验证的情况下声称已验证。
 6. 索引更新失败：保留磁盘写入结果，但设置 `dirty=true`、写审计并安排重扫，禁止静默漂移。
+
+`reconciledRevision` 断言的是「当前 entries 就是该 revision 的内容」，因此它随 entries 一起失效：
+增量写入和无法命名 revision 的 rescan 都必须清除它，只有 `dirty` 标记（不改 entries）保留它。
+沿用上一个 revision 会让文件树声称一个它已不满足的对应关系，而这正是第 5 条 HEAD 校验要比对的值。
 
 ### 6.3 路径和扫描安全
 

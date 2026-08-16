@@ -84,7 +84,13 @@ export function computeIncrementalAllowedWrites(
   ticket: Ticket,
 ): string[] {
   if (ticket.type === 'enhancement' && ticket.affectedArtifacts.length > 0) {
-    return ownedAffectedArtifacts(step, ticket.affectedArtifacts);
+    // Same floor the Change Request branch below already applies: an artifact list that names
+    // nothing this Step owns narrows the allowlist to nothing, and a Step that may write no file
+    // cannot act on any instruction it is given — it spends its whole round budget reporting that.
+    // A live Enhancement found at UNIT_TEST carried that Step's own documents and was routed to
+    // CODE, which owns none of them.
+    const owned = ownedAffectedArtifacts(step, ticket.affectedArtifacts);
+    return owned.length > 0 ? owned : computeStepAllowedWrites(step);
   }
   if (ticket.type === 'change-request') {
     const owned = ownedAffectedArtifacts(step, ticket.contractDelta.affectedArtifacts);

@@ -59,6 +59,31 @@ export const DeliveryGateSceneSchema = z.object({
 
 export type DeliveryGateScene = z.infer<typeof DeliveryGateSceneSchema>;
 
+/**
+ * Whether what a live scenario produced matches what the scenario said to expect.
+ *
+ * The process check answers a narrower question than the gate asks: a run that exits zero has not
+ * shown that it did the right thing. A delivered project passed every Step gate and its own 115
+ * tests while every one of its 100 output records carried the same text twice — the scenario's
+ * `expected` described exactly that content, and nothing read it.
+ *
+ * Judged, not matched: `expected` is prose written for the project at hand, and a pattern language
+ * general enough for every kind of project would express none of them well. The judgement is
+ * supplied by Runtime rather than performed here, so this module keeps knowing only the contract.
+ */
+export interface ScenarioOutcomeVerdict {
+  ok: boolean;
+  /** Why the produced result does or does not meet `expected`, in the judge's words. */
+  reason: string;
+  /** What the judgement was made from: output excerpts, artifact paths, command output. */
+  evidence: string[];
+}
+
+export type ScenarioOutcomeJudge = (input: {
+  scenario: DeliveryGateScenario;
+  scene: DeliveryGateScene;
+}) => Promise<ScenarioOutcomeVerdict>;
+
 const DeliveryGateInputSchema = z.object({
   kind: z.enum(DELIVERY_GATE_KINDS),
   summary: z.string().min(1),
