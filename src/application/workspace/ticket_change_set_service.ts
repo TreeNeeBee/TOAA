@@ -269,12 +269,22 @@ export class TicketChangeSetService {
     branch: string,
     revision: string,
   ): Promise<void> {
-    // `listWorktrees` reports canonical paths, so the computed path must be canonicalized too or a
-    // symlinked container root (macOS `/var` -> `/private/var`) never matches and the worktree is
-    // recreated on every call.
-    const canonicalRoot = await fs.realpath(root).catch(() => root);
-    const known = await this.git.listWorktrees();
-    if (known.some((entry) => entry.path === canonicalRoot)) return;
+    // Registration is not presence, and presence is the question this function exists to answer: a
+    // worktree deleted underneath the run stays registered, which is exactly the state to repair.
+    // Asking git whether it knows the path returns early on the one case that needs the work.
+    //
+    // macOS hid it. `listWorktrees` reports canonical paths, the container root reaches through a
+    // symlink (`/var` -> `/private/var`), and `realpath` cannot canonicalize a directory that is no
+    // longer there — so the comparison failed and the worktree was recreated by accident. On Linux
+    // the two paths are identical, the check returned early, and the branch content never arrived.
+    const present = await fs.stat(root).then((entry) => entry.isDirectory()).catch(() => false);
+    if (present) {
+      // `listWorktrees` reports canonical paths, so the computed path must be canonicalized too or a
+      // symlinked container root never matches and the worktree is recreated on every call.
+      const canonicalRoot = await fs.realpath(root).catch(() => root);
+      const known = await this.git.listWorktrees();
+      if (known.some((entry) => entry.path === canonicalRoot)) return;
+    }
     await this.git.pruneWorktrees();
     await this.git.addWorktree({ path: root, branch, startPoint: revision });
   }

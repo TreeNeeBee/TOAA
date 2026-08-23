@@ -23,6 +23,10 @@ export default defineConfig({
           include: ['tests/*.test.ts'],
           environment: 'node',
           globals: false,
+          // The domain engine drives whole V-model runs in memory; the slowest case takes ~3s on a
+          // developer machine and roughly three times that on a shared CI runner, which put it past
+          // the 5s default. Long enough to absorb a slower host, short enough to still catch a hang.
+          testTimeout: 20_000,
         },
       },
       {
@@ -31,6 +35,7 @@ export default defineConfig({
           include: ['tests/integration/**/*.test.ts'],
           environment: 'node',
           globals: false,
+          testTimeout: 20_000,
         },
       },
       {

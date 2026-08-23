@@ -293,6 +293,34 @@ describe('TicketChangeSetService', () => {
     expect(repair.changeSet?.baseRevision).toBe(merged.currentRevision);
   });
 
+  // The same deletion, with git reporting the path exactly as computed — which is what Linux does,
+  // and what macOS never does because the container root reaches through a symlink. The registration
+  // check matched there, returned early, and the branch content never arrived; the platform that ran
+  // the suite locally could not see it. Stubbing the listing removes the platform from the question.
+  it('recreates a deleted worktree even when git still reports it as registered', async () => {
+    const { service, repository, projectContainer, story, coding } = await fixture();
+    const first = await service.ensureFor(story, coding);
+    const worktreeGit = simpleGit({ baseDir: first.root });
+    await fs.writeFile(path.join(first.root, 'work.txt'), 'ticket work\n');
+    await worktreeGit.add('.');
+    await worktreeGit.commit('[xcompiler] ticket work');
+    await service.recordRevision(first.changeSet.id, (await worktreeGit.revparse(['HEAD'])).trim());
+    await fs.rm(first.root, { recursive: true, force: true });
+
+    const git = (service as unknown as { git: { listWorktrees(): Promise<Array<{ path: string }>> } }).git;
+    const realList = git.listWorktrees.bind(git);
+    git.listWorktrees = async () => {
+      const entries = await realList();
+      // Report the deleted worktree at the uncanonicalized path the service computes.
+      return [...entries, { path: first.root } as never];
+    };
+    const recovered = await new TicketChangeSetService(
+      repository, projectContainer, git as never,
+    ).ensureFor(story, coding);
+
+    expect(await fs.readFile(path.join(recovered.root, 'work.txt'), 'utf8')).toBe('ticket work\n');
+  });
+
   it('recreates a worktree deleted underneath it, without losing the branch commits', async () => {
     const { service, canonical, story, coding } = await fixture();
     const first = await service.ensureFor(story, coding);
