@@ -6,7 +6,7 @@ const TEXT_LOOP_MIN_LEN = 6_000;
 const TEXT_LOOP_TAIL = 14_000;
 const TEXT_LOOP_SAMPLE_LEN = 48;
 const TEXT_LOOP_STRIDE = 8;
-const TEXT_LOOP_REPEATS = 5;
+const TEXT_LOOP_REPEATS = 8;
 
 /**
  * Detects a model stuck in a periodic tail, such as `0000...` or a short phrase
@@ -46,22 +46,40 @@ export function detectRepeatedTextLoop(aggregate: string): boolean {
   const tail = aggregate.slice(-TEXT_LOOP_TAIL).replace(/\s+/gu, ' ').trim();
   if (tail.length < TEXT_LOOP_MIN_LEN) return false;
 
-  const seen = new Map<string, { count: number; first: number; last: number }>();
+  const seen = new Map<string, { count: number; first: number; last: number; positions: number[] }>();
   for (let i = 0; i + TEXT_LOOP_SAMPLE_LEN <= tail.length; i += TEXT_LOOP_STRIDE) {
     const sample = tail.slice(i, i + TEXT_LOOP_SAMPLE_LEN);
     if (!isHighSignalLoopSample(sample)) continue;
     const prior = seen.get(sample);
     if (!prior) {
-      seen.set(sample, { count: 1, first: i, last: i });
+      seen.set(sample, { count: 1, first: i, last: i, positions: [i] });
       continue;
     }
-    const next = { count: prior.count + 1, first: prior.first, last: i };
+    const next = {
+      count: prior.count + 1,
+      first: prior.first,
+      last: i,
+      positions: [...prior.positions.slice(-(TEXT_LOOP_REPEATS - 1)), i],
+    };
     seen.set(sample, next);
-    if (next.count >= TEXT_LOOP_REPEATS && next.last - next.first >= TEXT_LOOP_SAMPLE_LEN * 3) {
+    if (
+      next.count >= TEXT_LOOP_REPEATS &&
+      next.last - next.first >= TEXT_LOOP_SAMPLE_LEN * 3 &&
+      hasStableRepeatInterval(next.positions)
+    ) {
       return true;
     }
   }
   return false;
+}
+
+function hasStableRepeatInterval(positions: number[]): boolean {
+  if (positions.length < TEXT_LOOP_REPEATS) return false;
+  const intervals = positions.slice(1).map((position, index) => position - positions[index]!);
+  const min = Math.min(...intervals);
+  const max = Math.max(...intervals);
+  if (min <= 0) return false;
+  return max <= min * 1.35 + TEXT_LOOP_STRIDE * 2;
 }
 
 function isHighSignalLoopSample(sample: string): boolean {

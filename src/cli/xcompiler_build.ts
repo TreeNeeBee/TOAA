@@ -1,14 +1,19 @@
 import { Command } from 'commander';
-import { CompileExitError } from '../runtime/build.js';
-import { runBuildCommand } from '../runtime/commands.js';
+import { CompileExitError, XCOMPILER_VERSION, XCompilerRuntime } from '../runtime.js';
 import { setLocale, t } from '../i18n/index.js';
-import { XCOMPILER_VERSION } from '../version.js';
-import { configureLocalizedHelp, localeFromArgv, parseIntent, parseLocale } from './arguments.js';
+import {
+  configureLocalizedHelp,
+  localeFromArgv,
+  parseIntent,
+  parseLocale,
+  parseRecordReplayMode,
+} from './arguments.js';
 import { xcEnv } from '../config/env.js';
 import { createCliRuntimeIO } from './runtime_adapter.js';
 
 setLocale(localeFromArgv(process.argv) ?? xcEnv('LANG') ?? 'en');
 const defaultBaseDir = xcEnv('DEFAULT_BASE_DIR') ?? '/tmp';
+const runtime = new XCompilerRuntime({ io: createCliRuntimeIO() });
 
 const program = new Command();
 configureLocalizedHelp(program);
@@ -29,10 +34,12 @@ program
   .option('--baseline-plan <file>', t().cli.optBaselinePlan)
   .option('--plan-out <file>', t().cli.optPlanOut)
   .option('--project-file <file>', t().cli.optProjectFile)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (opts) => {
-    await runBuildCommand({
+    await runtime.buildCommand({
       output: opts.output,
       workspace: opts.workspace,
       baseDir: opts.baseDir,
@@ -45,9 +52,10 @@ program
       outputFile: opts.planOut,
       projectFilePath: opts.projectFile,
       projectCommand: 'build',
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
-      io: createCliRuntimeIO(),
     });
   });
 

@@ -7,8 +7,8 @@ import { extractObjectEnvelope, type ObjectEnvelope } from '../../domain/objects
 import { ObjectTypeSchema, type ObjectType } from '../../domain/objects/object_type.js';
 
 export const OBJECT_REGISTRY_KIND = 'xcompiler.object-registry';
-export const OBJECT_REGISTRY_VERSION = 1;
-export const OBJECT_REGISTRY_ROOT = '.xcompiler/registry';
+export const OBJECT_REGISTRY_VERSION = 2;
+export const OBJECT_REGISTRY_ROOT = 'registry';
 export const OBJECT_REGISTRY_INDEX_PATH = `${OBJECT_REGISTRY_ROOT}/index.json`;
 export const OBJECT_REGISTRY_EVENTS_PATH = `${OBJECT_REGISTRY_ROOT}/events.jsonl`;
 
@@ -68,6 +68,11 @@ export interface RegisterObjectInput {
   contentHash: string;
   parentId?: ObjectId;
   state?: string;
+}
+
+export interface RegistryBatchOperation {
+  mode: 'register' | 'update';
+  input: RegisterObjectInput;
 }
 
 export class ObjectRegistry {
@@ -198,6 +203,75 @@ export class ObjectRegistry {
     });
   }
 
+  async commitBatch(operations: readonly RegistryBatchOperation[]): Promise<ObjectRegistryEntry[]> {
+    if (operations.length === 0) return [];
+    return this.serialize(async () => {
+      const shadow = new Map(this.entries);
+      const entries: ObjectRegistryEntry[] = [];
+      for (const operation of operations) {
+        const envelope = extractObjectEnvelope(operation.input.envelope);
+        const current = shadow.get(envelope.id);
+        if (operation.mode === 'register') {
+          if (current) throw new Error(`Object id has already been registered and cannot be reused: ${envelope.id}`);
+        } else {
+          if (!current) throw new Error(`Object registry entry not found: ${envelope.id}`);
+          if (current.tombstonedAt) throw new Error(`Cannot update tombstoned object: ${envelope.id}`);
+          if (envelope.objectType !== current.objectType || envelope.projectId !== current.projectId) {
+            throw new Error(`Object identity metadata cannot change: ${envelope.id}`);
+          }
+          if (envelope.createdAt !== current.createdAt) {
+            throw new Error(`Object createdAt cannot change: ${envelope.id}`);
+          }
+          if (envelope.revision !== current.revision + 1) {
+            throw new Error(
+              `${envelope.objectType} ${envelope.name} (${envelope.id}) revision must advance ` +
+              `from ${current.revision} to ${current.revision + 1}, not ${envelope.revision}: ` +
+              'the caller is holding a copy read before another write landed',
+            );
+          }
+        }
+        const parentId = operation.input.parentId ?? current?.parentId;
+        assertProjectAndParentIn(shadow, envelope, parentId);
+        const entry = ObjectRegistryEntrySchema.parse({
+          ...envelope,
+          objectRef: normalizeObjectRef(operation.input.objectRef),
+          contentHash: operation.input.contentHash,
+          parentId,
+          state: operation.input.state,
+        });
+        shadow.set(entry.id, entry);
+        entries.push(entry);
+      }
+
+      const sequence = this.eventSequence;
+      let previousEventHash = this.lastEventHash;
+      const events: ObjectRegistryEvent[] = entries.map((entry, index) => {
+        const eventBase = {
+          id: createObjectId(),
+          sequence: sequence + index + 1,
+          type: operations[index]!.mode === 'register' ? 'registered' as const : 'updated' as const,
+          objectId: entry.id,
+          at: new Date().toISOString(),
+          previousEventHash,
+          entry,
+        };
+        const event = ObjectRegistryEventSchema.parse({
+          ...eventBase,
+          eventHash: hashRegistryEvent(eventBase),
+        });
+        previousEventHash = event.eventHash;
+        return event;
+      });
+      await this.workspace.appendFile(
+        OBJECT_REGISTRY_EVENTS_PATH,
+        events.map((event) => JSON.stringify(event)).join('\n') + '\n',
+      );
+      for (const event of events) this.applyEvent(event);
+      await this.writeSnapshot();
+      return entries.map((entry) => ({ ...entry }));
+    });
+  }
+
   async tombstone(id: ObjectId, expectedRevision: number, now = new Date().toISOString()): Promise<ObjectRegistryEntry> {
     return this.serialize(async () => {
       const current = this.require(id);
@@ -290,33 +364,7 @@ export class ObjectRegistry {
   }
 
   private assertProjectAndParent(envelope: ObjectEnvelope, parentId?: ObjectId): void {
-    if (envelope.objectType === 'project') {
-      if (envelope.projectId !== envelope.id) {
-        throw new Error('Project object must use its own id as projectId');
-      }
-      if (parentId) throw new Error('Project object cannot have a parent');
-      return;
-    }
-
-    const project = this.entries.get(envelope.projectId);
-    if (!project || project.objectType !== 'project' || project.tombstonedAt) {
-      throw new Error(`Active project must be registered before child objects: ${envelope.projectId}`);
-    }
-    if (!parentId) return;
-    const parent = this.entries.get(parentId);
-    if (!parent || parent.tombstonedAt) {
-      throw new Error(`Active parent object is not registered: ${parentId}`);
-    }
-    if (parent.projectId !== envelope.projectId) {
-      throw new Error(`Parent ${parentId} belongs to another project`);
-    }
-    let ancestor: ObjectRegistryEntry | undefined = parent;
-    while (ancestor) {
-      if (ancestor.id === envelope.id) {
-        throw new Error(`Parent relationship would create a cycle for object ${envelope.id}`);
-      }
-      ancestor = ancestor.parentId ? this.entries.get(ancestor.parentId) : undefined;
-    }
+    assertProjectAndParentIn(this.entries, envelope, parentId);
   }
 
   private async commit(type: ObjectRegistryEvent['type'], entry: ObjectRegistryEntry): Promise<void> {
@@ -413,6 +461,40 @@ function verifyEventChain(events: ObjectRegistryEvent[]): void {
       throw new Error(`Object registry event hash is invalid at sequence ${event.sequence}`);
     }
     previousEventHash = event.eventHash;
+  }
+}
+
+function assertProjectAndParentIn(
+  entries: ReadonlyMap<ObjectId, ObjectRegistryEntry>,
+  envelope: ObjectEnvelope,
+  parentId?: ObjectId,
+): void {
+  if (envelope.objectType === 'project') {
+    if (envelope.projectId !== envelope.id) {
+      throw new Error('Project object must use its own id as projectId');
+    }
+    if (parentId) throw new Error('Project object cannot have a parent');
+    return;
+  }
+
+  const project = entries.get(envelope.projectId);
+  if (!project || project.objectType !== 'project' || project.tombstonedAt) {
+    throw new Error(`Active project must be registered before child objects: ${envelope.projectId}`);
+  }
+  if (!parentId) return;
+  const parent = entries.get(parentId);
+  if (!parent || parent.tombstonedAt) {
+    throw new Error(`Active parent object is not registered: ${parentId}`);
+  }
+  if (parent.projectId !== envelope.projectId) {
+    throw new Error(`Parent ${parentId} belongs to another project`);
+  }
+  let ancestor: ObjectRegistryEntry | undefined = parent;
+  while (ancestor) {
+    if (ancestor.id === envelope.id) {
+      throw new Error(`Parent relationship would create a cycle for object ${envelope.id}`);
+    }
+    ancestor = ancestor.parentId ? entries.get(ancestor.parentId) : undefined;
   }
 }
 

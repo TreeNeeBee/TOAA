@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { PluginHost } from '../src/plugins/host.js';
 import { checkPluginCompatibility } from '../src/plugins/compatibility.js';
 import { ToolRegistry, type Tool } from '../src/tools/types.js';
-import { SkillRegistry } from '../src/skills/skill.js';
+import { SkillRegistry } from '../src/skills/index.js';
 import type { LLMClient } from '../src/llm/types.js';
 import type { XCompilerPlugin, XCompilerPluginManifest } from '../src/plugins/types.js';
 import { XCOMPILER_PLUGIN_API_VERSION, XCOMPILER_VERSION } from '../src/version.js';
@@ -124,6 +127,20 @@ describe('PluginHost', () => {
   });
 
   it('registers plugin tools and skills without allowing core overrides', async () => {
+    const skillRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-plugin-skill-'));
+    const skillDirectory = path.join(skillRoot, 'plugin-skill');
+    await fs.mkdir(skillDirectory);
+    await fs.writeFile(path.join(skillDirectory, 'SKILL.md'), [
+      '---',
+      'name: plugin-skill',
+      'description: Use the plugin tool for plugin-owned checks.',
+      'allowed-tools: plugin_tool',
+      '---',
+      '',
+      '# Plugin Skill',
+      '',
+      'Call the plugin tool and verify its result.',
+    ].join('\n'));
     const tool: Tool = {
       name: 'plugin_tool',
       description: 'plugin tool',
@@ -134,7 +151,7 @@ describe('PluginHost', () => {
       manifest: pluginManifest('extensions'),
       setup(api) {
         api.registerTool(tool);
-        api.registerSkill({ name: 'plugin_skill', prompt: 'use plugin tool', tools: ['plugin_tool'] });
+        api.registerSkillDirectory(skillDirectory);
       },
     };
     const host = new PluginHost({ plugins: [plugin] });
@@ -143,7 +160,7 @@ describe('PluginHost', () => {
     const skills = new SkillRegistry();
     host.applyExtensions({ tools, skills });
     expect(tools.get('plugin_tool')).toBe(tool);
-    expect(skills.get('plugin_skill')?.tools).toEqual(['plugin_tool']);
+    expect(skills.get('plugin-skill')?.allowedTools).toEqual(['plugin_tool']);
 
     expect(() => host.applyExtensions({ tools, skills })).toThrow(/cannot replace|不能覆盖/);
   });

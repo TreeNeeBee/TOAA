@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { analyzeArchitectureDemand, missingArchitectureDocumentTokens } from '../src/core/architecture.js';
 import { lintPlan } from '../src/core/lint.js';
-import { PlanSchema, type ArchitectureModule, type Plan, type Step } from '../src/core/plan.js';
+import { PLAN_VERSION, PlanSchema, type ArchitectureModule, type Plan, type Step } from '../src/core/plan.js';
 import { renderPlanMarkdown } from '../src/core/render.js';
 
 const baseDeliveryDocs = ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'];
@@ -67,7 +67,7 @@ function complexPlan(): Plan {
     dependsOn: ['S011', ...codeSteps.map((item) => item.id)],
   });
   return {
-    version: '1',
+    version: PLAN_VERSION,
     language: 'python',
     intent: 'greenfield',
     projectType: 'application',
@@ -363,9 +363,14 @@ describe('V-model architecture contract', () => {
       .filter((item) => !['S004', 'S005'].includes(item.id))
       .map((item) => ({
         ...item,
-        outputs: item.id === 'S006'
-          ? [...item.outputs, 'docs/tests/unit-test-plan.md', 'tests/test_unit.py']
-          : item.outputs,
+        inputs: item.id === 'S012'
+          ? item.inputs.filter((input) => !['src/main.py', 'src/domain.py', 'tests/test_main.py', 'tests/test_domain.py'].includes(input))
+          : item.inputs,
+        outputs: item.id === 'S002'
+          ? item.outputs.filter((output) => !['tests/test_main.py', 'tests/test_domain.py'].includes(output))
+          : item.id === 'S006'
+            ? [...item.outputs, 'docs/tests/unit-test-plan.md', 'tests/test_unit.py']
+            : item.outputs,
         dependsOn: item.dependsOn.filter((dependency) => !['S004', 'S005'].includes(dependency)),
       }));
 

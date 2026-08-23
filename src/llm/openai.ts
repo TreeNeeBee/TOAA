@@ -1,11 +1,42 @@
 import type { ChatMessage, ChatOptions, LLMClient } from './types.js';
+import type { StreamProgress } from './errors.js';
 import { Agent } from 'undici';
 import { detectCyclicTokenLoop, detectRepeatedTextLoop, RepeatTokenDetector } from './stream_watchdog.js';
+import {
+  LLMRequestError,
+  isLLMRequestError,
+  llmFailureCodeForStatus,
+} from './errors.js';
 
 export const DEFAULT_OPENAI_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 export const DEFAULT_OPENAI_CONNECT_TIMEOUT_MS = 60 * 1000;
 export const DEFAULT_OPENAI_STREAM_FIRST_TOKEN_TIMEOUT_MS = 5 * 60 * 1000;
 export const DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_MS = 60 * 1000;
+/**
+ * When the kernel starts probing an otherwise silent connection.
+ *
+ * A network that disappears mid-request leaves no RST and no FIN: the socket black-holes, and the
+ * application has nothing to detect. Probes are the only thing that turns that into an error, and
+ * they need no cooperation from the provider — a peer's kernel answers them whether or not its model
+ * is still thinking, which is exactly what separates "the path is gone" from "the answer is slow".
+ *
+ * 30s, not the few seconds a liveness check would suggest: Node exposes only when probing starts,
+ * not the probe interval or count, so the kernel's own defaults decide how long an unanswered
+ * connection survives (macOS: 75s x 8). Probing early costs nothing and shortens nothing.
+ */
+export const DEFAULT_OPENAI_TCP_KEEPALIVE_MS = 30 * 1000;
+/**
+ * How long a streaming request may go without response headers.
+ *
+ * Only meaningful while streaming, and that is why it is not one of the other timeouts: a streaming
+ * server writes its headers immediately and only then begins thinking, so headers arriving is a fact
+ * about the connection and the first token arriving is a fact about the model. Collapsing both into
+ * the first-token budget gave a dead endpoint the same five minutes as a model composing an answer.
+ *
+ * A non-stream request has no such split — its headers are withheld until the whole answer exists —
+ * so nothing here applies to that path.
+ */
+export const DEFAULT_OPENAI_STREAM_HEADERS_TIMEOUT_MS = 30 * 1000;
 
 export interface OpenAIConfig {
   providerName?: string;
@@ -24,21 +55,106 @@ export interface OpenAIConfig {
   streamFirstTokenTimeoutMs?: number;
   /** 流式异常保护阈值；真实有效输出不会因长度本身被截断，loop/无效输出由 watchdog 中断。 */
   maxOutputChars?: number;
+  /**
+   * 流式请求等待响应头的超时；默认 30 秒，0 关闭。仅对流式生效。
+   *
+   * 流式服务端会先写响应头再开始思考，所以「头到了」是关于连接的事实，「首个 token 到了」是关于
+   * 模型的事实。非流式的响应头要等整个答案生成完才发，这道闸对它没有意义，也不会加在它上面。
+   */
+  streamHeadersTimeoutMs?: number;
+  /**
+   * 内核在连接静默多久后开始发 TCP 探活包；默认 30 秒，0 关闭。
+   *
+   * 与三个超时无关：它检测的是「路径还在不在」，不是「答案来没来」。断网时这是唯一能把黑洞
+   * socket 变成真正连接错误的机制，且不需要对端应用层做任何配合。
+   */
+  tcpKeepAliveMs?: number;
+  /**
+   * 对端连续多久没有送来任何字节即触发一次环境诊断；不结束请求。0 关闭。
+   *
+   * 与三个超时是不同的量：超时决定「什么时候放弃」，这个决定「放弃时说得出原因」。
+   */
+  stallDiagnosisAfterMs?: number;
+}
+
+/**
+ * Watches for total silence from the provider and asks the caller to explain it, once.
+ *
+ * Silence is measured in bytes off the socket, not in parsed tokens: a reasoning model mid-thought,
+ * a gateway sending SSE comments, and a provider streaming content are all alive, and only the
+ * transport sees all three the same way. Nothing here ends the request — the timeouts own that
+ * decision. This exists so that when a request does fail, the failure can say whether the endpoint
+ * was reachable, instead of leaving a dead network and a slow model behind the same message.
+ */
+function armStallDiagnosis(cfg: OpenAIConfig, options?: ChatOptions) {
+  const afterMs = cfg.stallDiagnosisAfterMs ?? 0;
+  let diagnosis: string | undefined;
+  let timer: NodeJS.Timeout | null = null;
+  const active = afterMs > 0 && !!options?.onStall;
+  const arm = () => {
+    if (!active) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      // Fire and forget: a diagnosis must never become another thing the request waits on.
+      void options!.onStall!({ silentForMs: afterMs, provider: cfg.providerName, model: cfg.model })
+        .then((text) => { if (text) diagnosis = text; })
+        .catch(() => undefined);
+    }, afterMs);
+  };
+  arm();
+  return {
+    /** Any byte from the provider. Restarts the clock and discards a diagnosis it outlived. */
+    seen: () => { diagnosis = undefined; arm(); },
+    diagnosis: () => diagnosis,
+    cleanup: () => { if (timer) clearTimeout(timer); timer = null; },
+  };
+}
+
+/** Attaches a stall diagnosis to a failure, so the reason and the evidence arrive together. */
+function withStallDiagnosis(err: unknown, diagnosis: string | undefined): unknown {
+  if (!diagnosis || !(err instanceof Error)) return err;
+  err.message = `${err.message} Environment check while the provider was silent: ${diagnosis}`;
+  return err;
 }
 
 interface OpenAIChatResponse {
-  choices?: Array<{ message?: { content?: string } }>;
+  choices?: Array<{ message?: { content?: string | null; reasoning?: string } }>;
   error?: { message: string };
 }
 
 interface OpenAIStreamChunk {
   choices?: Array<{
-    delta?: { content?: string };
+    /**
+     * `reasoning` is a reasoning model's thinking, streamed before it answers.
+     *
+     * It is proof the stream is alive, and it is not output. A model that thinks for ten minutes
+     * before its first content token sends hundreds of these; counting only `content` reports that
+     * a fully active stream has gone idle.
+     */
+    delta?: { content?: string; reasoning?: string };
     message?: { content?: string };
     finish_reason?: string | null;
   }>;
   error?: { message?: string };
   done?: boolean;
+}
+
+/**
+ * The socket options this transport asks for, stated separately so they can be asserted.
+ *
+ * Named rather than inlined because undici binds `net.connect` when it is first imported, which puts
+ * the socket out of reach of any in-process test that has already loaded this module. Keeping the
+ * decision in one pure place means the choice is checkable even where the socket is not.
+ */
+export function openAIConnectOptions(cfg: Pick<OpenAIConfig, 'connectTimeoutMs' | 'tcpKeepAliveMs'>) {
+  const keepAliveMs = cfg.tcpKeepAliveMs ?? DEFAULT_OPENAI_TCP_KEEPALIVE_MS;
+  return {
+    timeout: cfg.connectTimeoutMs ?? DEFAULT_OPENAI_CONNECT_TIMEOUT_MS,
+    // Kernel-level, so a dead path is reported as a connection failure rather than left to expire on
+    // a timeout that cannot say which of the two faults it was.
+    ...(keepAliveMs > 0 ? { keepAlive: true, keepAliveInitialDelay: keepAliveMs } : {}),
+  };
 }
 
 export class OpenAIClient implements LLMClient {
@@ -47,9 +163,7 @@ export class OpenAIClient implements LLMClient {
 
   constructor(private readonly cfg: OpenAIConfig) {
     this.name = `openai:${cfg.model}`;
-    this.dispatcher = new Agent({
-      connect: { timeout: cfg.connectTimeoutMs ?? DEFAULT_OPENAI_CONNECT_TIMEOUT_MS },
-    });
+    this.dispatcher = new Agent({ connect: openAIConnectOptions(cfg) });
   }
 
   async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
@@ -67,8 +181,15 @@ export class OpenAIClient implements LLMClient {
     }
     if (options?.onToken) return this.streamChat(url, body, options);
     const ctrl = new AbortController();
-    const timeoutMs = this.cfg.requestTimeoutMs ?? DEFAULT_OPENAI_REQUEST_TIMEOUT_MS;
+    const unbindAbort = bindAbortSignal(options?.signal, (reason) => ctrl.abort(reason));
+    // A caller may cap one request below the provider's budget; it may never raise it.
+    const configuredTimeoutMs = this.cfg.requestTimeoutMs ?? DEFAULT_OPENAI_REQUEST_TIMEOUT_MS;
+    const timeoutMs = options?.requestTimeoutMs !== undefined && options.requestTimeoutMs > 0
+      ? Math.min(configuredTimeoutMs || options.requestTimeoutMs, options.requestTimeoutMs)
+      : configuredTimeoutMs;
     const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(new Error(`request timed out after ${timeoutMs}ms`)), timeoutMs) : null;
+    // No incremental data exists on this path, so the whole request is the silence being measured.
+    const stall = armStallDiagnosis(this.cfg, options);
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.cfg.apiKey) headers.authorization = `Bearer ${this.cfg.apiKey}`;
     try {
@@ -85,11 +206,27 @@ export class OpenAIClient implements LLMClient {
       }
       const json = (await res.json()) as OpenAIChatResponse;
       if (json.error) throw new Error(`OpenAI error: ${json.error.message}`);
-      return json.choices?.[0]?.message?.content ?? '';
+      const content = json.choices?.[0]?.message?.content;
+      // A reasoning model answers with `content: null` and its text in `reasoning` when the token
+      // budget ran out mid-thought. Returning '' for that reports an empty answer from a provider
+      // that in fact never answered — the caller then blames the model's quality for a shape it
+      // could not have known about.
+      if (content === null || content === undefined) {
+        const reasoning = json.choices?.[0]?.message?.reasoning;
+        if (reasoning) {
+          throw new Error(
+            `provider returned only reasoning (${reasoning.length} chars) and no content; ` +
+            'raise max_tokens or use a non-reasoning model for this role',
+          );
+        }
+      }
+      return content ?? '';
     } catch (err) {
-      throw wrapOpenAIError(this.cfg, err, 'non-stream');
+      throw wrapOpenAIError(this.cfg, withStallDiagnosis(err, stall.diagnosis()), 'non-stream');
     } finally {
+      stall.cleanup();
       if (timer) clearTimeout(timer);
+      unbindAbort();
     }
   }
 
@@ -104,20 +241,37 @@ export class OpenAIClient implements LLMClient {
     // 把 watchdog 触发的中断原因记下来，因为底层 reader 在 abort 时
     // 抛出的是泛型 AbortError，会丢失我们的人类可读信息。
     let abortReason: Error | null = null;
-    const abort = (err: Error) => {
-      if (!abortReason) abortReason = err;
+    // The transport is the only layer that can see this, so it records it rather than describing it.
+    let abortProgress: StreamProgress | undefined;
+    const abort = (err: Error, progress?: StreamProgress) => {
+      if (!abortReason) {
+        abortReason = err;
+        abortProgress = progress;
+      }
       ctrl.abort(err);
     };
+    const currentProgress = (): StreamProgress =>
+      streamedContentChars > 0 ? 'content-started' : reasoningChars > 0 ? 'reasoning-only' : 'no-bytes';
+    const unbindAbort = bindAbortSignal(options.signal, (reason) => abort(abortError(reason)));
 
     let wallTimer =
       timeoutMs > 0
         ? setTimeout(
-            () => abort(new Error(`OpenAI stream wall-clock ${timeoutMs}ms exceeded; aborting`)),
+            // Whichever watchdog ends it, a stream that only ever sent reasoning failed for that
+            // reason, and that is the fact an operator can act on. Reporting the timer instead
+            // sends them to raise a limit that was never the constraint.
+            () => abort(new Error(
+              streamedContentChars === 0 && reasoningChars > 0
+                ? `OpenAI stream sent ${reasoningChars} reasoning chars but no content within ${timeoutMs}ms; aborting`
+                : `OpenAI stream wall-clock ${timeoutMs}ms exceeded; aborting`,
+            ), currentProgress()),
             timeoutMs,
           )
         : null;
     let idleTimer: NodeJS.Timeout | null = null;
+    const stall = armStallDiagnosis(this.cfg, options);
     let streamedContentChars = 0;
+    let reasoningChars = 0;
     const armIdle = () => {
       const activeTimeoutMs = streamedContentChars === 0 ? firstTokenTimeoutMs : idleTimeoutMs;
       if (idleTimer) clearTimeout(idleTimer);
@@ -127,10 +281,16 @@ export class OpenAIClient implements LLMClient {
       }
       idleTimer = setTimeout(
         () => abort(new Error(
-          streamedContentChars === 0
-            ? `OpenAI stream idle before first token for ${activeTimeoutMs}ms; aborting`
-            : `OpenAI stream idle for ${activeTimeoutMs}ms; aborting`,
-        )),
+          // A stream that delivered reasoning and then stopped is a different fault from one that
+          // delivered nothing, and it needs a different answer: raising the timeout helps the
+          // second and does nothing for the first. Saying "idle" for both sent a live, thinking
+          // stream's failure to the one hint that could not fix it.
+          streamedContentChars === 0 && reasoningChars > 0
+            ? `OpenAI stream sent ${reasoningChars} reasoning chars but no content for ${activeTimeoutMs}ms; aborting`
+            : streamedContentChars === 0
+              ? `OpenAI stream idle before first token for ${activeTimeoutMs}ms; aborting`
+              : `OpenAI stream idle for ${activeTimeoutMs}ms; aborting`,
+        ), currentProgress()),
         activeTimeoutMs,
       );
     };
@@ -138,6 +298,7 @@ export class OpenAIClient implements LLMClient {
       if (wallTimer) clearTimeout(wallTimer);
       wallTimer = null;
       if (idleTimer) clearTimeout(idleTimer);
+      unbindAbort();
     };
 
     const headers: Record<string, string> = {
@@ -147,13 +308,26 @@ export class OpenAIClient implements LLMClient {
     if (this.cfg.apiKey) headers.authorization = `Bearer ${this.cfg.apiKey}`;
     try {
       armIdle();
+      // `fetch` settles when the response headers arrive, which makes this the one place the two
+      // phases can be told apart without a second dispatcher or a provider-specific option.
+      const headersTimeoutMs =
+        this.cfg.streamHeadersTimeoutMs ?? DEFAULT_OPENAI_STREAM_HEADERS_TIMEOUT_MS;
+      let headersTimer = headersTimeoutMs > 0
+        ? setTimeout(
+            () => abort(new Error(`OpenAI stream sent no response headers for ${headersTimeoutMs}ms; aborting`), 'no-bytes'),
+            headersTimeoutMs,
+          )
+        : null;
       const res = await fetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
         signal: ctrl.signal,
         dispatcher: this.dispatcher,
-      } as RequestInit & { dispatcher: Agent });
+      } as RequestInit & { dispatcher: Agent }).finally(() => {
+        if (headersTimer) clearTimeout(headersTimer);
+        headersTimer = null;
+      });
       if (!res.ok) {
         const text = await res.text();
         throw buildHttpError(this.cfg, res.status, res.statusText, text);
@@ -209,7 +383,17 @@ export class OpenAIClient implements LLMClient {
             terminalChoice = true;
           }
           const piece = choice.delta?.content ?? choice.message?.content ?? '';
-          if (!piece) continue;
+          if (!piece) {
+            // Liveness, not output. Reasoning keeps the watchdog fed without entering `aggregate`,
+            // reaching `onToken`, or advancing `streamedContentChars` — the model has not started
+            // answering yet, so the first-token budget still applies, and the wall-clock timer is
+            // still armed, which is what stops a model that only ever thinks.
+            if (choice.delta?.reasoning) {
+              reasoningChars += choice.delta.reasoning.length;
+              armIdle();
+            }
+            continue;
+          }
           if (streamedContentChars === 0 && wallTimer) {
             clearTimeout(wallTimer);
             wallTimer = null;
@@ -217,6 +401,10 @@ export class OpenAIClient implements LLMClient {
           aggregate += piece;
           streamedContentChars += piece.length;
           armIdle();
+          const embeddedProtocolError = openAIProtocolErrorEnvelope(aggregate);
+          if (embeddedProtocolError) {
+            throw new Error(`OpenAI error: ${embeddedProtocolError}`);
+          }
           options.onToken?.(piece);
           if (expectsJsonObject && hasDegenerateJsonPrefix(aggregate)) {
             throw new Error('detected degenerate non-JSON prefix in OpenAI stream; aborting');
@@ -245,6 +433,9 @@ export class OpenAIClient implements LLMClient {
         while (!done) {
           const { value, done: readerDone } = await reader.read();
           if (readerDone) break;
+          // Reset on bytes, not on parsed tokens: SSE comments and reasoning deltas prove the peer
+          // is alive even though neither becomes output, and only here are they all just bytes.
+          if (value) stall.seen();
           buf += decoder.decode(value, { stream: true });
           let sep = findSseSeparator(buf);
           while (sep) {
@@ -275,13 +466,42 @@ export class OpenAIClient implements LLMClient {
         ctrl.abort();
         throw abortReason ?? (err as Error);
       }
+      const embeddedProtocolError = openAIProtocolErrorEnvelope(aggregate);
+      if (embeddedProtocolError) {
+        throw new Error(`OpenAI error: ${embeddedProtocolError}`);
+      }
       return aggregate;
     } catch (err) {
-      throw wrapOpenAIError(this.cfg, err, 'stream');
+      throw wrapOpenAIError(this.cfg, withStallDiagnosis(err, stall.diagnosis()), 'stream', abortProgress);
     } finally {
+      stall.cleanup();
       cleanup();
     }
   }
+}
+
+/**
+ * Some OpenAI-compatible gateways return a provider protocol error as generated content inside a
+ * successful SSE choice instead of using HTTP status or the top-level `error` field. Treat only the
+ * canonical error envelope as protocol failure; ordinary user-requested JSON remains content.
+ */
+function openAIProtocolErrorEnvelope(content: string): string | undefined {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const envelope = value as Record<string, unknown>;
+  if (envelope.type !== 'error' || !envelope.error || typeof envelope.error !== 'object') {
+    return undefined;
+  }
+  const error = envelope.error as Record<string, unknown>;
+  if (typeof error.type !== 'string' || typeof error.message !== 'string') return undefined;
+  return `${error.type}: ${error.message}`;
 }
 
 interface OpenAIHttpFailure {
@@ -305,7 +525,7 @@ function buildHttpError(
   return err;
 }
 
-function wrapOpenAIError(cfg: OpenAIConfig, err: unknown, mode: 'stream' | 'non-stream'): Error {
+function wrapOpenAIError(cfg: OpenAIConfig, err: unknown, mode: 'stream' | 'non-stream', streamProgress?: StreamProgress): Error {
   if (isWrappedOpenAIError(err)) return err;
   const cause = err instanceof Error ? err : new Error(String(err));
   const provider = cfg.providerName ?? 'unnamed';
@@ -322,13 +542,29 @@ function wrapOpenAIError(cfg: OpenAIConfig, err: unknown, mode: 'stream' | 'non-
   }
   const detail = errorDetail(cause);
   const hint = hintForOpenAIError(cfg, cause);
-  const wrapped = new Error(`${parts.join(' ')}: ${detail}. ${hint}`, { cause });
-  wrapped.name = 'OpenAICompatibleRequestError';
-  return wrapped;
+  const statusCode = isHttpFailure(cause) ? cause.status : undefined;
+  const code = statusCode
+    ? llmFailureCodeForStatus(statusCode)
+    : /timed out|idle|wall-clock/iu.test(cause.message)
+      ? 'request_timeout'
+      : /fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND/iu.test(cause.message)
+        ? 'connection_failed'
+        : 'request_failed';
+  return new LLMRequestError(`${parts.join(' ')}: ${detail}. ${hint}`, {
+    code,
+    streamProgress,
+    provider,
+    model: cfg.model,
+    endpoint: baseUrl,
+    mode,
+    statusCode,
+    retryable: code === 'request_timeout' || code === 'connection_failed' || code === 'rate_limited' || code === 'provider_server_error',
+    switchProvider: code !== 'invalid_response',
+  }, { cause });
 }
 
 function isWrappedOpenAIError(err: unknown): err is Error {
-  return err instanceof Error && err.name === 'OpenAICompatibleRequestError';
+  return isLLMRequestError(err);
 }
 
 function isHttpFailure(err: Error): err is Error & OpenAIHttpFailure {
@@ -478,4 +714,25 @@ function findSseSeparator(buf: string): { index: number; length: number } | null
   if (lf < 0) return crlf < 0 ? null : { index: crlf, length: 4 };
   if (crlf < 0 || lf < crlf) return { index: lf, length: 2 };
   return { index: crlf, length: 4 };
+}
+
+function bindAbortSignal(
+  signal: AbortSignal | undefined,
+  abort: (reason: unknown) => void,
+): () => void {
+  if (!signal) return () => undefined;
+  const listener = () => abort(signal.reason);
+  if (signal.aborted) {
+    listener();
+    return () => undefined;
+  }
+  signal.addEventListener('abort', listener, { once: true });
+  return () => signal.removeEventListener('abort', listener);
+}
+
+function abortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason;
+  const error = new Error(typeof reason === 'string' ? reason : 'Runtime task cancelled');
+  error.name = 'AbortError';
+  return error;
 }

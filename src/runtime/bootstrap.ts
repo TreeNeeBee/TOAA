@@ -9,6 +9,8 @@ import { DockerSandbox } from '../sandbox/docker.js';
 import type { ExecResult } from '../sandbox/types.js';
 import { Workspace } from '../workspace/workspace.js';
 import { t } from '../i18n/index.js';
+import { GitRepositoryService } from '../infrastructure/git/git_repository_service.js';
+import { CONTAINER_WORKTREES_DIR } from '../workspace/project_container.js';
 import { runtimeLog, silentRuntimeIO, type RuntimeIO } from './io.js';
 
 export interface BootstrapOptions {
@@ -45,6 +47,9 @@ export interface BootstrapCheck {
 
 export interface BootstrapWorkspace {
   repository: string;
+  /** Temporary XCompiler project container used by Build/Run. */
+  container: string;
+  /** Candidate checkout at `<container>/worktrees/master`. */
   worktree: string;
   branch: string;
   baseCommit: string;
@@ -76,7 +81,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   let compiled;
   try {
     compiled = await runCompile({
-      workspace: prepared.worktree,
+      workspace: prepared.container,
       configPath,
       inputFile,
       topicFile,
@@ -102,7 +107,7 @@ export async function runBootstrap(opts: BootstrapOptions): Promise<BootstrapRes
   try {
     execution = await runExecute({
       planPath: compiled.planPath,
-      workspace: prepared.worktree,
+      workspace: prepared.container,
       configPath,
       force: !!opts.force,
       terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
@@ -216,26 +221,27 @@ export async function prepareBootstrapWorkspace(
   requestedWorktree?: string,
 ): Promise<BootstrapWorkspace> {
   const requested = path.resolve(repository);
-  const requestedGit = simpleGit({ baseDir: requested });
-  if (!(await requestedGit.checkIsRepo().catch(() => false))) {
+  const requestedService = new GitRepositoryService(requested);
+  if (!(await requestedService.isRepository())) {
     throw new Error(t().bootstrap.notGitRepository(requested));
   }
-  const root = (await requestedGit.revparse(['--show-toplevel'])).trim();
-  const git = simpleGit({ baseDir: root });
-  const status = await git.status();
-  if (!status.isClean()) {
+  const root = await requestedService.root();
+  const service = new GitRepositoryService(root);
+  if (!await service.isClean()) {
+    const status = await service.raw().status();
     throw new Error(t().bootstrap.dirtyRepository(status.files.map((file) => file.path).join(', ')));
   }
 
   const runId = createRunId();
   const branch = `xcompiler/bootstrap/${runId}`;
-  const baseCommit = (await git.revparse(['HEAD'])).trim();
-  const worktree = requestedWorktree
+  const baseCommit = await service.head();
+  const container = requestedWorktree
     ? path.resolve(requestedWorktree)
-    : path.join(root, '.xcompiler', 'bootstrap', 'worktrees', runId);
+    : path.join(root, '.xcompiler', 'bootstrap', 'containers', runId);
+  const worktree = path.join(container, CONTAINER_WORKTREES_DIR, 'master');
   await fs.mkdir(path.dirname(worktree), { recursive: true });
-  await git.raw(['worktree', 'add', '-b', branch, worktree, baseCommit]);
-  return { repository: root, worktree, branch, baseCommit, runId };
+  await service.addWorktree({ path: worktree, branch, startPoint: baseCommit });
+  return { repository: root, container, worktree, branch, baseCommit, runId };
 }
 
 export async function qualifyBootstrapCandidate(
@@ -327,7 +333,7 @@ async function createQualificationExecutor(
     const sandbox = new SubprocessSandbox({
       ws: workspace,
       language: 'typescript',
-      sandboxDir: '.sandbox/bootstrap-qualification',
+      environmentRoot: path.join(worktree, '.sandbox', 'bootstrap-qualification'),
       inheritEnv: false,
       limits: {
         cpu: 2,
@@ -347,6 +353,7 @@ async function createQualificationExecutor(
   const sandbox = new DockerSandbox({
     ws: workspace,
     language: 'typescript',
+    environmentRoot: path.join(worktree, '.sandbox', 'bootstrap-qualification'),
     image: options.dockerImage ?? 'node:24-slim',
     dockerBin: options.dockerBin,
     limits: {
@@ -474,6 +481,7 @@ export function renderBootstrapReport(result: BootstrapResult): string {
     `- ${L.baseCommit}: \`${result.baseCommit}\``,
     `- ${L.candidateCommit}: \`${result.candidateCommit ?? ''}\``,
     `- ${L.branch}: \`${result.branch}\``,
+    `- Container: \`${result.container}\``,
     `- ${L.worktree}: \`${result.worktree}\``,
     `- ${L.createdAt}: ${new Date().toISOString()}`,
     '',

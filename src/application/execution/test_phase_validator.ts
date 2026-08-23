@@ -1,80 +1,73 @@
-import chalk from 'chalk';
-import type { AuditLogger } from '../../audit/audit.js';
-import { t } from '../../i18n/index.js';
-import type { Sandbox } from '../../sandbox/types.js';
-import type {
-  ToolPermissionRequest,
-} from '../../tools/index.js';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import type { Workspace } from '../../workspace/workspace.js';
 import { testPlanDocForIteration } from '../../core/docs.js';
-import type { LanguageProfile } from '../../core/language.js';
 import {
-  V_MODEL_TEST_PHASES,
   V_MODEL_TEST_TO_SOURCE_PHASE,
   type Plan,
   type Step,
 } from '../../core/plan.js';
 import { inspectPairedSourceTests } from '../../core/paired_test_contract.js';
-import { pairedTestAssetPaths } from '../../core/test_assets.js';
+import {
+  pairedTestAssetPaths,
+  verificationSupplementRoot,
+  verificationSupplementUpwardPrefix,
+} from '../../core/test_assets.js';
 import {
   hasExecutableTestDeclaration,
   isTestFilePath,
   normalizeGitPath,
-  renderIncompleteTestPhaseFailure,
-  renderTestValidationFailure,
 } from './v_model_policy.js';
 
 export interface PairedTestAssetInspection {
   ok: boolean;
   testArgs: string[];
+  supplementalTestArgs: string[];
   testPlanPath?: string;
   missing: string[];
   invalid: string[];
   failureLog: string;
 }
 
-export type ExistingTestValidationResult =
-  | { status: 'passed' }
-  | { status: 'failed'; failureLog: string }
-  | { status: 'incomplete'; failureLog: string; missingOutputs: string[] }
-  | { status: 'denied'; failureLog: string };
-
+/** Enforces baseline ownership while allowing isolated, verification-owned risk supplements. */
 export class TestPhaseValidator {
-  constructor(
-    private readonly workspace: Workspace,
-    private readonly sandbox: Sandbox,
-    private readonly audit: AuditLogger,
-    private readonly requestPermission: (
-      request: ToolPermissionRequest,
-    ) => Promise<{ approved: boolean; reason?: string }>,
-    private readonly log: (message: string) => void,
-  ) {}
+  constructor(private readonly workspace: Workspace) {}
 
   testArgs(plan: Plan, step: Step): string[] {
     return pairedTestAssetPaths(plan.steps, step, plan.language)
       .map((testPath) => normalizeGitPath(testPath));
   }
 
+  supplementalRoot(step: Step): string {
+    return verificationSupplementRoot(step);
+  }
+
+  /** The frozen execution set: paired baseline plus this Step's own supplements. */
+  async executableTestArgs(plan: Plan, step: Step): Promise<string[]> {
+    return dedup([
+      ...this.testArgs(plan, step),
+      ...await this.supplementalTestArgs(plan, step),
+    ]);
+  }
+
   async inspect(plan: Plan, step: Step): Promise<PairedTestAssetInspection> {
     const testArgs = this.testArgs(plan, step);
+    const supplementalTestArgs = await this.supplementalTestArgs(plan, step);
     const iterationId = step.iterationId ?? 'P1';
     const testPlanPath = testPlanDocForIteration(step.phase, iterationId);
-    const expected = dedup([
-      ...(testPlanPath ? [testPlanPath] : []),
-      ...testArgs,
-    ]);
+    const expected = dedup([...(testPlanPath ? [testPlanPath] : []), ...testArgs]);
     const missing: string[] = [];
     const invalid: string[] = [];
+    const supplementalRoot = this.supplementalRoot(step);
     const illegallyOwnedTests = step.outputs
       .map((output) => normalizeGitPath(output))
-      .filter(isTestFilePath);
+      .filter((output) => isTestFilePath(output) && !output.startsWith(supplementalRoot));
 
-    if (testArgs.length === 0) {
-      invalid.push(`${step.phase} has no executable paired test asset`);
-    }
+    if (testArgs.length === 0) invalid.push(`${step.phase} has no executable paired baseline test`);
     if (illegallyOwnedTests.length > 0) {
       invalid.push(
-        `${step.phase} is validation-only but declares executable test outputs: ${illegallyOwnedTests.join(', ')}`,
+        `${step.phase} may own supplements only under ${supplementalRoot}: ` +
+        illegallyOwnedTests.join(', '),
       );
     }
     for (const file of expected) {
@@ -83,25 +76,25 @@ export class TestPhaseValidator {
         continue;
       }
       const content = await this.workspace.readFile(file).catch(() => '');
-      if (!content.trim()) {
-        invalid.push(`${file}: empty`);
-      } else if (
-        isTestFilePath(file) &&
-        !hasExecutableTestDeclaration(content, plan.language)
-      ) {
+      if (!content.trim()) invalid.push(`${file}: empty`);
+      else if (isTestFilePath(file) && !hasExecutableTestDeclaration(content, plan.language)) {
         invalid.push(`${file}: no executable test case declaration found`);
       }
     }
+    for (const file of supplementalTestArgs) {
+      const content = await this.workspace.readFile(file).catch(() => '');
+      if (!content.trim()) invalid.push(`${file}: empty supplemental test`);
+      else if (!hasExecutableTestDeclaration(content, plan.language)) {
+        invalid.push(`${file}: no executable supplemental test case declaration found`);
+      }
+    }
+    const sourcePhase = V_MODEL_TEST_TO_SOURCE_PHASE[
+      step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE
+    ];
     for (const sourceStep of plan.steps.filter((candidate) =>
-      (candidate.iterationId ?? 'P1') === iterationId &&
-      candidate.phase === V_MODEL_TEST_TO_SOURCE_PHASE[
-        step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE
-      ])) {
-      const sourceContract = await inspectPairedSourceTests(
-        this.workspace,
-        plan,
-        sourceStep,
-      );
+      (candidate.iterationId ?? 'P1') === iterationId && candidate.phase === sourcePhase
+    )) {
+      const sourceContract = await inspectPairedSourceTests(this.workspace, plan, sourceStep);
       invalid.push(...sourceContract.invalid);
     }
 
@@ -109,223 +102,50 @@ export class TestPhaseValidator {
     return {
       ok,
       testArgs,
+      supplementalTestArgs,
       testPlanPath,
       missing,
       invalid,
-      failureLog: ok
-        ? ''
-        : [
-            `${step.id} ${step.phase} paired test completeness gate failed.`,
-            `Paired source phase: ${V_MODEL_TEST_TO_SOURCE_PHASE[
-              step.phase as keyof typeof V_MODEL_TEST_TO_SOURCE_PHASE
-            ]}.`,
-            testPlanPath ? `Required test plan: ${testPlanPath}` : '',
-            testArgs.length > 0 ? `Executable tests: ${testArgs.join(', ')}` : '',
-            missing.length > 0 ? `Missing: ${missing.join(', ')}` : '',
-            invalid.length > 0 ? `Invalid: ${invalid.join(' | ')}` : '',
-            'Create a Bug Ticket and route it to the paired source phase; the validation phase must not create or rewrite tests.',
-          ].filter(Boolean).join('\n'),
-    };
-  }
-
-  async validateExisting(
-    plan: Plan,
-    step: Step,
-    profile: LanguageProfile,
-  ): Promise<ExistingTestValidationResult> {
-    if (!isVModelTestPhase(step.phase)) {
-      return {
-        status: 'denied',
-        failureLog:
-          `${step.id} ${step.phase} is not a V-model test phase and cannot run test revalidation.`,
-      };
-    }
-    const completeness = await this.inspect(plan, step);
-    const testArgs = completeness.testArgs;
-    if (!completeness.ok) {
-      await this.audit.event(
-        'note',
-        `rollback validation found incomplete paired tests for ${step.id}`,
-        {
-          messageId: 'engine.rollback_validation_test_cases_incomplete',
-          stepId: step.id,
-          phase: step.phase,
-          testPlanPath: completeness.testPlanPath,
-          testArgs,
-          missing: completeness.missing,
-          invalid: completeness.invalid,
-        },
-      );
-      return { status: 'failed', failureLog: completeness.failureLog };
-    }
-    const missing: string[] = [];
-    for (const output of step.outputs) {
-      if (!output.endsWith('/') && !(await this.workspace.exists(output))) {
-        missing.push(output);
-      }
-    }
-    const missingTestOutputs = missing
-      .map((output) => normalizeGitPath(output))
-      .filter(isTestFilePath);
-    if (missing.length > 0) {
-      await this.audit.event(
-        'note',
-        `rollback validation found missing outputs for ${step.id}: ${missing.join(', ')}`,
-        {
-          messageId: 'engine.rollback_validation_missing_outputs',
-          stepId: step.id,
-          phase: step.phase,
-          missing,
-          missingTestOutputs,
-          testGateRunnable: missingTestOutputs.length === 0,
-        },
-      );
-      if (missingTestOutputs.length > 0) {
-        const failureLog = renderIncompleteTestPhaseFailure(step, missing);
-        this.log(chalk.yellow(t().engine.cachedTestArtifactsIncomplete(step.id, missing)));
-        return { status: 'incomplete', failureLog, missingOutputs: missing };
-      }
-    }
-
-    await profile.ensureTestBootstrap?.(this.workspace, this.audit);
-    await profile.autoFixImports?.(this.workspace, this.audit);
-    const testPermission = await this.requestPermission({
-      operationType: 'test_command',
-      target: `${profile.id} rollback validation for ${step.id}`,
-      reason: 'Validate the repaired test phase outputs before regenerating them.',
-      risk: 'Project test commands execute code in the configured sandbox.',
-      scope: 'current workspace sandbox',
-      skippable: true,
-      denyBehavior: 'Regenerate the test phase through the normal V-model step.',
-      stepId: step.id,
-    });
-    if (!testPermission.approved) {
-      await this.audit.event('note', `rollback validation denied for ${step.id}`, {
-        messageId: 'engine.rollback_validation_denied',
-        stepId: step.id,
-        phase: step.phase,
-        reason: testPermission.reason,
-      });
-      return {
-        status: 'denied',
-        failureLog:
-          `permission denied for test revalidation ${step.id}` +
-          (testPermission.reason ? `: ${testPermission.reason}` : ''),
-      };
-    }
-
-    this.log(chalk.gray(t().engine.cachedTestGateStart(step.id, testArgs)));
-    await this.audit.event('note', `running current test gate for ${step.id}`, {
-      messageId: 'engine.rollback_validation_started',
-      stepId: step.id,
-      phase: step.phase,
-      testArgs,
-      missingNonTestOutputs: missing,
-    });
-    const tests = await this.sandbox.runTests(testArgs, {});
-    if (tests.exitCode !== 0 || tests.timedOut) {
-      this.log(
-        chalk.red(
-          t().engine.cachedTestGateFailed(step.id, tests.exitCode, !!tests.timedOut),
-        ),
-      );
-      await this.audit.event('note', `rollback validation failed for ${step.id}`, {
-        messageId: 'engine.rollback_validation_failed',
-        stepId: step.id,
-        phase: step.phase,
-        testArgs,
-        exitCode: tests.exitCode,
-        timedOut: tests.timedOut,
-        stdout: tests.stdout,
-        stderr: tests.stderr,
-      });
-      return {
-        status: 'failed',
-        failureLog: renderTestValidationFailure(step, testArgs, tests),
-      };
-    }
-    this.log(chalk.green(t().engine.cachedTestGatePassed(step.id)));
-
-    if (step.phase === 'FUNCTIONAL_TEST') {
-      const functionalResult = await this.validateFunctionalProbe(step, profile);
-      if (functionalResult) return functionalResult;
-    }
-    if (missing.length > 0) {
-      const failureLog = renderIncompleteTestPhaseFailure(step, missing);
-      this.log(chalk.yellow(t().engine.cachedTestArtifactsIncomplete(step.id, missing)));
-      await this.audit.event(
-        'note',
-        `current test gate passed but ${step.id} outputs are incomplete`,
-        {
-          messageId: 'engine.rollback_validation_incomplete_outputs',
-          stepId: step.id,
-          phase: step.phase,
-          testArgs,
-          missing,
-        },
-      );
-      return { status: 'incomplete', failureLog, missingOutputs: missing };
-    }
-    return { status: 'passed' };
-  }
-
-  private async validateFunctionalProbe(
-    step: Step,
-    profile: LanguageProfile,
-  ): Promise<ExistingTestValidationResult | undefined> {
-    const permission = await this.requestPermission({
-      operationType: 'shell_command',
-      target: `${profile.id} rollback functional probe for ${step.id}`,
-      reason: 'Validate the generated project entrypoint after rollback repair.',
-      risk: 'This executes project code in the configured sandbox.',
-      scope: 'current workspace sandbox',
-      skippable: true,
-      denyBehavior: 'Regenerate the functional test phase through the normal V-model step.',
-      stepId: step.id,
-    });
-    if (!permission.approved) {
-      await this.audit.event('note', `rollback functional probe denied for ${step.id}`, {
-        messageId: 'engine.rollback_functional_probe_denied',
-        stepId: step.id,
-        phase: step.phase,
-        reason: permission.reason,
-      });
-      return {
-        status: 'denied',
-        failureLog:
-          `permission denied for functional probe revalidation ${step.id}` +
-          (permission.reason ? `: ${permission.reason}` : ''),
-      };
-    }
-    const probe = await profile.probeEntry(this.workspace, this.sandbox);
-    if (probe.ok) return undefined;
-    await this.audit.event('note', `rollback functional probe failed for ${step.id}`, {
-      messageId: 'engine.rollback_functional_probe_failed',
-      stepId: step.id,
-      phase: step.phase,
-      command: probe.command,
-      exitCode: probe.exitCode,
-      timedOut: probe.timedOut,
-      stdoutTail: probe.stdoutTail,
-      stderrTail: probe.stderrTail,
-    });
-    return {
-      status: 'failed',
-      failureLog: [
-        `${step.phase} cached validation entrypoint probe failed for ${step.id}.`,
-        `command: ${probe.command}`,
-        `exit=${probe.exitCode} timedOut=${probe.timedOut}`,
-        probe.stdoutTail ? `stdout:\n${probe.stdoutTail}` : '',
-        probe.stderrTail ? `stderr:\n${probe.stderrTail}` : '',
+      failureLog: ok ? '' : [
+        `${step.id} ${step.phase} delivery-gate entry inspection failed.`,
+        `Paired source phase: ${sourcePhase}.`,
+        testPlanPath ? `Required baseline test plan: ${testPlanPath}` : '',
+        testArgs.length > 0 ? `Baseline tests: ${testArgs.join(', ')}` : '',
+        supplementalTestArgs.length > 0
+          ? `Existing verification supplements: ${supplementalTestArgs.join(', ')}`
+          : '',
+        `Supplement ownership root: ${supplementalRoot}`,
+        `From that root the product is ${verificationSupplementUpwardPrefix(supplementalRoot)}src/… ` +
+          '— use exactly that prefix rather than counting the directories, which is where a Step ' +
+          'spent every one of its attempts while the cases around it passed.',
+        missing.length > 0 ? `Missing: ${missing.join(', ')}` : '',
+        invalid.length > 0 ? `Invalid: ${invalid.join(' | ')}` : '',
+        'Route each baseline incompleteness finding to its paired source owner. A verifier may only ' +
+          'repair its own supplemental tests under the supplement root.',
       ].filter(Boolean).join('\n'),
     };
   }
+
+  private async supplementalTestArgs(plan: Plan, step: Step): Promise<string[]> {
+    const root = this.supplementalRoot(step);
+    const files: string[] = [];
+    await walk(this.workspace.abs(root), root.replace(/\/$/u, ''), files);
+    return files
+      .map((file) => normalizeGitPath(file))
+      .filter((file) => isTestFilePath(file))
+      .filter((file) => plan.language === 'typescript' ? /\.(?:test|spec)\.tsx?$/u.test(file) : true)
+      .sort();
+  }
 }
 
-function isVModelTestPhase(
-  phase: Step['phase'],
-): phase is (typeof V_MODEL_TEST_PHASES)[number] {
-  return (V_MODEL_TEST_PHASES as readonly string[]).includes(phase);
+async function walk(abs: string, rel: string, out: string[]): Promise<void> {
+  const entries = await fs.readdir(abs, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const childAbs = path.join(abs, entry.name);
+    const childRel = `${rel}/${entry.name}`;
+    if (entry.isDirectory()) await walk(childAbs, childRel, out);
+    else out.push(childRel);
+  }
 }
 
 function dedup<T>(items: T[]): T[] {

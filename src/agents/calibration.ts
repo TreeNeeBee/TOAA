@@ -18,11 +18,16 @@ import {
 } from '../core/docs.js';
 import { architectureImplementationPaths, pathCoveredByOutputs } from '../core/architecture.js';
 import { getLanguageProfile } from '../core/language.js';
-import { isExecutableTestPath } from '../core/test_assets.js';
 import {
-  isLoopbackNetworkFailureLine,
-  isTestAssertionDiagnosticLine,
-} from '../core/network_api_gate.js';
+  isExecutableTestPath,
+  isRuntimeOwnedVerificationTestPath,
+  verificationSupplementRoot,
+} from '../core/test_assets.js';
+import {
+  baselineDeliveryGate,
+  type DevelopmentDeliveryGateStage,
+  verificationDeliveryGate,
+} from '../domain/quality/delivery_gate.js';
 
 /**
  * 统一的 LLM 输出校准层（"calibration"）。
@@ -135,6 +140,10 @@ function packageKey(line: string): string {
 
 /** LLM 常用的旧文档名 → 规范化命名。 */
 export const DOC_PATH_ALIASES: Record<string, string> = {
+  'docs/project-topic.md': DOC_NAMES.topic,
+  'docs/project_topic.md': DOC_NAMES.topic,
+  'docs/project-topic.txt': DOC_NAMES.topic,
+  'docs/topic.txt': DOC_NAMES.topic,
   'docs/01-requirement.md': DOC_NAMES.requirementAnalysis,
   'docs/requirements.md': DOC_NAMES.requirementAnalysis,
   'docs/requirement.md': DOC_NAMES.requirementAnalysis,
@@ -199,7 +208,10 @@ export function calibrateDocPaths(steps: Step[], projectType: ProjectType = 'app
   const dropTopic = (p: string): boolean => p !== DOC_NAMES.topic;
   return steps.map((s) => {
     const iterationId = s.iterationId ?? 'P1';
-    const inputs = dedup((s.inputs ?? []).map((p) => iterationScopedInput(remap(p), s.phase, iterationId)));
+    let inputs = dedup((s.inputs ?? []).map((p) => iterationScopedInput(remap(p), s.phase, iterationId)));
+    if (s.phase === 'REQUIREMENT_ANALYSIS' && !inputs.includes(DOC_NAMES.topic)) {
+      inputs = [DOC_NAMES.topic, ...inputs];
+    }
     let outputs = dedup((s.outputs ?? []).map((p) => iterationScopedDoc(remap(p), s.phase, iterationId)).filter(dropTopic));
     outputs = outputs.filter((out) => {
       const ownerPhase = testPlanOwnerPhase(out, iterationId);
@@ -218,9 +230,35 @@ export function calibrateDocPaths(steps: Step[], projectType: ProjectType = 'app
     if (s.phase === 'FUNCTIONAL_TEST') {
       const requiredDocs = [...deliveryDocsForIteration(projectType, iterationId)];
       outputs = [...requiredDocs, ...outputs.filter((out) => !requiredDocs.includes(out))];
+      return { ...s, inputs, outputs, acceptance: withOutcomeAssertionRequirement(s.acceptance) };
     }
     return { ...s, inputs, outputs };
   });
+}
+
+/**
+ * Requires the acceptance level to check what the product produced, not merely its shape.
+ *
+ * Stated as a requirement rather than detected afterwards: whether an assertion examines a value or
+ * its type cannot be told apart from source text with any reliability. A delivered project passed
+ * 115 assertions of the form `expect(typeof item.title).toBe('string')` while every one of its
+ * hundred records carried the same summary twice — every field present, every type right, the
+ * content wrong. The Phase delivery gate judges the same question against the run's real output, so
+ * a suite that ignores this is caught there; saying it here is what gives the Step a chance to get
+ * it right the first time.
+ *
+ * Phrased without reference to any domain, because the Step it instructs may be verifying a
+ * scraper, a compiler, a migration, or a report.
+ */
+function withOutcomeAssertionRequirement(acceptance: string | undefined): string {
+  const requirement = 'Acceptance cases must assert what the produced result contains — exact ' +
+    'values, ranges, ordering, counts, or the absence of wrong content — not merely that a field ' +
+    'exists and has the expected type. A suite that only checks shape passes on output that is ' +
+    'duplicated, empty, or nonsense for the field it fills.';
+  const text = (acceptance ?? '').trim();
+  return text.includes('assert what the produced result contains') || text.includes(requirement)
+    ? text
+    : [text, requirement].filter(Boolean).join(' ');
 }
 
 /** 补齐同一 iteration 内标准 V 模型宏步骤的相邻顺序依赖。 */
@@ -248,6 +286,57 @@ export function calibrateVModelDependencies(steps: Step[]): Step[] {
   }
 
   return out;
+}
+
+/**
+ * Expands Planner globs only when they resolve to concrete outputs in the same StepPlan.
+ *
+ * Step inputs are an auditable artifact graph, not shell selectors. Models nevertheless copy
+ * patterns such as `src/**\/*.ts` from tsconfig conventions. Expanding a matched pattern preserves
+ * the intended dependency while keeping lint strict: an unmatched glob remains unchanged and is
+ * rejected as an unowned input instead of being silently accepted.
+ */
+export function calibrateProducedInputGlobs(steps: Step[]): Step[] {
+  const outputs = dedup(steps.flatMap((step) => step.outputs)).sort();
+  return steps.map((step) => ({
+    ...step,
+    inputs: dedup(step.inputs.flatMap((input) => {
+      if (!hasPathGlob(input)) return [input];
+      const matches = outputs.filter((output) => globPathMatches(input, output));
+      return matches.length > 0 ? matches : [input];
+    })),
+  }));
+}
+
+function hasPathGlob(value: string): boolean {
+  return /[*?]/u.test(value);
+}
+
+function globPathMatches(pattern: string, candidate: string): boolean {
+  let source = '^';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!;
+    if (char === '*') {
+      if (pattern[index + 1] === '*') {
+        index += 1;
+        if (pattern[index + 1] === '/') {
+          index += 1;
+          source += '(?:.*/)?';
+        } else {
+          source += '.*';
+        }
+      } else {
+        source += '[^/]*';
+      }
+      continue;
+    }
+    if (char === '?') {
+      source += '[^/]';
+      continue;
+    }
+    source += char.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  }
+  return new RegExp(`${source}$`, 'u').test(candidate);
 }
 
 export function calibrateArchitectureModuleDependencies(
@@ -535,29 +624,66 @@ const WRITE_CAPABLE_TOOL_REFS = new Set([
   'append_file',
   'apply_patch',
   'replace_in_file',
-  'skill:author',
-  'skill:patcher',
-  'skill:tester',
-  'skill:debugger',
-  'skill:refactorer',
+  'skill:artifact-authoring',
+  'skill:focused-file-editing',
+  'skill:file-operations',
+  'skill:test-design',
+  'skill:test-execution',
+  'skill:systematic-debugging',
+  'skill:behavior-preserving-refactoring',
 ]);
 
+import { DEPENDENCY_MANIFEST_OWNER } from '../domain/steps/step.js';
+
 const PHASE_DEFAULT_TOOLS: Record<string, string[]> = {
-  REQUIREMENT_ANALYSIS: ['skill:author'],
-  HIGH_LEVEL_DESIGN: ['skill:author'],
-  DETAILED_DESIGN: ['skill:author'],
-  CODE: ['skill:author'],
-  UNIT_TEST: ['skill:tester'],
-  INTEGRATION_TEST: ['skill:tester'],
-  MODULE_TEST: ['skill:tester'],
-  FUNCTIONAL_TEST: ['skill:tester'],
+  REQUIREMENT_ANALYSIS: ['skill:artifact-authoring', 'skill:test-design'],
+  // The phase that owns the manifest is handed the dependency Skill. An earlier capability existed
+  // but was wired to nobody, so the Step every dependency Change Request routes to could not act.
+  HIGH_LEVEL_DESIGN: ['skill:artifact-authoring', 'skill:test-design', 'skill:dependency-resolution'],
+  DETAILED_DESIGN: ['skill:artifact-authoring', 'skill:test-design'],
+  // CODE owns both build/static validation and the executable unit baseline gate.
+  CODE: ['skill:artifact-authoring', 'skill:test-design', 'run_program', 'run_tests'],
+  UNIT_TEST: ['skill:test-execution', 'skill:record-replay-fixtures'],
+  INTEGRATION_TEST: ['skill:test-execution', 'skill:record-replay-fixtures'],
+  MODULE_TEST: ['skill:test-execution', 'skill:record-replay-fixtures'],
+  FUNCTIONAL_TEST: ['skill:test-execution', 'skill:record-replay-fixtures', 'skill:verification-before-delivery'],
 };
 
+// Phases whose defaults are merged in rather than used only as a fallback. A verification phase
+// cannot verify without a runner, and the manifest owner cannot own a manifest it has no tool to
+// edit — in both cases the planner's list is a preference, not the whole story.
 const PHASE_DEFAULT_TOOLS_REQUIRED = new Set([
+  DEPENDENCY_MANIFEST_OWNER,
+  'CODE',
   'UNIT_TEST',
   'INTEGRATION_TEST',
   'MODULE_TEST',
   'FUNCTIONAL_TEST',
+]);
+
+/**
+ * Reading is a precondition of every contract a Step is held to, not a capability a plan may omit.
+ *
+ * A planner that declared only write tools left three of the four development phases unable to read
+ * anything. A Change Request disposition requires inspecting the affected artifacts before it can be
+ * recorded; a Step that cannot inspect produces no valid completion and spends its whole round
+ * budget — which is exactly how a downstream dependency re-check stalled with no tool call at all.
+ */
+const ALWAYS_AVAILABLE_TOOL_REFS = ['read_file', 'list_dir'] as const;
+
+/**
+ * Development phases own paired baseline suites, and their delivery gate can require executing them.
+ *
+ * S1-S3 defer that execution only on the initial pre-CODE pass; a correction routed back from CODE
+ * or any right-side Step proves a product baseline exists, and the gate then requires the run. The
+ * runner is injected automatically at that point — but only if the Step has it, and none of the
+ * three had it, so the requirement passed silently without a single test being executed.
+ */
+const BASELINE_OWNING_PHASES = new Set([
+  'REQUIREMENT_ANALYSIS',
+  'HIGH_LEVEL_DESIGN',
+  'DETAILED_DESIGN',
+  'CODE',
 ]);
 
 export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'outputs'>): string[] {
@@ -570,8 +696,27 @@ export function ensureEssentialToolRefs(step: Pick<Step, 'phase' | 'tools' | 'ou
     : tools;
   const hasWriteCapability = baseTools.some((tool) => WRITE_CAPABLE_TOOL_REFS.has(tool));
   const withChunkedWritePair = ensureChunkedWritePair(baseTools);
-  if (!needsWritableOutputs || hasWriteCapability) return withChunkedWritePair;
-  return ensureChunkedWritePair([...baseTools, ...(phaseDefaults.length > 0 ? phaseDefaults : ['write_file'])]);
+  if (!needsWritableOutputs || hasWriteCapability) {
+    return withBaselineRunner(withReadAccess(withChunkedWritePair), step.phase);
+  }
+  return withBaselineRunner(
+    withReadAccess(
+      ensureChunkedWritePair([...baseTools, ...(phaseDefaults.length > 0 ? phaseDefaults : ['write_file'])]),
+    ),
+    step.phase,
+  );
+}
+
+/** A skill that already carries reading satisfies this; only a Step with no reader gains one. */
+function withReadAccess(tools: string[]): string[] {
+  const missing = ALWAYS_AVAILABLE_TOOL_REFS.filter((tool) => !tools.includes(tool));
+  return missing.length === 0 ? tools : dedup([...tools, ...missing]);
+}
+
+/** Holding the runner does not run anything: the gate decides, and only `execute` injects a run. */
+function withBaselineRunner(tools: string[], phase: string): string[] {
+  if (!BASELINE_OWNING_PHASES.has(phase) || tools.includes('run_tests')) return tools;
+  return dedup([...tools, 'run_tests']);
 }
 
 function ensureChunkedWritePair(tools: string[]): string[] {
@@ -729,7 +874,7 @@ function dedup<T>(arr: T[]): T[] {
 /**
  * LLM 经常能正确列出 architectureModules，却没有把模块测试资产归给 HIGH_LEVEL_DESIGN。
  * 新版计划模型保留“大 Step”执行语义，不再把这些 Step 机械拆碎；模块级细分写入 subTasks。
- * MODULE_TEST 只消费并验证这些测试，不再负责创建测试文件。
+ * MODULE_TEST 消费这些基线，并只在自己的隔离命名空间按风险追加补充测试。
  */
 export function calibrateArchitectureStepMappings(
   steps: Step[],
@@ -888,9 +1033,9 @@ function flattenSubTaskTexts(tasks: StepSubtask[]): string[] {
 // =============================================================================
 
 /**
- * 兜底保证每个左侧阶段拥有配对的可执行测试资产，右侧测试阶段只消费
- * 这些测试并产出报告。若缺少 UNIT_TEST 宏 Step，则补充一个验证 Step，
- * 但测试文件仍由 CODE 阶段拥有。
+ * 兜底保证每个左侧阶段拥有配对的可执行基线测试。右侧测试阶段独立检查基线、
+ * 在自己的隔离目录按风险补充测试、冻结并执行完整集合。若缺少 UNIT_TEST 宏 Step，
+ * 则补充一个遵循相同门禁的验证 Step；基线测试文件仍由 CODE 阶段拥有。
  */
 export function calibratePlanCoverage(steps: Step[], language: Language = 'python'): Step[] {
   const withPairedTestAssets = ensurePairedTestAssets(steps, language);
@@ -954,6 +1099,11 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
     maxNum += 1;
     const newId = 'S' + String(maxNum).padStart(3, '0');
     const unitTestDoc = phaseDocForIteration('UNIT_TEST', iterationId);
+    const supplementalRoot = verificationSupplementRoot({
+      id: newId,
+      iterationId,
+      phase: 'UNIT_TEST',
+    });
     const testOutputs = uncovered.map((codeStep) => {
       const existing = codeStep.outputs.find((output) => isExecutableTestPath(output, language));
       if (existing) return existing;
@@ -971,20 +1121,21 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
       title: `自动补齐单元测试：覆盖 ${uncovered.map((c) => c.id).join(' / ')}`,
       description:
         `Planner 未为 ${targetTitles} 显式生成 UNIT_TEST Step，由 calibration 自动追加。` +
-        `Tester 只检查并执行 CODE 阶段已经生成的测试，记录验证结果。`,
+        `Tester 独立检查 CODE 基线，按风险补充、冻结并执行完整测试集合。`,
       systemPrompt:
         `本 Step 是 calibration 自动追加的 UNIT_TEST 验证兜底，覆盖以下 CODE Step：${targetTitles}。\n` +
-        `范围：读取并审查 ${testOutputs.join(', ')}，运行测试，只写 ${unitTestDoc ?? 'UNIT_TEST report'}；` +
-        `禁止创建或修改 tests/** 与 src/**。\n` +
-        `验收：测试完整性检查通过，所有既有测试在 ${tsMode ? 'npm test / Vitest' : 'pytest'} 下通过。`,
+        `范围：读取并审查 ${testOutputs.join(', ')}；只允许在 ${supplementalRoot} 新增风险补充测试，` +
+        `冻结“基线 + 补充”集合后运行测试，并写 ${unitTestDoc ?? 'UNIT_TEST report'}；` +
+        `禁止修改配对基线测试与 src/**。\n` +
+        `验收：测试完整性检查通过，冻结集合在 ${tsMode ? 'npm test / Vitest' : 'pytest'} 下全部通过。`,
       role: 'Tester',
-      tools: ['skill:tester'],
+      tools: ['skill:test-execution', 'skill:record-replay-fixtures'],
       inputs: dedup(uncovered.flatMap((c) => c.outputs)),
       outputs: unitTestDoc ? [unitTestDoc] : [],
       dependsOn: uncovered.map((c) => c.id),
       acceptance: tsMode
-        ? `既有 Vitest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`
-        : `既有 pytest 测试完整且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`,
+        ? `Vitest 基线与风险补充测试完整、冻结且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`
+        : `pytest 基线与风险补充测试完整、冻结且全部通过，验证报告覆盖 ${uncovered.map((c) => c.id).join(' / ')}。`,
       maxAttempts: 3,
     });
   }
@@ -1009,8 +1160,14 @@ export function calibratePlanCoverage(steps: Step[], language: Language = 'pytho
 function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
   const out = steps.map((step) => ({
     ...step,
-    inputs: dedup([...step.inputs]),
-    outputs: dedup([...step.outputs]),
+    inputs: dedup(step.inputs.filter((path) => !isRuntimeOwnedVerificationTestPath(path))),
+    outputs: dedup(step.outputs.filter((path) => !isRuntimeOwnedVerificationTestPath(path))),
+    deliveryGate: step.deliveryGate ?? (
+      (['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE'] as Step['phase'][])
+        .includes(step.phase)
+        ? baselineDeliveryGate(step.id, step.phase as DevelopmentDeliveryGateStage)
+        : verificationDeliveryGate(step.id)
+    ),
   }));
   const usedPaths = new Set(out.flatMap((step) => step.outputs));
   const iterationIds = dedup(out.map((step) => step.iterationId ?? 'P1'));
@@ -1075,18 +1232,22 @@ function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
         sourceStep.tools = ensureEssentialToolRefs(sourceStep);
       }
 
-      const validationMarker = 'V-model validation-only contract';
+      const validationMarker = 'V-model independent acceptance contract';
       for (const testStep of testSteps) {
         testStep.inputs = dedup([...testStep.inputs, ...testAssets]);
+        const supplementalRoot = verificationSupplementRoot(testStep);
         if (!testStep.systemPrompt.includes(validationMarker)) {
           testStep.systemPrompt +=
             `\n\n${validationMarker}（强制）：本 ${testPhase} 阶段先检查 ${testAssets.join(', ')} ` +
-            `与配对测试计划的完整性和一致性，再使用 ${testCommand} 运行这些既有测试；` +
-            `只写声明的验证报告/交付文档，禁止创建、修改或删除 tests/** 与 src/**。` +
-            `发现缺失、错误或失败时必须报告证据；若现有测试仍可能运行成功但语义覆盖不完整，` +
-            `在 JSON 中填写 validationDefect 并设置 done=false，由 Engine 建立 Bug Ticket 并路由回 ${sourcePhase}。`;
+            `与配对测试计划的完整性和一致性，执行风险分析；只允许在 ${supplementalRoot} ` +
+            `新增本阶段拥有的聚焦补充测试，禁止修改配对基线测试和 src/**。` +
+            `补充完成后冻结“基线 + 补充”测试集，再使用 ${testCommand} 完整执行。` +
+            `涉及外部数据时使用 Record/Replay 保持可复现；真实用户场景由 Phase 交付门禁统一执行。` +
+            `每个独立问题写入 qualityAssessment.findings；基线测试缺陷使用 test-defect + paired-source，` +
+            `补充测试缺陷使用 test-defect + current-step，` +
+            `产品缺陷使用 product-defect，测试不完整使用 test-incomplete，依赖问题使用 dependency。`;
           testStep.acceptance +=
-            ` 既有测试用例完整性检查通过且 ${testCommand} 执行成功；本阶段未改写测试或产品代码。`;
+            ` 基线与风险补充测试已冻结并由 ${testCommand} 执行成功；本阶段未改写基线测试或产品代码。`;
         }
         testStep.tools = ensureEssentialToolRefs(testStep);
       }
@@ -1117,499 +1278,26 @@ function uniqueRunnableTestPath(
 }
 
 // =============================================================================
-// 5. Debugger 失败日志 → 可执行修复建议
+// 5. Debugger 失败日志 → 修复知识
 // =============================================================================
-
-/**
- * 一条修复建议。`severity` 仅用于排序展示，hint 必须是"立即可执行"的指令型表达，
- * 避免空话；推荐工具调用名一律用反引号包裹，便于 Debugger LLM 直接复制使用。
- */
-export interface DebugSuggestion {
-  /** 模式标识，便于审计/统计；不会展示给 LLM。 */
-  code: string;
-  /** 1=高优先 2=中 3=兜底 */
-  severity: 1 | 2 | 3;
-  /** 给 Debugger 看的 actionable 文本（一行）。 */
-  hint: string;
-  /** 命中的关键证据片段（截断），便于排错。 */
-  evidence?: string;
-}
-
-interface SuggestionRule {
-  code: string;
-  severity: 1 | 2 | 3;
-  /** 用 RegExp 数组匹配 failureLog；任一命中即触发。 */
-  patterns: RegExp[];
-  /** 可选排除条件；用于避免基础设施 LLM provider 错误被业务网络 API 规则误吸收。 */
-  skip?: (text: string) => boolean;
-  /** 可选单次命中排除条件；用于忽略测试断言里的 mock HTTP 文本等局部误报。 */
-  ignoreMatch?: (m: RegExpExecArray, text: string) => boolean;
-  /** 由匹配组生成 hint；m 为第一条命中正则的 RegExpExecArray。 */
-  build: (m: RegExpExecArray) => string;
-}
-
-function networkApiStatusGuidance(log: string): string {
-  const status = extractNetworkStatus(log);
-  if (!status) {
-    return '先区分是认证/权限、URL 不存在、限流、超时还是服务端故障；';
-  }
-  if (status === '401' || status === '403') {
-    return `HTTP ${status} 表示认证/权限不可用：若用户未提供 key/token，必须切换到公开免 key/token API；若用户提供了凭证，先修正鉴权头/参数；`;
-  }
-  if (status === '404' || status === '410') {
-    return `HTTP ${status} 表示 URL/资源不可用：不要重试同一地址，必须更换仍维护的 endpoint 或 API；`;
-  }
-  if (status === '429') {
-    return 'HTTP 429 表示限流：优先切换免 key 且限流更宽的候选 API，或实现退避/缓存并用测试覆盖限流分支；';
-  }
-  if (status === '408') {
-    return 'HTTP 408/超时表示当前接口时延不可接受：尝试更稳定的 API，并设置显式 timeout 与失败分支；';
-  }
-  if (/^5/u.test(status)) {
-    return `HTTP ${status} 表示服务端故障：不要把它当成功降级，需切换可用 API 或提供明确失败退出路径；`;
-  }
-  return `HTTP ${status} 表示接口契约或请求参数不匹配：先核对参数/响应 schema，不匹配则切换更适合的 API；`;
-}
-
-function extractNetworkStatus(log: string): string | undefined {
-  const patterns = [
-    /\bHTTP\s*(?:status\s*)?(401|403|404|408|409|410|422|429|5\d\d)\b/i,
-    /\bstatus(?:\s*code)?\s*[=:]?\s*(401|403|404|408|409|410|422|429|5\d\d)\b/i,
-    /\b(?:api|request|fetch|接口|请求)\b[^\n]{0,80}\b(401|403|404|408|409|410|422|429|5\d\d)\b/i,
-    /\b(401|403|404|408|409|410|422|429|5\d\d)\b[^\n]{0,80}\b(?:api|request|fetch|接口|请求)\b/i,
-  ];
-  for (const pattern of patterns) {
-    const match = log.match(pattern)?.[1];
-    if (match) return match;
-  }
-  return undefined;
-}
-
-function hasOnlyLoopbackNetworkEvidence(text: string): boolean {
-  const lines = text.replace(/\r\n?/g, '\n').split('\n');
-  if (!lines.some(isLoopbackNetworkFailureLine)) return false;
-  return !lines.some((line) => {
-    if (isLoopbackNetworkFailureLine(line)) return false;
-    if (/^\s*Network API failure detected(?:\.|$)/i.test(line)) return false;
-    return /https?:\/\/(?!localhost\b|127(?:\.\d{1,3}){3}\b|\[?::1\]?\b)[^\s'")]+[^\n]{0,160}\b(?:failed|error|timeout|unreachable|unavailable|401|403|404|429|5\d\d)\b/i.test(line) ||
-      /\b(?:api|http|request|network|connection|timeout|timed out)\b[^\n]{0,120}\b(?:401|403|404|429|5\d\d)\b/i.test(line);
-  });
-}
-
-/**
- * 常见 Python 错误模式 → 可执行建议。
- * 顺序意义：上面的规则优先级更高（severity=1 也排在前），重复 code 只保留首条。
- *
- * 维护原则：
- *  - 只针对"LLM 实际反复踩坑"的错误加规则；不要堆砌教科书式提示。
- *  - hint 必须给"下一步具体动作"，不是"原因解释"。
- *  - 工具名（read_file/code_search/write_file/...）用反引号包裹，让 LLM 直接复制。
- */
-const PYTHON_ERROR_RULES: SuggestionRule[] = [
-  // —— 模块/路径类（用户最常见痛点） ————————————————————
-  {
-    code: 'ModuleNotFoundError-direct-script',
-    severity: 1,
-    // 命中：错误来自 tests/ 下的脚本，且缺失模块名是无点的"裸名"——典型的
-    // "python tests/test_X.py 直接执行 → src/ 不在 sys.path" 场景。
-    patterns: [
-      /File\s+["'][^"']*\/tests\/[^"']+\.py["'][^]*?ModuleNotFoundError:\s*No module named ['"]([A-Za-z_][A-Za-z0-9_]*)['"]/,
-    ],
-    build: (m) => {
-      const mod = m[1] ?? '<module>';
-      return (
-        `[直接 python 脚本执行测试导致 ModuleNotFoundError: ${mod}] ` +
-        `**首选**改用 \`run_tests\`（pytest）执行——XCompiler 已自动写入 tests/conftest.py 注入 src/ 到 sys.path，pytest 模式下能直接解析。` +
-        `如确需保留 \`python tests/test_X.py\` 直接运行，则用 \`read_file\` 打开测试文件，` +
-        `在 import 之前插入：\`import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))\`，` +
-        `再 \`replace_in_file\` 提交修改。**严禁**把 import 改成 "from src.${mod} import ..." 形式。`
-      );
-    },
-  },
-  {
-    code: 'ModuleNotFoundError',
-    severity: 1,
-    patterns: [
-      /ModuleNotFoundError:\s*No module named ['"]([^'"]+)['"]/,
-      /ImportError:\s*No module named ['"]?([A-Za-z0-9_.]+)['"]?/,
-    ],
-    build: (m) => {
-      const mod = m[1] ?? '<module>';
-      const top = mod.split('.')[0]!;
-      return (
-        `[ModuleNotFoundError: ${mod}] 先用 \`list_dir\` 查看 src/ 实际目录结构，` +
-        `再用 \`code_search\` 搜索 "${top}" 看真实文件名/路径。` +
-        `若是项目内模块缺失：用 \`read_file\` 确认 outputs 是否真的写入了 ${mod.replace(/\./g, '/')}.py，` +
-        `否则用 \`write_file\` 创建。` +
-        `若是第三方包：用 \`add_dependency\` 把真实 PyPI 包名（不是 import 名！例如 cv2→opencv-python, sklearn→scikit-learn, PIL→pillow）写进 requirements.txt。` +
-        `若当前代码 import 的库与 HIGH_LEVEL_DESIGN 的库选型不一致，优先改回设计选定的真实库并同步 add_dependency。` +
-        `**严禁**在生产 src/ 代码里 try/except ImportError 后伪造 module、写 fallback fake class/function，或用 mock 代码绕过缺失依赖。` +
-        `**绝不要**用 \`replace_in_file\` 提交 find===replace 的"假修复"。`
-      );
-    },
-  },
-  {
-    code: 'ImportError-name',
-    severity: 1,
-    patterns: [
-      /ImportError:\s*cannot import name ['"]([^'"]+)['"]\s*from\s*['"]?([A-Za-z0-9_.]+)['"]?/,
-    ],
-    build: (m) => {
-      const name = m[1] ?? '<name>';
-      const mod = m[2] ?? '<module>';
-      return (
-        `[ImportError: cannot import name '${name}' from '${mod}'] ` +
-        `先 \`read_file\` 打开 ${mod.replace(/\./g, '/')}.py 确认实际定义的符号；` +
-        `若拼写错误就 \`replace_in_file\` 修正 import；若符号未实现就回到对应模块用 \`write_file\`/\`apply_patch\` 补出来。`
-      );
-    },
-  },
-  {
-    code: 'pytest-collection',
-    severity: 1,
-    patterns: [
-      /ERROR\s+collecting/,
-      /pytest exit=2\b/,
-      /errors during collection/,
-    ],
-    build: () =>
-      `[pytest collection error (exit=2)] 通常是 import 失败或测试文件语法错。` +
-      `**第一步**用 \`run_tests\` 拿到完整 traceback（不要只看 exit code）；` +
-      `**第二步**用 \`read_file\` 打开报错的测试文件 + 它 import 的模块文件，比对真实符号；` +
-      `**第三步**针对真实差异做最小修改。禁止盲目 replace_in_file。`,
-  },
-  {
-    code: 'src-prefix-import',
-    severity: 1,
-    patterns: [/from\s+src\.[A-Za-z0-9_]+\s+import/],
-    build: (m) =>
-      `[检测到 "from src.X import" 形式] XCompiler 约定 src/ 内模块互相 import 必须用 \`from <module> import\`（不带 src. 前缀）；` +
-      `tests/ 也一样。请 \`read_file\` 确认 import 行，再 \`replace_in_file\` 把 "from src." 改为 "from "。证据: ${m[0]}`,
-  },
-  {
-    code: 'stale-date-test-data',
-    severity: 1,
-    patterns: [
-      /20\d{2}-\d{2}-\d{2}[\s\S]{0,1800}No upcoming holidays? found/i,
-      /No upcoming holidays? found[\s\S]{0,1800}20\d{2}-\d{2}-\d{2}/i,
-    ],
-    build: () =>
-      `[测试数据日期已过期] 失败是 hard-coded 日期相对当前日期已经变成过去时间，不是外部 API 不可用。` +
-      `用 \`read_file\` 打开失败测试，把固定日期改成基于 \`datetime.now().date() + timedelta(days=N)\` 生成的未来日期；` +
-      `随后 \`run_tests\` 验证。只有出现真实 HTTP 状态码、DNS/连接/超时异常时，才按网络 API 失败切换接口。`,
-  },
-  {
-    code: 'llm-context-too-large',
-    severity: 1,
-    patterns: [
-      /prefill_memory_exceeded/i,
-      /(?:prefill memory guard|dynamic ceiling|context length|context window|token limit|too many tokens|prompt too long|max(?:imum)? context|input[^\n]{0,80}tokens)/i,
-    ],
-    build: () =>
-      `[LLM/provider 上下文超限] 当前失败来自 XCompiler 到 LLM provider 的 prompt/token 容量限制，` +
-      `不是项目业务代码缺陷。请压缩 Debug 历史、裁剪 failureLog/上下文片段、拆分过大的 Step 或降低一次性注入的文件内容后重跑当前 step；` +
-      `不要让 Debugger 为此修改业务代码，也不要把该错误回退到 V 模型业务阶段。`,
-  },
-  {
-    code: 'llm-transport-failure',
-    severity: 1,
-    patterns: [
-	      /^TypeError:\s*fetch failed\s*$/m,
-	      /(?:LLM|provider|OpenAI|Ollama)[^\n]{0,120}(?:fetch failed|connection|timeout|unreachable)/i,
-	      /(?:LLM|provider|OpenAI|Ollama|OpenRouter)[^\n]{0,180}(?:HTTP 429|rate[- ]?limit|rate limited|rate-limited|retry-after|retry_after_seconds)/i,
-	      /(?:response_format|json_object|json_schema)[^\n]{0,220}(?:not support|unsupported|invalid_request_body|supported formats)/i,
-	    ],
-	    build: () =>
-	      `[LLM/provider 传输或协议能力失败] 当前失败没有项目 API URL 或 HTTP 状态，优先按 XCompiler 到 LLM provider 的连接/能力问题处理：` +
-	      `检查 \`OPENAI_BASE_URL\` / \`OPENROUTER_BASE_URL\` / provider base_url、模型服务是否可达、限流/配额、超时设置、网络权限，以及 provider 是否支持当前结构化输出格式。` +
-	      `不要把这个错误当成项目源码缺陷，也不要让 Debugger 为此修改业务代码；恢复 provider 后重新运行当前 step。`,
-  },
-  {
-    code: 'network-api-failure',
-    severity: 1,
-    skip: (text) => isLlmProviderFailureText(text) || hasOnlyLoopbackNetworkEvidence(text),
-    ignoreMatch: (m, text) => isTestAssertionDiagnosticLine(lineAtIndex(text, m.index)),
-    patterns: [
-      /Network API failure detected/i,
-      /https?:\/\/[^\s'")]+[^\n]{0,160}\b(?:failed|error|timeout|unreachable|unavailable|401|403|404|429|5\d\d)\b/i,
-      /\b(?:api|http|request|network|connection|timeout|timed out)\b[^\n]{0,120}\b(?:401|403|404|429|5\d\d)\b/i,
-      /(?:网络|接口|API|HTTP|请求|连接|超时|限流|不可用)[^\n]{0,120}(?:失败|错误|异常|超时|拒绝|不可达|不可用|限流)/,
-    ],
-    build: (m) =>
-      `[网络 API 调用失败] 本任务必须判定失败，禁止用静态假数据、吞异常或仅展示“降级成功”来过关。` +
-      networkApiStatusGuidance(m.input) +
-      `请先定位失败的 API URL 与响应/异常；若接口不可达、格式不符、限流或返回错误状态，必须更换为当前可用且适合需求的 API，` +
-      `并补充测试覆盖成功路径与失败路径。最多连续做 2 次 \`http_fetch\` 探测；一旦确认候选接口可用且 body 非空/格式可解析，` +
-      `必须立刻 \`read_file\` 定位源码并用 \`apply_patch\` / \`replace_in_file\` 修改真实集成，随后 \`run_program\` 验证入口不再输出 API 失败。`,
-  },
-  {
-    code: 'network-api-probe-loop',
-    severity: 1,
-    patterns: [
-      /tool calls:[\s\S]*(?:http_fetch).*(?:http_fetch)/i,
-      /http_fetch[\s\S]{0,400}(?:FAIL|失败)[\s\S]{0,400}http_fetch/i,
-      /http_fetch[\s\S]{0,400}(?:200|OK|成功)[\s\S]{0,200}(?:0B|0 字节|body 为空)/i,
-    ],
-    build: () =>
-      `[网络 API 探测循环] 已经出现多次 \`http_fetch\`，下一轮必须停止继续枚举接口。` +
-      `先 \`read_file\` / \`code_search\` 找到失败 URL 所在源码；选择最近一次非空、格式可解析且适合需求的候选 API，` +
-      `或换一个明确有文档的无 Key API；然后 patch 源码并用 \`run_program\` 运行入口验证。` +
-      `HTTP 200 但 0B/空 body 不是可用 API，不能据此 done=true。`,
-  },
-
-  // —— 名称/属性 ——————————————————————————————
-  {
-    code: 'NameError',
-    severity: 2,
-    patterns: [/NameError:\s*name ['"]([^'"]+)['"] is not defined/],
-    build: (m) =>
-      `[NameError: ${m[1]}] 先 \`code_search\` 这个名字看是否漏 import 或拼写错；` +
-      `再 \`read_file\` 当前文件检查作用域。修复手段：补 import 或改名。`,
-  },
-  {
-    code: 'AttributeError-module-api',
-    severity: 1,
-    patterns: [
-      /AttributeError:\s*module ['"]([^'"]+)['"] has no attribute ['"]([^'"]+)['"]/,
-      /module ['"]([^'"]+)['"] has no attribute ['"]([^'"]+)['"]/,
-    ],
-    build: (m) => {
-      const mod = m[1] ?? '<module>';
-      const attr = m[2] ?? '<attribute>';
-      return (
-        `[第三方库 API 不存在: ${mod}.${attr}] 当前导入的库没有这个入口。` +
-        `先用 \`code_search\` 查找 "${mod}.${attr}" 调用点，再 \`read_file\` 打开对应源码；` +
-        `若是库选型错误，改用 HIGH_LEVEL_DESIGN 中确认且真实支持该领域格式的库，并用 \`add_dependency\` 写入真实包名；` +
-        `若只是 API 名称错误，替换为该库真实存在的等价 API。` +
-        `禁止在生产 src/ 里伪造 fallback/mock 来绕过该错误。`
-      );
-    },
-  },
-  {
-    code: 'mock-patch-target-src-prefix',
-    severity: 1,
-    patterns: [/@patch\(['"]src\./, /patch\(['"]src\./],
-    build: () =>
-      `[测试 patch 目标使用了 src. 前缀] 测试文件按 XCompiler 约定应导入裸模块名，因此 mock 也必须 patch 运行时实际引用的模块名。` +
-      `用 \`read_file\` 对照测试 import 与被测文件 import，把 \`@patch('src.<module>.<name>')\` 改成 \`@patch('<module>.<name>')\` 或 patch 调用方模块里的符号。` +
-      `不要为了让 mock 通过而削弱断言；应修正 patch 目标与真实导入契约。`,
-  },
-  {
-    code: 'AttributeError',
-    severity: 2,
-    patterns: [/AttributeError:\s*['"]?([^'"\s]+)['"]?\s*object has no attribute ['"]([^'"]+)['"]/],
-    build: (m) =>
-      `[AttributeError: ${m[1]} 无属性 ${m[2]}] 先 \`code_search\` 这个属性的真实名字（常见 typo / 大小写 / 单复数）；` +
-      `若是第三方库 API 变更，\`read_file\` 该模块文档或换等价 API。`,
-  },
-  {
-    code: 'TypeError-args',
-    severity: 2,
-    patterns: [
-      /TypeError:\s*([A-Za-z_][A-Za-z0-9_]*)\(\)\s*(?:missing|takes|got|requires)[^\n]+/,
-    ],
-    build: (m) =>
-      `[TypeError 函数签名不匹配: ${m[1]}] \`read_file\` 看 ${m[1]} 的真实参数列表，再修正调用点；` +
-      `不要随手改函数签名（会破坏其它调用）。`,
-  },
-
-  // —— 语法/缩进 ——————————————————————————————
-  {
-    code: 'SyntaxError',
-    severity: 1,
-    patterns: [/SyntaxError:[^\n]+/, /IndentationError:[^\n]+/, /TabError:[^\n]+/],
-    build: (m) =>
-      `[${m[0].split(':')[0]}] 用 \`read_file\` 把整段函数读出来核对缩进/括号配对；` +
-      `若是分块 \`append_file\` 拆断了函数体，优先用 \`apply_patch\` / \`replace_in_file\` 修复；` +
-      `需要整文件重写时必须低于当前运行时 chunk limit，或按函数/类边界重新分块。`,
-  },
-
-  // —— 文件 IO ——————————————————————————————
-  {
-    code: 'FileNotFoundError-test-fixture',
-    severity: 1,
-    // 命中：traceback 含 tests/ 路径且缺失文件是相对裸名（典型测试 fixture，如 'sample.csv'）。
-    // 同时支持 Python 标准 traceback `File "tests/x.py"` 与 pytest 短格式 `tests/x.py:NN:`。
-    patterns: [
-      /(?:File\s+["']|^|\s)[^"'\s]*tests\/[^"'\s]+\.py(?:["']|:)[^]*?FileNotFoundError:[^\n]*['"]([^'"/\\:]+\.[A-Za-z0-9]+)['"]/,
-    ],
-    build: (m) => {
-      const f = m[1] ?? '<fixture>';
-      return (
-        `[测试用 fixture 文件未生成: ${f}] 测试代码引用了真实磁盘文件但没人创建它。可选修复（按推荐顺序）：` +
-        `(1) 先 \`list_dir\` / \`read_file\` 查找用户或工作区是否已有同类型真实样例；若有，用它作为测试输入或复制到 tests/fixtures/${f}；` +
-        `(2) 若这是第三方/行业标准格式且工作区无样例，用 \`http_fetch\` 获取官方文档、上游仓库或公开示例中的小型参考文件，` +
-        `保存到 tests/fixtures/${f}，并在测试报告或测试注释中记录来源；` +
-        `(3) 只有 CSV/JSON/INI 等简单文本格式，且能立即 \`run_tests\` 验证时，才可用 pytest \`tmp_path\` 构造最小样例；` +
-        `(4) 网络不可用、用户未提供样例且无法确认格式标准时，应明确报告 blocker 请求用户提供样例。` +
-        `**严禁**凭记忆反复编造复杂领域 fixture，或单纯把硬编码路径改成另一个不存在的路径。`
-      );
-    },
-  },
-  {
-    code: 'FileNotFoundError',
-    severity: 2,
-    patterns: [/FileNotFoundError:[^\n]*['"]([^'"]+)['"]/],
-    build: (m) =>
-      `[FileNotFoundError: ${m[1]}] 先 \`list_dir\` 确认路径是否真的存在；` +
-      `若测试期望的资源未生成，回 CODE 输出该文件；若路径硬编码错误，\`replace_in_file\` 修正路径。`,
-  },
-
-  // —— Fixture 内容格式错误 ——————————————————————————————
-  // 测试已运行，但被测函数在解析 fixture 时报"Invalid syntax / Parse error / Malformed"。
-  // LLM 反应模式常常是"反复重跑测试"或凭记忆重写复杂样例；这里强制先找真实/权威参考。
-  {
-    code: 'fixture-content-malformed',
-    severity: 1,
-    patterns: [
-      /Invalid syntax at line\s+(\d+)(?:,\s*column\s+\d+)?/i,
-      /(?:Parse(?:r)?Error|MalformedError|DecodeError(?!-Unicode))[:\s][^\n]+/,
-      /(?:failed to parse|unable to parse|cannot parse|invalid format)\b[^\n]+/i,
-    ],
-    build: (m) => {
-      const where = m[1] ? `（line ${m[1]}）` : '';
-      return (
-        `[Fixture 内容格式错误${where}] 测试已经能跑起来，但被测函数在解析输入文件时拒绝了内容——` +
-        `这通常意味着**fixture 文件本身写错了**（不是被测代码的 bug，也不是测试逻辑的 bug）。修复路径：` +
-        `(1) 用 \`read_file\` 打开测试文件和 tests/fixtures/<file> 看清 fixture 的真实内容；如果样例是测试里的内联常量，也要修该测试文件里的常量；` +
-        `(2) 根据扩展名、被测解析库和错误信息确认格式标准，先查找工作区/用户提供的真实样例；` +
-        `(3) 若本地没有可靠样例，用 \`http_fetch\` 下载官方文档、上游测试仓库或公开标准示例中的小型参考文件，再用 \`write_file\` 整文件重写 tests/fixtures/<file>；` +
-        `(4) 只有简单文本格式才允许自己构造最小样例，并且必须马上 \`run_tests\` 验证；复杂领域格式连续失败后必须停止编造并请求用户提供样例或网络参考。` +
-        `**严禁**因为这条错误就去改被测模块或测试断言，也严禁凭记忆反复生成复杂格式 fixture。`
-      );
-    },
-  },
-
-  // —— 依赖安装 ——————————————————————————————
-  {
-    code: 'pip-resolver',
-    severity: 2,
-    patterns: [
-      /Could not find a version that satisfies the requirement\s+([A-Za-z0-9._-]+)/,
-      /ERROR: No matching distribution found for\s+([A-Za-z0-9._-]+)/,
-    ],
-    build: (m) =>
-      `[pip 解析失败: ${m[1]}] 该包名/版本不存在。\`add_dependency\` 重写为真实 PyPI 包名并去掉版本约束；` +
-      `常见映射：sklearn→scikit-learn, cv2→opencv-python, PIL→pillow, yaml→PyYAML, bs4→beautifulsoup4, serial→pyserial。`,
-  },
-
-  // —— 编码/路径 ——————————————————————————————
-  {
-    code: 'UnicodeDecodeError',
-    severity: 3,
-    patterns: [/UnicodeDecodeError:[^\n]+/],
-    build: () =>
-      `[UnicodeDecodeError] 打开二进制文件用 \`open(..., "rb")\`；文本读 UTF-8 显式 \`encoding="utf-8"\`，` +
-      `必要时加 \`errors="replace"\`。`,
- },
-
-// —— Executor 工具反馈 ——————————————————————————————
-{
-  code: 'replace-missing-path',
-  severity: 1,
-  patterns: [/invalid replace_in_file args: path must be a non-empty string/i],
-  build: () =>
-    `[replace_in_file 缺少 path] 你调用了 replace_in_file 但没有提供 args.path。` +
-    `args.path 是目标文件的相对路径（取自当前 Step writable allowlist），必填且不能为空。` +
-    `请从 writable allowlist 或 required outputs 中选取目标文件路径，重新提交包含 path、find、replace 三个字段的 replace_in_file 调用。`,
-},
-{
-  code: 'replace-no-op',
- severity: 1,
- patterns: [/no-op edit refused: find === replace/],
- build: () =>
-   `[replace_in_file 被拒：find===replace] 你提交了无意义的相同字符串替换。` +
-   `请先 \`read_file\` 看清原文，再给出**真正不同**的 replace；如只是想确认内容用 \`read_file\`，不要走 \`replace_in_file\`。`,
- },
- {
-   code: 'replace-not-found',
-   severity: 2,
-   patterns: [/expected \d+ occurrences of find, found 0 in/],
-    build: () =>
-      `[replace_in_file: find 未命中] 文件实际内容与你假设不一致。` +
-      `立即 \`read_file\` 完整读出该文件，按真实字节构造 find；连续 2 次仍失败请改用 \`write_file\` 整文件重写。`,
-  },
-];
-
-function collectDebugSuggestions(text: string): DebugSuggestion[] {
-  const out: DebugSuggestion[] = [];
-  const seen = new Set<string>();
-  for (const rule of PYTHON_ERROR_RULES) {
-    if (seen.has(rule.code)) continue;
-    if (rule.skip?.(text)) continue;
-    for (const re of rule.patterns) {
-      const m = re.exec(text);
-      if (m && !rule.ignoreMatch?.(m, text)) {
-        seen.add(rule.code);
-        out.push({
-          code: rule.code,
-          severity: rule.severity,
-          hint: rule.build(m),
-          evidence: m[0].slice(0, 200),
-        });
-        break;
-      }
-    }
-  }
-  out.sort((a, b) => a.severity - b.severity);
-  return out;
-}
-
-function isLlmProviderFailureText(text: string): boolean {
-  return /all llm providers failed|openai-compatible provider request failed|provider_call_failed/i.test(text) ||
-    /(?:OpenAI|Ollama|OpenRouter|LLM|provider|response_format|json_object|json_schema)[^\n]{0,420}(?:HTTP\s+(?:401|403|408|409|429|5\d\d)|rate[- ]?limit|rate limited|rate-limited|retry-after|retry_after_seconds|fetch failed|network connection lost|stream (?:wall-clock|idle)|context (?:length|window)|token limit|prompt too long|prefill_memory_exceeded|not support|unsupported|invalid_request_body|supported formats)/i.test(text);
-}
-
-function lineAtIndex(text: string, index: number): string {
-  const start = text.lastIndexOf('\n', index - 1) + 1;
-  const end = text.indexOf('\n', index);
-  return text.slice(start, end < 0 ? undefined : end);
-}
-
-function latestFailureSlice(text: string): string {
-  const markers = [
-    /(?:^|\n)\s*-\s*(?:run_tests|run_program)\s+(?:失败|failed\b|FAIL\b)/giu,
-    /(?:^|\n)\s*(?:run_tests|run_program)[^\n]*(?:失败|failed\b|FAIL\b)/giu,
-  ];
-  let last = -1;
-  for (const marker of markers) {
-    let match: RegExpExecArray | null;
-    while ((match = marker.exec(text)) !== null) {
-      last = Math.max(last, match.index);
-    }
-  }
-  if (last < 0) return '';
-  return text.slice(last).trim();
-}
-
-/**
- * 把 Debugger 的失败日志（含 reason / pytest tail / tool calls）解析为一组建议。
- * 调用方应把结果拼到下一轮 Debugger 的 system / user prompt 中，引导其走出循环。
- *
- * - 同一 code 只保留首条命中
- * - 先聚焦最后一次工具失败段，避免历史错误覆盖当前失败证据
- * - 按 severity 升序、规则顺序输出
- * - 最多返回 6 条，避免淹没真正的 traceback
- */
-export function calibrateDebugSuggestions(
-  failureLog: string,
-  reason?: string,
-): DebugSuggestion[] {
-  const text = `${reason ?? ''}\n${failureLog ?? ''}`;
-  if (!text.trim()) return [];
-  const focused = latestFailureSlice(text);
-  const focusedSuggestions = focused ? collectDebugSuggestions(focused) : [];
-  const suggestions = focusedSuggestions.length > 0 ? focusedSuggestions : collectDebugSuggestions(text);
-  return suggestions.slice(0, 6);
-}
-
-/** 把建议数组渲染成可直接拼入 prompt 的 markdown 段（含编号 + 证据）。 */
-export function renderDebugSuggestions(sugs: DebugSuggestion[]): string {
-  if (sugs.length === 0) return '';
-  const lines: string[] = ['## 修复建议（按优先级，必须遵循）'];
-  sugs.forEach((s, i) => {
-    lines.push(`${i + 1}. ${s.hint}`);
-    if (s.evidence) lines.push(`   - 证据: \`${s.evidence.replace(/`/g, "'")}\``);
-  });
-  return lines.join('\n');
-}
+//
+// Removed. This section held ~26 regex rules that turned a failure log into prescriptive repair
+// instructions, and nothing in production called them: `calibrateDebugSuggestions` and
+// `renderDebugSuggestions` had only test callers, so every bundle tree-shook the table away. The
+// rules were never wrong — measured against three live runs they fired 55 times with no false
+// positive, and one of them held the exact diagnosis for a defect that later took a manual
+// investigation to find. They simply never reached a model.
+//
+// That knowledge belongs in the Debug Wiki (`src/core/debug_wiki.ts`, `debug-wiki/wiki/**`), which
+// is retrieved for real and beats a static table on every axis that matters here: it matches on the
+// DebugBrief rather than on raw prose, it records use and confidence so a bad entry decays, and it
+// presents itself to the model as a hypothesis rather than as a command. The general rules were
+// migrated there; `calibration-fixtures` and `calibration-python-imports` name the rules they came
+// from in their `evidence`.
+//
+// Deliberately not migrated: entries that only restate a traceback the model already reads
+// (NameError, AttributeError, TypeError-args, SyntaxError, UnicodeDecodeError), and one rule keyed
+// to a single past project's domain ("No upcoming holidays found").
+//
+// The live path for a failure is now: buildDebugBrief → category + debugDemand (always), then
+// DebugWiki.search(brief) → up to 3 ranked entries.

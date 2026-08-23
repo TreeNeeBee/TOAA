@@ -16,9 +16,9 @@ describe('workspace lock', () => {
   it('acquires + releases', async () => {
     const dir = await tmpdir();
     const l = await acquireLock(dir, 'xcompiler_build');
-    expect(await fs.stat(path.join(dir, '.xcompiler/.lock'))).toBeTruthy();
+    expect(await fs.stat(path.join(dir, '.lock'))).toBeTruthy();
     await l.release();
-    await expect(fs.stat(path.join(dir, '.xcompiler/.lock'))).rejects.toThrow();
+    await expect(fs.stat(path.join(dir, '.lock'))).rejects.toThrow();
   });
 
   it('rejects a second acquire on same workspace (live pid)', async () => {
@@ -33,7 +33,7 @@ describe('workspace lock', () => {
     await fs.mkdir(path.join(dir, '.xcompiler'), { recursive: true });
     // PID 999999 极不可能存活
     await fs.writeFile(
-      path.join(dir, '.xcompiler/.lock'),
+      path.join(dir, '.lock'),
       JSON.stringify({ pid: 999999, host: os.hostname(), command: 'ghost', startedAt: new Date().toISOString() }),
     );
     const l = await acquireLock(dir, 'xcompiler_build');
@@ -46,10 +46,10 @@ describe('workspace lock', () => {
     const second = await acquireLock(dir, 'second', { force: true });
 
     await first.release();
-    expect(await fs.stat(path.join(dir, '.xcompiler/.lock'))).toBeTruthy();
+    expect(await fs.stat(path.join(dir, '.lock'))).toBeTruthy();
 
     await second.release();
-    await expect(fs.stat(path.join(dir, '.xcompiler/.lock'))).rejects.toThrow();
+    await expect(fs.stat(path.join(dir, '.lock'))).rejects.toThrow();
   });
 
   it('does not install process signal listeners', async () => {

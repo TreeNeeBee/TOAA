@@ -1,7 +1,10 @@
 import chalk from 'chalk';
 import { confirm, editor, input, select } from '@inquirer/prompts';
 import { spinner as ora } from '../util/spinner.js';
-import type { RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimeProgress } from '../runtime/io.js';
+import type {
+  RuntimeIO, RuntimeInteraction, RuntimeLogLevel, RuntimePermissionPolicy, RuntimeProgress,
+} from '../runtime.js';
+import { isCancellationError } from '../core/cancellation.js';
 
 function renderLog(level: RuntimeLogLevel, message: string): void {
   switch (level) {
@@ -27,11 +30,28 @@ function renderLog(level: RuntimeLogLevel, message: string): void {
   }
 }
 
-export function createCliRuntimeIO(): RuntimeIO {
+/**
+ * @param options.permissionPolicy `auto` runs external capability checks unattended. `run` had no other way to proceed
+ * without a terminal, so a resumed validation stalled on the workspace-baseline prompt with
+ * nothing in its log to say it was waiting for an answer.
+ */
+export function createCliRuntimeIO(
+  options: { permissionPolicy?: RuntimePermissionPolicy } = {},
+): RuntimeIO {
   return {
+    permissionPolicy: options.permissionPolicy ?? 'request',
     terminalOutput: true,
     emit(event) {
       if (event.type === 'log') renderLog(event.level, event.message);
+      if (event.type === 'workflow' && event.event === 'ticket_routed') {
+        console.log(chalk.cyan('↳'), event.message ?? [
+          event.creatorRole ?? 'discoverer',
+          'created',
+          event.ticketName ?? event.ticketType ?? 'ticket',
+          '→ PM →',
+          [event.assigneeRole, event.assigneeAgent].filter(Boolean).join('/'),
+        ].join(' '));
+      }
     },
     progress(message, opts): RuntimeProgress {
       const spin = ora(message, { animate: opts?.animate ?? true }).start();
@@ -42,7 +62,49 @@ export function createCliRuntimeIO(): RuntimeIO {
       };
     },
     interaction: createCliInteraction(),
+    requestPermission: async (request) => {
+      const approved = await confirm({
+        message: [
+          `${request.operationType}: ${request.target}`,
+          request.reason,
+          `Risk: ${request.risk}`,
+          `Scope: ${request.scope}`,
+        ].join('\n'),
+        default: false,
+      });
+      const denialReason = approved
+        ? ''
+        : (await input({ message: 'Reason for denial (optional):' })).trim();
+      return {
+        approved,
+        reason: approved
+          ? 'Approved by CLI user.'
+          : `${request.denyBehavior}${denialReason ? ` User reason: ${denialReason}` : ''}`,
+      };
+    },
   };
+}
+
+/** Gives the Runtime one graceful interrupt so the active attempt can roll back its Git baseline. */
+export async function runCliAbortable<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const onSigint = () => {
+    if (!controller.signal.aborted) {
+      const error = new Error('CLI task cancelled by SIGINT');
+      error.name = 'AbortError';
+      controller.abort(error);
+    }
+  };
+  process.on('SIGINT', onSigint);
+  try {
+    return await task(controller.signal);
+  } finally {
+    process.off('SIGINT', onSigint);
+  }
+}
+
+export function isCliCancellation(error: unknown): boolean {
+  return isCancellationError(error);
 }
 
 function createCliInteraction(): RuntimeInteraction {

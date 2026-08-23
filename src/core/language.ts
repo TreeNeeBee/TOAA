@@ -19,7 +19,7 @@ import { t } from '../i18n/index.js';
  * 让 sandbox / engine / lint / render / planner / executor 等都通过 profile 取用，
  * 而不是在各处硬编码 Python 的 venv / pip / pytest / requirements.txt 假设。
  *
- * 默认语言仍是 Python（完全向后兼容）；TypeScript 作为新 profile 接入。
+ * 无法从需求确定语言时使用 Python；TypeScript 通过独立 profile 接入。
  */
 export interface LanguageProfile {
   readonly id: Language;
@@ -32,7 +32,7 @@ export interface LanguageProfile {
   readonly codeExtensions: string[];
 
   /**
-   * 是否由 runtime（cli/execute）根据 plan.dependencies 生成 manifest。
+   * 是否由 Runtime Run 用例根据 plan.dependencies 生成 manifest。
    *  - Python：true —— 渲染器把依赖写入 requirements.txt，HIGH_LEVEL_DESIGN 不得直接产出该文件。
    *  - TypeScript：false —— package.json 由 HIGH_LEVEL_DESIGN 步骤撰写（含 scripts / devDependencies）。
    */
@@ -56,7 +56,7 @@ export interface LanguageProfile {
   ensureTestBootstrap?(ws: Workspace, audit: AuditLogger): Promise<void>;
   /** 通用兜底：修复入口 import 路径问题（python sys.path；ts 无需）。 */
   autoFixImports?(ws: Workspace, audit: AuditLogger): Promise<string[]>;
-  /** FUNCTIONAL_TEST gate：探测入口 `--help` 是否开箱即用；缺失入口必须返回失败。 */
+  /** Phase delivery scenario fallback: probe whether the public entrypoint is directly usable. */
   probeEntry(ws: Workspace, sandbox: Sandbox): Promise<EntrypointProbe>;
 }
 
@@ -97,6 +97,9 @@ const typescriptProfile: LanguageProfile = {
   displayName: 'TypeScript',
   manifestFile: 'package.json',
   codeExtensions: ['.ts', '.tsx'],
+  // HIGH_LEVEL_DESIGN authors package.json; the runtime does not seed it. Creating the sandbox and
+  // filling it with dependencies are separate events — the environment exists before the V-model
+  // starts, and the manifest that populates it arrives when the design that chose it does.
   seedManifestFromDeps: false,
   defaultDockerImage: 'node:24-slim',
   renderManifest(deps) {
@@ -126,7 +129,13 @@ const typescriptProfile: LanguageProfile = {
     }
     return `tests/${stepId.toLowerCase()}.test.ts`;
   },
-  plannerPromptOverride: '',
+  // `vitest run` discovers only `**/*.{test,spec}.?(c|m)[jt]s?(x)`. A planner carrying Python habits
+  // declares `tests/test_thing.ts`, which vitest silently does not collect: the gate then fails with
+  // "No test files found" and no role can repair it, because the name came from the Step's declared
+  // outputs rather than from anything the executor chose.
+  plannerPromptOverride: '\n\nTypeScript test files must be named `<name>.test.ts` or `<name>.spec.ts` ' +
+    '(for example `tests/modules/scrapers.test.ts`). `vitest run` collects no other name, so a Step ' +
+    'declaring `tests/test_scrapers.ts` produces a suite that can never run.',
   executorPromptOverride: '',
   async autoFixImports(ws, audit) {
     return autoFixTypeScriptTypeOnlyImports(ws, audit);
@@ -145,7 +154,7 @@ export function getLanguageProfile(language: Language): LanguageProfile {
   return PROFILES[language] ?? pythonProfile;
 }
 
-/** FUNCTIONAL_TEST gate（TypeScript）：优先尝试 `node src/main.ts --help`，确保源码入口开箱即用。 */
+/** Phase delivery fallback (TypeScript): probe `node src/main.ts --help` when no concrete case command exists. */
 async function probeTsEntrypoint(
   ws: Workspace,
   sandbox: Sandbox,

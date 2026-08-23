@@ -1,27 +1,25 @@
 import { Command } from 'commander';
-import { CompileExitError } from '../runtime/build.js';
-import type { ExecuteResult } from '../runtime/run.js';
 import {
-  runAppendCommand,
-  runBuildCommand,
-  runEvolveCommand,
-  runLoadCommand,
-  runRunCommand,
-} from '../runtime/commands.js';
+  CompileExitError,
+  XCOMPILER_VERSION,
+  XCompilerRuntime,
+  type ExecuteResult,
+} from '../runtime.js';
 import { runLs, runShow } from './inspect.js';
 import { runDoctorCli } from './doctor.js';
-import { runBootstrap } from './bootstrap.js';
 import { setLocale, t } from '../i18n/index.js';
-import { XCOMPILER_VERSION } from '../version.js';
 import { xcEnv } from '../config/env.js';
-import { createCliRuntimeIO } from './runtime_adapter.js';
+import { createCliRuntimeIO, isCliCancellation, runCliAbortable } from './runtime_adapter.js';
 import { runAcpStdioServer } from '../acp/index.js';
 import {
   localeFromArgv,
   configureLocalizedHelp,
   parseIntent,
+  parseFixtureAction,
   parseLocale,
   parseNonNegativeInteger,
+  parseRecordReplayMode,
+  parsePermissionMode,
   parseStepId,
 } from './arguments.js';
 
@@ -29,6 +27,7 @@ import {
 // CLI flag wins (parsed below by Commander preAction).
 setLocale(localeFromArgv(process.argv) ?? xcEnv('LANG') ?? 'en');
 const defaultBaseDir = xcEnv('DEFAULT_BASE_DIR') ?? '/tmp';
+const runtime = new XCompilerRuntime({ io: createCliRuntimeIO() });
 
 const program = new Command();
 configureLocalizedHelp(program);
@@ -58,10 +57,13 @@ program
   .option('--baseline-plan <file>', t().cli.optBaselinePlan)
   .option('--plan-out <file>', t().cli.optPlanOut)
   .option('--project-file <file>', t().cli.optProjectFile)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (opts) => {
-    await runBuildCommand({
+    await runtime.buildCommand({
       output: opts.output,
       workspace: opts.workspace,
       baseDir: opts.baseDir,
@@ -74,9 +76,11 @@ program
       outputFile: opts.planOut,
       projectFilePath: opts.projectFile,
       projectCommand: 'build',
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
-      io: createCliRuntimeIO(),
     });
   });
 
@@ -95,10 +99,13 @@ program
   .option('--plan-out <file>', t().cli.optPlanOut)
   .option('--project-file <file>', t().cli.optProjectFile)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (opts) => {
-    const result = await runEvolveCommand({
+    const result = await runtime.evolveCommand({
       output: opts.output,
       workspace: opts.workspace,
       baseDir: opts.baseDir,
@@ -111,10 +118,12 @@ program
       planOut: opts.planOut,
       projectFilePath: opts.projectFile,
       debugWikiPath: opts.debugWikiPath,
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
       cwd: process.cwd(),
-      io: createCliRuntimeIO(),
     });
     applyExecuteExitCode(result.execution);
   });
@@ -127,14 +136,20 @@ program
   .option('--dry-run', t().cli.optDryRun, false)
   .option('--force', t().cli.optForce, false)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .action(async (projectArg, opts) => {
-    const result = await runLoadCommand({
+    const result = await runtime.loadCommand({
+      io: createCliRuntimeIO(),
       projectFile: projectArg,
       configPath: opts.config,
       dryRun: !!opts.dryRun,
       force: !!opts.force,
       debugWikiPath: opts.debugWikiPath,
-      io: createCliRuntimeIO(),
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
     });
     applyExecuteExitCode(result);
   });
@@ -149,10 +164,13 @@ program
   .option('--intent <kind>', t().cli.optIntent, parseIntent, 'feature')
   .option('--plan-out <file>', t().cli.optPlanOut)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .option('--yes', t().cli.optYes, false)
   .option('--force', t().cli.optForce, false)
   .action(async (projectArg, opts) => {
-    const result = await runAppendCommand({
+    const result = await runtime.appendCommand({
       projectFile: projectArg,
       configPath: opts.config,
       inputFile: opts.input,
@@ -160,9 +178,11 @@ program
       intent: opts.intent,
       planOut: opts.planOut,
       debugWikiPath: opts.debugWikiPath,
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
       yes: !!opts.yes && (!!opts.input || !!opts.topic),
       force: !!opts.force,
-      io: createCliRuntimeIO(),
     });
     applyExecuteExitCode(result.execution);
   });
@@ -180,7 +200,7 @@ program
   .option('--cleanup', t().cli.optCleanup, false)
   .option('--docker-qualification', t().cli.optDockerQualification, false)
   .action(async (opts) => {
-    const result = await runBootstrap({
+    const result = await runtime.bootstrap({
       repository: opts.repository,
       configPath: opts.config,
       inputFile: opts.input,
@@ -205,8 +225,12 @@ program
   .option('--force', t().cli.optForce, false)
   .option('--project-file <file>', t().cli.optProjectFile)
   .option('--debug-wiki-path <dir>', t().cli.optDebugWikiPath)
+  .option('--record-replay <mode>', t().cli.optRecordReplay, parseRecordReplayMode)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--permission-mode <mode>', t().cli.optPermissionMode, parsePermissionMode)
   .action(async (planArg, opts) => {
-    const result = await runRunCommand({
+    const result = await runCliAbortable((abortSignal) => runtime.runCommand({
+      io: createCliRuntimeIO({ permissionPolicy: opts.permissionMode }),
       planArg,
       output: opts.output,
       workspace: opts.workspace,
@@ -215,9 +239,12 @@ program
       force: !!opts.force,
       projectFilePath: opts.projectFile,
       debugWikiPath: opts.debugWikiPath,
+      recordReplayMode: opts.recordReplay,
+      recordReplayPath: opts.recordReplayPath,
+      permissionMode: opts.permissionMode,
+      abortSignal,
       cwd: process.cwd(),
-      io: createCliRuntimeIO(),
-    });
+    }));
     applyExecuteExitCode(result);
   });
 
@@ -259,6 +286,31 @@ program
   });
 
 program
+  .command('fixtures')
+  .description('Prepare, inspect, verify, or refresh deterministic external-interaction fixtures')
+  .argument('<action>', 'prepare | inspect | verify | refresh', parseFixtureAction)
+  .argument('[plan]', t().cli.argPlan)
+  .option('-w, --workspace <dir>', t().cli.optWorkspace, process.cwd())
+  .option('-c, --config <file>', t().cli.optConfig)
+  .option('--record-replay-path <dir>', t().cli.optRecordReplayPath)
+  .option('--force', t().cli.optForce, false)
+  .action(async (action, planArg, opts) => {
+    const result = await runtime.fixtures({
+      action,
+      workspace: opts.workspace,
+      configPath: opts.config,
+      path: opts.recordReplayPath,
+      planArg,
+      force: !!opts.force,
+    });
+    if (result.inspection) {
+      console.log(JSON.stringify(result.inspection, null, 2));
+      if (!result.inspection.ok) process.exitCode = 4;
+    }
+    applyExecuteExitCode(result.execution);
+  });
+
+program
   .command('acp')
   .description('Start XCompiler in ACP Code Agent mode over stdio JSON-RPC')
   .action(async () => {
@@ -266,6 +318,10 @@ program
   });
 
 program.parseAsync(process.argv).catch((err) => {
+  if (isCliCancellation(err)) {
+    process.exitCode = 130;
+    return;
+  }
   if (err instanceof CompileExitError) {
     process.exitCode = err.exitCode;
     return;

@@ -35,12 +35,12 @@ export function renderPlanMarkdown(plan: Plan): string {
   if ((plan.implementationPhases?.length ?? 0) > 0) {
     lines.push('## Implementation phases');
     lines.push('');
-    lines.push('| Phase | Status | Objective | Verification gate | Scope | Deliverables | Depends on |');
+    lines.push('| Phase | Status | Objective | Delivery gate | Scope | Deliverables | Depends on |');
     lines.push('| --- | --- | --- | --- | --- | --- | --- |');
     for (const phase of plan.implementationPhases ?? []) {
       lines.push(
         `| ${phase.id} ${escapePipe(phase.title)} | ${phase.status} | ${escapePipe(phase.objective)} | ` +
-        `${escapePipe(phase.verificationGate?.summary ?? '—')} | ` +
+        `${escapePipe(phase.deliveryGate?.summary ?? phase.verificationGate?.summary ?? '—')} | ` +
         `${phase.scope.join(', ') || '—'} | ${phase.deliverables.join(', ') || '—'} | ${phase.dependsOn.join(', ') || '—'} |`,
       );
     }
@@ -101,6 +101,7 @@ export function renderPlanMarkdown(plan: Plan): string {
     lines.push(`- Outputs: ${s.outputs.join(', ')}`);
     lines.push(`- Tools: ${s.tools.join(', ') || '—'}`);
     lines.push(`- Acceptance: ${s.acceptance}`);
+    lines.push(`- Delivery gate: ${s.deliveryGate?.summary ?? 'Runtime canonical default'}`);
     if ((s.subTasks?.length ?? 0) > 0) {
       lines.push('- Subtasks:');
       for (const item of renderSubTasks(s.subTasks ?? [], 1)) lines.push(item);

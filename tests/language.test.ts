@@ -38,3 +38,29 @@ describe('TypeScript language profile', () => {
     );
   });
 });
+
+describe('test file naming reaches the planner', () => {
+  // `vitest run` collects only `*.test.ts` / `*.spec.ts`. The profile has always encoded that in
+  // testFileFor, but nothing told the planner — and the planner is what declares Step outputs, so a
+  // Python-style `tests/test_x.ts` produced a suite no role could make runnable.
+  const VITEST_DEFAULT_INCLUDE = /^.*\.(test|spec)\.(c|m)?[jt]sx?$/u;
+
+  it('names generated TypeScript tests the way vitest discovers them', () => {
+    const profile = getLanguageProfile('typescript');
+    for (const [source, stepId] of [['src/scrapers.ts', 'S004'], ['src/a/b.ts', 'S004'], ['', 'S007']] as const) {
+      const file = profile.testFileFor(source, stepId);
+      expect(file, `${source || '(none)'} → ${file}`).toMatch(VITEST_DEFAULT_INCLUDE);
+    }
+  });
+
+  it('states the naming rule in the planner prompt, since the planner declares the outputs', () => {
+    const profile = getLanguageProfile('typescript');
+    expect(profile.plannerPromptOverride).toContain('.test.ts');
+    expect(profile.plannerPromptOverride).toContain('.spec.ts');
+    // The counter-example is the mistake actually observed in a live run.
+    expect(profile.plannerPromptOverride).toContain('tests/test_scrapers.ts');
+    // Python is unaffected: pytest collects `test_*.py`, so its profile needs no override.
+    expect(getLanguageProfile('python').testFileFor('src/x.py', 'S004')).toMatch(/^tests\/test_.*\.py$/u);
+    expect(getLanguageProfile('python').plannerPromptOverride).toBe('');
+  });
+});

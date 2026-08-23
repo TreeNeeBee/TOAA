@@ -1,4 +1,4 @@
-import type { RuntimeEvent } from '../runtime/io.js';
+import type { RuntimeEvent } from '../runtime.js';
 import type { AcpSessionUpdate } from './types.js';
 
 export interface AcpMappedUpdate {
@@ -12,7 +12,15 @@ export function mapRuntimeEventToAcpUpdates(
   ctx: { taskId: string; phase: 'build' | 'run' },
 ): AcpMappedUpdate[] {
   const meta = (eventType: string, extra: Record<string, unknown> = {}) => ({
-    xcompiler: { eventType, taskId: ctx.taskId, phase: ctx.phase, ...extra },
+    xcompiler: {
+      eventId: event.eventId,
+      eventVersion: event.eventVersion,
+      occurredAt: event.occurredAt,
+      eventType,
+      taskId: ctx.taskId,
+      phase: ctx.phase,
+      ...extra,
+    },
   });
 
   if (event.type === 'log') {

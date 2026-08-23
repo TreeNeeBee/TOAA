@@ -4,8 +4,11 @@ import path from 'node:path';
 import os from 'node:os';
 
 /**
- * 工程级文件锁，防止多个 XCompiler 进程并发改同一个 workspace。
- * 锁文件：<workspace>/.xcompiler/.lock，内容为 JSON：{pid, host, command, startedAt}。
+ * 容器级文件锁，防止多个 XCompiler 进程并发改同一个项目。
+ * 锁文件：<stateRoot>/.lock，内容为 JSON：{pid, host, command, startedAt}。
+ *
+ * 锁在容器状态根而非工作副本上：一个项目可以有多个 worktree，它们共享同一份状态，
+ * 因此争用点是状态而不是某个工作副本。
  *
  * 语义：
  *   - 优先 O_EXCL 创建，成功即获锁；
@@ -28,10 +31,10 @@ export class LockError extends Error {
   }
 }
 
-const LOCK_REL = '.xcompiler/.lock';
+const LOCK_REL = '.lock';
 
-function lockPath(workspace: string): string {
-  return path.join(workspace, LOCK_REL);
+function lockPath(stateRoot: string): string {
+  return path.join(stateRoot, LOCK_REL);
 }
 
 function isAlive(pid: number): boolean {
@@ -60,11 +63,11 @@ export interface AcquiredLock {
 }
 
 export async function acquireLock(
-  workspace: string,
+  stateRoot: string,
   command: string,
   options: { force?: boolean } = {},
 ): Promise<AcquiredLock> {
-  const file = lockPath(workspace);
+  const file = lockPath(stateRoot);
   await fs.mkdir(path.dirname(file), { recursive: true });
   const info: LockInfo = {
     ownerId: randomUUID(),

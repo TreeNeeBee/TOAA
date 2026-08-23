@@ -1,5 +1,20 @@
 locale: zh  # CLI / prompt 语言：en 或 zh
 
+# 当前 Runtime task 对外部系统资源的授权策略。工程内部文件、测试和 sandbox 程序执行
+# 由 Step/Tool/Gate 自身约束，不逐次弹窗；工程目录外文件访问始终硬拒绝。
+permissions:
+  mode: request  # request | auto | deny
+  timeout_ms: 0  # 0 = 不超时，等待用户回答或取消当前 task
+
+# 通用外部交互记录/重放。replay 模式禁止实时访问；找不到或记录冲突会明确失败。
+# 记录文件会脱敏并进行完整性校验，默认存放在当前工程的 .xcompiler 目录。
+record_replay:
+  mode: off  # off | record | replay | auto | refresh
+  path: .xcompiler/record-replay
+  # Replay external data, never an old build/test exit code for the current source tree.
+  channels: [http, llm]
+  redacted_fields: []
+
 llm:
   # 模型选择必须手动指定：每个角色都要在下方 roles 中显式列出 provider，
   # 不再支持 llm.default 隐式全局默认 provider。
@@ -15,8 +30,17 @@ llm:
       tags: [cluster]
       # If a provider rejects json_object, set: json_response_format: json_schema
       connect_timeout_ms: 60000
+      # 内核在连接静默这么久后开始发 TCP 探活包。断网留下的 socket 收不到 RST/FIN，应用层
+      # 无从察觉；探活是唯一能把它变成真正连接错误的机制，且不需要 provider 做任何配合。
+      # Node 只能设置「何时开始探活」，探活间隔与次数由内核决定（macOS: 75s x 8）。
+      # 0 = 关闭（仅当中间设备会掐掉被探活的连接时才需要）。
+      tcp_keepalive_ms: 30000
       request_timeout_ms: 900000
       stream_first_token_timeout_ms: 300000
+      # 仅对流式生效：流式服务端先写响应头再开始思考，所以「头没来」是连接问题（秒级），
+      # 「头来了但 token 慢」是模型问题（分钟级）。非流式的响应头要等整个答案生成完才发，
+      # 这道闸不会加在它上面。0 = 不限制。
+      stream_headers_timeout_ms: 30000
       stream_idle_timeout_ms: 60000
 
     # Backup: local OpenAI-compatible endpoint, e.g. mlx-server or vLLM.
@@ -59,6 +83,8 @@ llm:
     Coder:     [openrouter_free]
     Tester:    [openrouter_free]
     Debugger:  [openrouter_free]
+    # Judges delivery outcomes on the project's behalf; never executes a Step.
+    ProjectManager: [openrouter_free]
 
   # 动态评分快照由 XCompiler 自动维护，落盘到同目录的 llm_scores.yaml，请勿手工编辑。
   # 用户手动指定 provider 分数时，请在 config.yaml 同目录创建 llm_scores_user.yaml；
@@ -67,6 +93,10 @@ llm:
   # 可按需调整动态上下限（min 最低 0.1，max 最高 1.0）。用户覆盖文件不受 cluster 动态上限限制。
   cluster_score_min: 0.2
   cluster_score_max: 0.5
+  # 对端连续这么久没有送来任何字节时，主动跑一次环境诊断（doctor 同源）并把结论写进
+  # 最终报错与审计。它不结束请求 —— 超时决定何时放弃，这个决定放弃时说得出原因：
+  # 「网络断了」和「模型还在思考」会产生同一条超时，却需要相反的处置。0 = 关闭。
+  stall_diagnosis_after_ms: 600000
   # 全局 fallback 链：默认不启用本地备选；如已取消 provider 注释，可设为 [local_openai] 或 [local_openai, ollama_code]。
   fallbacks: []
   role_fallbacks: {}
@@ -78,10 +108,9 @@ agent:
   # EditGuard 单 Step 累计行数预算。auto 会按 phase/tools/outputs/prompt 上下文自适应；
   # 如需固定硬上限，可设为数字，例如 400。
   # max_edit_lines_per_step: auto
-  # write_file / append_file 的单次 content 窗口无需配置：Runtime 会根据当前 Provider 的
-  # context_window、实际 prompt 占用和响应安全预留自动更新；仅当单个逻辑文件超过当前窗口时
-  # 才需要 append_file。兼容场景如确需固定硬上限，可在 agent 下手动设置
-  # max_write_chunk_bytes 为正整数字节数；通常不建议覆盖自动窗口。
+  # write_file / append_file 的单次 content 窗口无需也不允许单独配置：Runtime 会根据当前
+  # Provider 的 context_window、实际 prompt 占用和响应安全预留自动更新。单个逻辑文件超过
+  # 当前窗口时，使用 append_file 做模块化增量写入。
   # 目标工程语言由 topic / 现有工程基线判定：明确写 Python/TS 时自动选择；
   # 无法判断时在澄清阶段询问；非交互或 topic 模式仍无法判断则默认 Python。
   sandboxes:
@@ -123,6 +152,10 @@ agent:
       local:
         sandbox_dir: .sandbox/typescript
         inherit_env: false
+        # Package registry the sandbox resolves dependencies from. Leave unset to use npm's default.
+        # The sandbox redirects HOME so host credentials never reach a generated project, which also
+        # discards ~/.npmrc — set this when your network resolves packages through a mirror.
+        # registry: https://registry.npmmirror.com/
         limits:
           cpu: 1
           memory_mb: 1024

@@ -23,6 +23,19 @@ const withOptions = <T extends object>(question: T): T & { options: typeof optio
   options,
 });
 
+/** A boundary question whose prioritized options resolve the API-library / application / mixed shape. */
+const projectShapeQuestion = {
+  id: 'Q4',
+  category: 'boundary',
+  question: '你希望这个程序最终以什么形态交付给使用者？',
+  why: '这会决定项目结构和交付边界。',
+  options: [
+    { label: 'A', answer: '作为可直接运行的 CLI 应用交付。' },
+    { label: 'B', answer: '作为可复用的 API library 软件包交付。' },
+    { label: 'C', answer: '采用应用与公共 API 并存的混合形态。' },
+  ],
+};
+
 const standardQuestions = [
   { id: 'Q1', category: 'functionality', question: 'Who is the primary user of this capability?', why: 'Determines actors and permissions.' },
   { id: 'Q2', category: 'data', question: 'What input fields are mandatory for one request?', why: 'Defines the input contract.' },
@@ -55,17 +68,7 @@ describe('Planner.clarify — multi-dimensional quality gate', () => {
 
   it('recognizes project-shape clarification from prioritized option answers', async () => {
     const questionsWithProjectShapeOptions = standardQuestions.map((question) => ({ ...question }));
-    questionsWithProjectShapeOptions[3] = {
-      id: 'Q4',
-      category: 'boundary',
-      question: '你希望这个程序最终以什么形态交付给使用者？',
-      why: '这会决定项目结构和交付边界。',
-      options: [
-        { label: 'A', answer: '作为可直接运行的 CLI 应用交付。' },
-        { label: 'B', answer: '作为可复用的 API library 软件包交付。' },
-        { label: 'C', answer: '采用应用与公共 API 并存的混合形态。' },
-      ],
-    };
+    questionsWithProjectShapeOptions[3] = projectShapeQuestion;
 
     const p = new Planner(fakeLLM(JSON.stringify(questionsWithProjectShapeOptions)));
     await expect(p.clarify('Build a customer lookup capability.')).resolves.toHaveLength(7);
@@ -105,8 +108,10 @@ describe('Planner.clarify — multi-dimensional quality gate', () => {
       new Planner(fakeLLM(JSON.stringify(standardQuestions))).clarify(topic),
     ).rejects.toThrow(/expected 8-10 unique questions/);
 
+    // A complex topic spanning API platform, CLI and dashboard leaves the deliverable shape
+    // ambiguous, so the set must also resolve it before planning can proceed.
     const deepQuestions = [
-      ...standardQuestions,
+      ...standardQuestions.map((question, index) => (index === 3 ? projectShapeQuestion : question)),
       withOptions({ id: 'Q8', category: 'functionality', question: 'What state transition completes the main workflow?', why: 'Defines the core lifecycle.' }),
     ];
     await expect(

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { getLanguageProfile } from '../src/core/language.js';
 import { setLocale, t } from '../src/i18n/index.js';
+import { renderExecutionPromptPolicy } from '../src/agents/prompt_policy.js';
 
 describe('language-specific planner/executor prompts', () => {
   beforeEach(() => setLocale('en'));
@@ -20,15 +21,25 @@ describe('language-specific planner/executor prompts', () => {
 
   it('keeps TypeScript StepPlan output ownership explicit in the two-level planner prompt', () => {
     const prompt = t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile('typescript'));
-    expect(prompt).toContain('CODE owns unit tests plus product source/runtime assets');
+    expect(prompt).toContain('CODE owns unit baseline tests plus product source/runtime assets');
     expect(prompt).toContain('assetPaths is optional and may contain only non-code files under src/');
     expect(prompt).toContain('Do not put test fixtures, sample inputs, temporary outputs, or documentation there.');
-    expect(prompt).toContain('HIGH_LEVEL_DESIGN owns module tests and architectureModules.testPaths');
-    expect(prompt).toContain('output validation reports/delivery docs only');
+    expect(prompt).toContain('HIGH_LEVEL_DESIGN owns module baseline tests and architectureModules.testPaths');
+    expect(prompt).toContain('consume paired baselines and own only validation reports/delivery docs');
+    expect(prompt).toContain('Runtime assigns the exact risk-supplement root');
     expect(prompt).toContain('HIGH_LEVEL_DESIGN Step must output package.json');
     expect(prompt).toContain('CODE must not output package.json');
     expect(prompt).toContain('"test": "vitest run"');
     expect(prompt).toContain('Do not mention or request Jest');
+    expect(prompt).toContain('Every planned phase is explicitly out of scope');
+    expect(prompt).toContain('exclude dependencies used solely');
+    expect(prompt).toContain('by a future planned phase');
+
+    setLocale('zh');
+    const zh = t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile('typescript'));
+    expect(zh).toContain('所有 planned phase 都是本次明确的范围外内容');
+    expect(zh).toContain('排除仅供未来');
+    expect(zh).toContain('planned phase 使用的 dependencies');
   });
 
   it('uses the canonical V-model phases and rollback semantics', () => {
@@ -118,6 +129,7 @@ describe('language-specific planner/executor prompts', () => {
   it('uses a dedicated TypeScript executor prompt instead of Python import rules', () => {
     const prompt = t().prompts.executorSystem(getLanguageProfile('typescript'));
     expect(prompt).toContain('TypeScript / Node.js best practice');
+    expect(prompt).toContain('"changeRequestDisposition": null');
     expect(prompt).toContain('ESM relative imports with explicit ".ts" specifiers');
     expect(prompt).toContain("Node's native TypeScript type stripping");
     expect(prompt).toContain('Never call `new Date()` / `date.today()` while hard-coding a calendar year');
@@ -133,6 +145,31 @@ describe('language-specific planner/executor prompts', () => {
     expect(ts).toContain('separate CODE/UNIT_TEST/INTEGRATION_TEST/MODULE_TEST/FUNCTIONAL_TEST Steps');
     expect(py).not.toContain('6000 bytes');
     expect(ts).not.toContain('6000 bytes');
+  });
+
+  it('requires tests to exercise production behavior through real injection seams', () => {
+    const prompt = renderExecutionPromptPolicy({ debug: true });
+    expect(prompt).toContain('real production function, module, orchestration, or entry boundary');
+    expect(prompt).toContain('never mock the function or module under test');
+    expect(prompt).toContain('repair the product API with dependency injection');
+    expect(prompt).toContain('Never reproduce production loops');
+    expect(prompt).toContain('spawn process.execPath with --import tsx');
+    expect(prompt).toContain('Do not use npx inside tests');
+    expect(prompt).toContain('deterministic by default');
+    expect(prompt).toContain('Never make unit, integration, module, or functional gates repeatedly call live public services');
+    expect(prompt).toContain('captured stdout, stderr, exit status or signal, and timeout state');
+
+    setLocale('zh');
+    const zh = renderExecutionPromptPolicy({ debug: true });
+    expect(zh).toContain('真实的被测产品函数、模块、编排或入口边界');
+    expect(zh).toContain('禁止 mock 被测函数或被测模块');
+    expect(zh).toContain('为产品 API 增加依赖注入');
+    expect(zh).toContain('禁止在测试内重写生产代码的循环');
+    expect(zh).toContain('process.execPath 配合 --import tsx');
+    expect(zh).toContain('禁止在测试内使用 npx');
+    expect(zh).toContain('默认必须可确定性离线执行');
+    expect(zh).toContain('禁止反复访问实时公共服务');
+    expect(zh).toContain('stdout、stderr、退出状态或 signal 以及 timeout 状态');
   });
 
   it('keeps Python-specific executor guidance for Python projects', () => {

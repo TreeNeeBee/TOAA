@@ -1,18 +1,116 @@
 import { describe, expect, it } from 'vitest';
+import { renderDebugBriefForPrompt } from '../src/core/debug_brief.js';
 import {
   reconcileMeasuredQualityAssessment,
+  reconcileDeferredSourceQualityAssessment,
+  prioritizeAttemptFailureEvidence,
   renderAttemptRetryFeedback,
+  renderExecutorFailure,
+  renderQualityAssessmentFailure,
   resolveAttemptRoundLimit,
+  selectActionableAttemptFailure,
   resolveAttemptTestArgs,
   resolveAttemptVerificationScope,
+  resolveBaselineGateExecution,
+  sandboxPreparationFailure,
+  shouldPreserveFailedCandidate,
+  shouldPreserveExistingFiles,
+  deliveredManifest,
+  isAttemptCancellation,
+  DomainAttemptRunner,
+  type AttemptInput,
+  ticketContextSnapshot,
 } from '../src/application/execution/attempt_runner.js';
 import type { DomainLog } from '../src/domain/observability/records.js';
-import { classifyAttemptFailure } from '../src/application/execution/failure_classification.js';
+import { classifyAttemptFailure, classifyFailure } from '../src/application/execution/failure_classification.js';
 import type { Plan, Step } from '../src/core/plan.js';
 import type { Ticket } from '../src/domain/tickets/ticket.js';
+import { getLanguageProfile } from '../src/core/language.js';
+import { computeIncrementalAllowedWrites } from '../src/application/execution/execution_context.js';
+
+describe('corrective write scope', () => {
+  it('limits a focused Enhancement to its structured affected test artifact', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: [
+        'docs/02-high-level-design.md',
+        'package.json',
+        'tests/modules/domain.test.ts',
+      ],
+    };
+    const allowed = computeIncrementalAllowedWrites(
+      plan,
+      design,
+      getLanguageProfile('typescript'),
+      {
+        type: 'enhancement',
+        affectedArtifacts: ['tests/modules/domain.test.ts'],
+      } as Ticket,
+    );
+
+    // Narrowing is the point: the named artifact, and none of the Step's unrelated deliverables.
+    expect(allowed).toContain('tests/modules/domain.test.ts');
+    expect(allowed).not.toContain('package.json');
+    expect(allowed).not.toContain('docs/02-high-level-design.md');
+    // The fixture directory rides along because the named artifact is a test, and a test that cannot
+    // write the data it reads cannot be repaired. Everything else stays out.
+    expect(allowed.filter((path) => !path.startsWith('tests/'))).toEqual([]);
+  });
+
+  // An artifact list naming nothing this Step owns narrows the allowlist to nothing, and a Step
+  // that may write no file cannot act on any instruction it is given — it spends its whole round
+  // budget reporting that. A live Enhancement raised at UNIT_TEST carried that Step's own documents
+  // and was routed to CODE, which owns none of them; the Change Request branch beside it already
+  // had this floor.
+  it('falls back to the Step outputs when an Enhancement names nothing it owns', () => {
+    const plan = fixturePlan();
+    const coding = {
+      ...plan.steps[0]!,
+      phase: 'CODE' as const,
+      outputs: ['src/cli.ts', 'src/scrapers/baidu.ts'],
+    };
+
+    const allowed = computeIncrementalAllowedWrites(
+      plan,
+      coding,
+      getLanguageProfile('typescript'),
+      {
+        type: 'enhancement',
+        affectedArtifacts: ['docs/05-unit-test.md', 'docs/reports/unit-test-report.md'],
+      } as Ticket,
+    );
+
+    expect(allowed).not.toEqual([]);
+    expect(allowed).toEqual(expect.arrayContaining(['src/cli.ts', 'src/scrapers/baidu.ts']));
+    // The floor is the Step's own outputs, never the artifacts it does not own.
+    expect(allowed).not.toContain('docs/05-unit-test.md');
+  });
+
+  it('keeps a downstream CR inside the current Step outputs when its delta is upstream-owned', () => {
+    const plan = fixturePlan();
+    const detail = {
+      ...plan.steps[0]!,
+      phase: 'DETAILED_DESIGN' as const,
+      outputs: ['docs/03-detailed-design.md', 'tests/integration/contracts.test.ts'],
+    };
+    const allowed = computeIncrementalAllowedWrites(
+      plan,
+      detail,
+      getLanguageProfile('typescript'),
+      {
+        type: 'change-request',
+        contractDelta: { affectedArtifacts: ['docs/02-high-level-design.md'] },
+      } as Ticket,
+    );
+    expect(allowed).toEqual(expect.arrayContaining(detail.outputs));
+    expect(allowed).not.toContain('package.json');
+  });
+});
 
 describe('attempt verification scope', () => {
-  it('inherits only the paired test gate when a verification Bug returns to its source Step', () => {
+  it('reruns the source baseline gate when a verification Bug returns upstream', () => {
     const plan = fixturePlan();
     const code = plan.steps[0]!;
     const ticket = bugTicket({
@@ -39,7 +137,7 @@ describe('attempt verification scope', () => {
     });
 
     expect(resolveAttemptVerificationScope(plan, code, ticket)).toEqual({
-      testArgs: [],
+      testArgs: ['tests/unit/core.test.ts'],
       inheritedFromTicket: false,
       verificationStepId: undefined,
       verificationPhase: undefined,
@@ -60,9 +158,144 @@ describe('attempt verification scope', () => {
       verificationPhase: 'INTEGRATION_TEST',
     }, 'typescript')).toEqual(['tests/integration/core.test.ts']);
   });
+
+  it('defers only the executable baseline on an initial S1-S3 pass', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(design);
+
+    expect(resolveBaselineGateExecution(
+      plan,
+      design,
+      { type: 'task' } as Ticket,
+    )).toEqual({ mode: 'defer', reason: 'initial-pre-code' });
+  });
+
+  it('executes an S1-S3 baseline when the correction originated at S4 or later', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(design);
+    const ticket = {
+      type: 'bug',
+      failure: {
+        failedStepId: 'code-id',
+        failedStepType: 'CODE',
+        targetStepId: 'design-id',
+        verificationStepId: 'unit-id',
+      },
+    } as Ticket;
+
+    expect(resolveBaselineGateExecution(plan, design, ticket)).toEqual({
+      mode: 'execute',
+      reason: 'post-code-correction',
+      originStepId: 'code-id',
+      originPhase: 'CODE',
+    });
+  });
+
+  it('keeps a pre-CODE corrective retry deferred until a code baseline exists', () => {
+    const plan = fixturePlan();
+    const requirement = {
+      ...plan.steps[0]!,
+      id: 'requirement-id',
+      phase: 'REQUIREMENT_ANALYSIS' as const,
+      outputs: ['docs/01-requirement-analysis.md', 'tests/functional/core.test.ts'],
+    };
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(requirement, design);
+
+    expect(resolveBaselineGateExecution(plan, requirement, {
+      type: 'enhancement',
+      stepId: 'design-id',
+      targetStepId: 'requirement-id',
+      verificationStepId: 'unit-id',
+    } as Ticket)).toEqual({
+      mode: 'defer',
+      reason: 'pre-code-correction',
+      originStepId: 'design-id',
+      originPhase: 'HIGH_LEVEL_DESIGN',
+    });
+  });
+
+  it('executes an S1-S3 baseline for an Enhancement discovered by a right-side Step', () => {
+    const plan = fixturePlan();
+    const design = {
+      ...plan.steps[0]!,
+      id: 'design-id',
+      phase: 'HIGH_LEVEL_DESIGN' as const,
+      outputs: ['docs/02-high-level-design.md', 'tests/module/core.test.ts'],
+    };
+    plan.steps.unshift(design);
+
+    expect(resolveBaselineGateExecution(plan, design, {
+      type: 'enhancement',
+      stepId: 'unit-id',
+      targetStepId: 'design-id',
+      verificationStepId: 'unit-id',
+    } as Ticket)).toEqual({
+      mode: 'execute',
+      reason: 'post-code-correction',
+      originStepId: 'unit-id',
+      originPhase: 'UNIT_TEST',
+    });
+  });
+});
+
+describe('quality failure evidence', () => {
+  it('preserves finding details when a failed assessment has no KPI gaps', () => {
+    const rendered = renderQualityAssessmentFailure({
+      gaps: [],
+      findings: [{
+        category: 'test-incomplete',
+        summary: 'tests/acceptance.test.ts does not import src/main.ts',
+        evidence: [
+          'exercises 0/1 required product sources',
+          'Import and exercise the planned product entrypoint before CODE.',
+        ],
+        target: 'current-step',
+        dependencyPackages: [],
+      }],
+    });
+
+    expect(rendered.summary).toContain('tests/acceptance.test.ts');
+    expect(rendered.detail).toContain('exercises 0/1 required product sources');
+    expect(rendered.detail).toContain('Import and exercise the planned product entrypoint');
+  });
+
+  it('uses a non-empty fallback when an invalid failed assessment carries no evidence', () => {
+    const rendered = renderQualityAssessmentFailure({ gaps: [], findings: [] });
+    expect(rendered.summary).not.toBe('');
+    expect(rendered.detail).toBe(rendered.summary);
+  });
 });
 
 describe('attempt failure classification', () => {
+  it('keeps sandbox preparation outside generated-project defect routing', () => {
+    expect(sandboxPreparationFailure('P1-S004', 'npm install timed out')).toEqual({
+      kind: 'infrastructure',
+      category: 'internal',
+      code: 'sandbox_not_ready',
+      message: 'sandbox is not ready for P1-S004: npm install timed out',
+      retryable: true,
+      switchProvider: false,
+    });
+  });
+
   it('separates LLM provider failures from generated-project execution failures', () => {
     expect(classifyAttemptFailure(
       'all LLM providers failed for role Tester: OpenAI-compatible provider request failed status=429',
@@ -72,10 +305,71 @@ describe('attempt failure classification', () => {
     expect(classifyAttemptFailure('run_tests failed: external news API returned HTTP 429'))
       .toBe('execution');
   });
+
+  it('only reads provider phrasing out of text the runtime authored', () => {
+    // XCompiler can be asked to build an LLM application; its test output legitimately contains
+    // this phrasing. Trusting captured output would retry forever instead of opening a Bug, so
+    // provider-text matching is opt-in and every un-annotated string stays an execution failure.
+    const subjectOutput = 'FAIL tests/router.spec.ts\n  Error: all LLM providers failed for role Tester';
+    expect(classifyFailure(subjectOutput).kind).toBe('execution');
+    expect(classifyFailure(subjectOutput, { trustProviderText: true }).kind).toBe('infrastructure');
+  });
+
+  it('classifies model no-progress loops as agent stalls rather than project defects', () => {
+    expect(classifyFailure(
+      'repeated read-only/probe actions without progress for 3 rounds',
+    )).toMatchObject({
+      kind: 'execution',
+      category: 'internal',
+      code: 'agent_execution_stalled',
+      retryable: true,
+      switchProvider: true,
+    });
+  });
+});
+
+describe('attempt cancellation detection', () => {
+  it('separates terminal SIGINT and Runtime aborts from project defects', () => {
+    const promptExit = new Error('User force closed the prompt with SIGINT');
+    promptExit.name = 'ExitPromptError';
+    expect(isAttemptCancellation(promptExit)).toBe(true);
+
+    const controller = new AbortController();
+    controller.abort(new Error('ACP task cancelled by client'));
+    expect(isAttemptCancellation(new Error('provider stopped'), controller.signal)).toBe(true);
+    expect(isAttemptCancellation(new Error('generated project test failed'))).toBe(false);
+  });
 });
 
 describe('attempt retry feedback', () => {
-  it('passes a compact actionable failure from a rolled-back Ticket attempt', () => {
+  it('persists bounded test output instead of replacing it with the short tool error', () => {
+    const failure = renderExecutorFailure({
+      success: false,
+      rounds: 1,
+      finalThought: 'module verification failed',
+      error: 'validation defect reported: module contract failed',
+      metrics: {
+        rounds: 1,
+        parseFailures: 0,
+        repeatedTurns: 0,
+        toolFailRatio: 1,
+        progressRatio: 1,
+        healthScore: 0,
+        providers: [],
+      },
+      toolCalls: [{
+        tool: 'run_tests',
+        ok: false,
+        error: 'npm test exit=1',
+        summary: 'npm test exit=1\nFAIL tests/modules/scrapers.test.ts\nAssertionError: invalid matcher',
+      }],
+    });
+
+    expect(failure).toContain('FAIL tests/modules/scrapers.test.ts');
+    expect(failure).toContain('AssertionError: invalid matcher');
+  });
+
+  it('passes compact actionable failure from a rolled-back non-progress attempt', () => {
     const feedback = renderAttemptRetryFeedback({
       message: 'Step executor reached max rounds',
       data: {
@@ -92,6 +386,90 @@ describe('attempt retry feedback', () => {
     expect(feedback).toContain('tests/unit/rss.spec.ts');
     expect(feedback).toContain("Cannot read properties of undefined");
   });
+
+  it('explains when a failed candidate was preserved for incremental correction', () => {
+    const feedback = renderAttemptRetryFeedback({
+      message: 'Quality gate failed',
+      data: {
+        workspaceDisposition: 'candidate-preserved',
+        failureLog: 'paired baseline test contract is incomplete',
+        structuredFailure: { kind: 'execution', category: 'quality' },
+      },
+    } as unknown as DomainLog, 'REQUIREMENT_ANALYSIS');
+
+    expect(feedback).toContain('candidate files were committed and preserved');
+    expect(feedback).toContain('Inspect and patch the preserved candidate');
+  });
+
+  it('places the latest rolled-back failure before the original Bug context', () => {
+    const evidence = prioritizeAttemptFailureEvidence(
+      'Original failure: runPipeline is not a function',
+      'Latest failure: expected zhihu to be baidu after the interface repair',
+    );
+
+    expect(evidence.indexOf('Latest failure')).toBeLessThan(evidence.indexOf('Original failure'));
+    expect(evidence).toContain('## original bug context');
+  });
+
+  it('uses the persisted failure category instead of reclassifying provider wording', () => {
+    const feedback = renderAttemptRetryFeedback({
+      message: 'all LLM providers failed after a low-quality response',
+      data: {
+        structuredFailure: {
+          kind: 'execution',
+          category: 'test',
+          code: 'test_command_failed',
+        },
+        failureLog: [
+          'run_tests: npm test exit=1 args=tests/integration/pipeline.test.ts',
+          "AssertionError: expected 'zhihu' to be 'baidu'",
+        ].join('\n'),
+      },
+    } as unknown as DomainLog, 'DETAILED_DESIGN');
+
+    expect(feedback).toContain('category: test_failure');
+    expect(feedback).toContain("expected 'zhihu' to be 'baidu'");
+    expect(feedback).not.toContain('This is LLM provider/context infrastructure');
+  });
+
+  it('prefers the latest project failure over a newer provider-only retry failure', () => {
+    const projectFailure = {
+      id: 'project-failure',
+      data: { structuredFailure: { kind: 'execution', category: 'test' } },
+    } as unknown as DomainLog;
+    const providerFailure = {
+      id: 'provider-failure',
+      data: { structuredFailure: { kind: 'infrastructure', category: 'llm-provider' } },
+    } as unknown as DomainLog;
+
+    expect(selectActionableAttemptFailure([projectFailure, providerFailure]))
+      .toBe(projectFailure);
+  });
+});
+
+describe('failed candidate persistence', () => {
+  it('preserves project defects and rolls back infrastructure, dependency, and agent stalls', () => {
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'quality', code: 'quality_gate_failed',
+      message: 'quality failed', retryable: true, switchProvider: false,
+    })).toBe(true);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'test', code: 'test_command_failed',
+      message: 'test failed', retryable: true, switchProvider: false,
+    })).toBe(true);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'infrastructure', category: 'llm-provider', code: 'provider_failed',
+      message: 'provider failed', retryable: true, switchProvider: true,
+    })).toBe(false);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'internal', code: 'agent_execution_stalled',
+      message: 'no progress', retryable: true, switchProvider: true,
+    })).toBe(false);
+    expect(shouldPreserveFailedCandidate({
+      kind: 'execution', category: 'tool', code: 'dependency_not_owned',
+      message: 'manifest owner required', retryable: true, switchProvider: false,
+    }, true)).toBe(false);
+  });
 });
 
 describe('attempt round limits', () => {
@@ -100,6 +478,15 @@ describe('attempt round limits', () => {
     expect(resolveAttemptRoundLimit('debug', 6)).toBe(9);
     expect(resolveAttemptRoundLimit('enhancement', 8)).toBe(12);
     expect(resolveAttemptRoundLimit('change-request', 6, 14)).toBe(14);
+  });
+});
+
+describe('attempt mutation policy', () => {
+  it('preserves accepted files for every corrective Ticket mode', () => {
+    expect(shouldPreserveExistingFiles('normal')).toBe(false);
+    expect(shouldPreserveExistingFiles('debug')).toBe(true);
+    expect(shouldPreserveExistingFiles('enhancement')).toBe(true);
+    expect(shouldPreserveExistingFiles('change-request')).toBe(true);
   });
 });
 
@@ -124,6 +511,54 @@ describe('measured test quality evidence', () => {
     expect(result?.metrics.branchCoverage).toBeCloseTo(0.8666);
     expect(result?.metrics.testCasePassRate).toBe(1);
     expect(result?.evidence.at(-1)).toContain('src/cli.ts=0%');
+  });
+});
+
+describe('deferred source quality evidence', () => {
+  it('hands a measured coverage gap back to the paired unit-test gate after a real source delta', () => {
+    const result = reconcileDeferredSourceQualityAssessment({
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['focused unit tests added'],
+      unavailableMetrics: ['lineCoverage', 'branchCoverage'],
+      gaps: ['CODE cannot execute the coverage command'],
+      blockedBy: ['UNIT_TEST must measure the new tests'],
+    }, {
+      currentPhase: 'CODE',
+      deferredToChangeRequest: true,
+      verificationPhase: 'UNIT_TEST',
+      changedFiles: ['tests/unit/core.test.ts'],
+    });
+
+    expect(result?.gaps).toEqual([]);
+    expect(result?.blockedBy).toContain('deferred to UNIT_TEST: CODE cannot execute the coverage command');
+  });
+
+  it('keeps gaps when no source delta was produced or the metric does not belong downstream', () => {
+    const assessment = {
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['inspection only'],
+      unavailableMetrics: ['unrelatedMetric'],
+      gaps: ['implementation is incomplete'],
+      blockedBy: ['UNIT_TEST is pending'],
+    };
+    expect(reconcileDeferredSourceQualityAssessment(assessment, {
+      currentPhase: 'CODE',
+      deferredToChangeRequest: true,
+      verificationPhase: 'UNIT_TEST',
+      changedFiles: [],
+    })?.gaps).toEqual(['implementation is incomplete']);
+    expect(reconcileDeferredSourceQualityAssessment(assessment, {
+      currentPhase: 'CODE',
+      deferredToChangeRequest: true,
+      verificationPhase: 'UNIT_TEST',
+      changedFiles: ['tests/unit/core.test.ts'],
+    })?.gaps).toEqual(['implementation is incomplete']);
   });
 });
 
@@ -160,6 +595,331 @@ function bugTicket(ids: {
 }): Ticket {
   return {
     type: 'bug',
-    failure: ids,
+    failure: {
+      ...ids,
+      failedStepType: ids.failedStepId === 'unit-id' ? 'UNIT_TEST' : 'CODE',
+      targetStepType: 'CODE',
+      verificationStepType: 'UNIT_TEST',
+    },
   } as unknown as Ticket;
 }
+
+describe('manifest delivery', () => {
+  it('recognises the manifest wherever it sits, and nothing merely named like it', () => {
+    // Writing package.json as a plain file output changes nothing about the sandbox on its own, so
+    // the runner rebuilds when it sees one delivered. A false positive would rebuild an environment
+    // nobody asked to change.
+    expect(deliveredManifest(['package.json'], 'package.json')).toBe(true);
+    expect(deliveredManifest(['packages/api/package.json'], 'package.json')).toBe(true);
+    expect(deliveredManifest(['requirements.txt'], 'requirements.txt')).toBe(true);
+
+    expect(deliveredManifest(['vendor-package.json'], 'package.json')).toBe(false);
+    expect(deliveredManifest(['package.json.bak'], 'package.json')).toBe(false);
+    expect(deliveredManifest(['src/main.ts', 'docs/02.md'], 'package.json')).toBe(false);
+    expect(deliveredManifest([], 'package.json')).toBe(false);
+  });
+});
+
+describe('quality gaps a Step does not own', () => {
+  const assessment = (gaps: string[]) => ({
+    completeness: 1, upstreamAlignment: 1, coverage: 1, metrics: {}, evidence: [], gaps,
+  }) as never;
+
+  // Both codes name a condition the Step does not own. REQUIREMENT_ANALYSIS runs before
+  // HIGH_LEVEL_DESIGN writes package.json; every design phase runs before CODE writes the sources
+  // its tsconfig points at. Reporting either accurately cost the Step an attempt, because the gate
+  // fails a Step for every gap it reports.
+  it.each([
+    ['manifest_missing', 'package.json does not exist; it is HIGH_LEVEL_DESIGN output'],
+    ['product_not_implemented', 'src/ does not exist; it is CODE output'],
+  ] as const)('drops gaps raised by a condition the Step cannot own (%s)', (code, gap) => {
+    const blocked = reconcileMeasuredQualityAssessment(
+      assessment([gap]),
+      [{ tool: 'run_tests', ok: false, code }],
+    );
+    expect(blocked?.gaps).toEqual([]);
+  });
+
+  it('keeps gaps when the Step could have acted on them', () => {
+    const real = reconcileMeasuredQualityAssessment(
+      assessment(['the renderer has no tests']),
+      [{ tool: 'run_tests', ok: false, error: '1 failing' }],
+    );
+    expect(real?.gaps).toEqual(['the renderer has no tests']);
+  });
+});
+
+/**
+ * Every watchdog wording, not one of them.
+ *
+ * `PROVIDER_FAILURE_TEXT` used to list `stream idle before first token`, which was one sentence out
+ * of several a stream watchdog composes. Two more were added this week — reasoning-only stalls and a
+ * missing response header — and neither matched, so an outage of our own provider would have been
+ * charged to the generated project as a Bug. The predicate now keys on the prefix the transport puts
+ * in front of all of them.
+ */
+describe('every stream watchdog wording is our infrastructure', () => {
+  const wordings = [
+    'OpenAI stream idle before first token for 300000ms; aborting',
+    'OpenAI stream idle for 60000ms; aborting',
+    'OpenAI stream sent 4293 reasoning chars but no content for 300000ms; aborting',
+    'OpenAI stream sent no response headers for 30000ms; aborting',
+    'OpenAI stream wall-clock 900000ms exceeded; aborting',
+  ];
+
+  for (const wording of wordings) {
+    it(`classifies "${wording.slice(0, 42)}…" as infrastructure`, () => {
+      expect(classifyAttemptFailure(wording)).toBe('infrastructure');
+    });
+  }
+
+  // The other direction is what the narrow predicate was protecting, and it still has to hold.
+  it('leaves a failure the generated project produced as execution', () => {
+    expect(classifyAttemptFailure('run_tests failed: external API returned HTTP 429')).toBe('execution');
+    expect(classifyAttemptFailure('pytest exit=1: 3 failed')).toBe('execution');
+  });
+});
+
+/**
+ * Lookup follows the top of the failure stack; the history stays in the prompt.
+ *
+ * A Ticket's own `failure` is the one that opened it, and a repair loop moves through several —
+ * unwritten tests, then an import error, then a failing assertion. Keying Debug Wiki retrieval on
+ * the opening failure answers the first question for the rest of the Ticket's life: a live dbc4 Bug
+ * received the same entry 51 times while the entry matching its current `ModuleNotFoundError` never
+ * appeared once, and the Ticket ran out of attempts on advice for a problem it had already left.
+ */
+describe('debug lookup keys on the failure in hand', () => {
+  const importFailure = {
+    message: 'Step executor reached max rounds',
+    data: {
+      failureLog: [
+        'pytest exit=2 args=tests/test_models.py',
+        "ImportError while importing test module 'tests/test_models.py'.",
+        'tests/test_models.py:3: in <module>',
+        '    from models import SignalInfo',
+        "E   ModuleNotFoundError: No module named 'models'",
+      ].join('\n'),
+    },
+  } as unknown as DomainLog;
+
+  it('builds the brief from the recorded failure, not from the Ticket that opened', async () => {
+    const { briefForAttemptFailure } = await import('../src/application/execution/attempt_policy.js');
+    const brief = briefForAttemptFailure(importFailure, 'CODE');
+    expect(brief.category).toBe('import_error');
+    expect(brief.primaryError).toContain('ModuleNotFoundError');
+  });
+
+  /**
+   * The consequence, asserted through retrieval: the same failure has to reach the entry written for
+   * it. Keying on the Ticket's opening text instead yields `test_failure` and a different entry.
+   */
+  it('retrieves the entry that matches the current error', async () => {
+    const { briefForAttemptFailure } = await import('../src/application/execution/attempt_policy.js');
+    const { DebugWiki, bundledDebugWikiPath } = await import('../src/core/debug_wiki.js');
+    const wiki = new DebugWiki(bundledDebugWikiPath());
+
+    const current = await wiki.search(briefForAttemptFailure(importFailure, 'CODE'), { limit: 3 });
+    expect(current[0]?.entry.id).toBe('agent.calibration.python-imports');
+
+    // What the Ticket carries once the loop has moved on: a description of the loop's shape, whose
+    // own text says nothing about imports.
+    const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+    const opening = buildDebugBrief({
+      reason: 'verification command repeated without a successful mutation',
+      failureLog: 'run_tests:{"cwd":"."}; the duplicate command was not executed again',
+      phase: 'CODE',
+    });
+    const stale = await wiki.search(opening, { limit: 3 });
+    expect(stale.map((match) => match.entry.id)).not.toContain('agent.calibration.python-imports');
+  });
+});
+
+/**
+ * An attempt that wrote real files keeps them, whatever ended it.
+ *
+ * The failure category describes why an attempt stopped, not whether it achieved anything, and an
+ * attempt can be both: a live CODE Step wrote the test files it owed and then ran the same
+ * verification command twice, so each rejection rolled the files away and the identical "these
+ * declared test files do not exist yet" refusal came back six times until the non-convergence guard
+ * stopped the run. The work was correct every time; only the bookkeeping lost it.
+ */
+describe('failed attempts keep the work they produced', () => {
+  const internalFailure = { kind: 'execution', category: 'internal', code: 'agent_execution_stalled' } as never;
+
+  it('preserves the candidate when files changed, whatever the category', async () => {
+    const { shouldPreserveFailedCandidate } = await import('../src/application/execution/attempt_policy.js');
+    expect(shouldPreserveFailedCandidate(internalFailure, false, 3)).toBe(true);
+  });
+
+  it('still rolls back an attempt that produced nothing', async () => {
+    const { shouldPreserveFailedCandidate } = await import('../src/application/execution/attempt_policy.js');
+    expect(shouldPreserveFailedCandidate(internalFailure, false, 0)).toBe(false);
+  });
+
+  // Conditions outside the project return to the baseline no matter what is on disk: a dependency
+  // request is answered by another Step, and infrastructure failures are not the project's work.
+  it('does not preserve work when the failure is not the project\'s to repair', async () => {
+    const { shouldPreserveFailedCandidate } = await import('../src/application/execution/attempt_policy.js');
+    expect(shouldPreserveFailedCandidate(internalFailure, true, 5)).toBe(false);
+    const infra = { kind: 'infrastructure', category: 'llm-provider', code: 'provider_call_failed' } as never;
+    expect(shouldPreserveFailedCandidate(infra, false, 5)).toBe(false);
+  });
+});
+
+/**
+ * A Step is told the metrics its own gate asks for, not a phase table it has to match itself
+ * against. CODE has no entry in that table, so a live run measured coverage nobody required, could
+ * not collect it, reported the shortfall honestly in `gaps` — and the gate failed it for
+ * volunteering, after its suite had already passed.
+ */
+describe('the prompt states this Step\'s metric contract', () => {
+  const stepWith = (metrics: Record<string, number>) => ({
+    id: 'S004', title: 'implement', phase: 'CODE', role: 'Coder',
+    acceptance: 'a', description: 'd', outputs: [], inputs: [], tools: [],
+    qualityGate: { metrics },
+  }) as never;
+
+  const render = async (metrics: Record<string, number>) => {
+    const { renderExecutionUserPrompt } = await import('../src/agents/execution/prompt_renderer.js');
+    return renderExecutionUserPrompt({
+      step: stepWith(metrics),
+      ctx: { contextWindowTokens: 128 * 1024, allowedWrites: ['src/'] },
+      contextSnippets: [],
+      architectureModules: [],
+      dependencies: [],
+    } as never, '');
+  };
+
+  it('names the required metrics when the gate has them', async () => {
+    const text = await render({ lineCoverage: 0.8 });
+    expect(text).toContain('lineCoverage');
+    expect(text).toMatch(/unavailableMetrics with its cause in\s+blockedBy/u);
+    expect(text).toMatch(/never in gaps/u);
+  });
+
+  it('says plainly that no metric is owed when the gate requires none', async () => {
+    const text = await render({});
+    expect(text).toMatch(/requires no metrics/u);
+    expect(text).toMatch(/do not record a gap about metrics/u);
+  });
+});
+
+/**
+ * The instruction and the gate have to name the same field.
+ *
+ * The prompt told a Step to put the cause of an unmeasurable metric in `gaps`, and the gate fails a
+ * Step for every gap it declares — so following the instruction was the failure. The rescue that
+ * exists for exactly this case, `reconcileMeasuredQualityAssessment`, keys on `blockedBy`, which the
+ * instruction never mentioned here. A live CODE Step passed its whole suite, honestly reported that
+ * coverage could not be collected, and was failed for saying so.
+ */
+describe('the unmeasurable-metric instruction names the non-failing field', () => {
+  for (const locale of ['zh', 'en'] as const) {
+    it(`points ${locale} at blockedBy rather than gaps`, async () => {
+      const { readFile } = await import('node:fs/promises');
+      const text = await readFile(new URL(`../src/i18n/${locale}.ts`, import.meta.url), 'utf8');
+      const line = text.split('\n').find((candidate) => candidate.includes('unavailableMetrics') && candidate.includes('Enhancement'));
+      expect(line).toBeDefined();
+      expect(line).toContain('blockedBy');
+      // The old wording sent the cause to the one field that fails the Step.
+      expect(line).not.toMatch(/(?:in|说明原因，并在) gaps 说明原因|explain the cause in gaps/u);
+    });
+  }
+});
+
+/**
+ * Retrieval and the prompt ask the same question — which failure is in hand — and answering it from
+ * two sources is how they came apart. Lookup followed the top of the stack while the prompt kept
+ * describing the failure the Ticket was opened for, so a live Debugger spent 26 attempts re-fixing
+ * an ImportError an earlier round had already fixed; the assertion actually failing never reached
+ * the model. `debugContextFrom` now takes the resolved brief rather than re-deriving one from the
+ * Ticket, which makes the two answers structurally the same value; what remains to guard is that the
+ * value follows the newest failure.
+ */
+describe('failure in hand', () => {
+  const importError = [
+    'pytest exit=2 args=tests/modules/test_main_module.py',
+    "E   ImportError: cannot import name 'validate_args' from 'src.main'",
+  ].join('\n');
+  const assertionFailure = [
+    'pytest exit=1 args=tests/modules/test_excel_writer_module.py',
+    'FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+    "E   assert None == ''",
+  ].join('\n');
+
+  const runnerFor = (logs: unknown[]): DomainAttemptRunner => new DomainAttemptRunner({
+    workspace: {}, git: {}, router: {}, audit: {}, plugins: { size: 0 },
+    debugWikiPath: '/tmp/xcompiler-brief-wiki',
+    repository: { read: async (id: string) => logs.find((log) => (log as { id: string }).id === id) },
+  } as never, 'python');
+
+  const attempt = (logIds: string[]): AttemptInput => ({
+    ticket: {
+      id: 'BUG-1', type: 'bug', logIds,
+      failure: { summary: 'collection failed', message: importError, category: 'test', code: 'test_command_failed' },
+    },
+    domainStep: { id: 'step-1' },
+    executionStep: { phase: 'HIGH_LEVEL_DESIGN' },
+  } as never);
+
+  const log = (id: string, failureLog: string) => ({
+    id, objectType: 'log', level: 'error', message: 'attempt failed',
+    data: { stepId: 'step-1', failureLog },
+  });
+
+  const briefFor = async (runner: DomainAttemptRunner, input: AttemptInput) =>
+    await (runner as unknown as {
+      latestFailureBrief(value: AttemptInput): Promise<unknown>;
+    }).latestFailureBrief(input);
+
+  it('follows the newest failure, not the one the Ticket was opened for', async () => {
+    const runner = runnerFor([log('l1', importError), log('l2', assertionFailure)]);
+    const brief = await briefFor(runner, attempt(['l1', 'l2']));
+    const rendered = renderDebugBriefForPrompt(brief as never);
+    expect(rendered).toContain('test_writes_signal_data');
+    expect(rendered).not.toContain('validate_args');
+    expect(rendered).not.toContain('ImportError');
+  });
+
+  it('falls back to the Ticket failure while no attempt has failed yet', async () => {
+    const brief = await briefFor(runnerFor([]), attempt([]));
+    expect(brief).toBeUndefined();
+  });
+});
+
+/**
+ * What the Ticket carries into the prompt. The renderer caps each snippet, so the order and the size
+ * of what goes in decides what the model actually reads: a live Bug's Ticket held 43KB of the pytest
+ * output from the day it was opened, the cap kept the first 3000 characters of that, and the failure
+ * in hand reached the model only as a one-line summary further down. It spent 26 attempts re-fixing
+ * the ImportError it could read in full.
+ */
+describe('ticket context snapshot', () => {
+  const openingDump = ['ImportError: cannot import name validate_args', 'x'.repeat(43_000)].join('\n');
+
+  const snapshot = (ticket: unknown): Record<string, unknown> =>
+    ticketContextSnapshot(ticket) as Record<string, unknown>;
+
+  it('bounds a captured failure so it cannot crowd out the Ticket fields', () => {
+    const trimmed = snapshot({
+      id: 'BUG-1', state: 'in_progress',
+      description: openingDump,
+      acceptance: ['Repair P1-S002 without unrelated rewrites.'],
+      failure: { summary: 'collection failed', message: openingDump, code: 'test_command_failed' },
+    });
+    expect(String(trimmed.description).length).toBeLessThan(1400);
+    expect(String(trimmed.description)).toContain('ImportError');
+    expect(String(trimmed.description)).toContain('ticket history trimmed');
+    expect((trimmed.failure as Record<string, string>).message.length).toBeLessThan(1400);
+    // The fields the routed role needs survive intact.
+    expect(trimmed.acceptance).toEqual(['Repair P1-S002 without unrelated rewrites.']);
+    expect((trimmed.failure as Record<string, string>).code).toBe('test_command_failed');
+  });
+
+  it('leaves a short failure untouched', () => {
+    const trimmed = snapshot({ description: 'assert None == \'\'', failure: { message: 'short' } });
+    expect(trimmed.description).toBe('assert None == \'\'');
+    expect((trimmed.failure as Record<string, string>).message).toBe('short');
+  });
+});

@@ -7,15 +7,6 @@ import type { LanguageProfile } from '../core/language.js';
  */
 export type Locale = 'en' | 'zh';
 
-export interface SkillPrompt {
-  patcher: string;
-  author: string;
-  tester: string;
-  dep_resolver: string;
-  debugger: string;
-  refactorer: string;
-}
-
 export interface Messages {
   // ───────── shared LLM role guidance ─────────
   llm: {
@@ -23,7 +14,7 @@ export interface Messages {
     invalidBaseUrl: (raw: string, fallback: string) => string;
     providerValidationFailed: (role: string, model: string) => string;
     providerValidationRetry: (role: string, model: string) => string;
-    providerValidationRepairPrompt: (error: string) => string;
+    providerValidationRepairPrompt: (error: string, rejectedOutput: string) => string;
     providerCallFailed: (role: string, model: string) => string;
     scoreReadFailed: (path: string, message: string) => string;
     scoreChanged: (provider: string, score: string, previous: string) => string;
@@ -40,7 +31,6 @@ export interface Messages {
     unhandledError: (message: string) => string;
     unsupportedSubprocessNetworkOff: string;
     dockerInsideContainerUnsupported: string;
-    firejailUnsupported: string;
     smokeHeader: (baseUrl: string) => string;
     smokeOk: (model: string, totalMs: number, firstTokenMs: number, chunks: number, preview: string) => string;
     smokeFail: (model: string, message: string) => string;
@@ -149,6 +139,9 @@ export interface Messages {
     optBaselinePlan: string;
     optProjectFile: string;
     optDebugWikiPath: string;
+    optRecordReplay: string;
+    optRecordReplayPath: string;
+    optPermissionMode: string;
     argPlan: string;
     argProjectFile: string;
     argStepId: string;
@@ -163,6 +156,8 @@ export interface Messages {
     invalidPhase: (value: string, allowed: string) => string;
     invalidStepId: (value: string) => string;
     invalidNonNegativeInteger: (value: string) => string;
+    invalidRecordReplayMode: (value: string, allowed: string) => string;
+    invalidPermissionMode: (value: string, allowed: string) => string;
     helpUsage: string;
     helpArguments: string;
     helpOptions: string;
@@ -398,6 +393,12 @@ export interface Messages {
     executorSystem: (profile: LanguageProfile) => string;
     executorDebugBlock: (reason: string, suggestions?: string) => string;
     executorGlobalBlock: (globalPrompt: string) => string;
+    executorContextBlock: (context: string) => string;
+    executorRoleBlock: (identity: {
+      rolePrompt: string;
+      capabilityPrompt: string;
+      prohibitions: readonly string[];
+    }) => string;
     executorStepBlock: (stepSystemPrompt: string) => string;
     executorSkillBlock: (hints: string[]) => string;
     executorUserPromptOutro: string;
@@ -414,9 +415,6 @@ export interface Messages {
     executorFeedbackBugResolutionPlanMissing: string;
     executorFeedbackPostMutationVerificationRequired: string;
   };
-
-  // ───────── Skill prompts ─────────
-  skills: SkillPrompt;
 
   // ───────── doctor (xcompiler doctor / startup env-check) ─────────
   doctor: {
@@ -465,6 +463,7 @@ export interface Messages {
     sandboxDockerDaemonDown: (msg: string) => string;
     sandboxInContainerWarn: string;
     skillToolMissing: (skill: string, tool: string) => string;
+    skillInvalid: (message: string) => string;
     skillOk: (n: number, tools: number) => string;
   };
 }

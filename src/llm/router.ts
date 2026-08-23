@@ -19,6 +19,9 @@ import {
   normalizeContextWindowTokens,
   resolveSkillOperationWindow,
 } from './window.js';
+import { isLLMRequestError, LLMRequestError } from './errors.js';
+import type { RecordReplayController } from '../application/record_replay/controller.js';
+import { isCancellationError } from '../core/cancellation.js';
 
 
 type ProviderConfig = XCompilerConfig['llm']['providers'][string];
@@ -50,10 +53,16 @@ export class LLMRouter {
     private readonly plugins?: PluginHost,
     private readonly probe: ProviderAvailabilityProbe = (name, provider) =>
       probeLLMProviderAvailability(provider, resolveLLMProbeTimeoutMs(provider)),
+    private readonly recordReplay?: RecordReplayController,
+    /** The config this run loaded. A diagnosis that re-resolves the default path would report on a
+     *  different configuration than the one that just went silent. */
+    private readonly configPath?: string,
   ) {
     for (const [name, p] of Object.entries(cfg.llm.providers)) {
-      const client = createClient(name, p);
-      if (client) this.clients.set(name, client);
+      const client = createClient(name, p, cfg.llm.stall_diagnosis_after_ms);
+      if (client) this.clients.set(name, recordReplay?.enabled('llm')
+        ? recordReplayClient(name, client, recordReplay)
+        : client);
     }
   }
 
@@ -62,6 +71,9 @@ export class LLMRouter {
    * 瞬时断连重试三个时机调用。结果按 maxAgeMs 缓存，永不抛错。
    */
   private async availability(name: string, maxAgeMs = PROBE_CACHE_TTL_MS): Promise<LLMProbeResult | undefined> {
+    if (this.recordReplay?.mode === 'replay') {
+      return { ok: true, latencyMs: 0, detail: 'offline replay' };
+    }
     const provider = this.cfg.llm.providers[name];
     if (!provider) return undefined;
     const cached = this.probeCache.get(name);
@@ -84,16 +96,58 @@ export class LLMRouter {
    * 排序：按 ScoreStore 的评分降序；评分 = 0 的 provider 直接剔除。
    * 链中第一个调用成功即返回；失败 → 自动降评分并尝试下一个。
    */
-  for(role: Role): LLMClient {
-    const candidates = this.resolveChain(role);
+  /**
+   * Explains a silent provider, once, without ending the request.
+   *
+   * Runs the same environment check an operator would run by hand, because the two faults that
+   * produce this silence — a dead network and a model still thinking — need opposite responses and
+   * are indistinguishable from the timeout alone.
+   *
+   * Diagnostic only, and deliberately never consulted to decide whether to keep waiting: this opens
+   * a new connection, and a new connection can succeed while the socket the request is blocked on
+   * stays black-holed. A healthy verdict here narrows the cause; it does not clear the request.
+   */
+  private async diagnoseStall(info: { silentForMs: number; provider?: string; model?: string }): Promise<string | undefined> {
+    try {
+      const { runDoctor } = await import('../core/doctor.js');
+      const report = await runDoctor({ configPath: this.configPath, probeTimeoutMs: 10_000 });
+      const bad = report.sections
+        .flatMap((section) => section.items
+          .filter((item) => item.level !== 'ok')
+          .map((item) => `[${section.title}] ${item.level}: ${item.message}`))
+        .slice(0, 6);
+      const silentFor = `${Math.round(info.silentForMs / 1000)}s`;
+      const summary = bad.length > 0
+        ? bad.join(' | ')
+        : 'every check passed, so the endpoint was reachable from a new connection while this request stayed silent';
+      await this.audit?.event('llm.error', `stall diagnosis after ${silentFor}: ${summary}`, {
+        messageId: 'llm.stall_diagnosis',
+        provider: info.provider,
+        model: info.model,
+        silentForMs: info.silentForMs,
+        fails: report.fails,
+        warns: report.warns,
+      });
+      return `after ${silentFor} of silence — ${summary}`;
+    } catch {
+      // A diagnosis that fails must not become the failure. The request's own error still stands.
+      return undefined;
+    }
+  }
+
+  for(role: Role, options: { providerPool?: readonly string[] } = {}): LLMClient {
+    const candidates = this.resolveChain(role, options.providerPool);
     if (candidates.length === 0) {
-      throw new Error(`LLM provider not configured for role: ${role}`);
+      throw new LLMRequestError(`LLM provider not configured for role: ${role}`, {
+        code: 'provider_not_configured', mode: 'router', retryable: false, switchProvider: false,
+      });
     }
     const ranked = this.rankByScore(candidates);
     if (ranked.length === 0) {
-      throw new Error(
+      throw new LLMRequestError(
         `No usable LLM provider for role ${role}: candidates [${candidates.join(', ')}] ` +
           `are disabled or unreachable in this run. Run preflight or restore at least one provider in config.`,
+        { code: 'provider_unavailable', mode: 'router', retryable: true, switchProvider: true },
       );
     }
     const clients = ranked
@@ -104,7 +158,9 @@ export class LLMRouter {
       }))
       .filter((x): x is { name: string; client: LLMClient; contextWindowTokens: number } => !!x.client);
     if (clients.length === 0) {
-      throw new Error(`No usable LLM provider in chain for role ${role}: [${ranked.join(', ')}]`);
+      throw new LLMRequestError(`No usable LLM provider in chain for role ${role}: [${ranked.join(', ')}]`, {
+        code: 'provider_unavailable', mode: 'router', retryable: true, switchProvider: true,
+      });
     }
     const composite = new FallbackClient(
       clients,
@@ -112,6 +168,7 @@ export class LLMRouter {
       String(role),
       this.scores,
       (name, maxAgeMs) => this.availability(name, maxAgeMs),
+      (info) => this.diagnoseStall(info),
     );
     const observable = this.audit
       ? wrapWithAudit(composite, String(role), this.audit)
@@ -160,11 +217,18 @@ export class LLMRouter {
     }
   }
 
-  private resolveChain(role: Role): string[] {
+  private resolveChain(role: Role, providerPool?: readonly string[]): string[] {
     const out: string[] = [];
     const push = (n: string | undefined) => {
       if (n && !out.includes(n)) out.push(n);
     };
+    // An actor bound to specific providers is authoritative and does not inherit the global
+    // fallback chain: binding a model to one of several parallel actors is meaningless if the run
+    // may silently substitute a different one.
+    if (providerPool && providerPool.length > 0) {
+      for (const n of providerPool) push(n);
+      return out;
+    }
     const explicit = this.cfg.llm.role_fallbacks?.[role];
     if (explicit && explicit.length > 0) {
       for (const n of explicit) push(n);
@@ -206,6 +270,8 @@ class FallbackClient implements LLMClient {
     private readonly role: string,
     private readonly scores?: ScoreStore,
     private readonly availability?: (name: string, maxAgeMs?: number) => Promise<LLMProbeResult | undefined>,
+    /** Explains total provider silence. Supplied by the router, which may import the checks. */
+    private readonly diagnoseStall?: (info: { silentForMs: number; provider?: string; model?: string }) => Promise<string | undefined>,
   ) {
     this.name = chain.length === 1
       ? chain[0]!.client.name
@@ -224,6 +290,11 @@ class FallbackClient implements LLMClient {
   async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
     let lastErr: unknown;
     const failures: string[] = [];
+    // Whether each recorded failure was the provider itself failing, or the model's content being
+    // refused by the caller's own contract. A run must not stop because every provider returned a
+    // turn the contract rejected: that is a round the Step can still be told to correct, and it
+    // reached the orchestrator as an infrastructure failure that aborted the whole run.
+    const failureKinds: ('content' | 'transport')[] = [];
     for (let i = 0; i < this.chain.length; i++) {
       const c = this.chain[i]!;
       // 冷启动 / 切换时的可用性检查（规则 1 / 2）。
@@ -246,6 +317,7 @@ class FallbackClient implements LLMClient {
         );
         if (isSwitch && i < this.chain.length - 1) {
           failures.push(`${c.name}/${c.client.name}: availability check failed: ${health.detail}`);
+          failureKinds.push('transport');
           continue;
         }
       }
@@ -287,10 +359,16 @@ class FallbackClient implements LLMClient {
             typeof attemptOptions?.maxTokens === 'number'
               ? Math.min(attemptOptions.maxTokens, operationWindow.responseTokenBudget)
               : operationWindow.responseTokenBudget,
+          // The caller supplies the explanation because the transport may not import it. A caller
+          // that already wants its own stall handling keeps it.
+          onStall: attemptOptions?.onStall ?? this.diagnoseStall,
         };
         try {
           out = await c.client.chat(providerMessages, providerOptions);
         } catch (err) {
+          // Host/user cancellation is control flow, not provider quality. It must never consume a
+          // fallback, trigger a retry, or alter the provider's score.
+          if (isCancellationError(err, options?.signal)) throw err;
           lastErr = err;
           const retryDelayMs = retryDelayForLLMError(err);
           if (
@@ -348,6 +426,7 @@ class FallbackClient implements LLMClient {
           }
           this.scores?.decay(c.name, `chat threw in role ${this.role}: ${errorMessage(err).slice(0, 120)}`);
           failures.push(formatProviderFailure(c.name, c.client.name, err));
+          failureKinds.push('transport');
           await this.audit?.event(
             'llm.error',
             t().llm.providerCallFailed(this.role, c.client.name),
@@ -378,13 +457,22 @@ class FallbackClient implements LLMClient {
                 remaining: this.chain.length - i - 1,
                 error: validationError,
                 output_preview: out.slice(0, 400),
+                output_tail: out.slice(-400),
+                output_chars: out.length,
+                output_has_done: /"done"\s*:/u.test(out),
               },
             );
             if (providerAttempt < FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS) {
+              const rejectedOutput = validationOutputForRetry(
+                out,
+                operationWindow.feedbackCharBudget,
+              );
               providerMessages = [
                 ...messages,
-                { role: 'assistant', content: validationOutputForRetry(out, operationWindow.feedbackCharBudget) },
-                { role: 'user', content: t().llm.providerValidationRepairPrompt(validationError) },
+                {
+                  role: 'user',
+                  content: t().llm.providerValidationRepairPrompt(validationError, rejectedOutput),
+                },
               ];
               await this.audit?.event(
                 'note',
@@ -404,6 +492,7 @@ class FallbackClient implements LLMClient {
             this.scores?.decay(c.name, `validate failed in role ${this.role}`);
             lastErr = vErr;
             failures.push(formatProviderFailure(c.name, c.client.name, vErr));
+            failureKinds.push('content');
             break;
           }
         }
@@ -415,8 +504,20 @@ class FallbackClient implements LLMClient {
       }
     }
     if (failures.length > 0) {
-      throw new Error(
+      throw new LLMRequestError(
         `all LLM providers failed for role ${this.role}: ${failures.map((f) => truncateFailure(f, 500)).join(' | ')}`,
+        {
+          code: 'all_providers_failed',
+          mode: 'router',
+          retryable: true,
+          switchProvider: true,
+          details: {
+            role: this.role,
+            failures,
+            contentRejectedOnly: failureKinds.every((kind) => kind === 'content'),
+          },
+        },
+        { cause: lastErr },
       );
     }
     throw lastErr instanceof Error ? lastErr : new Error('all LLM providers failed');
@@ -440,16 +541,42 @@ function validationOutputForRetry(text: string, feedbackBudget: number): string 
   return truncateFailure(text, max);
 }
 
+/** How long a post-stall non-stream retry may run. */
+const NON_STREAM_RETRY_TIMEOUT_MS = 180_000;
+
 function withoutStreamingOptions(options?: ChatOptions): ChatOptions | undefined {
   if (!options?.onToken) return options;
   const next: ChatOptions = { ...options };
   delete next.onToken;
   delete next.streamStopWhen;
+  // The non-stream path has no idle or first-token watchdog, so it runs to the full configured
+  // budget with nothing to observe. That budget is sized for a fresh request; this is a recovery
+  // attempt after a stream already stalled, and giving it the same allowance doubles the cost of one
+  // stall — a live Planner spent fifteen minutes here after its stream went idle at sixty seconds.
+  next.requestTimeoutMs = Math.min(next.requestTimeoutMs ?? Infinity, NON_STREAM_RETRY_TIMEOUT_MS);
   return next;
 }
 
+/**
+ * Whether dropping to a non-streaming request is worth one attempt.
+ *
+ * Reads what the stream delivered, not how the failure was worded. The transport records that on
+ * `LLMFailureDetails.streamProgress`; it used to be recoverable only by matching English, where
+ * `stream idle before first token` had to be excluded before `stream idle` was accepted — two
+ * sentences whose prefix relationship carried the entire policy. Both were rewritten this week for
+ * unrelated reasons, and nothing would have failed.
+ *
+ * A stream that produced nothing is not worth retrying blind: the non-stream path has no idle or
+ * first-token watchdog, only the wall clock, so a provider that sent no bytes gets the full timeout
+ * to send none again. A stream that had started producing may well finish without streaming.
+ *
+ * The prose fallback stays for transports that do not record progress, and only for failures whose
+ * wording this repository owns.
+ */
 function shouldRetryWithoutStreaming(err: unknown, options?: ChatOptions): boolean {
   if (!options?.onToken) return false;
+  const progress = isLLMRequestError(err) ? err.failure.streamProgress : undefined;
+  if (progress) return progress !== 'no-bytes';
   const msg = errorMessage(err).toLowerCase();
   if (msg.includes('stream idle before first token')) return false;
   return (
@@ -537,6 +664,7 @@ function wrapWithAudit(inner: LLMClient, role: string, audit: AuditLogger): LLMC
 function createClient(
   name: string,
   p: ProviderConfig,
+  stallDiagnosisAfterMs?: number,
 ): LLMClient | null {
   if (isOllamaProvider(p)) {
     return new OllamaClient({
@@ -557,10 +685,39 @@ function createClient(
       jsonResponseFormat: p.json_response_format,
       requestTimeoutMs: p.request_timeout_ms,
       connectTimeoutMs: p.connect_timeout_ms,
+      tcpKeepAliveMs: p.tcp_keepalive_ms,
       streamIdleTimeoutMs: p.stream_idle_timeout_ms,
       streamFirstTokenTimeoutMs: p.stream_first_token_timeout_ms,
+      streamHeadersTimeoutMs: p.stream_headers_timeout_ms,
       maxOutputChars: p.max_output_chars,
+      stallDiagnosisAfterMs,
     });
   }
   return null;
+}
+
+function recordReplayClient(
+  provider: string,
+  inner: LLMClient,
+  controller: RecordReplayController,
+): LLMClient {
+  return {
+    name: inner.name,
+    async chat(messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+      return controller.execute({
+        channel: 'llm',
+        operation: 'chat',
+        request: {
+          provider,
+          model: inner.name,
+          messages,
+          options: {
+            temperature: options?.temperature,
+            maxTokens: options?.maxTokens,
+            responseFormat: options?.responseFormat,
+          },
+        },
+      }, () => inner.chat(messages, options));
+    },
+  };
 }

@@ -43,8 +43,18 @@ export function isRunningInContainer(): boolean {
 export function createSandbox(
   cfg: XCompilerConfig,
   ws: Workspace,
+  /** Environment root under container state; identifies which environment this work owns. */
+  environmentRoot: string,
   audit?: AuditLogger,
   language: Language = 'python',
+  /**
+   * Shared per-project package download cache; each environment keeps its own installed state.
+   *
+   * Honoured by the subprocess sandbox only. The Docker sandbox bind-mounts the environment root as
+   * a whole, so sharing a cache there needs a second mount rather than a second path, and it keeps
+   * a cache per environment until that exists.
+   */
+  downloadCacheRoot?: string,
 ): Sandbox {
   const languageSandbox = cfg.agent.sandboxes[language];
   const kind = languageSandbox.mode;
@@ -66,11 +76,8 @@ export function createSandbox(
       pull: languageSandbox.docker.pull,
       dockerBin: languageSandbox.docker.docker_bin,
       extraRunArgs: languageSandbox.docker.extra_run_args,
-      sandboxDir: languageSandbox.docker.sandbox_dir,
+      environmentRoot,
     });
-  }
-  if (kind === 'firejail') {
-    throw new Error(t().system.firejailUnsupported);
   }
   // 在容器内默认提示（但不抦截）：subprocess 是唯一推荐选项
   return new SubprocessSandbox({
@@ -78,8 +85,10 @@ export function createSandbox(
     limits: languageSandbox.local.limits,
     audit,
     language,
-    sandboxDir: languageSandbox.local.sandbox_dir,
+    environmentRoot,
+    downloadCacheRoot,
     pythonBin: languageSandbox.local.python_bin,
+    registry: languageSandbox.local.registry,
     inheritEnv: languageSandbox.local.inherit_env,
   });
 }

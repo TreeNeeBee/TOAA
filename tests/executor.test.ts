@@ -3,14 +3,17 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { Workspace } from '../src/workspace/workspace.js';
-import { isCompleteTurnJson, StepExecutor } from '../src/agents/executor.js';
+import { isCompleteTurnJson, StepExecutor, verifyOutputs } from '../src/agents/executor.js';
+import { rejectedExecutionTurnEnvelopeKey } from '../src/agents/execution/turn_parser.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
+import { LLMRequestError } from '../src/llm/errors.js';
 import type { Step } from '../src/core/plan.js';
 import { getLanguageProfile } from '../src/core/language.js';
 import type { Tool, ToolContext, ToolExecutionEvent } from '../src/tools/types.js';
 import { readFileTool, writeFileTool } from '../src/tools/fs.js';
 import { replaceInFileTool } from '../src/tools/edit.js';
 import { runTestsTool } from '../src/tools/sandbox.js';
+import { seedRoleDefinition } from '../src/domain/workflow/role_definition.js';
 
 class CapturingLLM implements LLMClient {
   readonly name = 'cap';
@@ -83,6 +86,53 @@ describe('StepExecutor system prompt assembly', () => {
     expect(events).toHaveLength(2);
     expect(events.every((event) => event.stepId === canonicalId)).toBe(true);
     expect(events.every((event) => event.stepName === 'P1-S004')).toBe(true);
+  });
+
+  it('injects the assignee role identity into the system message', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const identity = seedRoleDefinition('developer');
+    const r = await exec.run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+      roleIdentity: {
+        rolePrompt: identity.rolePrompt,
+        capabilityPrompt: identity.capabilityPrompt,
+        prohibitions: identity.prohibitions,
+      },
+    });
+    expect(r.success).toBe(true);
+    expect(llm.lastSystem).toContain('## Your role');
+    expect(llm.lastSystem).toContain(identity.rolePrompt);
+    expect(llm.lastSystem).toContain(identity.capabilityPrompt);
+    for (const rule of identity.prohibitions) expect(llm.lastSystem).toContain(rule);
+  });
+
+  it('injects the assembled layered context, and nothing when there is none', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    await exec.run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+      layeredContext: '## Project\nobjective: ship the CLI\n\n## Ticket P1-S004-STORY\nconstraint: no network',
+    });
+    expect(llm.lastSystem).toContain('objective: ship the CLI');
+    expect(llm.lastSystem).toContain('constraint: no network');
+
+    const bare = new CapturingLLM();
+    await new StepExecutor({ llm: bare, maxRounds: 2 })
+      .run({ step: baseStep, tools: [writeFileTool], ctx, layeredContext: '   ' });
+    expect(bare.lastSystem).not.toContain('objective:');
+    expect(bare.lastSystem.length).toBeLessThan(llm.lastSystem.length);
+  });
+
+  it('omits the role block when no actor identity is supplied', async () => {
+    const llm = new CapturingLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
+    expect(llm.lastSystem).not.toContain('## Your role');
   });
 
   it('injects globalPrompt + step.systemPrompt into system message', async () => {
@@ -164,7 +214,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastUser).toContain('Create these exact paths before rewriting outputs that already exist');
   });
 
-  it('returns a structured validation defect from a right-side test phase', async () => {
+  it('rejects a validation defect that has no failed executable test evidence', async () => {
     class ValidationDefectLLM implements LLMClient {
       readonly name = 'validation-defect';
       async chat(): Promise<string> {
@@ -194,8 +244,430 @@ describe('StepExecutor system prompt assembly', () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.validationDefect).toContain('invalid-input behavior');
+    expect(result.validationDefect).toBeUndefined();
+    expect(result.error).toContain('max rounds exceeded');
+  });
+
+  it('lets a CR assignee report a defect that contradicts the original failed-gate diagnosis', async () => {
+    class ContradictedChangeRequestLLM implements LLMClient {
+      readonly name = 'contradicted-change-request';
+      lastUser = '';
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.lastUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        return JSON.stringify({
+          thoughts: 'the CLI exists; the acceptance test repeatedly calls live public services',
+          changeRequestDisposition: {
+            outcome: 'not-applicable',
+            reasonCategory: 'diagnosis-contradicted',
+            rationale:
+              'The CR premise is false: src/cli.ts is implemented, while the acceptance test depends on live HTTP instead of deterministic fixtures.',
+            inspectedArtifacts: ['src/cli.ts'],
+            evidence: ['The current CLI exports the required entrypoint and the failing test invokes live public URLs.'],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    const llm = new ContradictedChangeRequestLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 1 }).run({
+      step: { ...baseStep, outputs: [] },
+      tools: [],
+      ctx,
+      changeRequest: {
+        id: 'CR-CONTRADICTED',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'Implement the missing CLI.',
+        triggerStepId: 'S008',
+        sourceStepId: 'S003',
+        targetStepId: 'S004',
+        originFailure: {
+          category: 'test',
+          code: 'test_command_failed',
+          message: 'npm test exit=1 args=tests/functional/cli.test.ts',
+          summary: 'functional test failed',
+          retryable: true,
+          switchProvider: false,
+          failedStepId: 'S008',
+          failedStepType: 'FUNCTIONAL_TEST',
+          targetStepId: 'S001',
+          targetStepType: 'REQUIREMENT_ANALYSIS',
+          verificationStepId: 'S008',
+          verificationStepType: 'FUNCTIONAL_TEST',
+        },
+        contractDelta: {
+          summary: 'Implement the missing CLI.',
+          before: ['npm test exit=1'],
+          after: ['functional tests pass'],
+          affectedArtifacts: ['src/cli.ts'],
+        },
+      } as never,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.validationDefect).toContain('CR premise is false');
+    expect(llm.lastUser).toContain('original failed gate: FUNCTIONAL_TEST');
+    expect(llm.lastUser).toContain('Runtime will make the discovering role create a Bug');
+  });
+
+  it('converts a CR read-only warning into the structured diagnosis-contradicted path', async () => {
+    class ConvergingChangeRequestLLM implements LLMClient {
+      readonly name = 'converging-change-request';
+      calls = 0;
+      sawConvergenceGuidance = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        const feedback = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        this.sawConvergenceGuidance ||= feedback.includes('Change Request convergence:');
+        if (this.sawConvergenceGuidance) {
+          return JSON.stringify({
+            thoughts: 'inspection disproved the missing-entrypoint diagnosis',
+            changeRequestDisposition: {
+              outcome: 'not-applicable',
+              reasonCategory: 'diagnosis-contradicted',
+              rationale: 'The entrypoint exists; the failed gate instead depends on nondeterministic live HTTP.',
+              inspectedArtifacts: ['src/cli.ts', 'tests/functional/cli.test.ts'],
+              evidence: ['The CLI exports run while the functional test invokes live services.'],
+            },
+            actions: [],
+            done: true,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'inspect the diagnosis before changing code',
+          actions: [{ tool: 'read_file', args: { path: 'src/cli.ts' } }],
+          done: false,
+        });
+      }
+    }
+
+    await ws.writeFile('src/cli.ts', 'export async function run(): Promise<number> { return 0; }\n');
+    const llm = new ConvergingChangeRequestLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 4 }).run({
+      step: { ...baseStep, outputs: [] },
+      tools: [readFileTool],
+      ctx,
+      changeRequest: {
+        id: 'CR-CONVERGE',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'Implement the missing CLI.',
+        triggerStepId: 'S008',
+        sourceStepId: 'S003',
+        targetStepId: 'S004',
+        originFailure: {
+          category: 'test',
+          code: 'test_command_failed',
+          message: 'npm test timed out',
+          summary: 'functional test failed',
+          retryable: true,
+          switchProvider: false,
+          failedStepId: 'S008',
+          failedStepType: 'FUNCTIONAL_TEST',
+          targetStepId: 'S001',
+          targetStepType: 'REQUIREMENT_ANALYSIS',
+          verificationStepId: 'S008',
+          verificationStepType: 'FUNCTIONAL_TEST',
+        },
+        contractDelta: {
+          summary: 'Implement the missing CLI.',
+          before: ['npm test timed out'],
+          after: ['functional tests pass'],
+          affectedArtifacts: ['src/cli.ts'],
+        },
+      } as never,
+    });
+
+    expect(llm.calls).toBe(3);
+    expect(llm.sawConvergenceGuidance).toBe(true);
+    expect(result.validationDefect).toContain('entrypoint exists');
     expect(result.error).toContain('validation defect reported');
+  });
+
+  it('automatically runs the executable gate before accepting a verification Step', async () => {
+    class ReadThenAssessLLM implements LLMClient {
+      readonly name = 'read-then-assess';
+      calls = 0;
+      sawGateEvidence = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the declared unit-test asset',
+            actions: [{ tool: 'read_file', args: { path: 'tests/unit/x.test.ts' } }],
+            done: false,
+          });
+        }
+        this.sawGateEvidence = messages.at(-1)?.content.includes('60 passed') ?? false;
+        return JSON.stringify({
+          thoughts: 'the executable unit-test gate passed',
+          qualityAssessment: {
+            metrics: { lineCoverage: 0.9, branchCoverage: 0.8, testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['run_tests: 60 passed'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('tests/unit/x.test.ts', 'test("x", () => {});\n');
+    const tests: Tool = {
+      name: 'run_tests',
+      description: 'run exact unit tests',
+      argsSchema: {},
+      async run() { return { ok: true, summary: '60 passed' }; },
+    };
+    const llm = new ReadThenAssessLLM();
+    const step: Step = {
+      ...baseStep,
+      id: 'S005',
+      phase: 'UNIT_TEST',
+      role: 'Tester',
+      tools: ['read_file', 'run_tests'],
+      outputs: ['tests/unit/x.test.ts'],
+      qualityGate: {
+        metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+        tolerance: { metricShortfall: 0.02, maxFailedTests: 0, maxSkippedTests: 0, maxWarnings: 0 },
+      },
+    };
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step,
+      tools: [readFileTool, tests],
+      ctx: { ...ctx, allowedWrites: [], stepId: step.id },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.sawGateEvidence).toBe(true);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual(['read_file', 'run_tests']);
+  });
+
+  it('defers speculative verification writes until the current executable gate result is known', async () => {
+    class SpeculativeReportLLM implements LLMClient {
+      readonly name = 'speculative-report';
+      calls = 0;
+      sawGateEvidence = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'assume the old failure still applies and write a failed report',
+            qualityAssessment: {
+              metrics: { lineCoverage: 0, branchCoverage: 0, testCasePassRate: 0 },
+              tolerance: { failedTests: 1, skippedTests: 0, warnings: 0 },
+              evidence: ['historical failure'],
+              unavailableMetrics: [],
+              gaps: ['assumed failure'],
+              blockedBy: [],
+            },
+            actions: [
+              { tool: 'read_file', args: { path: 'tests/unit/x.test.ts' } },
+              { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# FAILED\n' } },
+            ],
+            done: true,
+          });
+        }
+        this.sawGateEvidence ||= messages.at(-1)?.content.includes('47 passed') ?? false;
+        if (this.calls === 2) {
+          return JSON.stringify({
+            thoughts: 'write the report from the current successful gate',
+            actions: [
+              { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit test\n47 passed\n' } },
+            ],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'complete from current executable evidence',
+          qualityAssessment: {
+            metrics: { lineCoverage: 0.9, branchCoverage: 0.8, testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['47 passed'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('tests/unit/x.test.ts', 'test("x", () => {});\n');
+    const tests: Tool = {
+      name: 'run_tests',
+      description: 'run exact unit tests',
+      argsSchema: {},
+      async run() { return { ok: true, summary: '47 passed' }; },
+    };
+    const llm = new SpeculativeReportLLM();
+    const step: Step = {
+      ...baseStep,
+      id: 'S005',
+      phase: 'UNIT_TEST',
+      role: 'Tester',
+      tools: ['read_file', 'run_tests', 'write_file'],
+      outputs: ['docs/05-unit-test.md'],
+      qualityGate: {
+        metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+        tolerance: { metricShortfall: 0.02, maxFailedTests: 0, maxSkippedTests: 0, maxWarnings: 0 },
+      },
+    };
+    const result = await new StepExecutor({ llm, maxRounds: 3 }).run({
+      step,
+      tools: [readFileTool, tests, writeFileTool],
+      ctx: { ...ctx, allowedWrites: ['docs/'], stepId: step.id },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.sawGateEvidence).toBe(true);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual(['read_file', 'run_tests', 'write_file']);
+    await expect(ws.readFile('docs/05-unit-test.md')).resolves.toBe('# Unit test\n47 passed\n');
+  });
+
+  // Who wrote the defect text decides who is held to have failed. Routing treats a role-authored
+  // defect as a role disproving the active Change Request's diagnosis and files it against that
+  // chain's origin; a runtime-rendered one makes no claim about fault and belongs to the Step whose
+  // gate failed. Presence of the field cannot tell them apart, so the provenance travels with it.
+  it('marks a runtime-rendered gate failure as gate-rendered, not a role claim', async () => {
+    class ReportingLLM implements LLMClient {
+      readonly name = 'reporting';
+
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'run the declared baseline suite',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 1, skippedTests: 0, warnings: 0 },
+            evidence: ['pytest exit=1'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+            findings: [{
+              category: 'test-defect',
+              summary: 'run_cli returns int while every assertion reads result.returncode',
+              evidence: ["AttributeError: 'int' object has no attribute 'returncode'"],
+              target: 'paired-source',
+              affectedArtifacts: ['tests/unit/x.test.ts'],
+              dependencyPackages: [],
+            }],
+          },
+          actions: [{ tool: 'run_tests', args: { args: ['tests/unit/x.test.ts'] } }],
+          done: false,
+        });
+      }
+    }
+    await ws.writeFile('tests/unit/x.test.ts', 'test("x", () => {});\n');
+    const tests: Tool = {
+      name: 'run_tests',
+      description: 'run exact unit tests',
+      argsSchema: {},
+      async run() {
+        return { ok: false, summary: 'pytest exit=1', error: 'AttributeError' };
+      },
+    };
+    const step: Step = {
+      ...baseStep,
+      id: 'S005',
+      phase: 'UNIT_TEST',
+      role: 'Tester',
+      tools: ['run_tests'],
+      outputs: ['tests/unit/x.test.ts'],
+    };
+    const result = await new StepExecutor({ llm: new ReportingLLM(), maxRounds: 2 }).run({
+      step,
+      tools: [tests],
+      ctx: { ...ctx, allowedWrites: [], stepId: step.id, testGateArgs: ['tests/unit/x.test.ts'] },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.validationDefect).toBeDefined();
+    // The runtime rendered the text; the role never claimed the contract was at fault.
+    expect(result.validationDefectSource).toBe('gate-rendered');
+  });
+
+  it('reuses a successful verification gate when the model only changes test arguments', async () => {
+    class RepeatingGateLLM implements LLMClient {
+      readonly name = 'repeating-gate';
+      calls = 0;
+
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls <= 2) {
+          return JSON.stringify({
+            thoughts: this.calls === 1 ? 'run the declared tests' : 'rerun with coverage reordered',
+            actions: [{
+              tool: 'run_tests',
+              args: { args: this.calls === 1
+                ? ['tests/unit/x.test.ts']
+                : ['--coverage', 'tests/unit/x.test.ts'] },
+            }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'use the existing successful gate evidence',
+          qualityAssessment: {
+            metrics: { lineCoverage: 0.9, branchCoverage: 0.8, testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['mandatory gate passed'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('tests/unit/x.test.ts', 'test("x", () => {});\n');
+    let executions = 0;
+    const tests: Tool = {
+      name: 'run_tests',
+      description: 'run exact unit tests',
+      argsSchema: {},
+      async run() {
+        executions++;
+        return { ok: true, summary: 'Tests 60 passed (60)' };
+      },
+    };
+    const step: Step = {
+      ...baseStep,
+      id: 'S005',
+      phase: 'UNIT_TEST',
+      role: 'Tester',
+      tools: ['run_tests'],
+      outputs: ['tests/unit/x.test.ts'],
+      qualityGate: {
+        metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+        tolerance: { metricShortfall: 0.02, maxFailedTests: 0, maxSkippedTests: 0, maxWarnings: 0 },
+      },
+    };
+    const result = await new StepExecutor({ llm: new RepeatingGateLLM(), maxRounds: 3 }).run({
+      step,
+      tools: [tests],
+      ctx: {
+        ...ctx,
+        allowedWrites: [],
+        stepId: step.id,
+        testGateArgs: ['tests/unit/x.test.ts', '--coverage'],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(executions).toBe(1);
+    expect(result.toolCalls.filter((call) => call.tool === 'run_tests')).toHaveLength(1);
   });
 
   it('updates skill operation windows when the active LLM provider switches', async () => {
@@ -247,7 +719,7 @@ describe('StepExecutor system prompt assembly', () => {
     const ctxWithAudit = { ...ctx, audit };
     const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx: ctxWithAudit });
     expect(r.success).toBe(true);
-    const jsonl = await fs.readFile(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const jsonl = await fs.readFile(path.join(tmp, 'audit', 'audit.jsonl'), 'utf8');
     const lines = jsonl.trim().split('\n').map((l) => JSON.parse(l));
     const turns = lines.filter((l) => l.kind === 'executor.turn');
     expect(turns.length).toBeGreaterThan(0);
@@ -272,7 +744,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.lastUser).toContain('role: Debugger');
     expect(llm.lastUser).not.toContain('role: Coder');
 
-    const jsonl = await fs.readFile(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const jsonl = await fs.readFile(path.join(tmp, 'audit', 'audit.jsonl'), 'utf8');
     const turns = jsonl.trim().split('\n').map((l) => JSON.parse(l)).filter((l) => l.kind === 'executor.turn');
     expect(turns[0].data.role).toBe('Debugger');
   });
@@ -473,7 +945,7 @@ describe('StepExecutor system prompt assembly', () => {
       async run(args, toolCtx) {
         executed.push('tests');
         expect(args).toEqual({});
-        expect(toolCtx.defaultTestArgs).toEqual(['tests/unit/x.test.ts']);
+        expect(toolCtx.testGateArgs).toEqual(['tests/unit/x.test.ts']);
         return { ok: true, summary: 'unit gate passed' };
       },
     };
@@ -492,7 +964,7 @@ describe('StepExecutor system prompt assembly', () => {
       ctx: {
         ...ctx,
         language: 'typescript',
-        defaultTestArgs: ['tests/unit/x.test.ts'],
+        testGateArgs: ['tests/unit/x.test.ts'],
       },
       debugContext: {
         bugTicketId: 'BUG-ROLLBACK',
@@ -508,11 +980,161 @@ describe('StepExecutor system prompt assembly', () => {
     });
 
     expect(r.success).toBe(true);
-    expect(executed).toEqual(['tests']);
-    expect(r.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_tests']);
+    expect(executed).toEqual(['tsc', 'tests']);
+    expect(r.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_program', 'run_tests']);
     expect(llm.lastUser).toContain('## inherited paired verification gate');
     expect(llm.lastUser).toContain('tests/unit/x.test.ts');
-    expect(llm.lastUser).toContain('Do not run broad compiler or all-project test commands');
+    expect(llm.lastUser).toContain('Do not widen it to all-project tests');
+  });
+
+  it('executes the paired baseline after a post-CODE rollback reaches a design Step', async () => {
+    class DesignRepairLLM implements LLMClient {
+      readonly name = 'design-repair';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'repair the architecture contract exposed by module verification',
+          bugResolutionPlan: 'Update the architecture contract and rerun its module baseline.',
+          actions: [{
+            tool: 'write_file',
+            args: {
+              path: 'docs/02-high-level-design.md',
+              content: '# High-level design\n\nCorrected module contract.\n',
+            },
+          }],
+          done: false,
+        });
+      }
+    }
+    let baselineRuns = 0;
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled module baseline gate',
+      argsSchema: { args: 'string[]?' },
+      async run(_args, toolCtx) {
+        baselineRuns++;
+        expect(toolCtx.testGateArgs).toEqual(['tests/module/core.test.ts']);
+        return { ok: true, summary: 'module baseline passed' };
+      },
+    };
+    const exec = new StepExecutor({ llm: new DesignRepairLLM(), maxRounds: 1 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        outputs: ['docs/02-high-level-design.md'],
+        tools: ['write_file', 'run_tests'],
+      },
+      executionRole: 'Debugger',
+      baselineTestExecution: 'execute',
+      tools: [writeFileTool, runTests],
+      ctx: {
+        ...ctx,
+        allowedWrites: ['docs/'],
+        testGateArgs: ['tests/module/core.test.ts'],
+      },
+      debugContext: {
+        bugTicketId: 'BUG-DESIGN-ROLLBACK',
+        reason: 'MODULE_TEST found an architecture contract defect',
+        failureLog: 'tests/module/core.test.ts failed',
+        repairRequired: true,
+        verificationScope: {
+          stepId: 'S007',
+          phase: 'MODULE_TEST',
+          testArgs: ['tests/module/core.test.ts'],
+        },
+      },
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(baselineRuns).toBe(1);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual(['write_file', 'run_tests']);
+  });
+
+  it('executes the paired baseline when a post-CODE design CR is an inspected no-op', async () => {
+    class DesignRecheckLLM implements LLMClient {
+      readonly name = 'design-recheck';
+      private round = 0;
+
+      async chat(): Promise<string> {
+        this.round++;
+        if (this.round === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the accepted manifest before disposing the dependency re-check',
+            actions: [{ tool: 'read_file', args: { path: 'package.json' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'the dependency is already represented and the executable baseline passed',
+          changeRequestDisposition: {
+            outcome: 'not-applicable',
+            reasonCategory: 'already-aligned',
+            rationale: 'The accepted manifest already contains the dependency.',
+            inspectedArtifacts: ['package.json'],
+            evidence: ['package.json contains the accepted dependency entry'],
+          },
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['package.json inspected and paired module baseline passed'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['no HIGH_LEVEL_DESIGN artifact change is required'],
+            postToolEvidence: 'run_tests passed after the manifest inspection',
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('package.json', '{"type":"module"}\n');
+    let baselineRuns = 0;
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled module baseline gate',
+      argsSchema: { args: 'string[]?' },
+      async run() {
+        baselineRuns++;
+        return { ok: true, summary: 'module baseline passed' };
+      },
+    };
+    const step: Step = {
+      ...baseStep,
+      phase: 'HIGH_LEVEL_DESIGN',
+      role: 'Architect',
+      outputs: ['package.json'],
+      tools: ['read_file', 'run_tests'],
+    };
+    const result = await new StepExecutor({ llm: new DesignRecheckLLM(), maxRounds: 2 }).run({
+      step,
+      baselineTestExecution: 'execute',
+      tools: [readFileTool, runTests],
+      ctx: {
+        ...ctx,
+        allowedWrites: [],
+        testGateArgs: ['tests/modules/dependencies.test.ts'],
+      },
+      changeRequest: {
+        id: 'DEP-P1-RECHECK',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'P1-S004-STORY',
+        description: 'Confirm the design after the dependency set changed.',
+        contractDelta: {
+          summary: 'The dependency set changed upstream.',
+          before: [],
+          after: ['node-cron is available to the project'],
+          affectedArtifacts: ['package.json'],
+        },
+      } as never,
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(baselineRuns).toBe(1);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual(['read_file', 'run_tests']);
   });
 
   it('returns the DEBUG Bug Ticket resolution plan when the Bug Ticket is fixed', async () => {
@@ -543,6 +1165,717 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(true);
     expect(r.bugResolutionPlan).toContain('Root cause');
+  });
+
+  it('tells an upstream Debugger to hand the accepted delta to downstream Change Requests', async () => {
+    class DeferredGateLLM implements LLMClient {
+      readonly name = 'deferred-gate';
+      lastUser = '';
+      async chat(messages: Array<{ role: string; content: string }>): Promise<string> {
+        this.lastUser = messages.at(-1)?.content ?? '';
+        return JSON.stringify({
+          thoughts: 'update only the current design contract',
+          bugResolutionPlan: 'Specify the injected scraper contract for downstream implementation.',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 3\n' } }],
+          done: true,
+        });
+      }
+    }
+    const llm = new DeferredGateLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 1 });
+    const result = await exec.run({
+      step: baseStep,
+      executionRole: 'Debugger',
+      tools: [writeFileTool],
+      ctx,
+      debugContext: {
+        bugTicketId: 'BUG-UPSTREAM',
+        reason: 'module tests failed',
+        failureLog: 'CLI invoked a network collaborator',
+        repairRequired: true,
+        deferredVerificationScope: {
+          stepId: 'S007',
+          phase: 'MODULE_TEST',
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.lastUser).toContain('## paired verification deferred to change-request propagation');
+    expect(llm.lastUser).toContain('Do not modify downstream product implementation');
+    expect(llm.lastUser).toContain('PM will propagate those exact affected artifacts through downstream Change Requests');
+  });
+
+  it('accepts an upstream repair when the unchanged downstream gate remains deferred', async () => {
+    class DeferredFailureLLM implements LLMClient {
+      readonly name = 'deferred-failure';
+      calls = 0;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'repair the upstream test contract and collect the downstream failure once',
+            bugResolutionPlan: 'Keep the accepted CLI contract, repair its test launcher, and propagate implementation through CRs.',
+            actions: [
+              { tool: 'write_file', args: { path: 'src/x.py', content: 'x = 3\n' } },
+              { tool: 'run_tests', args: { args: ['tests/functional/cli.test.ts'] } },
+            ],
+            done: false,
+          });
+        }
+        expect(messages.at(-1)?.content).toContain('Unresolved tool failures remain');
+        return JSON.stringify({
+          thoughts: 'the upstream repair is complete and the remaining failure belongs to CODE',
+          bugResolutionPlan: 'Keep the accepted CLI contract, repair its test launcher, and propagate implementation through CRs.',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 1, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py updated', 'functional test reached the missing CLI implementation'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['src/cli.ts must be implemented by downstream CODE'],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    const llm = new DeferredFailureLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'REQUIREMENT_ANALYSIS',
+        tools: ['write_file', 'run_tests'],
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      executionRole: 'Debugger',
+      tools: [writeFileTool, runTestsTool],
+      ctx: {
+        ...ctx,
+        sandbox: {
+          async runProgram() { throw new Error('not used'); },
+          async runTests() {
+            return {
+              exitCode: 1,
+              stdout: '',
+              stderr: 'CLI entry src/cli.ts is not implemented',
+              timedOut: false,
+              durationMs: 1,
+            };
+          },
+          async installDeps() { throw new Error('not used'); },
+        } as never,
+      },
+      debugContext: {
+        bugTicketId: 'BUG-DEFERRED-FAILURE',
+        reason: 'functional test failed',
+        failureLog: 'CLI output was not created',
+        repairRequired: true,
+        deferredVerificationScope: {
+          stepId: 'S008',
+          phase: 'FUNCTIONAL_TEST',
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls).toContainEqual(expect.objectContaining({ tool: 'run_tests', ok: false }));
+    expect(result.qualityAssessment?.tolerance.failedTests).toBe(0);
+    expect(result.qualityAssessment?.evidence.join('\n')).toContain('remains deferred');
+  });
+
+  it('hands an aligned upstream phase onward without inventing a repair', async () => {
+    class DeferredNoopLLM implements LLMClient {
+      readonly name = 'deferred-noop';
+
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'the accepted requirement artifacts are aligned; implementation belongs to downstream CODE',
+          bugResolutionPlan: 'Preserve the aligned requirement contract and carry the missing implementation through CRs.',
+          bugResolutionDisposition: {
+            outcome: 'deferred',
+            reasonCategory: 'downstream-owned',
+            rationale: 'The inspected executable entrypoint is outside this requirement Step and owns the remaining behavior.',
+            affectedArtifacts: ['src/cli.ts'],
+            evidence: ['The current src/cli.ts workspace artifact is the downstream implementation boundary.'],
+          },
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 7, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py was loaded from the current workspace and matches the accepted contract'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['downstream CODE must implement the executable CLI behavior'],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const result = await new StepExecutor({ llm: new DeferredNoopLLM(), maxRounds: 1 }).run({
+      step: {
+        ...baseStep,
+        phase: 'REQUIREMENT_ANALYSIS',
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      executionRole: 'Debugger',
+      tools: [],
+      ctx,
+      contextSnippets: [
+        { path: 'src/x.py', content: 'x = 1\n' },
+        { path: 'src/cli.ts', content: 'export async function run() { return 1; }\n' },
+      ],
+      ticket: {
+        id: 'BUG-DEFERRED-NOOP',
+        name: 'BUG-DEFERRED-NOOP',
+        type: 'bug',
+        state: 'in_progress',
+        acceptance: ['carry the concrete downstream implementation delta through CRs'],
+        failure: { code: 'test_command_failed' },
+      } as never,
+      debugContext: {
+        bugTicketId: 'BUG-DEFERRED-NOOP',
+        reason: 'functional behavior is not implemented',
+        failureLog: 'the functional gate produced no output file',
+        repairRequired: true,
+        deferredVerificationScope: {
+          stepId: 'S008',
+          phase: 'FUNCTIONAL_TEST',
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(1);
+    expect(result.toolCalls).toEqual([]);
+    expect(result.qualityAssessment?.tolerance.failedTests).toBe(0);
+    expect(result.qualityAssessment?.blockedBy).toContain(
+      'downstream CODE must implement the executable CLI behavior',
+    );
+  });
+
+  it('requires inspected downstream artifacts before accepting a Bug no-op handoff', async () => {
+    class UnstructuredBugNoopLLM implements LLMClient {
+      readonly name = 'unstructured-bug-noop';
+      calls = 0;
+      sawDispositionFeedback = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        const latestUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        this.sawDispositionFeedback ||= latestUser.includes('Invalid Bug no-op handoff:');
+        return JSON.stringify({
+          thoughts: 'claim a downstream owner without identifying its workspace artifact',
+          bugResolutionPlan: 'Preserve this source contract and pass the unspecified remainder downstream.',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py exists'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['downstream implementation'],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new UnstructuredBugNoopLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step: { ...baseStep, phase: 'REQUIREMENT_ANALYSIS' },
+      executionRole: 'Debugger',
+      tools: [],
+      ctx,
+      contextSnippets: [{ path: 'src/x.py', content: 'x = 1\n' }],
+      ticket: {
+        id: 'BUG-UNSTRUCTURED-NOOP',
+        name: 'BUG-UNSTRUCTURED-NOOP',
+        type: 'bug',
+        state: 'in_progress',
+        acceptance: ['repair or identify the concrete downstream owner'],
+        failure: { code: 'test_command_failed' },
+      } as never,
+      debugContext: {
+        bugTicketId: 'BUG-UNSTRUCTURED-NOOP',
+        reason: 'functional gate failed',
+        failureLog: 'the executable boundary returned a failure',
+        repairRequired: true,
+        deferredVerificationScope: { stepId: 'S008', phase: 'FUNCTIONAL_TEST' },
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(llm.calls).toBe(2);
+    expect(llm.sawDispositionFeedback).toBe(true);
+  });
+
+  it('does not hand a validation-contract Bug downstream without correcting an owned output', async () => {
+    class ValidationContractNoopLLM implements LLMClient {
+      readonly name = 'validation-contract-noop';
+      calls = 0;
+      sawOwnershipPrompt = false;
+      sawRepairFeedback = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        const latestUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        this.sawOwnershipPrompt ||= latestUser.includes('## validation-contract defect ownership');
+        this.sawRepairFeedback ||= latestUser.includes('Validation-contract Bug completion is invalid');
+        return JSON.stringify({
+          thoughts: 'incorrectly preserve the defective paired test and delegate it downstream',
+          bugResolutionPlan: 'Review the current validation contract and delegate the unchanged failure.',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['the paired test exists'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['downstream implementation should absorb the validation defect'],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('tests/functional/cli.test.ts', 'test("cli", () => {});\n');
+    const llm = new ValidationContractNoopLLM();
+    const step: Step = {
+      ...baseStep,
+      phase: 'REQUIREMENT_ANALYSIS',
+      role: 'Planner',
+      outputs: ['tests/functional/cli.test.ts'],
+    };
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step,
+      executionRole: 'Debugger',
+      tools: [],
+      ctx: { ...ctx, allowedWrites: ['tests/functional/'], stepId: step.id },
+      contextSnippets: [{
+        path: 'tests/functional/cli.test.ts',
+        content: 'test("cli", () => {});\n',
+      }],
+      ticket: {
+        id: 'BUG-VALIDATION-CONTRACT',
+        name: 'BUG-VALIDATION-CONTRACT',
+        type: 'bug',
+        state: 'in_progress',
+        acceptance: ['correct the paired validation contract'],
+        failure: { code: 'validation_contract_defect' },
+      } as never,
+      debugContext: {
+        bugTicketId: 'BUG-VALIDATION-CONTRACT',
+        reason: 'the failed validation contract was contradicted by current product evidence',
+        failureLog: 'the paired test uses an uncontrolled external collaborator',
+        repairRequired: true,
+        deferredVerificationScope: {
+          stepId: 'S008',
+          phase: 'FUNCTIONAL_TEST',
+        },
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(llm.calls).toBe(2);
+    expect(llm.sawOwnershipPrompt).toBe(true);
+    expect(llm.sawRepairFeedback).toBe(true);
+    expect(result.toolCalls).toEqual([]);
+  });
+
+  it('does not close a CR as a no-op when this Step owns an affected artifact', async () => {
+    class NoopChangeRequestLLM implements LLMClient {
+      readonly name = 'noop-change-request';
+
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'src/x.py already exists, so no change is needed',
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const result = await new StepExecutor({ llm: new NoopChangeRequestLLM(), maxRounds: 4 }).run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+      changeRequest: {
+        id: 'CR-CODE-IMPACT',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'CLI does not execute when invoked directly.',
+        contractDelta: {
+          summary: 'Implement the executable CLI behavior.',
+          before: ['CLI exits without producing output.'],
+          after: ['CLI writes the requested output.'],
+          affectedArtifacts: ['src/x.py'],
+        },
+      } as never,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls).toEqual([]);
+    expect(result.error).toContain('accepted contract delta remains unapplied');
+  });
+
+  it('rejects downstream-owned when this Step owns every affected CR artifact', async () => {
+    class InvalidOwnershipDispositionLLM implements LLMClient {
+      readonly name = 'invalid-ownership-disposition';
+      calls = 0;
+      sawOwnershipFeedback = false;
+      sawOwnershipPrompt = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        const latestUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        this.sawOwnershipPrompt ||= latestUser.includes(
+          'if this Step owns every declared affected artifact, "downstream-owned" is invalid',
+        );
+        this.sawOwnershipFeedback ||= latestUser.includes(
+          'Invalid Change Request classification:',
+        );
+        if (this.sawOwnershipFeedback) {
+          return JSON.stringify({
+            thoughts: 'the immutable diagnosis is contradicted by the inspected implementation',
+            changeRequestDisposition: {
+              outcome: 'not-applicable',
+              reasonCategory: 'diagnosis-contradicted',
+              rationale: 'The affected entrypoint already exists; the failed acceptance contract itself requires correction.',
+              inspectedArtifacts: ['src/x.py'],
+              evidence: ['The current implementation exports the entrypoint described as missing by the CR.'],
+            },
+            actions: [],
+            done: true,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'incorrectly delegate the only affected artifact to a downstream owner',
+          changeRequestDisposition: {
+            outcome: 'not-applicable',
+            reasonCategory: 'downstream-owned',
+            rationale: 'The affected implementation exists, so a later phase should own the remaining failure.',
+            inspectedArtifacts: ['src/x.py'],
+            evidence: ['The assembled workspace snippet contains the affected implementation.'],
+          },
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py was inspected against the CR contract'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['a downstream phase should handle the remaining failure'],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('src/x.py', 'export const entrypoint = true;\n');
+    const llm = new InvalidOwnershipDispositionLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 3 }).run({
+      step: baseStep,
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      contextSnippets: [{ path: 'src/x.py', content: 'export const entrypoint = true;\n' }],
+      changeRequest: {
+        id: 'CR-INVALID-OWNERSHIP',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'Implement the missing entrypoint.',
+        triggerStepId: 'S008',
+        sourceStepId: 'S003',
+        targetStepId: 'S010',
+        originFailure: {
+          category: 'test',
+          code: 'test_command_failed',
+          message: 'functional acceptance failed because the entrypoint was reported missing',
+          summary: 'functional test failed',
+          retryable: true,
+          switchProvider: false,
+          failedStepId: 'S008',
+          failedStepType: 'FUNCTIONAL_TEST',
+          targetStepId: 'S001',
+          targetStepType: 'REQUIREMENT_ANALYSIS',
+          verificationStepId: 'S008',
+          verificationStepType: 'FUNCTIONAL_TEST',
+        },
+        contractDelta: {
+          summary: 'Restore executable entrypoint behavior.',
+          before: ['The entrypoint is reported missing.'],
+          after: ['The entrypoint is executable.'],
+          affectedArtifacts: ['src/x.py'],
+        },
+      } as never,
+    });
+
+    expect(llm.calls).toBe(2);
+    expect(llm.sawOwnershipPrompt).toBe(true);
+    expect(llm.sawOwnershipFeedback).toBe(true);
+    expect(result.success).toBe(false);
+    expect(result.validationDefect).toContain('affected entrypoint already exists');
+  });
+
+  it('records an inspected not-applicable CR application without manufacturing a mutation', async () => {
+    class ReviewedNoopChangeRequestLLM implements LLMClient {
+      readonly name = 'reviewed-noop-change-request';
+      calls = 0;
+
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the owned artifact before deciding whether this CR applies',
+            actions: [{ tool: 'read_file', args: { path: 'src/x.py' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'the reported failure belongs to the downstream entrypoint, not this module',
+          changeRequestDisposition: {
+            outcome: 'not-applicable',
+            reasonCategory: 'downstream-owned',
+            rationale: 'The inspected module exports the accepted value; the missing executable behavior is owned by the downstream CLI entrypoint.',
+            inspectedArtifacts: ['src/x.py'],
+            evidence: ['read_file confirmed src/x.py contains the accepted exported value'],
+          },
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py was inspected against the CR contract'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['downstream CLI entrypoint must implement direct execution'],
+            postToolEvidence: 'read_file inspected src/x.py after the CR was assigned',
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'export const value = 1;\n');
+    const result = await new StepExecutor({
+      llm: new ReviewedNoopChangeRequestLLM(),
+      maxRounds: 3,
+    }).run({
+      step: baseStep,
+      tools: [readFileTool, writeFileTool],
+      ctx,
+      changeRequest: {
+        id: 'CR-CODE-REVIEWED-NOOP',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'The project entrypoint does not execute directly.',
+        contractDelta: {
+          summary: 'Restore executable project behavior.',
+          before: ['The final project probe times out.'],
+          after: ['The project entrypoint exits successfully.'],
+          affectedArtifacts: ['src/x.py', 'src/cli.py'],
+        },
+      } as never,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.changeRequestDisposition?.outcome).toBe('not-applicable');
+    expect(await ws.readFile('src/x.py')).toBe('export const value = 1;\n');
+  });
+
+  it('requires a disposition when a CR only passes through a non-owning phase', async () => {
+    class MissingDispositionLLM implements LLMClient {
+      readonly name = 'missing-cr-disposition';
+
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'claim the unrelated design is complete without disposing the CR',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['docs/design.md exists'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['CODE owns src/cli.ts'],
+            postToolEvidence: 'src/cli.ts is present in the assembled context',
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('docs/design.md', '# accepted design\n');
+    const result = await new StepExecutor({ llm: new MissingDispositionLLM(), maxRounds: 2 }).run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        tools: ['read_file'],
+        outputs: ['docs/design.md'],
+      },
+      tools: [readFileTool],
+      ctx: { ...ctx, allowedWrites: ['docs/', 'tests/'] },
+      contextSnippets: [{ path: 'src/cli.ts', content: 'export async function run() { return 1; }\n' }],
+      changeRequest: {
+        id: 'CR-MISSING-DISPOSITION',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'Repair the executable CLI behavior.',
+        contractDelta: {
+          summary: 'CLI must write an output file.',
+          before: ['CLI exits with status 1.'],
+          after: ['CLI exits successfully.'],
+          affectedArtifacts: ['src/cli.ts'],
+        },
+      } as never,
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts an audited pass-through CR after an unrelated phase rewrite is denied', async () => {
+    class DeniedRewriteThenPassThroughLLM implements LLMClient {
+      readonly name = 'denied-rewrite-pass-through';
+      calls = 0;
+      lastUser = '';
+      userPrompts: string[] = [];
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        this.lastUser = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        this.userPrompts.push(this.lastUser);
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the downstream artifact named by the CR',
+            actions: [{ tool: 'read_file', args: { path: 'src/cli.ts' } }],
+            done: false,
+          });
+        }
+        if (this.calls === 2) {
+          return JSON.stringify({
+            thoughts: 'incorrectly attempt to rewrite this unrelated phase output',
+            actions: [{ tool: 'write_file', args: { path: 'docs/design.md', content: '# rewritten\n' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'the CR belongs to the downstream CODE owner, so preserve this accepted design',
+          changeRequestDisposition: {
+            outcome: 'not-applicable',
+            reasonCategory: 'outside-step-scope',
+            rationale: 'This design Step does not own the executable CLI artifact; the accepted design remains aligned and the CODE owner must repair runtime behavior.',
+            inspectedArtifacts: ['src/cli.ts'],
+            evidence: ['read_file confirmed the affected CLI artifact exists downstream'],
+          },
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['docs/design.md remains the accepted baseline'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['CODE owner must repair the executable CLI behavior'],
+            postToolEvidence: 'src/cli.ts was inspected after CR assignment',
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('src/cli.ts', 'export async function run(): Promise<number> { return 1; }\n');
+    await ws.writeFile('docs/design.md', '# accepted design\n');
+    const llm = new DeniedRewriteThenPassThroughLLM();
+    const result = await new StepExecutor({
+      llm,
+      maxRounds: 4,
+    }).run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        tools: ['read_file', 'write_file'],
+        outputs: ['docs/design.md'],
+      },
+      tools: [readFileTool, writeFileTool],
+      ctx: {
+        ...ctx,
+        allowedWrites: ['docs/'],
+        requestPermission: async () => ({
+          approved: false,
+          reason: 'CR does not apply to this accepted design artifact',
+        }),
+      },
+      changeRequest: {
+        id: 'CR-PASS-THROUGH',
+        revision: 1,
+        state: 'in_progress',
+        sourceTicketId: 'BUG-FUNCTIONAL',
+        description: 'Repair the executable CLI behavior.',
+        contractDelta: {
+          summary: 'CLI must produce an output file.',
+          before: ['CLI exits with status 1.'],
+          after: ['CLI exits successfully and writes output.'],
+          affectedArtifacts: ['src/cli.ts'],
+        },
+      } as never,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(3);
+    expect(result.changeRequestDisposition?.outcome).toBe('not-applicable');
+    expect(llm.userPrompts.some((prompt) =>
+      prompt.includes('Use this concrete path first when available: src/cli.ts'))).toBe(true);
+    expect(llm.userPrompts.some((prompt) =>
+      prompt.includes("Do not substitute this Step's report or plan for that inspection"))).toBe(true);
+    expect(result.toolCalls.find((call) => !call.ok)?.error).toContain('permission denied for file_write');
+    expect(await ws.readFile('docs/design.md')).toBe('# accepted design\n');
   });
 
   it('extends past the base round limit when successful writes reduce missing outputs', async () => {
@@ -713,6 +2046,54 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.calls).toBe(3);
   });
 
+  it('treats timeout changes as the same verification identity', async () => {
+    class RetryWithLongerTimeoutLLM implements LLMClient {
+      readonly name = 'retry-with-longer-timeout';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'run the focused integration gate',
+            actions: [{
+              tool: 'run_tests',
+              args: { args: ['tests/integration/pipeline.test.ts'], timeoutMs: 30_000 },
+            }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'retry the same gate with enough time to finish',
+          actions: [{
+            tool: 'run_tests',
+            args: { args: ['tests/integration/pipeline.test.ts'], timeoutMs: 60_000 },
+          }],
+          done: false,
+        });
+      }
+    }
+    let testRuns = 0;
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled test gate',
+      argsSchema: {},
+      async run() {
+        testRuns++;
+        return testRuns === 1
+          ? { ok: false, error: 'integration gate timed out' }
+          : { ok: true, summary: '9 tests passed' };
+      },
+    };
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new RetryWithLongerTimeoutLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const r = await exec.run({ step: baseStep, tools: [runTests], ctx });
+
+    expect(r.success).toBe(true);
+    expect(r.rounds).toBe(2);
+    expect(testRuns).toBe(2);
+  });
+
   it('keeps failed verification commands unresolved when a different command succeeds', async () => {
     class DifferentVerificationLLM implements LLMClient {
       readonly name = 'different-verification';
@@ -771,11 +2152,13 @@ describe('StepExecutor system prompt assembly', () => {
         });
       }
     }
+    let actualRuns = 0;
     const runProgram: Tool = {
       name: 'run_program',
       description: 'always failing compiler gate',
       argsSchema: {},
       async run() {
+        actualRuns++;
         return { ok: false, error: 'tsc exit=2: TS2339 missing API' };
       },
     };
@@ -789,8 +2172,10 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(false);
     expect(r.rounds).toBe(2);
-    expect(r.toolCalls).toHaveLength(2);
+    expect(r.toolCalls).toHaveLength(1);
+    expect(actualRuns).toBe(1);
     expect(r.error).toContain('verification command repeated without a successful mutation');
+    expect(r.error).toContain('duplicate command was not executed again');
     expect(r.error).toContain('next attempt must patch/write');
   });
 
@@ -899,7 +2284,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.error).toContain('without repair evidence');
   });
 
-  it('omits executed write payloads from assistant history instead of inventing contentBytes args', async () => {
+  it('omits executed write payloads without adding non-protocol fields to assistant history', async () => {
     class HistoryInspectingLLM implements LLMClient {
       readonly name = 'history-inspecting';
       calls = 0;
@@ -922,10 +2307,19 @@ describe('StepExecutor system prompt assembly', () => {
     const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
 
     expect(r.success).toBe(true);
-    expect(llm.assistantHistory).toContain('payload omitted');
+    expect(llm.assistantHistory).not.toContain('transcriptNote');
+    expect(llm.assistantHistory).not.toContain('Content omitted from this transcript');
     expect(llm.assistantHistory).not.toContain('contentBytes');
     expect(llm.assistantHistory).not.toContain('sensitive generated payload');
-    expect(JSON.parse(llm.assistantHistory).actions).toEqual([]);
+    const historyTurn = JSON.parse(llm.assistantHistory) as Record<string, unknown>;
+    expect(historyTurn).not.toHaveProperty('executedPayloadActions');
+    expect(historyTurn.actions).toEqual([]);
+    expect(Object.keys(historyTurn).sort()).toEqual([
+      'actions',
+      'bugResolutionPlan',
+      'done',
+      'thoughts',
+    ]);
   });
 
   it('parses LLM output that contains multiple back-to-back ```json blocks (uses first)', async () => {
@@ -1019,6 +2413,53 @@ describe('StepExecutor system prompt assembly', () => {
     }))).toBe(true);
   });
 
+  it('rejects echoed provider request envelopes as soon as their top-level key is known', () => {
+    expect(rejectedExecutionTurnEnvelopeKey('{"messages":')).toBe('messages');
+    expect(rejectedExecutionTurnEnvelopeKey('```json\n{"choices": [')).toBe('choices');
+    expect(rejectedExecutionTurnEnvelopeKey('{"thoughts":"still streaming')).toBeUndefined();
+    expect(rejectedExecutionTurnEnvelopeKey('{"actions":[')).toBeUndefined();
+    expect(rejectedExecutionTurnEnvelopeKey('{":": ","}')).toBeUndefined();
+    expect(rejectedExecutionTurnEnvelopeKey('{"unknown":"bad turn"}')).toBeUndefined();
+  });
+
+  it('aborts an echoed request envelope from the streaming callback before it can grow', async () => {
+    class EnvelopeEchoLLM implements LLMClient {
+      readonly name = 'envelope-echo';
+      rejection = '';
+      calls = 0;
+
+      async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        this.calls++;
+        if (this.calls > 1) {
+          return JSON.stringify({
+            thoughts: 'the valid mutation is complete',
+            actions: [],
+            done: true,
+          });
+        }
+        try {
+          options?.onToken?.('{"messages":');
+        } catch (error) {
+          this.rejection = error instanceof Error ? error.message : String(error);
+        }
+        return JSON.stringify({
+          thoughts: 'valid provider response after the rejected echo',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }],
+          done: false,
+        });
+      }
+    }
+    const llm = new EnvelopeEchoLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(true);
+    expect(llm.rejection).toContain('unexpected top-level key "messages"');
+  });
+
   it('completes declarative design phases after verified output mutations without an extra handshake round', async () => {
     class DeclarativeWriterLLM implements LLMClient {
       readonly name = 'declarative-writer';
@@ -1036,6 +2477,13 @@ describe('StepExecutor system prompt assembly', () => {
               tool: 'write_file',
               args: { path: 'docs/tests/integration-test-plan.md', content: '# Integration Test Plan\n' },
             },
+            {
+              tool: 'write_file',
+              args: {
+                path: 'tests/integration/pipeline.test.ts',
+                content: 'import { describe, expect, it } from "vitest";\nimport { pipeline } from "../../src/pipeline.ts";\ndescribe("pipeline", () => { it("exposes its contract", () => { expect(typeof pipeline).toBe("function"); }); });\n',
+              },
+            },
           ],
           done: false,
         });
@@ -1049,13 +2497,18 @@ describe('StepExecutor system prompt assembly', () => {
         phase: 'DETAILED_DESIGN',
         role: 'Architect',
         tools: ['write_file'],
-        outputs: ['docs/03-detailed-design.md', 'docs/tests/integration-test-plan.md'],
+        outputs: [
+          'docs/03-detailed-design.md',
+          'docs/tests/integration-test-plan.md',
+          'tests/integration/pipeline.test.ts',
+        ],
       },
+      baselineTestExecution: 'defer',
       tools: [writeFileTool],
-      ctx: { ...ctx, allowedWrites: ['docs/'] },
+      ctx: { ...ctx, allowedWrites: ['docs/', 'tests/'] },
     });
 
-    expect(result.success).toBe(true);
+    expect(result.success, result.error).toBe(true);
     expect(result.rounds).toBe(1);
     expect(llm.calls).toBe(1);
   });
@@ -1135,6 +2588,93 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.toolCalls).toHaveLength(1);
   });
 
+  it('rejects a contradictory deferred-baseline assessment before PM can create an Enhancement', async () => {
+    class DeferredAssessmentLLM implements LLMClient {
+      readonly name = 'deferred-assessment';
+      calls = 0;
+      sawConsistencyFeedback = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'the design is complete but product code is a downstream precondition',
+            qualityAssessment: {
+              completion: 1,
+              upstreamAlignment: 1,
+              metrics: { moduleCoverage: 1 },
+              tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+              evidence: ['docs/02-high-level-design.md', 'tests/modules/x.test.ts'],
+              unavailableMetrics: ['moduleCoverage'],
+              gaps: ['the module baseline cannot execute before CODE implements the product'],
+              blockedBy: ['CODE owns the product implementation'],
+              findings: [],
+            },
+            actions: [],
+            done: true,
+          });
+        }
+        this.sawConsistencyFeedback = messages.at(-1)?.content.includes(
+          'conflicts with qualityAssessment.unavailableMetrics',
+        ) ?? false;
+        return JSON.stringify({
+          thoughts: 'report the deferred execution precondition without inventing a current-Step gap',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['docs/02-high-level-design.md', 'tests/modules/x.test.ts'],
+            unavailableMetrics: ['moduleCoverage'],
+            gaps: [],
+            blockedBy: ['CODE owns the product implementation'],
+            findings: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('docs/02-high-level-design.md', '# High-level design\n');
+    await ws.writeFile(
+      'tests/modules/x.test.ts',
+      'import { describe, expect, it } from "vitest";\n' +
+        'import { x } from "../../src/x.ts";\n' +
+        'describe("x", () => { it("has a contract", () => expect(typeof x).toBe("function")); });\n',
+    );
+    const llm = new DeferredAssessmentLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 2 }).run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        tools: [],
+        outputs: ['docs/02-high-level-design.md', 'tests/modules/x.test.ts'],
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      baselineTestExecution: 'defer',
+      tools: [],
+      ctx,
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(llm.calls).toBe(2);
+    expect(llm.sawConsistencyFeedback).toBe(true);
+    expect(result.qualityAssessment?.gaps).toEqual([]);
+    expect(result.qualityAssessment?.blockedBy).toEqual(['CODE owns the product implementation']);
+  });
+
   it('hands a measured test-quality gap to the outer Ticket gate without looping on the failed probe', async () => {
     class CoverageGapLLM implements LLMClient {
       readonly name = 'coverage-gap';
@@ -1156,6 +2696,7 @@ describe('StepExecutor system prompt assembly', () => {
             metrics: { testCasePassRate: 1 },
             tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
             evidence: ['reports/unit-test-report.md'],
+            unavailableMetrics: ['lineCoverage', 'branchCoverage'],
             gaps: [
               'lineCoverage is unavailable because @vitest/coverage-v8 is missing',
               'branchCoverage is unavailable because @vitest/coverage-v8 is missing',
@@ -1175,6 +2716,7 @@ describe('StepExecutor system prompt assembly', () => {
         return {
           ok: false,
           error: "MISSING DEPENDENCY Cannot find dependency '@vitest/coverage-v8'",
+          code: 'manifest_missing',
         };
       },
     };
@@ -1352,7 +2894,9 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('npx tsc --noEmit exit=2');
-    expect(result.error).not.toContain('qualityAssessment.postToolEvidence');
+    // The staleness note must not ride along on an unrelated validation failure. Matched on the
+    // phrasing the model actually receives, not on a field name — the field name was the defect.
+    expect(result.error).not.toContain('predates it');
   });
 
   it('keeps empty or whitespace-only declared artifacts in the missing-output set', async () => {
@@ -1478,7 +3022,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.success).toBe(true);
     expect(await ws.exists('src/x.py')).toBe(true);
     expect(r.toolCalls.find((c) => c.tool === 'invalid_action' && !c.ok)?.error).toContain('missing string tool');
-    const jsonl = await fs.readFile(path.join(tmp, '.xcompiler/audit.jsonl'), 'utf8');
+    const jsonl = await fs.readFile(path.join(tmp, 'audit', 'audit.jsonl'), 'utf8');
     expect(jsonl).toContain('audit.executor_invalid_actions_ignored');
   });
 
@@ -1502,6 +3046,229 @@ describe('StepExecutor system prompt assembly', () => {
     expect(r.error).toContain('unresolved tool failures remain');
     expect(r.toolCalls.find((c) => c.tool === 'write_file' && !c.ok)?.error).toContain('write denied');
     await expect(fs.readFile(path.join(tmp, 'src/x.py'), 'utf8')).resolves.toBe('x = 1\n');
+  });
+
+  it('allows canonical tools to supersede denied command aliases with the same capability', async () => {
+    class AliasThenCanonicalLLM implements LLMClient {
+      readonly name = 'alias-then-canonical';
+      calls = 0;
+      feedback = '';
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect and test using familiar shell aliases',
+            actions: [
+              { tool: 'run_shell', args: { command: 'cat src/x.py' } },
+              { tool: 'run_command', args: { command: 'npm test' } },
+            ],
+            done: false,
+          });
+        }
+        if (this.calls === 2) {
+          this.feedback = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+          return JSON.stringify({
+            thoughts: 'retry through the authorized Runtime capabilities',
+            actions: [
+              { tool: 'read_file', args: { path: 'src/x.py' } },
+              { tool: 'run_tests', args: {} },
+            ],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'canonical inspection and test gate succeeded',
+          qualityAssessment: {
+            metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['run_tests passed'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    await ws.writeFile('docs/05-unit-test.md', '# Unit test\n');
+    const llm = new AliasThenCanonicalLLM();
+    const passingTests: Tool = {
+      name: 'run_tests',
+      description: 'run tests',
+      argsSchema: {},
+      async run() { return { ok: true, summary: '1 passed' }; },
+    };
+    const exec = new StepExecutor({ llm, maxRounds: 3 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'UNIT_TEST',
+        role: 'Tester',
+        tools: ['read_file', 'run_tests'],
+        outputs: ['docs/05-unit-test.md'],
+        qualityGate: {
+          metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+          tolerance: { metricShortfall: 0.02, maxFailedTests: 0, maxSkippedTests: 0, maxWarnings: 0 },
+        },
+      },
+      tools: [readFileTool, passingTests],
+      ctx,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(3);
+    expect(llm.feedback).toContain('run_shell are not Runtime tools');
+    expect(result.toolCalls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ tool: 'run_shell', ok: false }),
+      expect.objectContaining({ tool: 'run_command', ok: false }),
+      expect.objectContaining({ tool: 'read_file', ok: true }),
+      expect.objectContaining({ tool: 'run_tests', ok: true }),
+    ]));
+  });
+
+  it('does not require rerunning tests after writing verification Markdown reports', async () => {
+    class TestThenReportLLM implements LLMClient {
+      readonly name = 'test-then-report';
+      calls = 0;
+
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'run the gate before deriving its reports',
+            actions: [{ tool: 'run_tests', args: {} }],
+            done: false,
+          });
+        }
+        if (this.calls === 2) {
+          return JSON.stringify({
+            thoughts: 'persist reports from the successful gate result',
+            actions: [
+              { tool: 'write_file', args: { path: 'docs/05-unit-test.md', content: '# Unit test\n47 passed\n' } },
+              { tool: 'write_file', args: { path: 'docs/reports/unit-test-report.md', content: '# Report\n47 passed\n' } },
+            ],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'reports preserve the successful test evidence',
+          qualityAssessment: {
+            metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['run_tests passed and reports were written'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    const passingTests: Tool = {
+      name: 'run_tests',
+      description: 'run tests',
+      argsSchema: {},
+      async run() { return { ok: true, summary: '47 passed' }; },
+    };
+    const llm = new TestThenReportLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 3 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        phase: 'UNIT_TEST',
+        role: 'Tester',
+        tools: ['run_tests', 'write_file'],
+        outputs: ['docs/05-unit-test.md', 'docs/reports/unit-test-report.md'],
+        qualityGate: {
+          metrics: { lineCoverage: 0.8, branchCoverage: 0.7, testCasePassRate: 1 },
+          tolerance: { metricShortfall: 0.02, maxFailedTests: 0, maxSkippedTests: 0, maxWarnings: 0 },
+        },
+      },
+      tools: [passingTests, writeFileTool],
+      ctx: { ...ctx, allowedWrites: ['docs/'] },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(3);
+    expect(result.toolCalls.filter((call) => call.tool === 'run_tests')).toHaveLength(1);
+  });
+
+  it('does not count a repeated run against a missing manifest as no progress', async () => {
+    // Three guards had to be told the same thing: unresolved-failure tracking, the mutation-repeat
+    // breaker, and this one. A Step that reruns its tests while the manifest is still another
+    // Step's undelivered output is not failing to progress — it cannot progress, and saying so is
+    // not the same as looping.
+    const blocked = { ...ctx, allowedWrites: ['src/'] } as typeof ctx;
+    class RerunsLLM implements LLMClient {
+      readonly name = 'reruns';
+      private round = 0;
+      async chat(): Promise<string> {
+        this.round += 1;
+        return JSON.stringify({
+          thoughts: 'write the output, then try to run it',
+          actions: [
+            ...(this.round === 1
+              ? [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }]
+              : []),
+            { tool: 'run_tests', args: {} },
+          ],
+          done: this.round >= 3,
+        });
+      }
+    }
+    const failing: Tool = {
+      name: 'run_tests',
+      description: 'stub',
+      argsSchema: {},
+      async run() {
+        return { ok: false, code: 'manifest_missing' as const, error: 'npm test exit=254\nNo package.json' };
+      },
+    };
+    const exec = new StepExecutor({ llm: new RerunsLLM(), maxRounds: 4 });
+    const r = await exec.run({ step: baseStep, tools: [writeFileTool, failing], ctx: blocked });
+
+    expect(r.error ?? '').not.toContain('verification command repeated');
+    expect(r.success).toBe(true);
+  });
+
+  it('does not hold a missing manifest against a Step that cannot own it', async () => {
+    // REQUIREMENT_ANALYSIS writes its acceptance tests and runs them; a TypeScript project has no
+    // package.json until HIGH_LEVEL_DESIGN. Counting that as an unresolved failure blocks a
+    // completion no role in this phase can earn, so the Step burns its debug rounds instead.
+    const blocked = { ...ctx, allowedWrites: ['src/'] } as typeof ctx;
+    class MissingManifestLLM implements LLMClient {
+      readonly name = 'missing-manifest';
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'write the output, then try to run it',
+          actions: [
+            { tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } },
+            { tool: 'run_tests', args: {} },
+          ],
+          done: true,
+        });
+      }
+    }
+    const failing: Tool = {
+      name: 'run_tests',
+      description: 'stub',
+      argsSchema: {},
+      async run() {
+        return { ok: false, code: 'manifest_missing' as const, error: 'npm test exit=254\nNo package.json' };
+      },
+    };
+    const exec = new StepExecutor({ llm: new MissingManifestLLM(), maxRounds: 1 });
+    const r = await exec.run({ step: baseStep, tools: [writeFileTool, failing], ctx: blocked });
+
+    expect(r.toolCalls.find((c) => c.tool === 'run_tests')?.ok).toBe(false);
+    expect(r.error ?? '').not.toContain('unresolved tool failures remain');
+    expect(r.success).toBe(true);
   });
 
   it('allows completion when a pathless write_file arg failure is repaired by a later valid write_file', async () => {
@@ -1801,7 +3568,7 @@ describe('StepExecutor system prompt assembly', () => {
     expect(llm.secondUser).not.toContain('x'.repeat(3000));
   });
 
-  it('stops a test step after the configured run_tests failure budget is exhausted', async () => {
+  it('stops a test step at its first executable failure and preserves the failure as a defect', async () => {
     class RepeatingTestFailureLLM implements LLMClient {
       readonly name = 'test-failure-loop';
       calls = 0;
@@ -1809,7 +3576,10 @@ describe('StepExecutor system prompt assembly', () => {
         this.calls++;
         return JSON.stringify({
           thoughts: 'run the test gate again',
-          actions: [{ tool: 'run_tests', args: { args: ['tests/test_integration.py'] } }],
+          actions: [
+            { tool: 'run_tests', args: { args: ['tests/test_integration.py'] } },
+            { tool: 'write_file', args: { path: 'src/x.py', content: 'must not run\n' } },
+          ],
           done: false,
         });
       }
@@ -1828,16 +3598,18 @@ describe('StepExecutor system prompt assembly', () => {
       ...baseStep,
       phase: 'INTEGRATION_TEST',
       role: 'Tester',
-      tools: ['run_tests'],
+      tools: ['run_tests', 'write_file'],
       outputs: [],
     };
 
-    const r = await exec.run({ step: testStep, tools: [failingRunTestsTool], ctx });
+    const r = await exec.run({ step: testStep, tools: [failingRunTestsTool, writeFileTool], ctx });
 
     expect(r.success).toBe(false);
-    expect(r.rounds).toBe(2);
-    expect(llm.calls).toBe(2);
-    expect(r.error).toContain('V-model rollback');
+    expect(r.rounds).toBe(1);
+    expect(llm.calls).toBe(1);
+    expect(r.validationDefect).toContain('src/parser.py: receivers bug');
+    expect(r.error).toContain('validation defect reported');
+    await expect(fs.stat(path.join(tmp, 'src/x.py'))).rejects.toThrow();
   });
 
   it('accepts completion evidence from a successful verification tool even without done=true', async () => {
@@ -1876,7 +3648,7 @@ describe('StepExecutor system prompt assembly', () => {
     const requests: string[] = [];
     const events: string[] = [];
     let permissionCallId: string | undefined;
-    let startedCallId: string | undefined;
+    let firstStartedCallId: string | undefined;
     const exec = new StepExecutor({ llm: new CapturingLLM(), maxRounds: 1 });
     const r = await exec.run({
       step: baseStep,
@@ -1890,16 +3662,76 @@ describe('StepExecutor system prompt assembly', () => {
         },
         onToolEvent: (event) => {
           events.push(`${event.status}:${event.tool}:${event.ok ?? ''}`);
-          if (event.status === 'started') startedCallId = event.callId;
+          if (event.status === 'started') firstStartedCallId ??= event.callId;
         },
       },
     });
     expect(r.success).toBe(false);
     expect(requests).toEqual(['file_write:src/x.py']);
-    expect(permissionCallId).toBe(startedCallId);
+    expect(permissionCallId).toBe(firstStartedCallId);
     expect(r.toolCalls[0]?.error).toContain('permission denied');
     expect(events).toContain('completed:write_file:false');
     await expect(fs.stat(path.join(tmp, 'src/x.py'))).rejects.toThrow();
+  });
+
+  it('allows one adaptation after denial without asking for the same capability again', async () => {
+    class DeniedVariantsLLM implements LLMClient {
+      readonly name = 'denied-variants';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        return JSON.stringify({
+          thoughts: 'try another unauthorized rewrite variant',
+          actions: [{
+            tool: 'write_file',
+            args: { path: 'src/x.py', content: `x = ${this.calls}\n` },
+          }],
+          done: false,
+        });
+      }
+    }
+    const llm = new DeniedVariantsLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 10 }).run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx: {
+        ...ctx,
+        requestPermission: async () => ({ approved: false, reason: 'would weaken the test gate' }),
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('one allowed adaptation still requires denied capability');
+    expect(llm.calls).toBe(2);
+  });
+
+  it('never extends productive mutation rounds past the adaptive hard limit', async () => {
+    class EndlessMutationLLM implements LLMClient {
+      readonly name = 'endless-mutation';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        return JSON.stringify({
+          thoughts: 'keep changing an already complete output',
+          actions: [{
+            tool: 'write_file',
+            args: { path: 'src/x.py', content: `x = ${this.calls}\n` },
+          }],
+          done: false,
+        });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 0\n');
+    const llm = new EndlessMutationLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 1 }).run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.rounds).toBe(5);
+    expect(llm.calls).toBe(5);
   });
 
   it('fails early when the model repeats read-only probes without progress', async () => {
@@ -1945,6 +3777,213 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.error).toContain('missing outputs: src/x.py');
     expect(llm.calls).toBe(2);
     expect(llm.sawWarning).toBe(true);
+  });
+
+  it('focuses a no-progress retry on the first exact missing output', async () => {
+    class FocusedEmptyTurnLLM implements LLMClient {
+      readonly name = 'focused-empty-turn';
+      calls = 0;
+      feedback = '';
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 2) this.feedback = messages.at(-1)?.content ?? '';
+        return JSON.stringify({ thoughts: 'create the files', actions: [], done: false });
+      }
+    }
+    const llm = new FocusedEmptyTurnLLM();
+    await new StepExecutor({ llm, maxRounds: 10 }).run({
+      step: { ...baseStep, outputs: ['src/first.py', 'src/second.py'] },
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(llm.feedback).toContain('Create exactly the first missing output now');
+    expect(llm.feedback).toContain('path="src/first.py"');
+    expect(llm.feedback).not.toContain('path="src/second.py"');
+  });
+
+  // A live Step wrote every output it owed and then answered with empty rounds until the guard
+  // stopped the attempt and the run with it. The feedback had told it to return done=true "only
+  // when completion is already verified" — the condition of the very branch it was in — so the one
+  // thing left to do was phrased as something for the model to judge.
+  it('tells a no-progress round with verified outputs to finish, not to judge whether it may', async () => {
+    class SettledEmptyTurnLLM implements LLMClient {
+      readonly name = 'settled-empty-turn';
+      calls = 0;
+      feedback = '';
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 2) this.feedback = messages.at(-1)?.content ?? '';
+        return JSON.stringify({ thoughts: 'nothing left', actions: [], done: false });
+      }
+    }
+    await ws.writeFile('src/x.py', 'value = 1\n');
+    const llm = new SettledEmptyTurnLLM();
+    await new StepExecutor({ llm, maxRounds: 10 }).run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(llm.feedback).toContain('No-progress warning');
+    expect(llm.feedback).toContain('return done=true');
+    expect(llm.feedback).not.toContain('only when completion is already verified');
+    // Naming done=true alone is an instruction the turn contract then refuses: a live Coder
+    // followed it and every provider rejected the turn for the missing assessment.
+    expect(llm.feedback).toContain('qualityAssessment');
+  });
+
+  it('rejects an incomplete done-only quality handshake through provider validation', async () => {
+    class ProviderValidatedQualityLLM implements LLMClient {
+      readonly name = 'provider-validated-quality';
+      validationError = '';
+
+      async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+        const incomplete = JSON.stringify({
+          thoughts: 'the artifact already exists',
+          actions: [],
+          done: true,
+        });
+        try {
+          options?.validate?.(incomplete);
+        } catch (error) {
+          this.validationError = error instanceof Error ? error.message : String(error);
+        }
+        const corrected = JSON.stringify({
+          thoughts: 'submit the required quality evidence',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py exists and is non-empty'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+          },
+          actions: [],
+          done: true,
+        });
+        options?.validate?.(corrected);
+        return corrected;
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new ProviderValidatedQualityLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 5 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(1);
+    expect(llm.validationError).toContain('done=true with actions=[] requires a complete qualityAssessment');
+    // Naming only the absent object leaves nothing to build. Both live providers answered
+    // `missing: qualityAssessment` with the same turn again, and the exhausted retries surfaced as
+    // an infrastructure failure that stopped the run — so the rejection must list the fields.
+    expect(llm.validationError).toContain('qualityAssessment.evidence');
+  });
+
+  it('stops repeated invalid completion handshakes that ignore quality feedback', async () => {
+    class InvalidCompletionLoopLLM implements LLMClient {
+      readonly name = 'invalid-completion-loop';
+      calls = 0;
+      sawQualityFeedback = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        this.sawQualityFeedback = this.sawQualityFeedback ||
+          (messages.at(-1)?.content.includes('Quality gate protocol is incomplete') ?? false);
+        return JSON.stringify({ thoughts: 'done', actions: [], done: true });
+      }
+    }
+    await ws.writeFile('src/x.py', 'x = 1\n');
+    const llm = new InvalidCompletionLoopLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 10 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        qualityGate: {
+          completionMin: 0.95,
+          upstreamAlignmentMin: 0.9,
+          metrics: {},
+          tolerance: {
+            metricShortfall: 0.02,
+            maxFailedTests: 0,
+            maxSkippedTests: 0,
+            maxWarnings: 0,
+          },
+        },
+      },
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('invalid completion loop');
+    expect(result.error).toContain('qualityAssessment');
+    expect(llm.calls).toBe(2);
+    expect(llm.sawQualityFeedback).toBe(true);
+  });
+
+  // The caller's own turn contract runs as provider-side validation, so a turn nobody would accept
+  // exhausts the chain and arrives looking exactly like an outage. Recovery keyed on the message
+  // text and the text had drifted — the contract says "low-quality Executor response" while the
+  // pattern allowed only "low-quality response" — so the recovery never ran and a live run aborted
+  // twice with every provider healthy. The router now reports the fact, whatever the wording.
+  it('keeps going when every provider refused the content rather than failing itself', async () => {
+    class ContentRefusedThenValidLLM implements LLMClient {
+      readonly name = 'content-refused-then-valid';
+      calls = 0;
+      feedback = '';
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          throw new LLMRequestError(
+            'all LLM providers failed for role Debugger: a/b: low-quality Executor response: ' +
+            'done=true with actions=[] requires a complete qualityAssessment',
+            {
+              code: 'all_providers_failed',
+              mode: 'router',
+              retryable: true,
+              switchProvider: true,
+              details: { role: 'Debugger', failures: ['a/b: …'], contentRejectedOnly: true },
+            },
+          );
+        }
+        this.feedback = messages.at(-1)?.content ?? '';
+        return JSON.stringify({
+          thoughts: 'write the output',
+          actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 2\n' } }],
+          done: true,
+        });
+      }
+    }
+    const llm = new ContentRefusedThenValidLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 10 }).run({
+      step: baseStep,
+      tools: [writeFileTool],
+      ctx,
+    });
+
+    expect(llm.calls).toBe(2);
+    expect(result.success).toBe(true);
+    expect(llm.feedback).toContain('previous provider output was rejected');
   });
 
   it('extends once when a successful mutation is followed by one inspection before verification', async () => {
@@ -2828,7 +4867,7 @@ describe('StepExecutor system prompt assembly', () => {
             done: false,
           });
         }
-        this.sawReplaceMissGuidance = messages.at(-1)?.content.includes('Replace miss recovery') ?? false;
+        this.sawReplaceMissGuidance = messages.at(-1)?.content.includes('Replace count recovery') ?? false;
         return JSON.stringify({
           thoughts: 'use the concrete write after guidance',
           actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 4\n' } }],
@@ -2843,7 +4882,7 @@ describe('StepExecutor system prompt assembly', () => {
       async run() {
         return {
           ok: false,
-          error: 'expected 1 occurrences of find, found 0 in src/x.py',
+          error: 'expected 5 occurrences of find, found 7 in src/x.py',
         };
       },
     };
@@ -2901,7 +4940,8 @@ describe('StepExecutor system prompt assembly', () => {
     class LargeWriteThenInspectLLM implements LLMClient {
       readonly name = 'large-history';
       calls = 0;
-      sawPayloadOmitted = false;
+      sawOmissionNote = false;
+      sawNonProtocolPayloadSummary = false;
       sawContentBytes = false;
       sawRawContent = false;
       async chat(messages: ChatMessage[]): Promise<string> {
@@ -2914,7 +4954,8 @@ describe('StepExecutor system prompt assembly', () => {
           });
         }
         const history = messages.map((message) => message.content).join('\n');
-        this.sawPayloadOmitted = history.includes('payload omitted');
+        this.sawOmissionNote = history.includes('Content omitted from this transcript');
+        this.sawNonProtocolPayloadSummary = history.includes('executedPayloadActions');
         this.sawContentBytes = history.includes('"contentBytes"');
         this.sawRawContent = history.includes('A'.repeat(500));
         return JSON.stringify({ thoughts: 'finish', actions: [], done: true });
@@ -2924,7 +4965,8 @@ describe('StepExecutor system prompt assembly', () => {
     const exec = new StepExecutor({ llm, maxRounds: 2 });
     const r = await exec.run({ step: baseStep, tools: [writeFileTool], ctx });
     expect(r.success).toBe(true);
-    expect(llm.sawPayloadOmitted).toBe(true);
+    expect(llm.sawOmissionNote).toBe(false);
+    expect(llm.sawNonProtocolPayloadSummary).toBe(false);
     expect(llm.sawContentBytes).toBe(false);
     expect(llm.sawRawContent).toBe(false);
   });
@@ -3027,5 +5069,204 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(r.success).toBe(true);
     expect(llm.messageCounts).toEqual([2, 4, 6, 6, 6]);
+  });
+});
+
+describe('glob outputs', () => {
+  it('accepts a declared pattern satisfied by a real file', async () => {
+    // A Step declares `tests/functional/**/*.test.ts` before any of those files exist. Checking the
+    // pattern as a literal filename can never succeed, so the Step could not report completion no
+    // matter what it wrote — and stopped for no progress instead.
+    const step = { ...baseStep, outputs: ['tests/functional/**/*.test.ts'] };
+    expect((await verifyOutputs({ step, tools: [], ctx })).missing)
+      .toEqual(['tests/functional/**/*.test.ts']);
+
+    await ws.writeFile('tests/functional/cli-acceptance.test.ts', 'export const x = 1;\n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(true);
+  });
+
+  it('is not satisfied by a file that fails to match, or by an empty one', async () => {
+    const step = { ...baseStep, outputs: ['tests/unit/*.test.ts'] };
+    await ws.writeFile('tests/unit/notes.md', 'not a test\n');
+    await ws.writeFile('tests/unit/deep/nested.test.ts', 'export const y = 1;\n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(false);
+
+    // `*` does not cross a separator, so the nested file above must not count; a direct one does.
+    await ws.writeFile('tests/unit/empty.test.ts', '   \n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(false);
+    await ws.writeFile('tests/unit/real.test.ts', 'export const z = 1;\n');
+    expect((await verifyOutputs({ step, tools: [], ctx })).ok).toBe(true);
+  });
+});
+
+describe('design-phase policy', () => {
+  const capture = async (phase: Step['phase']): Promise<string> => {
+    const llm = new CapturingLLM();
+    await new StepExecutor({ llm, maxRounds: 1 })
+      .run({ step: { ...baseStep, phase, outputs: ['src/x.py'] }, tools: [writeFileTool], ctx });
+    return llm.lastSystem;
+  };
+
+  it('tells a design Step its paired tests are run elsewhere and fail by construction', async () => {
+    // Without this, REQUIREMENT_ANALYSIS runs the acceptance tests it just authored, reads their
+    // failure as a defect, and spends every attempt implementing product code owned by CODE.
+    for (const phase of ['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN'] as const) {
+      const system = await capture(phase);
+      expect(system, phase).toContain('Design Step');
+      expect(system, phase).toContain('paired verification Step');
+      // Rule D tells the Step the deferral is expected; without this it reports that expectation as
+      // a quality gap, and the gate fails the Step for every gap it reports — punishing it for
+      // being accurate.
+      expect(system, phase).toContain('Do not record that deferral as a quality gap');
+    }
+  });
+
+  it('says nothing of the sort to an implementation or verification Step', async () => {
+    for (const phase of ['CODE', 'UNIT_TEST', 'FUNCTIONAL_TEST'] as const) {
+      expect(await capture(phase), phase).not.toContain('Design Step');
+    }
+  });
+
+  it('withdraws the rule in Debug, where repairing the design is the whole point', async () => {
+    // A Bug reaches a design Step only because its paired verification opened one. Telling that
+    // attempt not to repair failing assertions would suppress the repair it exists to make.
+    const llm = new CapturingLLM();
+    await new StepExecutor({ llm, maxRounds: 1 }).run({
+      step: { ...baseStep, phase: 'DETAILED_DESIGN', outputs: ['src/x.py'] },
+      tools: [writeFileTool],
+      ctx,
+      debugContext: { reason: 'integration gate failed', failureLog: 'contract mismatch' },
+    });
+    expect(llm.lastSystem).not.toContain('Design Step');
+    expect(llm.lastSystem).toContain('DEBUG mode');
+  });
+});
+
+/**
+ * A rejection has to name something the model can change.
+ *
+ * `freshAfterTools` is false when the assessment was produced before the last tool call — a fact
+ * about round ordering. It was reported as a missing field, `qualityAssessment.postToolEvidence`,
+ * which `StageQualityAssessment` has no room for; supplying it changes no round number, so the same
+ * rejection returns and the Step spends its rounds on it. A live dbc2excel S003 opened a Bug against
+ * the generated project for it — an XCompiler wording defect charged to the product.
+ */
+describe('stale quality assessment feedback', () => {
+  const stepWithGate = () => ({
+    phase: 'DETAILED_DESIGN',
+    qualityGate: { metrics: {} },
+    outputs: ['docs/03-detailed-design.md'],
+  }) as never;
+
+  it('asks for a re-assessment instead of naming a field that does not exist', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const { normalizeQualityAssessment } = await import('../src/core/quality_gate.js');
+    const complete = normalizeQualityAssessment({
+      completion: 1, upstreamAlignment: 1, metrics: {}, evidence: ['docs written'],
+    })!;
+
+    const stale = missingQualityAssessmentFields(stepWithGate(), complete, false);
+    expect(stale.join(' ')).toMatch(/re-assess/u);
+    // The invented field name is what made the rejection unactionable.
+    expect(stale.join(' ')).not.toContain('postToolEvidence');
+    // And an assessment that is fresh reports nothing at all.
+    expect(missingQualityAssessmentFields(stepWithGate(), complete, true)).toEqual([]);
+  });
+
+  /**
+   * The condition cannot be cleared from the payload, which is why naming a payload field was wrong:
+   * a model that does exactly what the message said still gets the same message back.
+   */
+  it('is not silenced by adding the field the old message named', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const { normalizeQualityAssessment } = await import('../src/core/quality_gate.js');
+    const obedient = normalizeQualityAssessment({
+      completion: 1, upstreamAlignment: 1, metrics: {}, evidence: ['docs written'],
+      postToolEvidence: 'run_tests passed after the write',
+    })!;
+
+    expect(missingQualityAssessmentFields(stepWithGate(), obedient, false).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * An absent assessment and a stale one need different instructions, and only one applies at a time.
+ *
+ * When no assessment was produced at all, the whole action is producing one — and a produced one is
+ * necessarily post-tool. Emitting the re-assessment line beside "there is no assessment" spends a
+ * line of the instruction contradicting the one above it, and a live dbc3 S001 got a six-item list
+ * whose first and second entries disagreed.
+ */
+describe('absent versus stale quality assessment', () => {
+  const stepWithGate = () => ({
+    phase: 'REQUIREMENT_ANALYSIS',
+    qualityGate: { metrics: {} },
+    outputs: ['docs/01-requirement-analysis.md'],
+  }) as never;
+
+  it('does not ask for a re-assessment when none was made', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const missing = missingQualityAssessmentFields(stepWithGate(), undefined, false);
+    expect(missing[0]).toBe('qualityAssessment');
+    expect(missing.join(' ')).not.toMatch(/re-assess/u);
+  });
+
+  // The staleness line still has to appear where it is the actual problem.
+  it('still asks for one when an assessment exists but predates the tools', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const { normalizeQualityAssessment } = await import('../src/core/quality_gate.js');
+    const complete = normalizeQualityAssessment({
+      completion: 1, upstreamAlignment: 1, metrics: {}, evidence: ['written'],
+    })!;
+    expect(missingQualityAssessmentFields(stepWithGate(), complete, false).join(' ')).toMatch(/re-assess/u);
+  });
+});
+
+/**
+ * A repeat-command ticket has to carry why the command kept failing.
+ *
+ * "You reran a command" is the shape; "you have not written the files that command runs" is the
+ * cause, and only the cause tells the role receiving the ticket what to do. A live dbc3 Bug reached
+ * a Debugger describing the repetition while the five unwritten outputs sat in a separate feedback
+ * line the ticket did not carry.
+ */
+describe('repeat-verification ticket carries the owed outputs', () => {
+  class RepeatingVerificationLLM implements LLMClient {
+    readonly name = 'repeat-verify';
+    async chat(): Promise<string> {
+      // The same verification command every round, never writing the declared output.
+      return JSON.stringify({
+        thoughts: 'rerun the suite',
+        actions: [{ tool: 'run_tests', args: { cwd: '.' } }],
+        done: false,
+      });
+    }
+  }
+
+  it('names the declared outputs the Step still owes', async () => {
+    const exec = new StepExecutor({ llm: new RepeatingVerificationLLM(), maxRounds: 4 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        outputs: ['tests/test_main.py', 'docs/tests/unit-test-plan.md'],
+      },
+      stepName: 'P1-S004',
+      tools: [runTestsTool],
+      ctx: {
+        ...ctx,
+        sandbox: {
+          async runTests() {
+            return { exitCode: 4, stdout: '', stderr: 'ERROR: file or directory not found', timedOut: false, durationMs: 1 };
+          },
+          async runProgram() { throw new Error('not used'); },
+          async installDeps() { throw new Error('not used'); },
+        } as never,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    // The shape was always reported; the cause is what the ticket used to lose.
+    expect(result.error).toMatch(/tests\/test_main\.py/u);
+    expect(result.error).toMatch(/docs\/tests\/unit-test-plan\.md/u);
   });
 });

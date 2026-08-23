@@ -1,8 +1,9 @@
 import path from 'node:path';
-import { loadPlanTarget, savePhasePlan, savePlan } from '../core/storage.js';
-import { assertPlanValid, topoSort } from '../core/lint.js';
+import { loadPlanTarget } from '../core/storage.js';
+import { topoSort } from '../core/lint.js';
 import { AuditLogger } from '../audit/audit.js';
 import { Workspace } from '../workspace/workspace.js';
+import { ProjectContainer } from '../workspace/project_container.js';
 import { GitService } from '../workspace/git.js';
 import { loadConfigWithPath } from '../config/config.js';
 import { LLMRouter } from '../llm/router.js';
@@ -10,28 +11,29 @@ import { reportRoleModelAdvice } from '../llm/role_advice.js';
 import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
 import { createSandbox } from '../sandbox/factory.js';
+import { sandboxDownloadCachePath, sandboxEnvironmentPath } from '../sandbox/environment.js';
 import {
-  DomainExecutionEngine,
-  type DomainEngineResult,
-} from '../application/execution/domain_engine.js';
+  ProjectOrchestrator,
+  type ProjectOrchestratorResult,
+} from '../application/project_management/orchestrator.js';
+import type { AttemptInput, ExecutionScope } from '../application/execution/attempt_runner.js';
+import { TicketChangeSetService } from '../application/workspace/ticket_change_set_service.js';
+import { MergeGateService } from '../application/workspace/merge_gate_service.js';
+import { MergeIntegrationService } from '../application/workspace/merge_integration_service.js';
+import { prepareScopeEnvironment } from '../application/execution/scope_environment.js';
+import { runMergeGateChecks } from '../application/workspace/merge_gate_checks.js';
+import { containerOwnershipRecord, GitRepositoryService } from '../infrastructure/git/git_repository_service.js';
 import { acquireLock, LockError } from '../core/lock.js';
-import {
-  Planner,
-  buildPlan,
-  type DraftPhasePlan,
-} from '../agents/planner.js';
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
 import { runProjectAudit } from '../core/project_audit.js';
+import { judgeScenarioOutcome } from '../application/execution/scenario_outcome_judge.js';
 import {
   generateProjectDevelopmentReport,
 } from '../core/project_report.js';
 import { refreshProjectMemory } from '../core/project_memory.js';
 import { updateProjectFile } from '../core/project_file.js';
-import { DOC_NAMES } from '../core/docs.js';
-import { renderPlanMarkdown } from '../core/render.js';
-import { advancePhasePlan, phasePlanFileName, type PhasePlan } from '../core/phase_plan.js';
-import type { Language, Plan, PlanIntent } from '../core/plan.js';
+import type { Language, PlanIntent } from '../core/plan.js';
 import { setLocale, t } from '../i18n/index.js';
 import { PluginHost } from '../plugins/host.js';
 import type { XCompilerPlugin } from '../plugins/types.js';
@@ -39,17 +41,26 @@ import { hasXcEnv } from '../config/env.js';
 import type { ProjectAuditResult } from '../core/project_audit.js';
 import type { ToolExecutionEvent, ToolPermissionRequest } from '../tools/types.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
-import { compilePhaseMaterialization } from '../domain/planning/compiler.js';
-import { ProjectPlanSchema } from '../domain/planning/plan.js';
-import { reviseObjectEnvelope } from '../domain/objects/object_envelope.js';
-import type { ObjectId } from '../domain/identity/object_id.js';
-import { DomainAuditTrail } from '../domain/observability/audit_trail.js';
+import { DomainAuditTrail } from '../application/observability/domain_audit_trail.js';
+import { FileProjectProjectionWriter } from '../infrastructure/projections/index.js';
 import {
+  emitRuntimeEvent,
   runtimeLog,
   runtimeResult,
   silentRuntimeIO,
+  runtimePermissionAuthorizer,
   type RuntimeIO,
 } from './io.js';
+import { createRuntimeRecordReplay } from './record_replay.js';
+import { withRecordReplaySandbox } from '../infrastructure/record_replay/sandbox.js';
+import { ProjectPermissionService } from '../application/project_management/permission_service.js';
+import { resolveFileTreeService } from '../application/workspace/file_tree_resolver.js';
+import { resolvePhaseDeliveryGate } from '../domain/phases/phase.js';
+import { PhaseMaterializationService } from '../application/project_management/phase_materialization_service.js';
+import { PhaseProgressionService } from '../application/planning/phase_progression_service.js';
+import type { RecordReplayMode } from '../application/record_replay/types.js';
+import { isCancellationError } from '../core/cancellation.js';
+import { buildRuntimeCapabilities } from '../application/capabilities/runtime_capabilities.js';
 
 export interface ExecuteOptions {
   planPath: string;
@@ -72,11 +83,19 @@ export interface ExecuteOptions {
   io?: RuntimeIO;
   /** Allow human terminal progress from lower-level engines. Defaults to false; CLI adapters opt in. */
   terminalOutput?: boolean;
+  /** Override external-interaction fixture behavior for this invocation. */
+  recordReplayMode?: RecordReplayMode;
+  /** Workspace-relative fixture root override. */
+  recordReplayPath?: string;
+  /** Cancels active PM/Agent/provider work. */
+  abortSignal?: AbortSignal;
+  /** Overrides config.permissions.mode for this Runtime task. */
+  permissionMode?: import('./io.js').RuntimePermissionPolicy;
 }
 
 export interface ExecuteResult {
-  status: 'ok' | 'failed' | 'error' | 'dry-run';
-  engine?: DomainEngineResult;
+  status: 'ok' | 'failed' | 'error' | 'dry-run' | 'cancelled';
+  engine?: ProjectOrchestratorResult;
   audit?: ProjectAuditResult;
   message?: string;
   exitCode?: number;
@@ -91,7 +110,11 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   } catch {
     /* ignore */
   }
-  const ws = new Workspace(path.resolve(opts.workspace));
+  // `-w <dir>` addresses the project container. Project state lives at <dir>/.xcompiler and the
+  // working copy at <dir>/worktrees/<branch>, so a sandbox mounting the working copy cannot reach
+  // XCompiler's own registry, audit trail, or fixtures.
+  const container = new ProjectContainer(path.resolve(opts.workspace));
+  const ws = container.canonical().workspace;
   const { config: cfg, path: cfgPath, missingEnv } = await loadConfigWithPath(opts.configPath);
   // AuditLogger 会立即创建过程日志，因此必须先应用配置语言。
   if (!hasXcEnv('LANG')) setLocale(cfg.locale);
@@ -100,7 +123,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
   let lock;
   try {
-    lock = await acquireLock(ws.root, 'xcompiler_run', { force: !!opts.force });
+    lock = await acquireLock(container.state.root, 'xcompiler_run', { force: !!opts.force });
   } catch (err) {
     if (err instanceof LockError) {
       await runtimeLog(io, 'error', t().system.unhandledError(err.message));
@@ -110,7 +133,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     throw err;
   }
   try {
-  const audit = new AuditLogger({ root: ws.root, command: 'xcompiler_run' });
+  const audit = new AuditLogger({ root: container.root, stateRoot: container.state.root, command: 'xcompiler_run' });
   await audit.start({
     workspace: ws.root,
     plan: opts.planPath,
@@ -121,13 +144,14 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     strict: opts.pluginStrict,
     audit,
   });
-  await pluginHost.initialize();
+  const capabilities = await buildRuntimeCapabilities(pluginHost);
 
   let target = await loadPlanTarget(opts.planPath);
   let planAbs = target.planPath;
   let publicPlanPath = target.phasePlanPath ?? target.planPath;
   let plan = target.plan;
-  const domainRepository = new DomainObjectRepository(ws);
+  capabilities.skills.validateRefs(plan.steps.flatMap((step) => step.tools));
+  const domainRepository = new DomainObjectRepository(container.state);
   await domainRepository.load();
   const domainAudit = new DomainAuditTrail(domainRepository);
   let domainProject = await domainRepository.findProject();
@@ -142,8 +166,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     throw new Error(`Canonical Phase ${plan.phaseId} is missing from Project ${domainProject.name}`);
   }
   if (domainPhase.stepIds.length === 0) {
-    await materializeNextDomainPhase({
-      repository: domainRepository,
+    await new PhaseMaterializationService(domainRepository).materialize({
       projectId: domainProject.id,
       phaseId: domainPhase.id,
       plan,
@@ -162,6 +185,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
   let projectFilePath = await updateProjectFile({
     workspace: ws.root,
+    container: container.root,
     planPath: publicPlanPath,
     configPath: cfgPath,
     projectFilePath: opts.projectFilePath,
@@ -198,6 +222,15 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     }
   }
 
+  // Whatever a suite needs before it can import the product at all. For Python that is
+  // `tests/conftest.py` putting the project root and `src/` on sys.path; TypeScript needs nothing.
+  //
+  // The profile has carried this method since the language layer was written and nothing called it,
+  // so the file was never created: every Python project's tests failed to import `src/` until some
+  // Step happened to invent a fix. Two live runs lost Tickets to `ModuleNotFoundError` that way, and
+  // one of them was refused permission to write the very file Runtime had not written either.
+  await profile.ensureTestBootstrap?.(ws, audit);
+
   const order = topoSort(plan.steps);
   await audit.event('plan.persist', t().execute.auditPlanLoaded(planAbs), {
     messageId: 'execute.plan_loaded',
@@ -223,15 +256,22 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
 
   const scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
+  const recordReplay = createRuntimeRecordReplay(cfg, container.control, {
+    mode: opts.recordReplayMode,
+    path: opts.recordReplayPath,
+  });
   let unavailableProviders: Set<string>;
   try {
-    const pf = await preflightProviders(cfg, scoreStore, audit);
-    unavailableProviders = new Set(pf.unreachable);
-    if (pf.zeroed.length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
-    }
-    if (Object.keys(pf.autoAdded).length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+    unavailableProviders = new Set();
+    if (recordReplay.mode !== 'replay') {
+      const pf = await preflightProviders(cfg, scoreStore, audit);
+      unavailableProviders = new Set(pf.unreachable);
+      if (pf.zeroed.length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
+      }
+      if (Object.keys(pf.autoAdded).length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+      }
     }
   } catch (err) {
     await runtimeLog(io, 'error', t().system.unhandledError((err as Error).message));
@@ -240,7 +280,26 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     await runtimeResult(io, 'run', 'error', { message: (err as Error).message, exitCode: 7 });
     return { status: 'error', message: (err as Error).message, exitCode: 7 };
   }
-  const router = new LLMRouter(cfg, audit, scoreStore, unavailableProviders, pluginHost);
+  const router = new LLMRouter(
+    cfg,
+    audit,
+    scoreStore,
+    unavailableProviders,
+    pluginHost,
+    undefined,
+    recordReplay,
+    cfgPath,
+  );
+  const phaseProgression = new PhaseProgressionService(
+    ws,
+    container.state,
+    container.control,
+    router,
+    audit,
+    io.terminalOutput === true,
+    opts.abortSignal,
+    capabilities.skills,
+  );
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   if (recoverUnadvancedPhase) {
     if (!target.phasePlan || !target.phasePlanPath || !domainProject.currentPhaseId) {
@@ -248,22 +307,16 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         `Project ${domainProject.name} advanced beyond ${domainPhase.name}, but the PhasePlan recovery context is missing.`,
       );
     }
-    const recovery = await completeAndPrepareNextPhase({
+    const recovery = await phaseProgression.completeAndPrepareNext({
       phasePlan: target.phasePlan,
       phasePlanPath: target.phasePlanPath,
-      ws,
-      router,
-      audit,
-      io,
       currentPlanPath: planAbs,
-      currentPlan: plan,
       iterationDelivered: true,
     });
     if (!recovery.nextPlan) {
       throw new Error(`Project ${domainProject.name} points to a next Phase but PhasePlan has no next plan`);
     }
-    await materializeNextDomainPhase({
-      repository: domainRepository,
+    await new PhaseMaterializationService(domainRepository).materialize({
       projectId: domainProject.id,
       phaseId: domainProject.currentPhaseId,
       plan: recovery.nextPlan,
@@ -272,6 +325,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     planAbs = target.planPath;
     publicPlanPath = target.phasePlanPath ?? target.planPath;
     plan = target.plan;
+    capabilities.skills.validateRefs(plan.steps.flatMap((step) => step.tools));
     domainProject = await domainRepository.findProject();
     if (!domainProject) throw new Error('Canonical Project disappeared during Phase recovery');
     phaseObjects = await Promise.all(domainProject.phaseIds.map((id) => domainRepository.read(id)));
@@ -291,6 +345,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     await runtimeLog(io, 'success', `recovered ${domainPhase.name} from the canonical Project state`);
     projectFilePath = await updateProjectFile({
       workspace: ws.root,
+      container: container.root,
       planPath: publicPlanPath,
       configPath: cfgPath,
       projectFilePath,
@@ -299,17 +354,193 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
   }
   const git = new GitService(ws);
-  const sandbox = createSandbox(cfg, ws, audit, plan.language);
-  const requestPermission = io.requestPermission
-    ? async (request: ToolPermissionRequest) => {
-        await io.emit({ type: 'permission', status: 'requested', request });
-        const decision = await io.requestPermission!(request);
-        await io.emit({ type: 'permission', status: decision.approved ? 'approved' : 'denied', request });
-        return decision;
-      }
-    : undefined;
+  // Canonical, per-role CODE, and gate environments each install separately — that isolation is
+  // about installed state. The archives they download are identical and immutable, so they share one
+  // cache and fetch each package once for the whole project.
+  const downloadCacheRoot = sandboxDownloadCachePath(container.state.root, domainProject.id);
+  const canonicalEnvironmentRoot = sandboxEnvironmentPath(container.state.root, {
+    scope: 'canonical',
+    projectId: domainProject.id,
+  });
+  const sandbox = withRecordReplaySandbox(
+    createSandbox(cfg, ws, canonicalEnvironmentRoot, audit, plan.language, downloadCacheRoot),
+    recordReplay,
+  );
+  // The sandbox is a precondition, not something each Step discovers for itself. A run that
+  // continues without one spends its whole budget on Steps whose every verification is going to
+  // fail for a reason none of them owns, and reports those as defects in the generated project.
+  try {
+    await sandbox.build(profile.manifestFile);
+  } catch (err) {
+    const message =
+      `sandbox is not ready, so execution cannot start: ${(err as Error).message}. ` +
+      'Dependencies resolve through the registry configured for this language sandbox; ' +
+      'set agent.sandboxes.<language>.local.registry if the default is unreachable here.';
+    await audit.event('note', message, { messageId: 'execute.sandbox_not_ready' });
+    await runtimeResult(io, 'run', 'error', { message, exitCode: 7 });
+    return { status: 'error', message, exitCode: 7 };
+  }
+
+  const changeSets = new TicketChangeSetService(
+    domainRepository,
+    container,
+    new GitRepositoryService(ws.root),
+  );
+  // A Ticket's persisted binding decides where it runs. CODE opens a candidate on first use;
+  // corrections retain that candidate even when PM routes them back through an earlier Step.
+  const scopeCache = new Map<string, ExecutionScope>();
+  const resolveScope = async (input: AttemptInput): Promise<ExecutionScope> => {
+    const resolved = await changeSets.ensureFor(input.ticket, input.domainStep);
+    const binding = resolved.ticket.workspaceBinding;
+    const scopeKey = resolved.workspace?.id ??
+      `${binding?.kind ?? 'canonical'}:${binding?.relativePath ?? resolved.root}`;
+    const cached = scopeCache.get(scopeKey);
+    if (cached) return cached;
+    const scopeWorkspace = new Workspace(resolved.root);
+    const isolated = resolved.changeSet !== undefined;
+    const environmentRoot = sandboxEnvironmentPath(
+      container.state.root,
+      isolated
+        ? {
+            scope: 'development',
+            projectId: domainProject.id,
+            phaseId: input.domainStep.phaseId,
+            roleId: input.domainStep.role,
+          }
+        : { scope: 'canonical', projectId: domainProject.id },
+    );
+    const scope: ExecutionScope = {
+      // The binding is what decided where this attempt runs, so it is also what says which working
+      // copy it is. Downstream must not re-derive this by comparing roots.
+      kind: binding?.kind ?? (isolated ? 'ticket' : 'canonical'),
+      workspace: scopeWorkspace,
+      git: new GitService(scopeWorkspace),
+      sandbox: withRecordReplaySandbox(
+        createSandbox(cfg, scopeWorkspace, environmentRoot, audit, plan.language, downloadCacheRoot),
+        recordReplay,
+      ),
+    };
+    const preparation = await prepareScopeEnvironment({
+      sandbox: scope.sandbox,
+      manifestFile: profile.manifestFile,
+      isolated,
+      root: resolved.root,
+      audit,
+    });
+    if (preparation.error) scope.preparationError = preparation.error;
+    await audit.event('note', `resolved ${resolved.ticket.name} workspace`, {
+      messageId: 'domain.ticket_workspace_resolved',
+      projectId: resolved.ticket.projectId,
+      phaseId: resolved.ticket.phaseId,
+      stepId: input.domainStep.id,
+      ticketId: resolved.ticket.id,
+      workspaceKind: binding?.kind ?? 'canonical',
+      workspacePath: binding?.relativePath,
+      workspaceBranch: binding?.branch,
+      workspaceRevision: binding?.revision,
+      changeSetId: binding?.changeSetId,
+      mergeGateRunId: binding?.mergeGateRunId,
+    });
+    scopeCache.set(scopeKey, scope);
+    return scope;
+  };
+  const repositoryGit = new GitRepositoryService(ws.root);
+  const repositoryInfo = await repositoryGit.ensureRepository(
+    undefined,
+    {
+      initialBranch: container.canonicalBranch,
+      ownershipRecord: containerOwnershipRecord(container.state),
+    },
+  );
+  const canonicalFileTree = await resolveFileTreeService(
+    domainRepository,
+    domainProject.id,
+    ws.root,
+  );
+  // The scan reads the working copy while the stamp names HEAD, and a run that died mid-write
+  // leaves those two describing different things. The revision is still the best account of where
+  // the tree came from, so it is kept and marked unverified rather than dropped — dropping it would
+  // leave delivery with nothing to check against.
+  await canonicalFileTree.rescan(await repositoryGit.head());
+  const pendingAtStart = await repositoryGit.pendingChanges();
+  if (pendingAtStart.length > 0) {
+    await canonicalFileTree.markDirty();
+    await audit.event('note', `canonical file tree starts unverified: ${pendingAtStart.length} uncommitted path(s)`, {
+      messageId: 'domain.file_tree_dirty_at_start',
+      projectId: domainProject.id,
+      pendingChanges: pendingAtStart.slice(0, 50),
+    });
+  }
+  const permissionService = new ProjectPermissionService(domainRepository, domainProject, {
+    projectRoot: container.root,
+    timeoutMs: cfg.permissions.timeout_ms,
+    mode: opts.permissionMode ?? cfg.permissions.mode,
+    audit,
+  });
+  const permissionAuthorizer = runtimePermissionAuthorizer(
+    opts.permissionMode ? { ...io, permissionPolicy: opts.permissionMode } : io,
+    cfg.permissions.mode,
+  );
+  const requestPermission = (request: ToolPermissionRequest) => permissionService.request(
+    request,
+    permissionAuthorizer,
+    (status) => emitRuntimeEvent(io, { type: 'permission', status, request }),
+  );
+  const mergeGates = new MergeGateService(
+    domainRepository,
+    container,
+    repositoryGit,
+    container.canonicalBranch,
+  );
+  const mergeIntegration = new MergeIntegrationService({
+    repository: domainRepository,
+    gates: mergeGates,
+    git: repositoryGit,
+    targetBranch: container.canonicalBranch,
+    // A repository that already existed belongs to whoever created it, so a validated change waits
+    // for explicit authorization rather than being written onto their mainline.
+    mayMerge: repositoryInfo.ownership === 'xcompiler-created',
+    authorizeMerge: (changeSet) => requestPermission({
+          operationType: 'git_operation',
+          target: `merge ${changeSet.sourceBranch} into ${container.canonicalBranch}`,
+          reason: 'Land the validated CODE ChangeSet so downstream V-model Steps test the new code.',
+          risk: 'Creates one squash commit on the canonical project branch.',
+          scope: 'canonical project repository',
+          skippable: false,
+          denyBehavior: 'Keep the ChangeSet gate-passed and stop delivery before downstream testing.',
+          metadata: {
+            requiresExternalAuthorization: true,
+            changeSetId: changeSet.id,
+            rootTicketId: changeSet.rootTicketId,
+            generation: changeSet.generation,
+          },
+        }),
+    releaseChangeSet: async (changeSetId) => {
+      await changeSets.release(changeSetId);
+    },
+    reconcileCanonicalTree: (revision) => canonicalFileTree.rescan(revision).then(() => undefined),
+    runChecks: async (root, scope) => {
+      const candidate = new Workspace(root);
+      const gateSandbox = withRecordReplaySandbox(
+        createSandbox(
+          cfg,
+          candidate,
+          sandboxEnvironmentPath(container.state.root, {
+            scope: 'gate',
+            projectId: domainProject.id,
+            phaseId: domainPhase.id,
+          }),
+          audit,
+          plan.language,
+          downloadCacheRoot,
+        ),
+        recordReplay,
+      );
+      return runMergeGateChecks(gateSandbox, plan.language, recordReplay, scope);
+    },
+  });
   let finalProjectAudit: ProjectAuditResult | undefined;
-  const engine = new DomainExecutionEngine({
+  const engine = new ProjectOrchestrator({
     workspace: ws,
     git,
     sandbox,
@@ -317,15 +548,56 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     audit,
     repository: domainRepository,
     plugins: pluginHost,
+    registry: capabilities.tools,
+    skills: capabilities.skills,
+    capabilitiesPrepared: true,
+    // Container state, not the working copy. The projection is XCompiler's own bookkeeping and is
+    // rewritten constantly; written into the generated project it was tracked by Git, and the
+    // squash merge refused a dirty working copy — XCompiler's own cache blocked XCompiler's merge.
+    projectionWriter: new FileProjectProjectionWriter(new Workspace(container.state.root)),
     maxRoundsPerStep: cfg.agent.max_rounds_per_step,
     maxDebugRoundsPerStep: cfg.agent.max_debug_rounds_per_step,
     maxEditLinesPerStep: cfg.agent.max_edit_lines_per_step,
-    maxWriteChunkBytes: cfg.agent.max_write_chunk_bytes,
     terminalOutput: opts.terminalOutput ?? io.terminalOutput ?? false,
     debugWikiPath: opts.debugWikiPath ? path.resolve(opts.debugWikiPath) : undefined,
+    projectDebugWikiPath: container.state.abs('debug-wiki'),
+    recordReplay,
     requestPermission,
+    resolveScope,
+    preserveRejectedCandidate: async ({ ticketId, candidateRevision, baseRevision }) => {
+      const promoted = await changeSets.preserveRejectedCandidate({
+        ticketId,
+        candidateRevision,
+        baseRevision,
+      });
+      if (!promoted.ticket.workspaceBinding) {
+        throw new Error(`Rejected candidate for ${promoted.ticket.name} has no workspace binding`);
+      }
+      return promoted.ticket.workspaceBinding;
+    },
+    recordChangeSetRevision: async (ticketId, revision) => {
+      const object = await domainRepository.read(ticketId);
+      if (object.objectType !== 'ticket') throw new Error(`Object ${ticketId} is not a Ticket`);
+      if (object.workspaceBinding?.changeSetId) {
+        await changeSets.recordRevision(object.workspaceBinding.changeSetId, revision);
+      }
+    },
+    integrateTicket: (rootTicketId) => mergeIntegration.integrateTicket(domainProject.id, rootTicketId),
+    integratePhase: (phaseId) => mergeIntegration.integratePhase(domainProject.id, phaseId),
+    integratePendingAuthorization: (phaseId) =>
+      mergeIntegration.integratePendingAuthorization(domainProject.id, phaseId),
+    canonicalRevisionState: async () => ({
+      head: await repositoryGit.head(),
+      pending: await repositoryGit.pendingChanges(),
+    }),
+    commitCanonicalArtifact: async (stepId, summary) => {
+      const revision = await git.snapshot(stepId, 0, summary);
+      await canonicalFileTree.rescan(revision);
+      return revision;
+    },
+    abortSignal: opts.abortSignal,
     onToolEvent: async (event: ToolExecutionEvent) => {
-      await io.emit({
+      await emitRuntimeEvent(io, {
         type: 'tool_call',
         callId: event.callId,
         status: event.status,
@@ -338,7 +610,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
         error: event.error,
       });
       if (event.patch && event.status === 'started') {
-        await io.emit({
+        await emitRuntimeEvent(io, {
           type: 'patch_proposed',
           callId: event.callId,
           stepId: event.stepId,
@@ -349,7 +621,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       }
       if (event.status === 'completed' && event.ok && event.changedFiles) {
         for (const changed of event.changedFiles) {
-          await io.emit({
+          await emitRuntimeEvent(io, {
             type: 'file_changed',
             callId: event.callId,
             stepId: event.stepId,
@@ -361,7 +633,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       }
     },
     onTransition: async (event) => {
-      await io.emit({ type: 'workflow', ...event });
+      await emitRuntimeEvent(io, { type: 'workflow', ...event });
       await domainAudit.recordEvent({
         projectId: event.projectId,
         subject: event.ticketId
@@ -378,12 +650,19 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           stepId: event.stepId,
           stepName: event.stepName,
           ticketId: event.ticketId,
+          ticketName: event.ticketName,
           ticketType: event.ticketType,
+          creatorActorId: event.creatorActorId,
+          creatorRole: event.creatorRole,
+          assigneeActorId: event.assigneeActorId,
+          assigneeRole: event.assigneeRole,
+          assigneeAgent: event.assigneeAgent,
           message: event.message,
         },
       });
       projectFilePath = await updateProjectFile({
         workspace: ws.root,
+        container: container.root,
         planPath: publicPlanPath,
         configPath: cfgPath,
         projectFilePath,
@@ -392,6 +671,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       });
     },
     finalGate: async () => {
+      const phaseGate = resolvePhaseDeliveryGate(domainPhase);
       if (requestPermission) {
         const decision = await requestPermission({
           operationType: 'test_command',
@@ -403,8 +683,60 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           denyBehavior: 'Keep the phase open and return a failed run.',
         });
         if (!decision.approved) return { ok: false, reason: 'project audit permission denied' };
+        if (phaseGate.scenarios.some((scenario) => scenario.environment === 'live')) {
+          const networkDecision = await requestPermission({
+            operationType: 'network_access',
+            target: `${domainPhase.name} live delivery scenarios`,
+            reason: 'Validate the delivered functionality through declared real-user operations.',
+            risk: 'The product commands may contact live external services using the configured sandbox.',
+            scope: 'current workspace sandbox',
+            skippable: false,
+            denyBehavior: 'Keep the Phase open without creating a product-defect Ticket.',
+          });
+          if (!networkDecision.approved) {
+            return { ok: false, reason: 'phase delivery live-scenario permission denied' };
+          }
+        }
       }
-      finalProjectAudit = await runProjectAudit({ ws, sandbox, plan, profile });
+      // What the workspace held before the scenario ran, so whatever it touches can be told apart
+      // from everything already there. Difference is what makes this work for any project: nothing
+      // here knows what kind of artifact the scenario is supposed to produce.
+      const beforeScenario = (await canonicalFileTree.entries())
+        .filter((entry) => entry.type === 'file')
+        .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
+      finalProjectAudit = await runProjectAudit({
+        ws,
+        sandbox,
+        plan,
+        profile,
+        scenarios: phaseGate.scenarios,
+        runLiveScenario: (operation) => recordReplay.runWithMode('off', operation),
+        judgeScenarioOutcome: ({ scenario, scene }) => judgeScenarioOutcome({
+          router,
+          before: beforeScenario,
+          scenario,
+          scene,
+          artifacts: {
+            snapshot: async () => {
+              await canonicalFileTree.rescan();
+              return (await canonicalFileTree.entries())
+                .filter((entry) => entry.type === 'file')
+                .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
+            },
+            read: async (relative, maxBytes) => {
+              const text = await ws.readFile(relative).catch(() => undefined);
+              return text === undefined ? undefined : text.slice(0, maxBytes);
+            },
+          },
+        }),
+      });
+      await audit.event('phase.delivery_gate', `${domainPhase.name} delivery gate evaluated`, {
+        messageId: 'domain.phase_delivery_gate_evaluated',
+        projectId: domainProject.id,
+        phaseId: domainPhase.id,
+        gate: phaseGate,
+        result: finalProjectAudit,
+      });
       await emitProjectAudit(io, finalProjectAudit);
       return {
         ok: finalProjectAudit.ok,
@@ -415,13 +747,19 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           .filter((check) => check.severity === 'error' && !check.ok)
           .map((check) => `${check.name}: ${check.summary}${check.detail ? `\n${check.detail}` : ''}`)
           .join('\n'),
+        findings: finalProjectAudit.checks
+          .filter((check) => check.severity === 'error' && !check.ok)
+          .flatMap((check) => check.finding ? [check.finding] : []),
+        evidence: finalProjectAudit.checks.map((check) =>
+          `${check.ok ? 'PASS' : 'FAIL'} ${check.name}: ${check.summary}`
+        ),
       };
     },
   }, plan);
 
   try {
     const r = await engine.run(domainPhase.id);
-    await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
+    await persistProjectMemory(ws, container.state, audit, planAbs, plan.language, plan.intent);
     if (r.failedStepId) {
       await runtimeLog(io, 'error', t().execute.runInterrupted(r.failedStepId, r.executedSteps, r.totalSteps));
       if (r.failureReason) {
@@ -444,21 +782,15 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     }
     const iterationDelivered = true;
     const phaseAdvance = target.phasePlan && target.phasePlanPath && iterationDelivered
-      ? await completeAndPrepareNextPhase({
+      ? await phaseProgression.completeAndPrepareNext({
           phasePlan: target.phasePlan,
           phasePlanPath: target.phasePlanPath,
-          ws,
-          router,
-          audit,
-          io,
           currentPlanPath: planAbs,
-          currentPlan: plan,
           iterationDelivered,
         })
       : undefined;
     if (phaseAdvance?.nextPlan && r.nextPhaseId) {
-      await materializeNextDomainPhase({
-        repository: domainRepository,
+      await new PhaseMaterializationService(domainRepository).materialize({
         projectId: domainProject.id,
         phaseId: r.nextPhaseId,
         plan: phaseAdvance.nextPlan,
@@ -469,10 +801,10 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
       ? await generateProjectDevelopmentReport({
           workspace: ws,
           plan,
-          phasePlan: phaseAdvance?.phasePlan ?? target.phasePlan,
           projectAudit: finalProjectAudit,
           finalDelivery: !phaseAdvance?.nextPlan,
           repository: domainRepository,
+          recordReplay: recordReplay.evidence(),
         })
       : undefined;
     if (reportPath) {
@@ -499,6 +831,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
     await updateProjectFile({
       workspace: ws.root,
+      container: container.root,
       planPath: publicPlanPath,
       configPath: cfgPath,
       projectFilePath,
@@ -514,16 +847,31 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     });
     return { status: 'ok', engine: r, audit: finalProjectAudit, reportPath };
   } catch (err) {
-    const msg = (err as Error).message;
-    const stack = (err as Error).stack;
+    const msg = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    if (isCancellationError(err, opts.abortSignal)) {
+      await audit.end({ status: 'cancelled', message: msg });
+      await updateProjectFile({
+        workspace: ws.root,
+        container: container.root,
+        planPath: publicPlanPath,
+        configPath: cfgPath,
+        projectFilePath,
+        command: projectCommand,
+        intent: plan.intent,
+      });
+      await runtimeResult(io, 'run', 'cancelled', { message: msg, exitCode: 130 });
+      return { status: 'cancelled', message: msg, exitCode: 130 };
+    }
     await runtimeLog(io, 'error', t().system.unhandledError(msg));
     if (stack && stack !== msg) {
       await runtimeLog(io, 'dim', stack);
     }
-    await persistProjectMemory(ws, audit, planAbs, plan.language, plan.intent);
+    await persistProjectMemory(ws, container.state, audit, planAbs, plan.language, plan.intent);
     await audit.end({ status: 'error', message: msg, stack });
     await updateProjectFile({
       workspace: ws.root,
+      container: container.root,
       planPath: publicPlanPath,
       configPath: cfgPath,
       projectFilePath,
@@ -540,168 +888,16 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
   }
 }
 
-async function materializeNextDomainPhase(input: {
-  repository: DomainObjectRepository;
-  projectId: ObjectId;
-  phaseId: ObjectId;
-  plan: Plan;
-}): Promise<void> {
-  const projectObject = await input.repository.read(input.projectId);
-  const phaseObject = await input.repository.read(input.phaseId);
-  if (projectObject.objectType !== 'project') throw new Error(`Object ${input.projectId} is not a Project`);
-  if (phaseObject.objectType !== 'phase') throw new Error(`Object ${input.phaseId} is not a Phase`);
-  const phasePlanObject = await input.repository.read(phaseObject.planId);
-  const epicObject = await input.repository.read(phaseObject.epicTicketId);
-  if (phasePlanObject.objectType !== 'plan' || phasePlanObject.planKind !== 'phase') {
-    throw new Error(`Phase ${phaseObject.name} does not reference a PhasePlan`);
-  }
-  if (epicObject.objectType !== 'ticket' || epicObject.type !== 'epic') {
-    throw new Error(`Phase ${phaseObject.name} does not reference an Epic Ticket`);
-  }
-  const materialization = compilePhaseMaterialization({
-    draft: input.plan,
-    project: projectObject,
-    phase: phaseObject,
-    phasePlan: phasePlanObject,
-    epic: epicObject,
-  });
-  await input.repository.persistPhaseMaterialization(materialization);
-  const projectPlanObject = await input.repository.read(projectObject.projectPlanId);
-  if (projectPlanObject.objectType !== 'plan' || projectPlanObject.planKind !== 'project') {
-    throw new Error(`Project ${projectObject.name} does not reference a ProjectPlan`);
-  }
-  const projectPlan = ProjectPlanSchema.parse({
-    ...projectPlanObject,
-    ...reviseObjectEnvelope(projectPlanObject),
-    activePhaseId: phaseObject.id,
-  });
-  await input.repository.update(projectPlan, 'materialized');
-}
-
-async function completeAndPrepareNextPhase(args: {
-  phasePlan: PhasePlan;
-  phasePlanPath: string;
-  ws: Workspace;
-  router: LLMRouter;
-  audit: AuditLogger;
-  io: RuntimeIO;
-  currentPlanPath: string;
-  currentPlan: Plan;
-  iterationDelivered: boolean;
-}): Promise<{ completedPhaseId: string; phasePlan: PhasePlan; nextPlan?: Plan }> {
-  if (!args.iterationDelivered) {
-    throw new Error('cannot advance implementation phase before its Delivery Feature and Epic close');
-  }
-  const transition = advancePhasePlan(args.phasePlan);
-  const next = transition.nextPhase;
-  if (!next) {
-    await savePhasePlan(args.phasePlanPath, transition.phasePlan);
-    await args.audit.event('plan.persist', `completed final implementation phase ${transition.completedPhaseId}`, {
-      messageId: 'execute.phase_completed',
-      phaseId: transition.completedPhaseId,
-      phasePlanPath: args.phasePlanPath,
-    });
-    return {
-      completedPhaseId: transition.completedPhaseId,
-      phasePlan: transition.phasePlan,
-    };
-  }
-
-  next.planPath ??= phasePlanFileName(next.id);
-  const nextPlanPath = path.resolve(path.dirname(args.phasePlanPath), next.planPath);
-  assertWorkspacePath(args.ws.root, nextPlanPath);
-  const topic = await args.ws.exists(DOC_NAMES.topic)
-    ? await args.ws.readFile(DOC_NAMES.topic)
-    : transition.phasePlan.requirementDigest;
-  let baselineSummary = transition.phasePlan.baselineSummary;
-  try {
-    const memory = await refreshProjectMemory(args.ws, {
-      planPath: args.currentPlanPath,
-      language: transition.phasePlan.language,
-      intent: transition.phasePlan.intent,
-    });
-    baselineSummary = memory.summary;
-  } catch (err) {
-    await args.audit.event('note', `could not refresh phase baseline: ${(err as Error).message}`, {
-      messageId: 'execute.phase_baseline_refresh_failed',
-      phaseId: next.id,
-    });
-  }
-
-  const draftPhasePlan: DraftPhasePlan = {
-    requirementDigest: transition.phasePlan.requirementDigest,
-    globalPrompt: transition.phasePlan.globalPrompt,
-    projectType: transition.phasePlan.projectType,
-    complexityAssessment: transition.phasePlan.complexityAssessment,
-    implementationPhases: transition.phasePlan.phases.map(({ planPath: _planPath, ...phase }) => phase),
-  };
-  const planner = new Planner(
-    args.router.for('Planner'),
-    args.audit,
-    transition.phasePlan.language,
-    args.io.terminalOutput === true,
-  );
-  const draft = await planner.decomposePhase(
-    {
-      rawRequirement: topic,
-      clarifications: [],
-      userAddenda: transition.phasePlan.userAddenda,
-      baselineContext: baselineSummary,
-      intent: transition.phasePlan.intent,
-    },
-    draftPhasePlan,
-    next.id,
-  );
-  const nextPlan = buildPlan(draft, {
-    language: transition.phasePlan.language,
-    intent: transition.phasePlan.intent,
-    userAddenda: transition.phasePlan.userAddenda,
-    baselineSummary,
-  });
-  if (nextPlan.phaseId !== next.id) {
-    throw new Error(`materialized plan phase ${nextPlan.phaseId} does not match activated phase ${next.id}`);
-  }
-  assertPlanValid(nextPlan);
-
-  // Persist the materialized plan first. A crash cannot point phasePlan.json at a missing file.
-  await savePlan(nextPlanPath, nextPlan);
-  await savePhasePlan(args.phasePlanPath, transition.phasePlan);
-  await args.ws.writeFile(DOC_NAMES.plan, renderPlanMarkdown(nextPlan));
-  await refreshProjectMemory(args.ws, {
-    planPath: nextPlanPath,
-    language: nextPlan.language,
-    intent: nextPlan.intent,
-  });
-  await args.audit.event('plan.persist', `prepared implementation phase ${next.id}`, {
-    messageId: 'execute.phase_prepared',
-    completedPhaseId: transition.completedPhaseId,
-    nextPhaseId: next.id,
-    nextPlanPath,
-    phasePlanPath: args.phasePlanPath,
-  });
-  return {
-    completedPhaseId: transition.completedPhaseId,
-    phasePlan: transition.phasePlan,
-    nextPlan,
-  };
-}
-
-function assertWorkspacePath(workspace: string, target: string): void {
-  const relative = path.relative(path.resolve(workspace), path.resolve(target));
-  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error(`phase plan path escapes workspace: ${target}`);
-  }
-}
-
 async function persistProjectMemory(
   ws: Workspace,
+  state: Workspace,
   audit: AuditLogger,
   planPath: string,
   language: Language,
   intent: PlanIntent,
 ): Promise<void> {
   try {
-    await refreshProjectMemory(ws, { planPath, language, intent });
+    await refreshProjectMemory(ws, state, { planPath, language, intent });
   } catch (err) {
     await audit.event('note', t().execute.projectMemoryRefreshFailed((err as Error).message), {
       messageId: 'execute.project_memory_refresh_failed',

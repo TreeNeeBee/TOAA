@@ -7,6 +7,8 @@ import { DockerSandbox } from '../src/sandbox/docker.js';
 
 let tmp: string;
 let ws: Workspace;
+// Environments live in container state, never inside the bind-mounted working copy.
+let envRoot: string;
 let scriptDir: string;
 let fakeDocker: string;
 
@@ -28,15 +30,15 @@ beforeEach(async () => {
       '  # extract -v <hostpath>:<containerpath>',
       '  HOSTPATH=""',
       '  while [ "$#" -gt 0 ]; do',
-      '    if [ "$1" = "-v" ]; then HOSTPATH="${2%%:*}"; fi',
+      '    if [ "$1" = "-v" ]; then case "$2" in *:/xcsandbox) HOSTPATH="${2%%:*}";; esac; fi',
       '    if [ "$1" = "bash" ]; then break; fi',
       '    shift',
       '  done',
       '  if [ -n "$HOSTPATH" ]; then',
-      '    # 解析 bash -lc "python -m venv /workspace/.sandbox/<name> && ..." 中的 venv 路径',
+      '    # 解析 bash -lc "python -m venv /xcsandbox/<name> && ..." 中的 venv 名',
       '    BASH_CMD="$@"',
-      '    VENV_REL=$(echo "$BASH_CMD" | sed -n "s/.*python -m venv \\/workspace\\/\\(\\.sandbox\\/[A-Za-z0-9._-]*\\).*/\\1/p")',
-      '    if [ -z "$VENV_REL" ]; then VENV_REL=".sandbox/venv"; fi',
+      '    VENV_REL=$(echo "$BASH_CMD" | sed -n "s/.*python -m venv \\/xcsandbox\\/\\([A-Za-z0-9._-]*\\).*/\\1/p")',
+      '    if [ -z "$VENV_REL" ]; then VENV_REL="venv"; fi',
       '    mkdir -p "$HOSTPATH/$VENV_REL/bin"',
       '    : > "$HOSTPATH/$VENV_REL/bin/python"',
       '    chmod +x "$HOSTPATH/$VENV_REL/bin/python"',
@@ -48,22 +50,25 @@ beforeEach(async () => {
     'utf8',
   );
   await fs.chmod(fakeDocker, 0o755);
+  envRoot = path.join(tmp, '..', `${path.basename(tmp)}-state`, 'sandboxes', 'p', 'canonical');
+  await fs.mkdir(envRoot, { recursive: true });
 });
 
 describe('DockerSandbox', () => {
-  it('build creates .sandbox/<project>/bin/python on first call (cache miss) and short-circuits on second (cache hit)', async () => {
+  it('builds the venv in the shared environment, outside the working copy, and caches it', async () => {
     await ws.writeFile('requirements.txt', 'pytest==8.*\n');
     const sb = new DockerSandbox({
+      environmentRoot: envRoot,
       ws,
       limits: { cpu: 1, memory_mb: 256, wall_seconds: 30, network: 'download-only' },
       dockerBin: fakeDocker,
     });
-    const venvName = path.basename(tmp);
-
     const r1 = await sb.build();
     expect(r1.rebuilt).toBe(true);
-    expect(await ws.exists(`.sandbox/${venvName}/bin/python`)).toBe(true);
-    expect(await ws.exists('.sandbox/requirements.sha256')).toBe(true);
+    // The environment must land in container state, never in the mounted working copy.
+    expect(await fs.stat(path.join(envRoot, 'venv', 'bin', 'python'))).toBeTruthy();
+    expect(await fs.stat(path.join(envRoot, 'requirements.sha256'))).toBeTruthy();
+    expect(await ws.exists('.sandbox')).toBe(false);
 
     const r2 = await sb.build();
     expect(r2.rebuilt).toBe(false);
@@ -72,6 +77,7 @@ describe('DockerSandbox', () => {
 
   it('exec issues docker run with -v <ws>:<workdir> and --memory/--cpus flags', async () => {
     const sb = new DockerSandbox({
+      environmentRoot: envRoot,
       ws,
       limits: { cpu: 2, memory_mb: 512, wall_seconds: 10, network: 'off' },
       dockerBin: fakeDocker,
@@ -79,6 +85,7 @@ describe('DockerSandbox', () => {
     await sb.exec('echo', ['hello']);
     const calls = await fs.readFile(`${fakeDocker}.calls`, 'utf8');
     expect(calls).toContain(`-v ${ws.root}:/workspace`);
+    expect(calls).toContain(`-v ${envRoot}:/xcsandbox`);
     expect(calls).toContain('--cpus=2');
     expect(calls).toContain('--memory=512m');
     expect(calls).toContain('--network none');
@@ -87,6 +94,7 @@ describe('DockerSandbox', () => {
 
   it('publishes expose_ports to 127.0.0.1 when network=full', async () => {
     const sb = new DockerSandbox({
+      environmentRoot: envRoot,
       ws,
       limits: { cpu: 1, memory_mb: 256, wall_seconds: 10, network: 'full', expose_ports: [8000, 5173] },
       dockerBin: fakeDocker,
@@ -101,6 +109,7 @@ describe('DockerSandbox', () => {
 
   it('does not publish ports when network=download-only (default)', async () => {
     const sb = new DockerSandbox({
+      environmentRoot: envRoot,
       ws,
       limits: { cpu: 1, memory_mb: 256, wall_seconds: 10, network: 'download-only', expose_ports: [9000] },
       dockerBin: fakeDocker,

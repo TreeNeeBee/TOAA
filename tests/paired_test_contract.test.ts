@@ -140,6 +140,64 @@ describe('paired source test product-reference contract', () => {
     expect(result.ok).toBe(true);
   });
 
+  it('rejects a requirement baseline that drifts from required field contracts', async () => {
+    const plan = contractPlan(
+      'typescript',
+      'tests/functional/acceptance.test.ts',
+      'REQUIREMENT_ANALYSIS',
+    );
+    plan.steps[0]!.outputs.unshift('docs/01-requirements.md');
+    await workspace.writeFile('docs/01-requirements.md', [
+      '| Field | Type | Required |',
+      '| --- | --- | --- |',
+      '| title | string | yes |',
+      '| summary | string | yes |',
+      '| heatIndex | number | yes |',
+      '| category | string | yes |',
+    ].join('\n'));
+    await workspace.writeFile('tests/functional/acceptance.test.ts', [
+      'import { render } from "../../src/renderer/render.ts";',
+      'interface NewsItem { title: string; summary: string; heatScore: number; tags: string[] }',
+      'it("renders", () => expect(render({ title: "news", summary: "brief", heatScore: 1, tags: [] })).toBeTruthy());',
+    ].join('\n'));
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+
+    expect(result.ok).toBe(false);
+    expect(result.invalid.join('\n')).toContain('heatIndex, category');
+    expect(result.invalid.join('\n')).toContain('redeclares the product contract locally (NewsItem)');
+  });
+
+  it('rejects direct awaited product access when the baseline promises controlled fixtures', async () => {
+    const plan = contractPlan(
+      'typescript',
+      'tests/functional/acceptance.test.ts',
+      'REQUIREMENT_ANALYSIS',
+    );
+    plan.steps[0]!.outputs.unshift('docs/tests/functional-test-plan.md');
+    await workspace.writeFile(
+      'docs/tests/functional-test-plan.md',
+      '# Test plan\nAll external responses use controlled fixtures and mocks.\n',
+    );
+    await workspace.writeFile('tests/functional/acceptance.test.ts', [
+      'import { fetchNews } from "../../src/renderer/render.ts";',
+      'it("loads", async () => expect(await fetchNews()).toBeTruthy());',
+    ].join('\n'));
+
+    const direct = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(direct.ok).toBe(false);
+    expect(direct.invalid.join('\n')).toContain('without an executable isolation mechanism');
+
+    await workspace.writeFile('tests/functional/acceptance.test.ts', [
+      'import { vi } from "vitest";',
+      'import { fetchNews } from "../../src/renderer/render.ts";',
+      'vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true }));',
+      'it("loads", async () => expect(await fetchNews()).toBeTruthy());',
+    ].join('\n'));
+    const controlled = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(controlled.ok).toBe(true);
+  });
+
   it('requires a detailed-design integration test to exercise two product sources', async () => {
     const plan = contractPlan(
       'typescript',
@@ -186,6 +244,42 @@ describe('paired source test product-reference contract', () => {
     expect(integrated.ok).toBe(true);
   });
 
+  it('rejects an integration test whose catch swallows whatever the product did', async () => {
+    const plan = contractPlan(
+      'typescript',
+      'tests/integration/renderer-pipeline.test.ts',
+      'DETAILED_DESIGN',
+    );
+    plan.architectureModules!.push({
+      id: 'M002',
+      name: 'Pipeline',
+      responsibility: 'Coordinate collaborators and render the resulting records.',
+      sourcePaths: ['src/pipeline/run.ts'],
+      testPaths: ['tests/modules/pipeline.test.ts'],
+      dependencies: ['M001'],
+    });
+    await workspace.writeFile(
+      'tests/integration/renderer-pipeline.test.ts',
+      [
+        'import { render } from "../../src/renderer/render.ts";',
+        'import { run } from "../../src/pipeline/run.ts";',
+        'test("pipeline", async () => {',
+        '  const values: string[] = [];',
+        '  for (const input of ["news"]) {',
+        '    try { values.push(await run(render, input)); } catch { /* copied fallback */ }',
+        '  }',
+        '  expect(values).toHaveLength(1);',
+        '});',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+
+    expect(result.ok).toBe(false);
+    // The real defect in this shape: `run` can throw and the test still passes.
+    expect(result.invalid.join('\n')).toContain('without asserting or rethrowing');
+  });
+
   it('accepts a Python import and rejects a local-only stand-in', async () => {
     const plan = contractPlan('python', 'tests/test_renderer.py');
     await workspace.writeFile(
@@ -211,7 +305,7 @@ describe('paired source test product-reference contract', () => {
     expect(localOnly.ok).toBe(false);
   });
 
-  it('tells design remediation to reference future product paths without creating source stubs', () => {
+  it('routes one actionable finding without duplicating it as KPI and remediation gaps', () => {
     const merged = mergePairedSourceTestQuality(
       {
         completion: 1,
@@ -230,8 +324,111 @@ describe('paired source test product-reference contract', () => {
       },
     );
 
-    expect(merged.gaps.join('\n')).toContain('imports may target planned source paths that do not exist yet');
-    expect(merged.gaps.join('\n')).toContain('Do not create src/** stubs');
+    expect(merged.completion).toBe(1);
+    expect(merged.gaps).toEqual([]);
+    expect(merged.findings).toHaveLength(1);
+    expect(merged.findings?.[0]?.summary).toContain('exercises 0/2 required');
+    expect(merged.findings?.[0]?.evidence.join('\n'))
+      .toContain('imports may target planned source paths that do not exist yet');
+    expect(merged.findings?.[0]?.evidence.join('\n')).toContain('Do not create src/** stubs');
+  });
+});
+
+/**
+ * The shape a real integration test has, which the removed heuristic could not distinguish from a
+ * defect.
+ *
+ * A live DETAILED_DESIGN Enhancement stopped unconverged on exactly this file shape: it referenced
+ * three declared product modules, called the real entry point, and asserted its exit code. Its only
+ * loop read the workbook the product produced and its only `try` wrapped that call with `finally`
+ * restoring a permission — no handler swallowed anything. The old check saw a loop beside a try and
+ * reported "duplicates orchestration/failure-handling" seven times word for word, because the only
+ * way to satisfy it was to delete correct code.
+ */
+describe('integration tests that assert on real failures', () => {
+  let root = '';
+  let workspace: Workspace;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-swallow-'));
+    workspace = new Workspace(root);
+  });
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('accepts a loop that reads the produced artifact beside a try that asserts the failure', async () => {
+    const plan = contractPlan('python', 'tests/test_integration.py', 'DETAILED_DESIGN');
+    plan.architectureModules!.push({
+      id: 'M002',
+      name: 'Exporter',
+      responsibility: 'Write the parsed records to a workbook.',
+      sourcePaths: ['src/exporter.py'],
+      testPaths: ['tests/modules/test_exporter.py'],
+      dependencies: ['M001'],
+    });
+    await workspace.writeFile(
+      'tests/test_integration.py',
+      [
+        'from src.renderer.render import render',
+        'from src.exporter import export_to_excel',
+        '',
+        'def _read_rows(path):',
+        '    rows = []',
+        '    for index in range(2, 5):',
+        '        rows.append(index)',
+        '    return rows',
+        '',
+        'def test_export_writes_rows(tmp_path):',
+        '    out = tmp_path / "out.xlsx"',
+        '    export_to_excel(render("news"), out)',
+        '    assert _read_rows(out) == [2, 3, 4]',
+        '',
+        'def test_readonly_target_fails(tmp_path):',
+        '    target = tmp_path / "ro"',
+        '    target.mkdir()',
+        '    target.chmod(0o444)',
+        '    try:',
+        '        code = export_to_excel(render("news"), target / "out.xlsx")',
+        '        assert code != 0',
+        '    finally:',
+        '        target.chmod(0o755)',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(result.invalid.join('\n')).not.toMatch(/without asserting or rethrowing/u);
+    expect(result.ok).toBe(true);
+  });
+
+  // The other direction, in Python: an except that says nothing leaves the test unable to fail.
+  it('rejects an except block that neither asserts nor reraises', async () => {
+    const plan = contractPlan('python', 'tests/test_integration.py', 'DETAILED_DESIGN');
+    plan.architectureModules!.push({
+      id: 'M002',
+      name: 'Exporter',
+      responsibility: 'Write the parsed records to a workbook.',
+      sourcePaths: ['src/exporter.py'],
+      testPaths: ['tests/modules/test_exporter.py'],
+      dependencies: ['M001'],
+    });
+    await workspace.writeFile(
+      'tests/test_integration.py',
+      [
+        'from src.renderer.render import render',
+        'from src.exporter import export_to_excel',
+        '',
+        'def test_export(tmp_path):',
+        '    try:',
+        '        export_to_excel(render("news"), tmp_path / "out.xlsx")',
+        '    except Exception:',
+        '        pass',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(result.ok).toBe(false);
+    expect(result.invalid.join('\n')).toContain('without asserting or rethrowing');
   });
 });
 

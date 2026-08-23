@@ -1,9 +1,9 @@
 import chalk from 'chalk';
 import {
-  runDoctorCommand,
+  XCompilerRuntime,
   type CheckLevel,
   type RuntimeDoctorOptions,
-} from '../runtime/doctor.js';
+} from '../runtime.js';
 import { t } from '../i18n/index.js';
 
 export type DoctorCliOptions = RuntimeDoctorOptions;
@@ -12,7 +12,7 @@ export type DoctorCliOptions = RuntimeDoctorOptions;
 export async function runDoctorCli(opts: DoctorCliOptions = {}): Promise<void> {
   const M = t().doctor;
   console.log(chalk.bold(M.header));
-  const { report, exitCode } = await runDoctorCommand(opts);
+  const { report, exitCode } = await new XCompilerRuntime().doctor(opts);
   for (const sec of report.sections) {
     console.log('\n' + chalk.bold(sec.title));
     for (const it of sec.items) {

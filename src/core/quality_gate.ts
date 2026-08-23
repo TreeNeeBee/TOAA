@@ -1,11 +1,14 @@
 import {
   V_MODEL_DEVELOPMENT_PHASES,
-  V_MODEL_SOURCE_TO_TEST_PHASE,
   V_MODEL_TEST_PHASES,
   type Phase,
   type StageQualityGate,
   type Step,
 } from './plan.js';
+import {
+  DeliveryGateFindingSchema,
+  type DeliveryGateFinding,
+} from '../domain/quality/delivery_gate.js';
 
 
 export interface StageQualityAssessment {
@@ -18,13 +21,36 @@ export interface StageQualityAssessment {
     warnings: number;
   };
   evidence: string[];
+  /** Gate metric identifiers that a concrete probe could not measure. */
+  unavailableMetrics: string[];
+  /** Shortfalls in this Step's own work. Any one of them fails its gate. */
   gaps: string[];
+  /**
+   * Preconditions this Step does not own and cannot satisfy.
+   *
+   * Separate from `gaps` because the gate fails a Step for every gap it reports, and a Step that
+   * accurately says "the product source does not exist yet, which is expected before CODE" was being
+   * failed for being right. The alternative — recognising such statements in `gaps` — means matching
+   * internal metric identifiers against free prose, and it lost to a model writing "test pass rate"
+   * where the matcher expected "testCasePassRate".
+   *
+   * Recorded as evidence and never gate-failing. A precondition that actually needs action reaches
+   * PM through a tool failure code or a Change Request, not through this field.
+   */
+  blockedBy: string[];
+  /** Independent defects/shortfalls discovered by this gate. */
+  findings?: DeliveryGateFinding[];
 }
 
 export interface QualityGateEvaluation {
   passed: boolean;
   enhancementFailures: string[];
   bugFailures: string[];
+}
+
+export interface QualityAssessmentConsistencyContext {
+  /** S1-S3 have authored a baseline, but Runtime intentionally has no product code to execute yet. */
+  baselineExecutionDeferred?: boolean;
 }
 
 
@@ -86,6 +112,9 @@ export function withDefaultQualityGate(step: Step): Step {
 
 export function normalizeQualityAssessment(value: unknown): StageQualityAssessment | undefined {
   if (!isRecord(value)) return undefined;
+  const findingValue = value.findings ?? value.deliveryFindings;
+  const findings = normalizeDeliveryGateFindings(findingValue);
+  if (findingValue !== undefined && findings === undefined) return undefined;
   const metrics = normalizeRatioRecord(value.metrics);
   const toleranceValue = isRecord(value.tolerance) ? value.tolerance : {};
   const assessment: StageQualityAssessment = {
@@ -98,9 +127,49 @@ export function normalizeQualityAssessment(value: unknown): StageQualityAssessme
       warnings: normalizeCount(toleranceValue.warnings),
     },
     evidence: normalizeStrings(value.evidence),
+    unavailableMetrics: normalizeStrings(value.unavailableMetrics ?? value.unavailable_metrics),
     gaps: normalizeStrings(value.gaps),
+    blockedBy: normalizeStrings(value.blockedBy ?? value.blocked_by),
+    findings: findings ?? [],
   };
   return assessment;
+}
+
+/**
+ * Reject structurally contradictory model evidence before it can create a corrective Ticket.
+ *
+ * Runtime owns the execution policy, so this deliberately uses typed fields rather than trying to
+ * recognise phrases such as "source code is missing" in model prose.
+ */
+export function qualityAssessmentConsistencyIssues(
+  assessment: StageQualityAssessment,
+  context: QualityAssessmentConsistencyContext = {},
+): string[] {
+  const issues: string[] = [];
+  const unavailable = new Set(assessment.unavailableMetrics);
+  for (const metric of Object.keys(assessment.metrics)) {
+    if (unavailable.has(metric)) {
+      issues.push(
+        `qualityAssessment.metrics.${metric} conflicts with qualityAssessment.unavailableMetrics`,
+      );
+    }
+  }
+  if (
+    context.baselineExecutionDeferred &&
+    assessment.completion === 1 &&
+    assessment.gaps.length > 0 &&
+    assessment.blockedBy.length > 0 &&
+    (assessment.findings?.length ?? 0) === 0 &&
+    assessment.tolerance.failedTests === 0 &&
+    assessment.tolerance.skippedTests === 0 &&
+    assessment.tolerance.warnings === 0
+  ) {
+    issues.push(
+      'qualityAssessment.gaps contradict completion=1 during deferred baseline execution; ' +
+        'an expected downstream precondition belongs only in blockedBy, while a real current-Step gap must reduce completion or produce a finding',
+    );
+  }
+  return issues;
 }
 
 export function emptyQualityAssessment(): StageQualityAssessment {
@@ -112,80 +181,11 @@ export function emptyQualityAssessment(): StageQualityAssessment {
       warnings: 0,
     },
     evidence: [],
+    unavailableMetrics: [],
     gaps: [],
+    blockedBy: [],
+    findings: [],
   };
-}
-
-/**
- * Reconcile a development-stage LLM assessment with output verification
- * performed after its tool actions. Stale "missing required output" gaps and
- * explicitly deferred paired-test execution are removed; semantic, alignment,
- * coverage, and tolerance findings remain.
- */
-export function reconcileDevelopmentQualityAssessment(
-  step: Step,
-  assessment: StageQualityAssessment | undefined,
-  missingOutputs: readonly string[],
-): StageQualityAssessment | undefined {
-  if (
-    !assessment ||
-    !(V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase)
-  ) {
-    return assessment;
-  }
-  const missing = new Set(missingOutputs);
-  const verifiedOutputs = step.outputs.filter(
-    (output) => !output.endsWith('/') && !missing.has(output),
-  );
-  const staleOutputGaps = assessment.gaps.filter((gap) =>
-    isVerifiedMissingOutputGap(gap, step.outputs, missing),
-  );
-  const deferredVerificationGaps = assessment.gaps.filter((gap) =>
-    isDeferredPairedTestExecutionGap(step, gap),
-  );
-  const downstreamMetricGaps = assessment.gaps.filter(isDownstreamVerificationMetricGap);
-  const reconciledGaps = new Set([
-    ...staleOutputGaps,
-    ...deferredVerificationGaps,
-    ...downstreamMetricGaps,
-  ]);
-  const gaps = assessment.gaps.filter((gap) => !reconciledGaps.has(gap));
-  const evidence = dedup([...assessment.evidence, ...verifiedOutputs]);
-  const completion =
-    missing.size === 0 &&
-    reconciledGaps.size > 0 &&
-    gaps.length === 0
-      ? 1
-      : assessment.completion;
-  if (
-    reconciledGaps.size === 0 &&
-    evidence.length === assessment.evidence.length &&
-    completion === assessment.completion
-  ) {
-    return assessment;
-  }
-  return {
-    ...assessment,
-    completion,
-    evidence,
-    gaps,
-  };
-}
-
-function isDownstreamVerificationMetricGap(gap: string): boolean {
-  const normalized = gap.toLowerCase().replaceAll(/[^a-z0-9]+/g, '');
-  return [
-    'lineCoverage',
-    'branchCoverage',
-    'testCasePassRate',
-    'interfaceCoverage',
-    'integrationScenarioCoverage',
-    'moduleCoverage',
-    'contractCoverage',
-    'functionalCoverage',
-    'requirementCoverage',
-    'endToEndPassRate',
-  ].some((metric) => normalized.includes(metric.toLowerCase()));
 }
 
 export function evaluateQualityGate(
@@ -247,7 +247,19 @@ export function evaluateQualityGate(
   if (assessment.evidence.length === 0) {
     enhancementFailures.push('qualityAssessment evidence is empty');
   }
-  enhancementFailures.push(...assessment.gaps.map((gap) => `declared gap: ${gap}`));
+  enhancementFailures.push(
+    ...assessment.gaps
+      .filter((gap) => !namesAToolThisStepLacks(gap, step))
+      .map((gap) => `declared gap: ${gap}`),
+  );
+  for (const finding of assessment.findings ?? []) {
+    const rendered = `${finding.category}: ${finding.summary}`;
+    if (finding.category === 'test-defect' || finding.category === 'product-defect') {
+      bugFailures.push(rendered);
+    } else if (finding.category !== 'dependency') {
+      enhancementFailures.push(rendered);
+    }
+  }
   return {
     passed: enhancementFailures.length === 0 && bugFailures.length === 0,
     enhancementFailures,
@@ -255,51 +267,25 @@ export function evaluateQualityGate(
   };
 }
 
-function isDeferredPairedTestExecutionGap(step: Step, gap: string): boolean {
-  if (
-    !(V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase) ||
-    step.tools.includes('run_tests')
-  ) {
-    return false;
-  }
-  const pairedPhase = V_MODEL_SOURCE_TO_TEST_PHASE[
-    step.phase as keyof typeof V_MODEL_SOURCE_TO_TEST_PHASE
-  ];
-  const normalized = gap.toLowerCase();
-  const deniedCurrentTool =
-    /\brun_tests\b/u.test(normalized) &&
-    /not (?:authori[sz]ed|allowed)|unauthori[sz]ed|未授权|不允许|未开放/u.test(normalized);
-  const scheduledForPairedPhase =
-    normalized.includes(pairedPhase.toLowerCase()) ||
-    /will be executed|deferred to|scheduled for|留到|将在|后续.*(?:执行|测试)/u.test(normalized);
-  const plannedCodeImplementation =
-    /\b(?:product\s+)?src\/?.*\b(?:will be|is)\s+(?:created|implemented)\b.*\bcode\b/u.test(normalized) ||
-    /(?:产品)?源码.*(?:将在|留到|由).*\bcode\b.*(?:创建|实现)/u.test(normalized);
-  const actualDefect =
-    /\b(?:bug|error|fail(?:ed|ing|ure)?|invalid|incorrect|incomplete|missing|omit(?:s|ted)?|mismatch|uncovered|unsupported|blocked)\b/u.test(normalized) ||
-    /\b(?:coverage|contract|alignment|requirement)\b.*\b(?:gap|missing|below|fail|insufficient)\b/u.test(normalized) ||
-    /错误|失败|无效|不正确|不完整|缺失|遗漏|不一致|未覆盖|覆盖率不足|契约缺陷|需求缺陷|阻塞/u.test(normalized);
-  return !actualDefect && (
-    (deniedCurrentTool && scheduledForPairedPhase) ||
-    scheduledForPairedPhase ||
-    plannedCodeImplementation
-  );
+/**
+ * Whether a declared gap is about work this Step has no tool to do.
+ *
+ * `blockedBy` is the channel for a precondition a Step does not own, and a model that uses it is
+ * never in this branch. Three live runs showed models putting it in `gaps` instead — "cannot run
+ * tsc/vitest here, the whitelist has no run_program/run_tests" — and the gate failed the Step for
+ * being right, raised an Enhancement, and left it with nothing to do but stall.
+ *
+ * The judgment is the Step's own tool whitelist, which is a fact the system owns; the tool names
+ * matched here are XCompiler's identifiers, not model prose. It cannot rescue a gap phrased without
+ * naming a tool — that is what `blockedBy` is for, and this only stops the gate punishing accuracy.
+ */
+function namesAToolThisStepLacks(gap: string, step: Step): boolean {
+  const granted = new Set(step.tools ?? []);
+  return VERIFICATION_TOOL_NAMES.some((tool) =>
+    !granted.has(tool) && new RegExp(`\\b${tool}\\b`, 'u').test(gap));
 }
 
-function isVerifiedMissingOutputGap(
-  gap: string,
-  outputs: readonly string[],
-  missing: ReadonlySet<string>,
-): boolean {
-  if (!/(?:missing required outputs?|缺失\s+required outputs?)/iu.test(gap)) {
-    return false;
-  }
-  return outputs.some((output) => gap.includes(output) && !missing.has(output));
-}
-
-function dedup(values: readonly string[]): string[] {
-  return [...new Set(values)];
-}
+const VERIFICATION_TOOL_NAMES = ['run_tests', 'run_program', 'install_deps', 'add_dependency'] as const;
 
 function testGate(metrics: Record<string, number>): StageQualityGate {
   return {
@@ -359,6 +345,18 @@ function normalizeStrings(value: unknown): string[] {
         typeof item === 'string' && item.trim().length > 0
       ).map((item) => item.trim()))]
     : [];
+}
+
+function normalizeDeliveryGateFindings(value: unknown): DeliveryGateFinding[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return undefined;
+  const parsed = value.map((candidate) => {
+    const parsed = DeliveryGateFindingSchema.safeParse(candidate);
+    return parsed.success ? parsed.data : undefined;
+  });
+  return parsed.some((candidate) => candidate === undefined)
+    ? undefined
+    : parsed as DeliveryGateFinding[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

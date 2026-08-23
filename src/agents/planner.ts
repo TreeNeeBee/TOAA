@@ -1,7 +1,6 @@
 import {
+  PLAN_VERSION,
   ArchitectureModuleSchema,
-  ComplexityAssessmentSchema,
-  ImplementationPhaseSchema,
   PHASES,
   REQUIRED_V_MODEL_PHASES,
   type ArchitectureModule,
@@ -13,6 +12,7 @@ import {
   type PlanIntent,
   type ProjectType,
 } from '../core/plan.js';
+import { lintPlan } from '../core/lint.js';
 import { getLanguageProfile } from '../core/language.js';
 import { withDefaultQualityGate } from '../core/quality_gate.js';
 import {
@@ -22,6 +22,12 @@ import {
   validateArchitectureContract,
 } from '../core/architecture.js';
 import type { LLMClient } from '../llm/types.js';
+import {
+  PlannerContractViolation,
+  errorMessage,
+  formatPlannerValidationFeedback,
+  isPlannerStructuredValidationError,
+} from './planning/validation_retry.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { makeStreamReporter } from '../llm/stream.js';
 import { t } from '../i18n/index.js';
@@ -36,39 +42,47 @@ import {
   calibrateLanguageStepOwnership,
   calibrateArchitectureModuleDependencies,
   calibrateArchitectureModulePaths,
+  calibrateProducedInputGlobs,
 } from './calibration.js';
+import {
+  hasExternalApiOrUrlRequirement,
+  parseClarifyJson,
+  validateClarifyJson,
+  type ClarificationCategory,
+  type ClarifyOption,
+  type ClarifyQuestion,
+} from './planning/clarification.js';
+import {
+  hasForcedPhaseSplit,
+  inferComplexityAssessment,
+  inferProjectType,
+  isProjectShapeAmbiguous,
+  normalizeImplementationPhases,
+  normalizeStepIterations,
+  parseComplexityAssessment,
+  parseImplementationPhases,
+  parseProjectType,
+  validateImplementationPhaseDraft,
+  validateCurrentPhaseDeliveryEntrypoints,
+  validateIterationVModelDraft,
+} from './planning/phase_strategy.js';
+import { parsePlannerJson } from './planning/json.js';
+import { buildDefaultSkills, renderSkillCatalog, type SkillRegistry } from '../skills/index.js';
+
+export {
+  CLARIFICATION_CATEGORIES,
+  CLARIFICATION_OPTION_LABELS,
+  type ClarificationCategory,
+  type ClarificationOptionLabel,
+  type ClarifyOption,
+  type ClarifyQuestion,
+} from './planning/clarification.js';
 
 // NOTE: SYSTEM_PROMPT, clarify, and decompose user-prompt strings now live in
 // src/i18n/{en,zh}.ts and are pulled at call time via t().prompts.*.
 // They are intentionally lazy so the global --lang flag (parsed by Commander
 // preAction) can switch language before the Planner is constructed/used.
 
-
-export const CLARIFICATION_CATEGORIES = [
-  'functionality',
-  'data',
-  'acceptance',
-  'boundary',
-  'quality',
-  'extensibility',
-] as const;
-export type ClarificationCategory = (typeof CLARIFICATION_CATEGORIES)[number];
-
-export const CLARIFICATION_OPTION_LABELS = ['A', 'B', 'C', 'D', 'E'] as const;
-export type ClarificationOptionLabel = (typeof CLARIFICATION_OPTION_LABELS)[number];
-
-export interface ClarifyOption {
-  label: ClarificationOptionLabel;
-  answer: string;
-}
-
-export interface ClarifyQuestion {
-  id: string;
-  category: ClarificationCategory;
-  question: string;
-  why: string;
-  options: ClarifyOption[];
-}
 
 export interface PlannerInput {
   rawRequirement: string;
@@ -107,12 +121,18 @@ export interface DraftPhasePlan {
 }
 
 export class Planner {
+  private readonly skills: SkillRegistry;
+
   constructor(
     private readonly llm: LLMClient,
     private readonly audit?: AuditLogger,
     private readonly language: Language = 'python',
     private readonly streamOutput = false,
-  ) {}
+    private readonly signal?: AbortSignal,
+    skills?: SkillRegistry,
+  ) {
+    this.skills = skills ?? buildDefaultSkills();
+  }
 
   async clarify(
     rawRequirement: string,
@@ -141,6 +161,7 @@ export class Planner {
           { role: 'user', content: prompt },
         ],
         {
+          signal: this.signal,
           responseFormat: 'json',
           temperature: 0.2,
           onToken: rep.onToken,
@@ -265,18 +286,25 @@ export class Planner {
           role: 'system',
           content:
             t().prompts.plannerPhaseDecomposeSystem(getLanguageProfile(this.language)) +
+            `\n\n${renderSkillCatalog(this.skills.list())}` +
             (intent === 'self' ? `\n\n${t().prompts.plannerSelfMode}` : ''),
         },
         { role: 'user', content: prompt + feedback },
       ],
-      validate: (t) => parsePhaseStepPlanJson(t, parseContext, phasePlan, currentPhase),
+      validate: (t) => {
+        const candidate = parsePhaseStepPlanJson(t, parseContext, phasePlan, currentPhase);
+        this.skills.validateRefs(candidate.steps.flatMap((step) => step.tools));
+        assertPlanRulesSatisfied(candidate, parseContext);
+      },
     });
     await this.audit?.plannerThought('decompose', text, {
       qaCount: input.clarifications.length,
       provider,
       phaseId: currentPhase.id,
     });
-    return parsePhaseStepPlanJson(text, parseContext, phasePlan, currentPhase);
+    const result = parsePhaseStepPlanJson(text, parseContext, phasePlan, currentPhase);
+    this.skills.validateRefs(result.steps.flatMap((step) => step.tools));
+    return result;
   }
 
   private async chatWithStructuredValidationRetry(input: {
@@ -299,6 +327,7 @@ export class Planner {
         const text = await this.llm.chat(
           input.messages(repairFeedback),
           {
+            signal: this.signal,
             responseFormat: 'json',
             temperature: 0.1,
             onToken: rep.onToken,
@@ -345,46 +374,30 @@ function plannerStructuredRepairAttemptLimit(context: DraftParseContext): number
   return demand.nonTrivial || context.intent !== 'greenfield' ? 3 : 2;
 }
 
-function formatPlannerValidationFeedback(err: unknown): string {
-  if (!err) return '';
-  const message = errorMessage(err).slice(0, 1800);
-  return [
-    '',
-    '',
-    '上一次输出未通过 XCompiler 计划契约校验。请根据以下错误修正后重新输出完整、严格 JSON，禁止解释或 Markdown：',
-    `校验错误：${message}`,
-    '修正要求：',
-    '- 保留已确认的 PhasePlan 约束；只生成当前 current phase 的内容。',
-    '- architectureModules 必须满足 sourcePaths/testPaths 和 HIGH_LEVEL_DESIGN/CODE/MODULE_TEST 可追踪性；不要为凑数量拆散内聚模块。',
-    '- architectureModules.testPaths 是 HIGH_LEVEL_DESIGN 创建、MODULE_TEST 消费的模块契约测试，不能同时出现在 CODE 的单元测试输出中。',
-    '- 若一个 CODE 宏 Step 覆盖多个模块，必须在该 CODE Step 的 subTasks 中逐一列出对应模块。',
-    '- 不要删除标准 V 模型 8 个宏 Step。',
-  ].join('\n');
-}
-
-function isPlannerStructuredValidationError(err: unknown): boolean {
-  const message = errorMessage(err);
-  if (isPlannerTransportFailure(message)) return false;
-  return /^Planner (?:architecture|phase|PhasePlan|JSON|draft|complexityAssessment|implementationPhases|iteration)/u.test(message);
-}
-
-function isPlannerTransportFailure(message: string): boolean {
-  const text = message.toLowerCase();
-  return (
-    text.includes('fetch failed') ||
-    text.includes('timed out') ||
-    text.includes('timeout') ||
-    text.includes('connection') ||
-    text.includes('econnrefused') ||
-    text.includes('econnreset') ||
-    text.includes('socket') ||
-    text.includes('terminated') ||
-    text.includes('server closed')
+/**
+ * Runs the plan's own rules while the planner can still fix them.
+ *
+ * These rules were only checked after decompose returned, so a plan that broke one killed the build
+ * outright — two model calls and several minutes spent, and the one party able to repair it never
+ * heard about it. The planner already retries structured failures with feedback; a lint error is the
+ * same kind of failure and now takes the same path.
+ *
+ * The check stays in `runtime/build.ts` too. This is the repairable attempt; that one is the
+ * guarantee, and it must not depend on the planner having been asked nicely.
+ */
+function assertPlanRulesSatisfied(draft: DraftPlan, context: DraftParseContext): void {
+  const issues = lintPlan(buildPlan(draft, {
+    userAddenda: context.userAddenda,
+    language: context.language,
+    intent: context.intent,
+    baselineSummary: context.baselineSummary,
+  })).filter((issue) => issue.level === 'error');
+  if (issues.length === 0) return;
+  throw new PlannerContractViolation(
+    `Planner draft violates plan rules: ${
+      issues.map((issue) => `[${issue.stepId ?? '*'}] ${issue.message}`).join('; ')
+    }`,
   );
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function formatClarificationTranscript(input: PlannerInput['clarifications']): string {
@@ -436,9 +449,9 @@ export function buildPlan(
   const draftDependencies = architectureDependencyCalibration.dependencies;
   const iterated = normalizeStepIterations(draft.steps, implementationPhases);
   const shaped = calibrateLanguageStepOwnership(
-    calibrateVModelDependencies(
+    calibrateProducedInputGlobs(calibrateVModelDependencies(
       calibrateDocPaths(calibrateStepShape(calibrateStepIds(iterated)), projectType),
-    ),
+    )),
     {
       language,
       intent: opts.intent ?? 'greenfield',
@@ -456,7 +469,7 @@ export function buildPlan(
       ? calibratePythonRequirements(draftDependencies)
       : [...new Set((draftDependencies ?? []).map((d) => d.trim()).filter(Boolean))];
   return {
-    version: '1',
+    version: PLAN_VERSION,
     language,
     intent: opts.intent ?? 'greenfield',
     phaseId,
@@ -531,185 +544,6 @@ function injectArchitectureContractPrompts(
   });
 }
 
-function parseClarifyJson(text: string): ClarifyQuestion[] {
-  const data = safeJson(text);
-  const arr = coerceClarifyArray(data);
-  const seenQuestions = new Set<string>();
-  const seenIds = new Set<string>();
-  const questions: ClarifyQuestion[] = [];
-  for (const [index, raw] of arr.entries()) {
-    const question = typeof raw?.question === 'string' ? raw.question.trim() : '';
-    if (!question) continue;
-    const dedupKey = question.toLowerCase().replace(/[\s?？。.!！,，;；:：]+/gu, '');
-    if (seenQuestions.has(dedupKey)) continue;
-    seenQuestions.add(dedupKey);
-    const candidateId = typeof raw?.id === 'string' && /^Q\d+$/iu.test(raw.id.trim())
-      ? raw.id.trim().toUpperCase()
-      : `Q${index + 1}`;
-    let id = candidateId;
-    let fallbackNumber = index + 1;
-    while (seenIds.has(id)) {
-      fallbackNumber += 1;
-      id = `Q${fallbackNumber}`;
-    }
-    seenIds.add(id);
-    questions.push({
-      id,
-      category: normalizeClarificationCategory(raw?.category),
-      question,
-      why: typeof raw?.why === 'string' ? raw.why.trim() : '',
-      options: parseClarifyOptions(raw?.options),
-    });
-  }
-  return questions;
-}
-
-/**
- * 宽容处理 LLM 可能的几种返回形式：
- *  - 数组：[{id,question}, ...]
- *  - 单个对象：{id,question}                  -> 包成长度 1 的数组
- *  - 包装对象：{questions:[...]} 或 {items:[...]} -> 取其中的数组
- *  - 其他：返回空数组（表示“无需澄清”）
- */
-interface RawClarifyQuestion {
-  id?: unknown;
-  category?: unknown;
-  question?: unknown;
-  why?: unknown;
-  options?: unknown;
-}
-
-function coerceClarifyArray(data: unknown): RawClarifyQuestion[] {
-  if (Array.isArray(data)) return data as RawClarifyQuestion[];
-  if (data && typeof data === 'object') {
-    const obj = data as Record<string, unknown>;
-    if (Array.isArray(obj.questions)) return obj.questions as RawClarifyQuestion[];
-    if (Array.isArray(obj.items)) return obj.items as RawClarifyQuestion[];
-    if (typeof obj.question === 'string') return [obj as RawClarifyQuestion];
-  }
-  return [];
-}
-
-const CLARIFICATION_CATEGORY_ALIASES: Record<string, ClarificationCategory> = {
-  functionality: 'functionality', functional: 'functionality', function: 'functionality', feature: 'functionality',
-  data: 'data', input: 'data', output: 'data', 'input-output': 'data',
-  acceptance: 'acceptance', correctness: 'acceptance', verification: 'acceptance',
-  boundary: 'boundary', scope: 'boundary', edge: 'boundary',
-  quality: 'quality', performance: 'quality', reliability: 'quality', security: 'quality',
-  extensibility: 'extensibility', scalability: 'extensibility', evolution: 'extensibility', extension: 'extensibility',
-};
-
-function parseClarificationCategory(value: unknown): ClarificationCategory | undefined {
-  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return CLARIFICATION_CATEGORY_ALIASES[normalized];
-}
-
-function normalizeClarificationCategory(value: unknown): ClarificationCategory {
-  return parseClarificationCategory(value) ?? 'functionality';
-}
-
-function parseClarifyOptions(value: unknown): ClarifyOption[] {
-  if (!Array.isArray(value)) return [];
-  const seen = new Set<string>();
-  const options: ClarifyOption[] = [];
-  for (const item of value) {
-    const rawAnswer = extractClarifyOptionAnswer(item);
-    const answer = stripOptionLabel(rawAnswer).trim();
-    if (!answer) continue;
-    const dedupKey = answer.toLowerCase().replace(/[\s?？。.!！,，;；:：]+/gu, '');
-    if (seen.has(dedupKey)) continue;
-    seen.add(dedupKey);
-    const label = CLARIFICATION_OPTION_LABELS[options.length];
-    if (!label) break;
-    options.push({ label, answer });
-  }
-  return options;
-}
-
-function extractClarifyOptionAnswer(item: unknown): string {
-  if (typeof item === 'string') return item;
-  if (!item || typeof item !== 'object') return '';
-  const obj = item as Record<string, unknown>;
-  for (const key of ['answer', 'text', 'value', 'setting', 'title', 'label']) {
-    const value = obj[key];
-    if (typeof value === 'string' && value.trim()) return value;
-  }
-  return '';
-}
-
-function stripOptionLabel(value: string): string {
-  return value.replace(/^\s*[A-Ea-e]\s*[).\]、:：-]\s*/u, '');
-}
-
-function validateClarifyJson(
-  text: string,
-  complex: boolean,
-  opts: {
-    projectShapeAmbiguous?: boolean;
-    externalApiRequired?: boolean;
-    languageAmbiguous?: boolean;
-  } = {},
-): ClarifyQuestion[] {
-  const data = safeJson(text);
-  const raw = coerceClarifyArray(data);
-  if (raw.length === 0) {
-    throw new Error('clarify returned no questions; interactive intake requires a multi-dimensional question set');
-  }
-  for (const [index, question] of raw.entries()) {
-    if (typeof question.question !== 'string' || question.question.trim().length < 6) {
-      throw new Error(`clarify question ${index + 1} is missing or too short`);
-    }
-    if (!parseClarificationCategory(question.category)) {
-      throw new Error(`clarify question ${index + 1} is missing a valid category`);
-    }
-    if (typeof question.why !== 'string' || question.why.trim().length < 4) {
-      throw new Error(`clarify question ${index + 1} is missing a concise why field`);
-    }
-    const rawOptions = Array.isArray(question.options) ? question.options : [];
-    const options = parseClarifyOptions(question.options);
-    if (rawOptions.length < 2 || rawOptions.length > 5 || options.length !== rawOptions.length) {
-      throw new Error(`clarify question ${index + 1} must include 2-5 prioritized answer options`);
-    }
-  }
-
-  const parsed = parseClarifyJson(text);
-  if (parsed.length !== raw.length) {
-    throw new Error(`clarify contains duplicate or empty questions (${raw.length} raw, ${parsed.length} unique)`);
-  }
-  const minQuestions = complex ? 8 : 7;
-  if (parsed.length < minQuestions || parsed.length > 10) {
-    throw new Error(`clarify expected ${minQuestions}-10 unique questions, got ${parsed.length}`);
-  }
-  const count = (category: ClarificationCategory): number =>
-    parsed.filter((question) => question.category === category).length;
-  const functionalCount = count('functionality') + count('data') + count('acceptance');
-  const minFunctional = complex ? 5 : 4;
-  if (functionalCount < minFunctional) {
-    throw new Error(`clarify requires at least ${minFunctional} function-focused questions, got ${functionalCount}`);
-  }
-  for (const required of ['boundary', 'quality', 'extensibility'] as const) {
-    if (count(required) === 0) {
-      throw new Error(`clarify missing required ${required} question`);
-    }
-  }
-  if (opts.projectShapeAmbiguous && !parsed.some(isProjectShapeClarification)) {
-    throw new Error(
-      'clarify missing required project shape question: ask whether this should be an API library, runnable application, or mixed deliverable',
-    );
-  }
-  if (opts.externalApiRequired && !parsed.some(isExternalApiCredentialClarification)) {
-    throw new Error(
-      'clarify missing required external API credential question: ask whether the user has an API/key/token; if not, default to open no-key APIs',
-    );
-  }
-  if (opts.languageAmbiguous && !parsed.some(isDevelopmentLanguageClarification)) {
-    throw new Error(
-      'clarify missing required development language question: ask whether the project should use Python or TypeScript/Node.js, with Python as the default option',
-    );
-  }
-  return parsed;
-}
-
 interface DraftParseContext {
   language: Language;
   rawRequirement: string;
@@ -723,7 +557,7 @@ interface DraftParseContext {
 }
 
 function parsePhasePlanJson(text: string, context: DraftParseContext): DraftPhasePlan {
-  const data = safeJson(text);
+  const data = parsePlannerJson(text);
   if (!data || typeof data !== 'object') {
     throw new Error('Planner did not return a JSON object for phase planning.');
   }
@@ -749,7 +583,9 @@ function parsePhasePlanJson(text: string, context: DraftParseContext): DraftPhas
   if (!parsedImplementationPhases || parsedImplementationPhases.length === 0) {
     throw new Error('Planner PhasePlan missing valid implementationPhases; P1 current phase must be explicit.');
   }
-  const phaseIssue = validateImplementationPhaseDraft(parsedImplementationPhases, complexityAssessment);
+  const phaseIssue = validateImplementationPhaseDraft(parsedImplementationPhases, complexityAssessment, {
+    language: context.language,
+  });
   if (phaseIssue) {
     throw new Error(`Planner PhasePlan implementationPhases invalid: ${phaseIssue}`);
   }
@@ -769,8 +605,13 @@ function parsePhasePlanJson(text: string, context: DraftParseContext): DraftPhas
     },
     context.language,
   );
+  // User sources only. The field is `userForcedPhaseSplit`, so the question is what the *user*
+  // asked for — and `digest` is the model's own summary from this very response. Including it let
+  // the model's wording decide what the user had demanded, and the trigger word is one the system
+  // prompt teaches: a rationale reading "建议分阶段交付：P1 …, P2 …" was read as a user mandate, the
+  // model answered `false` because that was true, and the contract check rejected it.
+  // `inferComplexityAssessment` still reads the digest — it synthesises an answer, not verifies one.
   const forcedPhaseSplit = hasForcedPhaseSplit([
-    digest,
     context.rawRequirement,
     context.userAddenda,
   ].join('\n'));
@@ -798,7 +639,7 @@ function parsePhaseStepPlanJson(
   phasePlan: DraftPhasePlan,
   currentPhase: ImplementationPhase,
 ): DraftPlan {
-  const data = safeJson(text);
+  const data = parsePlannerJson(text);
   if (!data || typeof data !== 'object') {
     throw new Error('Planner did not return a JSON object for phase Step planning.');
   }
@@ -834,11 +675,19 @@ function parsePhaseStepPlanJson(
       'Future planned phases must stay in PhasePlan until they are loaded as the current phase.',
     );
   }
+  const deliveryEntrypointIssue = validateCurrentPhaseDeliveryEntrypoints(
+    currentPhase,
+    parsed.steps,
+    context.language,
+  );
+  if (deliveryEntrypointIssue) {
+    throw new Error(`Planner phase StepPlan delivery contract invalid: ${deliveryEntrypointIssue}`);
+  }
   return parsed;
 }
 
 function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPlan {
-  const data = safeJson(text);
+  const data = parsePlannerJson(text);
   if (!data || typeof data !== 'object') {
     throw new Error('Planner did not return a JSON object.');
   }
@@ -906,7 +755,14 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
   }
   const architectureResult = ArchitectureModuleSchema.array().safeParse(obj.architectureModules ?? []);
   if (!architectureResult.success) {
-    throw new Error(`Planner architectureModules invalid: ${architectureResult.error.issues.map((i) => i.message).join('; ')}`);
+    // Name the field, not just the rule. "Too small: expected array to have >=1 items" told the
+    // model nothing about which of seven module fields was empty, so both providers retried and
+    // failed identically — a schema error that cannot be acted on is a schema error that repeats.
+    throw new Error(
+      `Planner architectureModules invalid: ${architectureResult.error.issues
+        .map((issue) => `architectureModules.${issue.path.join('.')}: ${issue.message}`)
+        .join('; ')}`,
+    );
   }
   const architectureDependencyCalibration = calibrateArchitectureModuleDependencies(
     calibrateArchitectureModulePaths(architectureResult.data, context?.language ?? 'python'),
@@ -950,7 +806,10 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     ? validateImplementationPhaseDraft(
         parsedImplementationPhases,
         complexityAssessment,
-        context?.currentPhaseId ?? 'P1',
+        {
+          language: context?.language ?? 'python',
+          expectedCurrentPhaseId: context?.currentPhaseId ?? 'P1',
+        },
       )
     : undefined;
   if (context && phaseIssue) {
@@ -971,8 +830,13 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
       architectureDemandInputForDraft(context, digest, globalPrompt),
       context.language,
     );
+    // User sources only. The field is `userForcedPhaseSplit`, so the question is what the *user*
+    // asked for — and `digest` is the model's own summary from this very response. Including it let
+    // the model's wording decide what the user had demanded, and the trigger word is one the system
+    // prompt teaches: a rationale reading "建议分阶段交付：P1 …, P2 …" was read as a user mandate, the
+    // model answered `false` because that was true, and the contract check rejected it.
+    // `inferComplexityAssessment` still reads the digest — it synthesises an answer, not verifies one.
     const forcedPhaseSplit = hasForcedPhaseSplit([
-      digest,
       context.rawRequirement,
       context.userAddenda,
     ].join('\n'));
@@ -1067,302 +931,4 @@ function phaseDemandText(currentPhase: ImplementationPhase): string {
     .map((part) => part.trim())
     .filter(Boolean)
     .join('\n');
-}
-
-function parseComplexityAssessment(value: unknown): ComplexityAssessment | undefined {
-  const result = ComplexityAssessmentSchema.safeParse(value);
-  return result.success ? result.data : undefined;
-}
-
-function parseImplementationPhases(value: unknown): ImplementationPhase[] | undefined {
-  const result = ImplementationPhaseSchema.array().safeParse(value);
-  return result.success ? result.data : undefined;
-}
-
-function validateImplementationPhaseDraft(
-  phases: ImplementationPhase[],
-  assessment: ComplexityAssessment,
-  expectedCurrentPhaseId = 'P1',
-): string | undefined {
-  const requiredCount = requiredImplementationPhaseCount(assessment);
-  const executable = phases.filter((phase) => phase.status !== 'deferred');
-  if (executable.length < requiredCount) {
-    return `complexityAssessment.level=${assessment.level} requires at least ${requiredCount} executable implementation iteration(s)`;
-  }
-  if (
-    assessment.level === 'simple' &&
-    !assessment.splitRecommended &&
-    !assessment.userForcedPhaseSplit &&
-    executable.length !== 1
-  ) {
-    return 'simple complexity without splitRecommended must use exactly one executable implementation iteration';
-  }
-  const current = phases.filter((phase) => phase.status === 'current');
-  if (current.length !== 1 || current[0]?.id !== expectedCurrentPhaseId) {
-    return `exactly one current phase is required and it must be ${expectedCurrentPhaseId}`;
-  }
-  if (phases[0]?.id !== 'P1') {
-    return 'P1 must be the first implementation phase';
-  }
-  if (assessment.userForcedPhaseSplit && !assessment.splitRecommended) {
-    return 'userForcedPhaseSplit=true requires splitRecommended=true';
-  }
-  if (assessment.level !== 'simple' && !assessment.splitRecommended) {
-    return 'moderate/complex complexity requires splitRecommended=true';
-  }
-  if (assessment.splitRecommended && executable.filter((phase) => phase.id !== 'P1').length === 0) {
-    return 'splitRecommended=true requires at least one planned executable iteration after P1';
-  }
-  return undefined;
-}
-
-function validateIterationVModelDraft(
-  steps: Step[],
-  phases: ImplementationPhase[],
-): string | undefined {
-  const current = phases.filter((phase) => phase.status === 'current');
-  const materializedIds = new Set(current.map((phase) => phase.id));
-  for (const step of steps) {
-    const iterationId = step.iterationId ?? 'P1';
-    if (!materializedIds.has(iterationId)) {
-      return `${step.id} references non-current iteration ${iterationId}; planned phases are PhasePlan goals and must not contain executable Steps yet`;
-    }
-  }
-  for (const iteration of current) {
-    const iterationSteps = steps.filter((step) => (step.iterationId ?? 'P1') === iteration.id);
-    const phaseSet = new Set(iterationSteps.map((step) => step.phase));
-    for (const required of REQUIRED_V_MODEL_PHASES) {
-      if (!phaseSet.has(required)) {
-        return `${iteration.id} is missing ${required}; every iteration must be a complete V-model cycle`;
-      }
-    }
-  }
-  return undefined;
-}
-
-function parseProjectType(value: unknown): ProjectType | undefined {
-  return value === 'application' || value === 'library' || value === 'mixed'
-    ? value
-    : undefined;
-}
-
-function isProjectShapeAmbiguous(text: string): boolean {
-  const signals = projectShapeSignals(text);
-  if (signals.genericApi && !signals.libraryLike && !signals.appLike) return true;
-  return !signals.libraryLike && !signals.appLike;
-}
-
-function isProjectShapeClarification(question: ClarifyQuestion): boolean {
-  const text = `${question.question}\n${question.why}\n${question.options.map((option) => option.answer).join('\n')}`.toLowerCase();
-  return (
-    /api[- ]?library|public api|reusable api|client library|sdk|package|library|runnable app|application|cli|service|mixed/u.test(text) ||
-    /api\s*(库|客户端|能力)|公共\s*api|可复用接口|库项目|软件包|开发包|可运行|应用|命令行|服务|混合/u.test(text)
-  );
-}
-
-function hasExternalApiOrUrlRequirement(text: string): boolean {
-  const lower = text.toLowerCase();
-  return (
-    /\b(external|third[- ]party|provider|remote|public|open)\s+(api|url|endpoint|service)\b/u.test(lower) ||
-    /\b(fetch|request|call|consume|access|query)\s+(?:an?\s+)?(?:external|third[- ]party|remote|public|open)\s+(api|url|endpoint|service)\b/u.test(lower) ||
-    /\bhttps?:\/\//iu.test(text) ||
-    /(?:外部|第三方|公开|开放|远程|联网|网络).{0,12}(?:api|接口|url|地址|服务|数据源)/iu.test(text) ||
-    /(?:天气|节假日|假日|地图|汇率|股票|新闻|物流).{0,18}(?:api|接口|查询|获取|请求|调用|数据)/iu.test(text) ||
-    /(?:获取|查询|请求|调用).{0,18}(?:天气|节假日|假日|地图|汇率|股票|新闻|物流).{0,18}(?:数据|接口|api)?/iu.test(text)
-  );
-}
-
-function isExternalApiCredentialClarification(question: ClarifyQuestion): boolean {
-  const text = `${question.question}\n${question.why}\n${question.options.map((option) => option.answer).join('\n')}`.toLowerCase();
-  const asksCredential = /\b(api key|apikey|token|credential|secret|auth|authorization|provider key)\b/u.test(text) ||
-    /(?:api\s*)?(?:key|token)|密钥|令牌|凭证|鉴权|授权/u.test(text);
-  const mentionsNoKeyFallback =
-    /\b(no[- ]?key|without key|no token|free public|open api|public api|no authentication)\b/u.test(text) ||
-    /免\s*(?:key|token|密钥|鉴权)|无需\s*(?:key|token|密钥|鉴权)|公开接口|开放接口|免费接口/u.test(text);
-  const externalApiContext =
-    /\b(api|url|endpoint|provider|external|third[- ]party|fetch|request)\b/u.test(text) ||
-    /外部|第三方|接口|数据源|天气|节假日|联网/u.test(text);
-  return externalApiContext && asksCredential && mentionsNoKeyFallback;
-}
-
-function isDevelopmentLanguageClarification(question: ClarifyQuestion): boolean {
-  const text = `${question.question}\n${question.why}\n${question.options.map((option) => option.answer).join('\n')}`.toLowerCase();
-  const mentionsPython = /\bpython\b/u.test(text) || /python\s*脚本|python\s*项目/u.test(text);
-  const mentionsTypeScript =
-    /\btypescript\b|\btype\s*script\b|\bnode(?:\.js)?\b/u.test(text) ||
-    /type\s*script|ts\s*(程序|工程|项目|脚本|语言|实现)|typescript\s*项目/u.test(text);
-  const asksLanguage =
-    /\b(language|runtime|implementation stack|programming language)\b/u.test(text) ||
-    /开发语言|编程语言|实现语言|运行时|技术栈/u.test(text);
-  return asksLanguage && mentionsPython && mentionsTypeScript;
-}
-
-function projectShapeSignals(text: string): { libraryLike: boolean; appLike: boolean; genericApi: boolean } {
-  const lower = text.toLowerCase();
-  const libraryLike =
-    /\b(api[- ]?library|library|sdk|package|npm package|pypi package|client library|api client|reusable module|public api)\b/u.test(lower) ||
-    /api\s*(库|客户端)|公共\s*api|可复用接口|公共库|库项目|软件包|客户端库|开发包/u.test(text);
-  const appLike =
-    /\b(cli|command|command line|web app|server|service|dashboard|software|script|tool|terminal|application|app|api[- ]?server|api[- ]?service|rest api|http api|web api|api endpoint)\b/u.test(lower) ||
-    /命令行|服务|应用|脚本|工具|控制台|后台|仪表盘|软件/u.test(text);
-  const explicitApiSurface =
-    /\b(api[- ]?server|api[- ]?service|rest api|http api|web api|api endpoint|api client|api[- ]?library)\b/u.test(lower) ||
-    /api\s*(服务|网关|端点|客户端|库)/u.test(text);
-  const genericApi = (/\bapi\b/u.test(lower) || /接口/u.test(text)) && !explicitApiSurface;
-  return { libraryLike, appLike, genericApi };
-}
-
-function inferComplexityAssessment(input: {
-  requirementDigest: string;
-  rawRequirement?: string;
-  globalPrompt?: string;
-  userAddenda?: string;
-  baselineSummary?: string;
-  intent: PlanIntent;
-  language: Language;
-}): ComplexityAssessment {
-  const text = [
-    input.requirementDigest,
-    input.rawRequirement ?? '',
-    input.userAddenda ?? '',
-    input.baselineSummary ?? '',
-  ].join('\n');
-  const demand = analyzeArchitectureDemand(input, input.language);
-  const forced = hasForcedPhaseSplit(text);
-  const level: ComplexityAssessment['level'] =
-    demand.nonTrivial || forced
-      ? 'complex'
-      : demand.surfaces.length > 0 || demand.baselineModules > 0
-        ? 'moderate'
-        : 'simple';
-  return {
-    level,
-    rationale: demand.reasonLabel,
-    splitRecommended: forced || level !== 'simple',
-    userForcedPhaseSplit: forced,
-  };
-}
-
-function normalizeImplementationPhases(
-  phases: ImplementationPhase[] | undefined,
-  assessment: ComplexityAssessment,
-  requirementDigest: string,
-): ImplementationPhase[] {
-  const requiredCount = requiredImplementationPhaseCount(assessment);
-  const hasCurrent = (phases ?? []).some((phase) => phase.status === 'current');
-  const sanitized: ImplementationPhase[] = (phases ?? [])
-    .filter((phase) => phase.id && phase.title && phase.objective)
-    .map((phase, index) => ({
-      ...phase,
-      id: phase.id || `P${index + 1}`,
-      status: hasCurrent
-        ? phase.status
-        : index === 0
-          ? 'current' as const
-          : phase.status === 'deferred'
-            ? 'deferred' as const
-            : 'planned' as const,
-      dependsOn: index === 0 ? [] : phase.dependsOn.length > 0 ? phase.dependsOn : [`P${index}`],
-      verificationGate: phase.verificationGate ?? defaultVerificationGate(phase.id || `P${index + 1}`),
-    }));
-  if (sanitized.length > 0) {
-    while (sanitized.filter((phase) => phase.status !== 'deferred').length < requiredCount) {
-      sanitized.push(plannedIterationPhase(requirementDigest, sanitized.length + 1));
-    }
-    return sanitized;
-  }
-  const p1: ImplementationPhase = {
-    id: 'P1',
-    title: 'Core functionality',
-    objective: `Deliver the smallest complete core slice for: ${requirementDigest}`,
-    status: 'current',
-    scope: ['Core domain behaviour', 'Runnable entrypoint', 'Primary tests', 'Functional validation documentation'],
-    deliverables: ['Complete V-model iteration for the highest-priority core slice.'],
-    dependsOn: [],
-    verificationGate: defaultVerificationGate('P1'),
-  };
-  const out = [p1];
-  while (out.length < requiredCount) {
-    out.push(plannedIterationPhase(requirementDigest, out.length + 1));
-  }
-  return out;
-}
-
-function requiredImplementationPhaseCount(assessment: ComplexityAssessment): number {
-  if (assessment.level === 'complex') return 3;
-  if (assessment.level === 'moderate' || assessment.splitRecommended || assessment.userForcedPhaseSplit) return 2;
-  return 1;
-}
-
-function plannedIterationPhase(requirementDigest: string, index: number): ImplementationPhase {
-  return {
-    id: `P${index}`,
-    title: `Iteration ${index} enhancements`,
-    objective: `Deliver the next highest-priority iteration after P${index - 1}: ${requirementDigest}`,
-    status: 'planned',
-    scope: ['Next prioritized workflows', 'Extended integrations', 'Quality hardening', 'Functional validation update'],
-    deliverables: ['Complete V-model iteration with requirement analysis, high-level design, detailed design, code, unit test, integration test, module test, and functional test steps.'],
-    dependsOn: [`P${Math.max(1, index - 1)}`],
-    verificationGate: defaultVerificationGate(`P${index}`),
-  };
-}
-
-function defaultVerificationGate(iterationId: string) {
-  return {
-    summary: `${iterationId} iteration gate: documentation, automated tests, runnable entrypoint, and language quality checks must pass.`,
-    checks: [
-      'Declared functional validation documentation exists for this iteration.',
-      'Automated test suite passes with no detected network API failure.',
-      'Runnable entrypoint or public API probe succeeds.',
-      'Language-specific build/lint checks pass when configured.',
-    ],
-    failurePolicy:
-      'If any check fails, feed the full gate failure log into Debugger and repair the same iteration through the paired V-model rollback phase before rerunning subsequent phases.',
-  };
-}
-
-function normalizeStepIterations(steps: Step[], _phases: ImplementationPhase[]): Step[] {
-  return steps.map((step) => {
-    const iterationId = step.iterationId ?? 'P1';
-    return {
-      ...step,
-      iterationId,
-    };
-  });
-}
-
-function hasForcedPhaseSplit(text: string): boolean {
-  return /\b(?:phase\s*\d+|multi[- ]phase|phase split|staged rollout)\b|分阶段|多阶段|分期|阶段拆分|一期|二期|第一阶段|第二阶段|后续阶段/iu.test(text);
-}
-
-function inferProjectType(text: string): ProjectType {
-  const { libraryLike, appLike } = projectShapeSignals(text);
-  if (libraryLike && appLike) return 'mixed';
-  if (libraryLike) return 'library';
-  return 'application';
-}
-
-function safeJson(text: string): unknown {
-  // Strip ```json fences if present.
-  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // attempt to find first JSON-looking substring
-    const start = cleaned.indexOf('{');
-    const lastObj = cleaned.lastIndexOf('}');
-    const startArr = cleaned.indexOf('[');
-    const lastArr = cleaned.lastIndexOf(']');
-    const candidates: string[] = [];
-    if (start >= 0 && lastObj > start) candidates.push(cleaned.slice(start, lastObj + 1));
-    if (startArr >= 0 && lastArr > startArr) candidates.push(cleaned.slice(startArr, lastArr + 1));
-    for (const c of candidates) {
-      try {
-        return JSON.parse(c);
-      } catch {
-        /* keep trying */
-      }
-    }
-    throw new Error(`Planner returned non-JSON content:\n${text.slice(0, 500)}`);
-  }
 }

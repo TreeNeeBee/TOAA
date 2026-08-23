@@ -2,8 +2,8 @@ import type {
   RuntimeBuildCommandOptions,
   RuntimeBuildCommandResult,
   RuntimeRunCommandOptions,
-} from '../runtime/commands.js';
-import type { ExecuteResult } from '../runtime/run.js';
+  ExecuteResult,
+} from '../runtime.js';
 
 export const ACP_PROTOCOL_VERSION = 1;
 

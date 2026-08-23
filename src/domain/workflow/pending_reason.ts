@@ -8,6 +8,8 @@ export const PENDING_REASONS = [
   'manual-review',
   'defect',
   'quality-gap',
+  /** The run that started this work died before the attempt completed. */
+  'interrupted',
 ] as const;
 
 export type PendingReason = (typeof PENDING_REASONS)[number];

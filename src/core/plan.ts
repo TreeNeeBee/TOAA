@@ -1,33 +1,42 @@
 import { z } from 'zod';
+import {
+  PLAN_DRAFT_COMPLEXITY_LEVELS,
+  type PlanDraftComplexityLevel,
+} from '../domain/planning/plan_draft.js';
+import { ExecutingRoleSchema, ROLES as DOMAIN_DEFINED_ROLES } from '../domain/workflow/role.js';
+import {
+  DEVELOPMENT_STEP_TYPES,
+  SOURCE_TO_VERIFICATION_STEP,
+  STEP_TYPES,
+  VERIFICATION_STEP_TYPES,
+  VERIFICATION_TO_SOURCE_STEP,
+  V_MODEL_STEP_PAIRS,
+  type DevelopmentStepType,
+  type StepType,
+  type VerificationStepType,
+} from '../domain/steps/step.js';
+import { DeliveryGateSchema } from '../domain/quality/delivery_gate.js';
+
+export const PLAN_VERSION = '2';
 
 /**
  * Planned V-model phases.
  *
+ * The Domain owns this vocabulary; the plan file re-exports it so there is exactly one definition
+ * of the V-model end to end rather than a second list that can silently drift.
+ *
  * DEBUG deliberately does not belong here: it is an execution mode entered after
  * a failed gate and routed back to the paired source phase.
  */
-export const V_MODEL_PAIRS = [
-  ['REQUIREMENT_ANALYSIS', 'FUNCTIONAL_TEST'],
-  ['HIGH_LEVEL_DESIGN', 'MODULE_TEST'],
-  ['DETAILED_DESIGN', 'INTEGRATION_TEST'],
-  ['CODE', 'UNIT_TEST'],
-] as const;
+export const V_MODEL_PAIRS = V_MODEL_STEP_PAIRS;
 
-export type VModelDevelopmentPhase = (typeof V_MODEL_PAIRS)[number][0];
-export type VModelTestPhase = (typeof V_MODEL_PAIRS)[number][1];
-export type Phase = VModelDevelopmentPhase | VModelTestPhase;
+export type VModelDevelopmentPhase = DevelopmentStepType;
+export type VModelTestPhase = VerificationStepType;
+export type Phase = StepType;
 
-export const V_MODEL_DEVELOPMENT_PHASES = V_MODEL_PAIRS.map(
-  ([phase]) => phase,
-) as readonly VModelDevelopmentPhase[];
-export const V_MODEL_TEST_PHASES = [...V_MODEL_PAIRS].reverse().map(
-  ([, phase]) => phase,
-) as readonly VModelTestPhase[];
-
-export const PHASES = [
-  ...V_MODEL_DEVELOPMENT_PHASES,
-  ...V_MODEL_TEST_PHASES,
-] as unknown as readonly [Phase, ...Phase[]];
+export const V_MODEL_DEVELOPMENT_PHASES = DEVELOPMENT_STEP_TYPES;
+export const V_MODEL_TEST_PHASES = VERIFICATION_STEP_TYPES;
+export const PHASES = STEP_TYPES;
 
 export const EXECUTION_MODES = ['NORMAL', 'DEBUG'] as const;
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
@@ -36,14 +45,10 @@ export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 export const REQUIRED_V_MODEL_PHASES = PHASES;
 
 /** Synchronous test-design mapping generated while executing the corresponding left-side phase. */
-export const V_MODEL_SOURCE_TO_TEST_PHASE = Object.fromEntries(
-  V_MODEL_PAIRS,
-) as Record<VModelDevelopmentPhase, VModelTestPhase>;
+export const V_MODEL_SOURCE_TO_TEST_PHASE = SOURCE_TO_VERIFICATION_STEP;
 
 /** Test failure rollback target: a failed test phase debugs from its paired source phase. */
-export const V_MODEL_TEST_TO_SOURCE_PHASE = Object.fromEntries(
-  V_MODEL_PAIRS.map(([source, test]) => [test, source]),
-) as Record<VModelTestPhase, VModelDevelopmentPhase>;
+export const V_MODEL_TEST_TO_SOURCE_PHASE = VERIFICATION_TO_SOURCE_STEP;
 
 export const PHASE_ORDER = Object.fromEntries(
   PHASES.map((phase, index) => [phase, index]),
@@ -62,20 +67,29 @@ export const PROJECT_TYPES = ['application', 'library', 'mixed'] as const;
 export type ProjectType = (typeof PROJECT_TYPES)[number];
 
 /** Planner's first-pass project complexity estimate. */
-export const COMPLEXITY_LEVELS = ['simple', 'moderate', 'complex'] as const;
-export type ComplexityLevel = (typeof COMPLEXITY_LEVELS)[number];
+// Owned by the Domain planning contract so compilation and the plan file agree by construction.
+export const COMPLEXITY_LEVELS = PLAN_DRAFT_COMPLEXITY_LEVELS;
+export type ComplexityLevel = PlanDraftComplexityLevel;
 
 /** Implementation phase status. Only `current` is materialized as executable Steps. */
 export const IMPLEMENTATION_PHASE_STATUSES = ['current', 'planned', 'complete', 'deferred'] as const;
 export type ImplementationPhaseStatus = (typeof IMPLEMENTATION_PHASE_STATUSES)[number];
 
-export const ROLES = [
-  'Planner',
-  'Architect',
-  'Coder',
-  'Tester',
-  'Debugger',
-] as const;
+/**
+ * Every role a model can be configured for.
+ *
+ * Built from the agents that execute Steps plus `ProjectManager`, which does not. Keeping the two
+ * lists as one derivation rather than two parallel constants is deliberate: a Step's `role` must
+ * only ever name something that executes, and a second hand-maintained list is where that stops
+ * being true.
+ *
+ * PM's other capabilities — ticket routing, phase control, problem intake — are decided from
+ * structural fields and stay that way: replacing a capability table or a state machine with a model
+ * would trade working logic for a guess. What PM alone can answer is whether a finished result is
+ * what the project asked for, which is a judgement no executing role should make about its own work.
+ */
+export const ROLES = DOMAIN_DEFINED_ROLES;
+
 export type Role = (typeof ROLES)[number];
 
 /**
@@ -170,6 +184,8 @@ export const ImplementationPhaseSchema = z
     deliverables: z.array(z.string().min(1)).default([]),
     dependsOn: z.array(z.string()).default([]),
     verificationGate: IterationVerificationGateSchema.optional(),
+    /** Phase-wide integrated delivery gate; Runtime supplies a canonical default when omitted. */
+    deliveryGate: DeliveryGateSchema.optional(),
   })
   .strict();
 
@@ -211,7 +227,10 @@ export const StepSchema = z
      * xcompiler_run 会拼接到 Executor 的通用 system prompt 后，以防止 LLM 发散。
      */
     systemPrompt: z.string().min(1, 'systemPrompt must be non-empty (xcompiler_build must populate)'),
-    role: z.enum(ROLES),
+    // Executing agents only. `ROLES` also carries ProjectManager, which judges outcomes on the
+    // project's behalf and never runs a Step; letting it be assigned here would put the judge in
+    // the position of doing the work it later assesses.
+    role: ExecutingRoleSchema,
     tools: z.array(z.string()).default([]),
     inputs: z.array(z.string()).default([]),
     outputs: z.array(z.string()).default([]),
@@ -220,6 +239,8 @@ export const StepSchema = z
     acceptance: z.string().min(1),
     /** Engineering delivery thresholds evaluated before the Step can become DONE. */
     qualityGate: StageQualityGateSchema.optional(),
+    /** Step delivery contract: baseline-test on S1-S4, acceptance on S5-S8. */
+    deliveryGate: DeliveryGateSchema.optional(),
     /** Attempt policy copied into the canonical Step; this draft never owns execution state. */
     maxAttempts: z.number().int().positive().default(3),
   })
@@ -235,7 +256,7 @@ export function stepExecutionKey(
 
 export const PlanSchema = z
   .object({
-    version: z.literal('1'),
+    version: z.literal(PLAN_VERSION),
     language: z.enum(LANGUAGES).default('python'),
     intent: z.enum(PLAN_INTENTS).default('greenfield'),
     /** Materialized implementation phase for this phase-specific plan file. */

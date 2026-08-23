@@ -1,14 +1,11 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { simpleGit, type SimpleGit } from 'simple-git';
+import { GitRepositoryService } from '../infrastructure/git/git_repository_service.js';
 import type { Workspace } from './workspace.js';
 
 const RUNTIME_EXCLUDE_PATTERNS = [
-  '.xcompiler/*',
-  '!.xcompiler/.gitkeep',
-  'logs/',
-  'docs/process_log.md',
-  '*.xc',
+  '.xcw/',
   '.sandbox/',
   '.pytest_cache/',
   '**/__pycache__/',
@@ -25,26 +22,31 @@ const RUNTIME_EXCLUDE_PATTERNS = [
  */
 export class GitService {
   private readonly git: SimpleGit;
+  private readonly repository: GitRepositoryService;
 
   constructor(private readonly ws: Workspace) {
     this.git = simpleGit({ baseDir: ws.root });
+    this.repository = new GitRepositoryService(ws.root);
   }
 
   /** 若仓库不存在则 git init + 首次空提交。幂等。 */
   async ensureRepo(): Promise<void> {
-    const isRepo = await this.git.checkIsRepo().catch(() => false);
-    if (!isRepo) await this.git.init();
+    if (!await this.git.checkIsRepo().catch(() => false)) await this.git.init();
     // 配置最小 user 以便能 commit；仅在缺省时设置
     const local = await this.git.listConfig('local').catch(() => null);
     const has = (k: string) => !!local?.all?.[k];
     if (!has('user.email')) await this.git.addConfig('user.email', 'xcompiler@local');
     if (!has('user.name')) await this.git.addConfig('user.name', 'XCompiler');
     await this.ensureRuntimeExcludes();
-    if (isRepo) return;
-    // 创建一个 .gitkeep 让初次 commit 不为空
-    await this.ws.writeFile('.xcompiler/.gitkeep', '');
+    // The condition is an unborn HEAD, not a missing repository: the run path initializes the
+    // repository through GitRepositoryService before this ever executes, so guarding on "is a
+    // repository" skipped the initial commit and left every snapshot resolving HEAD against
+    // nothing.
+    if (await this.repository.hasCommits()) return;
     await this.prepareSnapshotIndex();
-    await this.git.commit('[xcompiler] init workspace');
+    // Project state lives in the container, not in the working copy, so there is no placeholder to
+    // commit; an empty initial commit is the honest representation of an empty working copy.
+    await this.git.commit('[xcompiler] init workspace', undefined, { '--allow-empty': null });
   }
 
   /** 在某个 Step 的某次重试前打快照；返回 commit sha。 */
@@ -65,12 +67,17 @@ export class GitService {
   }
 
   private async ensureRuntimeExcludes(): Promise<void> {
-    const excludePath = this.ws.abs('.git/info/exclude');
+    // `.git` is a file inside a linked worktree, so joining it against the working copy silently
+    // resolves to nothing there and runtime artifacts would start being staged. `--git-path` returns
+    // the right location whichever kind of worktree this is.
+    const excludePath = await this.repository.gitPath('info/exclude').catch(() => undefined);
+    if (!excludePath) return;
     let current = '';
     try {
       current = await fs.readFile(excludePath, 'utf8');
     } catch {
-      return;
+      await fs.mkdir(path.dirname(excludePath), { recursive: true }).catch(() => undefined);
+      current = '';
     }
     const missing = RUNTIME_EXCLUDE_PATTERNS.filter((pattern) => !current.split(/\r?\n/u).includes(pattern));
     if (missing.length === 0) return;
@@ -94,6 +101,11 @@ export class GitService {
   /** 硬重置到指定 ref；用于 DEBUG 失败回滚。 */
   async revertTo(ref: string): Promise<void> {
     await this.git.reset(['--hard', ref]);
+    // The baseline snapshot committed every project file that existed before the attempt. Any
+    // remaining untracked, non-ignored path was therefore created by the failed attempt and must be
+    // removed as part of the same rollback. Runtime state, sandboxes, dependency caches, and other
+    // excluded paths remain untouched because `git clean` respects Git ignore/exclude rules here.
+    await this.git.raw(['clean', '-fd']);
   }
 
   /** 返回最近 N 条 [xcompiler] 提交。 */
@@ -119,10 +131,7 @@ function isRuntimeArtifactPath(file: string): boolean {
   const normalized = file.replace(/\\/g, '/');
   if (!normalized) return false;
   return (
-    (normalized.startsWith('.xcompiler/') && normalized !== '.xcompiler/.gitkeep') ||
-    normalized.startsWith('logs/') ||
-    normalized === 'docs/process_log.md' ||
-    normalized.endsWith('.xc') ||
+    normalized.startsWith('.xcw/') ||
     normalized === '.coverage' ||
     normalized.startsWith('.sandbox/') ||
     normalized.startsWith('.pytest_cache/') ||

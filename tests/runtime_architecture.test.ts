@@ -21,13 +21,14 @@ describe('Runtime architecture boundary', () => {
     expect(runtime).not.toContain("./cli/bootstrap.js");
   });
 
-  it('build/run CLI files are thin adapters and do not import business internals', async () => {
-    const compile = await read('src/cli/compile.ts');
-    const execute = await read('src/cli/execute.ts');
-    const cli = `${compile}\n${execute}`;
+  it('build/run CLI files are thin Runtime adapters and do not import business internals', async () => {
+    const build = await read('src/cli/xcompiler_build.ts');
+    const run = await read('src/cli/xcompiler_run.ts');
+    const cli = `${build}\n${run}`;
 
-    expect(compile).toContain("../runtime/build.js");
-    expect(execute).toContain("../runtime/run.js");
+    expect(build).toContain("../runtime.js");
+    expect(run).toContain("../runtime.js");
+    expect(cli).toContain('XCompilerRuntime');
     expect(cli).not.toMatch(/\.\.\/agents\/planner|Planner|buildPlan/u);
     expect(cli).not.toMatch(/\.\.\/core\/engine|PhaseEngine/u);
     expect(cli).not.toMatch(/\.\.\/llm\/router|LLMRouter/u);
@@ -39,21 +40,16 @@ describe('Runtime architecture boundary', () => {
     const main = await read('src/cli/xcompiler.ts');
     const build = await read('src/cli/xcompiler_build.ts');
     const run = await read('src/cli/xcompiler_run.ts');
-    const bootstrap = await read('src/cli/bootstrap.ts');
     const doctor = await read('src/cli/doctor.ts');
     const inspect = await read('src/cli/inspect.ts');
     const entrypoints = `${main}\n${build}\n${run}`;
 
-    expect(entrypoints).toContain("../runtime/commands.js");
+    expect(entrypoints).toContain("../runtime.js");
     expect(entrypoints).not.toMatch(/loadXCompilerProject|resolveCompileWorkspace|resolveEvolveWorkspace/u);
     expect(entrypoints).not.toMatch(/from '\.\/compile\.js'|from '\.\/execute\.js'|from '\.\/workspace\.js'/u);
     expect(entrypoints).not.toMatch(/runCompile\(|runExecute\(/u);
-    expect(bootstrap).toContain("../runtime/bootstrap.js");
-    expect(bootstrap).not.toContain("../runtime/build.js");
-    expect(bootstrap).not.toContain("../runtime/run.js");
-    expect(bootstrap).not.toMatch(/from '\.\/compile\.js'|from '\.\/execute\.js'/u);
-    expect(doctor).toContain("../runtime/doctor.js");
-    expect(inspect).toContain("../runtime/inspect.js");
+    expect(doctor).toContain("../runtime.js");
+    expect(inspect).toContain("../runtime.js");
     expect(`${doctor}\n${inspect}`).not.toMatch(/from '\.\.\/core\//u);
   });
 
@@ -75,4 +71,24 @@ describe('Runtime architecture boundary', () => {
     const router = await read('src/llm/router.ts');
     expect(`${config}\n${router}`).not.toMatch(/console\.(log|error|warn)|process\.(stdout|stderr)\.write/u);
   });
+});
+
+/**
+ * A hook with no caller is the same as no hook.
+ *
+ * `ensureTestBootstrap` sat on the language profile from the day the layer was written, fully
+ * implemented and never invoked, so `tests/conftest.py` was never created and every Python project's
+ * tests failed to import `src/`. Asserted at the call site rather than on the profile, because the
+ * profile method was always correct — it was the absence of the call that cost two live runs their
+ * Tickets.
+ */
+it('runs the language test bootstrap before executing a plan', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const run = await readFile(new URL('../src/runtime/run.ts', import.meta.url), 'utf8');
+  expect(run).toMatch(/ensureTestBootstrap\?\.\(/u);
+  // Before the Steps run, or the first suite still executes without it.
+  const bootstrapAt = run.indexOf('ensureTestBootstrap');
+  const executeAt = run.indexOf('topoSort(plan.steps)');
+  expect(bootstrapAt).toBeGreaterThan(0);
+  expect(bootstrapAt).toBeLessThan(executeAt);
 });

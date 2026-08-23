@@ -90,6 +90,22 @@ describe('LLMRouter fallback chain', () => {
     expect(client.name).toBe('chain[openai:gpt>ollama:qwen]');
   });
 
+  it('an actor provider pool overrides the role pool and does not inherit global fallbacks', () => {
+    const cfg = mkCfg({
+      fallbacks: ['openai'],
+      role_fallbacks: { Coder: ['ollama_code'] },
+    });
+    const router = new LLMRouter(cfg);
+    // Neither the role pool, the role fallbacks, nor the global fallbacks contribute: the bound
+    // actor gets exactly the providers it was bound to.
+    expect(router.for('Coder', { providerPool: ['ollama_design'] }).name).toBe('ollama:gemma');
+    expect(router.for('Coder', { providerPool: ['openai', 'ollama_design'] }).name)
+      .toBe('chain[openai:gpt>ollama:gemma]');
+    // An absent or empty binding leaves the configured resolution untouched.
+    expect(router.for('Coder', {}).name).toBe('ollama:qwen');
+    expect(router.for('Coder', { providerPool: [] }).name).toBe('ollama:qwen');
+  });
+
   it('FallbackClient.chat tries each provider in order', async () => {
     // Manually construct a router and patch internal clients via reflection
     const cfg = mkCfg({ fallbacks: ['openai'] });
@@ -121,6 +137,35 @@ describe('LLMRouter fallback chain', () => {
     expect(firstCalls).toBe(1);
     expect(secondCalls).toBe(1);
     expect(selectedProvider).toBe('openai');
+  });
+
+  it('propagates host cancellation without fallback or score decay', async () => {
+    const cfg = mkCfg({ fallbacks: ['openai'] });
+    const scores = new ScoreStore('/tmp/x/config.yaml');
+    const router = new LLMRouter(cfg, undefined, scores, undefined, undefined, stubProbe);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clientsMap: Map<string, LLMClient> = (router as any).clients;
+    let secondaryCalls = 0;
+    clientsMap.set('ollama_code', {
+      name: 'fake-primary',
+      chat: async () => {
+        const error = new Error('CLI task cancelled by SIGINT');
+        error.name = 'AbortError';
+        throw error;
+      },
+    });
+    clientsMap.set('openai', {
+      name: 'fake-secondary',
+      chat: async () => {
+        secondaryCalls++;
+        return 'must not run';
+      },
+    });
+
+    await expect(router.for('Coder').chat([{ role: 'user', content: 'hi' }]))
+      .rejects.toThrow('CLI task cancelled by SIGINT');
+    expect(secondaryCalls).toBe(0);
+    expect(scores.get('ollama_code')).toBe(ScoreStore.DEFAULT);
   });
 
   it('reports all provider failures when the whole chain fails', async () => {
@@ -330,6 +375,34 @@ describe('LLMRouter fallback chain', () => {
     expect(secondaryCalls).toBe(0);
     expect(correctionSeen).toBe(true);
     expect(scores.get('ollama_code')).toBeGreaterThanOrEqual(ScoreStore.DEFAULT);
+  });
+
+  it('marks a contract-rejected candidate as never executed during provider correction', async () => {
+    const cfg = mkCfg({ fallbacks: ['openai'] });
+    const router = new LLMRouter(cfg, undefined, undefined, undefined, undefined, stubProbe);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clientsMap: Map<string, LLMClient> = (router as any).clients;
+    let calls = 0;
+    let correction = '';
+    clientsMap.set('ollama_code', {
+      name: 'fake-primary',
+      chat: async (messages) => {
+        calls++;
+        correction = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        return calls === 1 ? 'rejected mutation candidate' : 'corrected mutation';
+      },
+    });
+
+    const output = await router.for('Coder').chat([{ role: 'user', content: 'repair' }], {
+      validate: (text) => {
+        if (text.startsWith('rejected')) throw new Error('incomplete JSON turn');
+      },
+    });
+
+    expect(output).toBe('corrected mutation');
+    expect(correction).toContain('before any action was parsed, authorized, executed, or persisted');
+    expect(correction).toContain('never-executed="true"');
+    expect(correction).toContain('rejected mutation candidate');
   });
 
   it('can disable success score boosts for workflow-level LLM calls', async () => {
@@ -713,6 +786,7 @@ describe('Coder and Debugger model advice', () => {
       roles: {
         Coder: ['ollama_code'],
         Debugger: ['ollama_code', 'ollama_design'],
+        ProjectManager: ['ollama_code', 'ollama_design'],
       },
     });
     const scores = new ScoreStore('/tmp/x/config.yaml');
@@ -734,4 +808,74 @@ describe('Coder and Debugger model advice', () => {
       log.mockRestore();
     }
   });
+});
+
+/**
+ * A recovery attempt does not get a fresh request's budget.
+ *
+ * The non-stream path has no idle or first-token watchdog — a non-stream response sends nothing
+ * until it is whole — so it runs to the configured `request_timeout_ms` with nothing to observe.
+ * That budget is sized for a first attempt; this one follows a stream that already stalled, and
+ * handing it the same allowance doubles the cost of a single stall. A live Planner spent fifteen
+ * minutes there after its stream went idle at sixty seconds, and the build failed on the wait.
+ */
+describe('non-stream retry after a stalled stream', () => {
+  // Asserted at the call site: the client accepting a cap proves nothing about whether the retry
+  // path applies one, and that is the half that was missing.
+  it('applies the cap when the router drops streaming', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const router = await readFile(new URL('../src/llm/router.ts', import.meta.url), 'utf8');
+    const start = router.indexOf('function withoutStreamingOptions');
+    expect(start).toBeGreaterThan(0);
+    const body = router.slice(start, router.indexOf('\n}', start));
+    expect(body).toContain('requestTimeoutMs');
+    expect(body).toMatch(/Math\.min\(/u);
+    expect(body).toContain('NON_STREAM_RETRY_TIMEOUT_MS');
+  });
+
+  it('caps the retry below the provider budget', async () => {
+    // Exercised through the client, since the helper is module-private.
+    const { OpenAIClient } = await import('../src/llm/openai.js');
+    const { createServer } = await import('node:http');
+    let served = 0;
+    const server = createServer((_req, res) => {
+      served += 1;
+      // Never answers: the request can only end on whichever clock is shorter.
+      void res;
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as import('node:net').AddressInfo;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'slow',
+        requestTimeoutMs: 60_000,
+      });
+      const started = Date.now();
+      await expect(client.chat([{ role: 'user', content: 'hi' }], { requestTimeoutMs: 300 }))
+        .rejects.toThrow(/timed out after 300ms/u);
+      expect(Date.now() - started).toBeLessThan(20_000);
+      expect(served).toBe(1);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 30_000);
+
+  // A caller may narrow one request; it may never widen it past what the provider is configured for.
+  it('never raises the budget above the provider configuration', async () => {
+    const { OpenAIClient } = await import('../src/llm/openai.js');
+    const { createServer } = await import('node:http');
+    const server = createServer(() => { /* never answers */ });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as import('node:net').AddressInfo;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'slow',
+        requestTimeoutMs: 250,
+      });
+      await expect(client.chat([{ role: 'user', content: 'hi' }], { requestTimeoutMs: 60_000 }))
+        .rejects.toThrow(/timed out after 250ms/u);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 30_000);
 });

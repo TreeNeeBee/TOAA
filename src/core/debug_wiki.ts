@@ -9,9 +9,17 @@ import type { Phase } from './plan.js';
 
 export const DEFAULT_DEBUG_WIKI_REL_PATH = '.xcompiler/debug-wiki';
 export const BUNDLED_DEBUG_WIKI_REL_PATH = 'debug-wiki';
-export const DEBUG_WIKI_VERSION = 1;
+export const DEBUG_WIKI_VERSION = 2;
 
-export type DebugWikiLayer = 'system' | 'agent' | 'external';
+/**
+ * Where a piece of debugging knowledge belongs.
+ *
+ * `system`, `agent`, and `external` are installation-scoped: platform behaviour, agent interaction
+ * failures, and third-party ecosystem issues, all of which are true for every project. `project` is
+ * specific to one codebase — its architecture, conventions, and recurring defects — and would be
+ * noise, or wrong advice, anywhere else.
+ */
+export type DebugWikiLayer = 'system' | 'agent' | 'external' | 'project';
 export type DebugWikiEntryStatus = 'active' | 'needs_review' | 'superseded';
 
 const DEBUG_WIKI_STATUS_TRANSITIONS: StateTransitions<DebugWikiEntryStatus> = {
@@ -81,7 +89,7 @@ export interface DebugWikiResolutionInput {
 }
 
 interface DebugWikiIndex {
-  version: 1;
+  version: 2;
   updatedAt: string;
   root: string;
   layers: Record<DebugWikiLayer, { entries: number; writable: boolean }>;
@@ -99,7 +107,9 @@ interface DebugWikiOperationLogEntry {
   reason?: string;
 }
 
-const LAYERS: DebugWikiLayer[] = ['system', 'agent', 'external'];
+const INSTALLATION_LAYERS: DebugWikiLayer[] = ['system', 'agent', 'external'];
+const PROJECT_LAYER: DebugWikiLayer = 'project';
+const LAYERS: DebugWikiLayer[] = [...INSTALLATION_LAYERS, PROJECT_LAYER];
 const EMPTY_STATS = { uses: 0, successes: 0, failures: 0 };
 
 export function defaultDebugWikiPath(fallbackRoot?: string): string {
@@ -128,11 +138,27 @@ export class DebugWiki {
   public readonly rootPath: string;
   public readonly filePath: string;
   private readonly bundledPath: string;
+  /**
+   * Project-scoped wiki root. When absent the wiki behaves exactly as before — installation tier
+   * only — so a caller that has no project still gets platform knowledge.
+   */
+  private readonly projectPath?: string;
 
-  constructor(rootPath: string, opts: { bundledPath?: string } = {}) {
+  constructor(rootPath: string, opts: { bundledPath?: string; projectPath?: string } = {}) {
     this.rootPath = path.resolve(rootPath);
     this.filePath = this.rootPath;
     this.bundledPath = opts.bundledPath ?? bundledDebugWikiPath();
+    this.projectPath = opts.projectPath ? path.resolve(opts.projectPath) : undefined;
+  }
+
+  /** Layers this instance can read; the project tier only exists when a project root was given. */
+  private activeLayers(): DebugWikiLayer[] {
+    return this.projectPath ? LAYERS : INSTALLATION_LAYERS;
+  }
+
+  /** Where a run-time discovery is written. Project findings must not reach the shared tiers. */
+  private writableLayer(): DebugWikiLayer {
+    return this.projectPath ? PROJECT_LAYER : 'external';
   }
 
   async load(): Promise<void> {
@@ -143,10 +169,16 @@ export class DebugWiki {
     await this.ensureOperationLog();
     await this.copyBundledLayers();
     this.entries = [];
-    for (const layer of LAYERS) {
+    for (const layer of this.activeLayers()) {
       this.entries.push(...await this.readLayer(layer));
     }
     await this.applyFeedbackLog();
+    const quarantined = this.entries.filter((entry) =>
+      entry.status === 'active' && hasLegacyMergedSolutions(entry.solution));
+    for (const entry of quarantined) transitionDebugWikiEntry(entry, 'needs_review');
+    if (quarantined.some((entry) => entry.layer === this.writableLayer())) {
+      await this.persistExternalEntries();
+    }
     await this.writeIndex();
   }
 
@@ -155,6 +187,10 @@ export class DebugWiki {
     const limit = opts.limit ?? 3;
     return this.rank(brief, opts.language)
       .filter((match) => match.score >= 4)
+      // At equal relevance a finding from this codebase beats a generic one.
+      .sort((left, right) =>
+        right.score - left.score ||
+        Number(right.entry.layer === PROJECT_LAYER) - Number(left.entry.layer === PROJECT_LAYER))
       .slice(0, limit);
   }
 
@@ -217,13 +253,16 @@ export class DebugWiki {
     await this.load();
     const now = new Date().toISOString();
     const used = this.byIds(input.usedEntryIds ?? []);
-    const externalTargets = used.filter((entry) => entry.layer === 'external');
-    const target = externalTargets.length > 0
-      ? externalTargets
-      : this.rank(input.brief, input.language)
-          .filter((match) => match.entry.layer === 'external' && match.score >= 8)
-          .slice(0, 1)
-          .map((m) => m.entry);
+    const writable = this.writableLayer();
+    // Retrieval returns hypotheses, not proof that the current Bug has the same root cause.
+    // Updating every retrieved project entry merged unrelated fixes into one contradictory page.
+    // Only the Ticket that owns an entry may revise it. A later Ticket that disproves a reviewed
+    // hypothesis creates a replacement entry and links it with supersedes instead of erasing or
+    // reactivating the disputed history.
+    const target = dedup(this.entries.filter((entry) =>
+      entry.layer === writable &&
+      input.ticketId !== undefined &&
+      entry.sourceTicketId === input.ticketId));
     const updated: string[] = [];
     let createdId: string | undefined;
     for (const entry of target) {
@@ -231,13 +270,14 @@ export class DebugWiki {
       updated.push(entry.id);
     }
     if (updated.length === 0) {
-      const created = createEntry(input, now, this.nextExternalId(now), 'external');
-      created.supersedes = used.length > 0 ? used.map((entry) => entry.id) : undefined;
+      const created = createEntry(input, now, this.nextWritableId(now), writable);
+      const reviewed = used.filter((entry) => entry.status === 'needs_review');
+      created.supersedes = reviewed.length > 0 ? reviewed.map((entry) => entry.id) : undefined;
       this.entries.push(created);
       createdId = created.id;
     }
     const correctedFeedback = this.feedbackFrom(
-      used.filter((entry) => entry.layer !== 'external').map((entry) => entry.id),
+      used.filter((entry) => entry.layer !== writable).map((entry) => entry.id),
       input,
       now,
       'corrected',
@@ -266,7 +306,7 @@ export class DebugWiki {
   }
 
   private async ensureLayout(): Promise<void> {
-    for (const layer of LAYERS) {
+    for (const layer of this.activeLayers()) {
       await fs.mkdir(this.layerDir(layer), { recursive: true });
     }
   }
@@ -306,7 +346,7 @@ export class DebugWiki {
       const abs = path.join(dir, file);
       const page = parseWikiPage(await fs.readFile(abs, 'utf8'));
       const entry = normalizeEntry({ ...page.data, layer, solution: page.data.solution ?? page.body }, layer);
-      entry.sourcePath = path.relative(this.rootPath, abs).replace(/\\/g, '/');
+      entry.sourcePath = path.relative(this.layerBase(layer), abs).replace(/\\/g, '/');
       entries.push(entry);
     }
     return entries;
@@ -339,6 +379,7 @@ export class DebugWiki {
     now: string,
     kind: DebugWikiFeedback['kind'],
   ): void {
+    const replacingDisputedSolution = entry.status === 'needs_review';
     transitionDebugWikiEntry(entry, 'active');
     entry.updatedAt = now;
     entry.summary = input.brief.summary;
@@ -348,7 +389,9 @@ export class DebugWiki {
     entry.symptoms = dedup([...input.brief.evidence, ...entry.symptoms]).slice(0, 12);
     entry.evidence = dedup([...(input.evidence ?? []), ...entry.evidence]).slice(0, 12);
     if (input.resolutionPlan?.trim()) entry.resolutionPlan = input.resolutionPlan.trim();
-    entry.solution = mergeSolution(entry.solution, input.solution);
+    entry.solution = replacingDisputedSolution
+      ? input.solution.trim()
+      : mergeSolution(entry.solution, input.solution);
     entry.repairFiles = dedup([...(input.repairFiles ?? []), ...(entry.repairFiles ?? [])]).slice(0, 12);
     entry.stats.successes += 1;
     pushFeedback(entry, {
@@ -363,9 +406,13 @@ export class DebugWiki {
   }
 
   private async persistExternalEntries(): Promise<void> {
-    for (const entry of this.entries.filter((item) => item.layer === 'external')) {
-      const abs = path.join(this.rootPath, entry.sourcePath ?? this.externalEntryPath(entry));
-      entry.sourcePath = path.relative(this.rootPath, abs).replace(/\\/g, '/');
+    const writable = this.writableLayer();
+    for (const entry of this.entries.filter((item) => item.layer === writable)) {
+      // Paths are relative to the tier's own root, so a project entry never resolves into the
+      // shared installation directory.
+      const base = this.layerBase(writable);
+      const abs = path.join(base, entry.sourcePath ?? this.writableEntryPath(entry, writable));
+      entry.sourcePath = path.relative(base, abs).replace(/\\/g, '/');
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, renderWikiPage(entry), 'utf8');
     }
@@ -378,7 +425,8 @@ export class DebugWiki {
   }
 
   private async appendLayerFeedback(feedback: DebugWikiFeedback[]): Promise<void> {
-    await this.appendFeedback(feedback.filter((item) => this.byId(item.entryId)?.layer !== 'external'));
+    const writable = this.writableLayer();
+    await this.appendFeedback(feedback.filter((item) => this.byId(item.entryId)?.layer !== writable));
   }
 
   private async appendOperationLog(entry: DebugWikiOperationLogEntry): Promise<void> {
@@ -387,9 +435,10 @@ export class DebugWiki {
   }
 
   private async writeIndex(now = new Date().toISOString()): Promise<void> {
-    const layerCounts = Object.fromEntries(LAYERS.map((layer) => [
+    const writable = this.writableLayer();
+    const layerCounts = Object.fromEntries(this.activeLayers().map((layer) => [
       layer,
-      { entries: this.entries.filter((entry) => entry.layer === layer).length, writable: layer === 'external' },
+      { entries: this.entries.filter((entry) => entry.layer === layer).length, writable: layer === writable },
     ])) as DebugWikiIndex['layers'];
     const index: DebugWikiIndex = {
       version: DEBUG_WIKI_VERSION,
@@ -442,7 +491,14 @@ export class DebugWiki {
           reasons.push(`category:${entry.category}`);
         }
         if (language && entry.language === language) score += 1;
-        const exact = entry.fingerprints.filter((fp) => queryFingerprints.includes(fp));
+        // `cat:` is already scored above, and it is the one fingerprint a human can write by hand
+        // that reliably matches — every other form is a whole normalized error sentence. Counting it
+        // twice gave every entry in a category the same guaranteed score there, so the most specific
+        // entry could not outrank the most generic one: a plain assertion failure retrieved three
+        // unrelated test_failure entries at 7.0 while the entry written for it scored the same.
+        const exact = entry.fingerprints.filter(
+          (fp) => !fp.startsWith('cat:') && queryFingerprints.includes(fp),
+        );
         if (exact.length > 0) {
           score += exact.length * 3;
           reasons.push(`fingerprint:${exact.length}`);
@@ -468,7 +524,8 @@ export class DebugWiki {
   }
 
   private layerDir(layer: DebugWikiLayer): string {
-    return path.join(this.rootPath, 'wiki', layer);
+    const base = layer === PROJECT_LAYER && this.projectPath ? this.projectPath : this.rootPath;
+    return path.join(base, 'wiki', layer);
   }
 
   private feedbackPath(): string {
@@ -479,14 +536,19 @@ export class DebugWiki {
     return path.join(this.rootPath, 'log.md');
   }
 
-  private nextExternalId(now: string): string {
+  private nextWritableId(now: string): string {
+    const layer = this.writableLayer();
     const stamp = now.replace(/[-:.TZ]/g, '').slice(0, 14);
-    const count = this.entries.filter((entry) => entry.layer === 'external').length + 1;
-    return `external.${stamp}.${String(count).padStart(4, '0')}`;
+    const count = this.entries.filter((entry) => entry.layer === layer).length + 1;
+    return `${layer}.${stamp}.${String(count).padStart(4, '0')}`;
   }
 
-  private externalEntryPath(entry: DebugWikiEntry): string {
-    return path.join('wiki', 'external', `${slugify(entry.id)}.md`);
+  private layerBase(layer: DebugWikiLayer): string {
+    return layer === PROJECT_LAYER && this.projectPath ? this.projectPath : this.rootPath;
+  }
+
+  private writableEntryPath(entry: DebugWikiEntry, layer: DebugWikiLayer): string {
+    return path.join('wiki', layer, `${slugify(entry.id)}.md`);
   }
 }
 
@@ -502,8 +564,10 @@ export function renderDebugWikiMatchesForPrompt(matches: DebugWikiMatch[]): stri
       `- ${entry.id} layer=${entry.layer} score=${match.score.toFixed(2)} confidence=${match.confidence.toFixed(2)} status=${entry.status}`,
       `  problem: [${entry.category}] ${entry.summary}`,
       `  symptoms: ${entry.symptoms.slice(0, 4).join(' | ') || entry.primaryError}`,
-      entry.resolutionPlan ? `  priorPlan: ${entry.resolutionPlan}` : '',
-      `  confirmedSolution: ${entry.solution}`,
+      entry.status !== 'needs_review' && entry.resolutionPlan ? `  priorPlan: ${entry.resolutionPlan}` : '',
+      entry.status === 'needs_review'
+        ? '  disputedSolution: hidden because prior reuse failed or the legacy entry merged unrelated fixes; derive a fresh solution from current evidence'
+        : `  candidateSolution: ${entry.solution}`,
       `  feedback: uses=${entry.stats.uses} successes=${entry.stats.successes} failures=${entry.stats.failures}`,
     );
     if (entry.repairFiles?.length) lines.push(`  repairFiles: ${entry.repairFiles.join(', ')}`);
@@ -657,11 +721,14 @@ function renderReadableIndex(index: DebugWikiIndex, entries: DebugWikiEntry[]): 
     '| Layer | Entries | Writable | Purpose |',
     '| --- | ---: | --- | --- |',
   ];
-  for (const layer of LAYERS) {
+  // Render the layers this index actually has: the project tier is absent when the wiki was opened
+  // without a project root.
+  const presentLayers = LAYERS.filter((layer) => index.layers[layer] !== undefined);
+  for (const layer of presentLayers) {
     const info = index.layers[layer];
     lines.push(`| ${layer} | ${info.entries} | ${info.writable ? 'yes' : 'no'} | ${layerPurpose(layer)} |`);
   }
-  for (const layer of LAYERS) {
+  for (const layer of presentLayers) {
     const layerEntries = entries.filter((entry) => entry.layer === layer);
     lines.push('', `## ${layer}`, '');
     if (layerEntries.length === 0) {
@@ -711,7 +778,9 @@ function layerPurpose(layer: DebugWikiLayer): string {
     case 'agent':
       return 'bundled agent calibration knowledge';
     case 'external':
-      return 'local project bug-ticket resolutions';
+      return 'third-party ecosystem issues generalized from real projects';
+    case 'project':
+      return 'this codebase: its architecture, conventions, and recurring defects';
   }
 }
 
@@ -754,6 +823,10 @@ function mergeSolution(previous: string, next: string): string {
   if (!trimmed || previous.includes(trimmed)) return previous;
   if (!previous.trim()) return trimmed;
   return `${previous.trim()}\nCorrected/confirmed resolution: ${trimmed}`;
+}
+
+function hasLegacyMergedSolutions(solution: string): boolean {
+  return solution.split('Corrected/confirmed resolution:').length - 1 > 1;
 }
 
 function pushFeedback(entry: DebugWikiEntry, feedback: DebugWikiFeedback): void {

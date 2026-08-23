@@ -1,3 +1,4 @@
+import { ArchitectureModuleSchema } from '../src/core/plan.js';
 import { describe, it, expect } from 'vitest';
 import { buildPlan } from '../src/agents/planner.js';
 import { lintPlan } from '../src/core/lint.js';
@@ -365,5 +366,20 @@ describe('buildPlan — Step id 规整', () => {
     expect(markdown).toContain('- S001 P1 CODE:');
     expect(markdown).toContain('  - T1: Core module [src/core.py]');
     expect(markdown).toContain('    - T1.1: Parser [src/parser.py]');
+  });
+});
+
+describe('planner schema errors', () => {
+  it('names the field a module got wrong, not only the rule it broke', () => {
+    // "Too small: expected array to have >=1 items" told the model nothing about which of seven
+    // module fields was empty. Both providers retried and failed identically, and the build aborted
+    // — a schema error that cannot be acted on is one that repeats.
+    const result = ArchitectureModuleSchema.array().safeParse([
+      { id: 'M001', name: 'fetcher', responsibility: 'fetches the news', sourcePaths: ['src/a.ts'], testPaths: [] },
+    ]);
+    expect(result.success).toBe(false);
+    const described = result.success ? [] : result.error.issues
+      .map((issue) => `architectureModules.${issue.path.join('.')}: ${issue.message}`);
+    expect(described.join('; ')).toContain('testPaths');
   });
 });

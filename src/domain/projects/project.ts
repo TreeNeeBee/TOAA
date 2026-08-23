@@ -38,6 +38,8 @@ export const ProjectSchema = ObjectEnvelopeSchema.extend({
   intent: z.enum(['greenfield', 'feature', 'refactor', 'self']),
   projectType: z.enum(['application', 'library', 'mixed']),
   projectPlanId: ObjectIdSchema,
+  managementPlanId: ObjectIdSchema,
+  pmActorId: ObjectIdSchema,
   phaseIds: z.array(ObjectIdSchema).min(1),
   currentPhaseId: ObjectIdSchema.optional(),
   kpiIds: z.array(ObjectIdSchema).default([]),

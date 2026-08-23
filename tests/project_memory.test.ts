@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Workspace } from '../src/workspace/workspace.js';
 import {
   buildProjectMemory,
+  PROJECT_MEMORY_PATH,
   loadProjectMemory,
   refreshProjectMemory,
   selectMemoryContractsForStep,
@@ -34,6 +35,7 @@ describe('project memory', () => {
   it('captures docs, manifests and implementation snippets', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-memory-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile('docs/topic.md', 'Invoice reporting with CSV export.');
     await ws.writeFile(
       'docs/02-high-level-design.md',
@@ -71,19 +73,27 @@ describe('project memory', () => {
   it('persists and reloads project memory for later incremental runs', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-memory-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile('docs/topic.md', 'Existing export workflow.');
     await ws.writeFile('src/exporter.ts', 'export function exportData() { return "done"; }\n');
 
-    await refreshProjectMemory(ws, { language: 'typescript', intent: 'feature' });
-    const loaded = await loadProjectMemory(ws);
+    await refreshProjectMemory(ws, state, { language: 'typescript', intent: 'feature' });
+    const loaded = await loadProjectMemory(state);
 
     expect(loaded?.summary).toContain('Existing export workflow.');
     expect(loaded?.keyFiles.some((file) => file.path === 'src/exporter.ts')).toBe(true);
+
+    // It lands in the container state tier beside the PM projection, never in the code tree: a
+    // worktree copy would diverge per worktree and would be lost whenever one is pruned.
+    expect(await state.exists(PROJECT_MEMORY_PATH)).toBe(true);
+    expect(await ws.exists(PROJECT_MEMORY_PATH)).toBe(false);
+    expect(await ws.exists('.xcompiler/project_memory.json')).toBe(false);
   });
 
   it('loads the stable design contracts when planning a self-bootstrap', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-memory-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile('docs/XCompiler_design.md', 'Stable runtime and V-model architecture.');
     await ws.writeFile('docs/self_bootstrap.md', 'Generation N builds N+1 in an isolated worktree.');
     await ws.writeFile('package.json', JSON.stringify({ name: '@xcompiler/cli' }));
@@ -100,6 +110,7 @@ describe('project memory', () => {
   it('selects relevant snippets for the current step', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-memory-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile('src/reporting/service.ts', 'export class ReportingService { exportCsv() { return "csv"; } }\n');
     await ws.writeFile('src/auth/service.ts', 'export class AuthService { login() { return true; } }\n');
 

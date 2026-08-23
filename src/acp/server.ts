@@ -1,14 +1,16 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { XCOMPILER_VERSION } from '../version.js';
 import {
-  runBuildCommand,
-  runRunCommand,
+  XCOMPILER_VERSION,
+  XCompilerRuntime,
   type RuntimeBuildCommandOptions,
+  type RuntimeIO,
+  type RuntimeInteraction,
+  type RuntimeProgress,
   type RuntimeRunCommandOptions,
-} from '../runtime/commands.js';
-import type { RuntimeIO, RuntimeInteraction, RuntimeProgress, RuntimeSelectChoice } from '../runtime/io.js';
-import type { ToolPermissionRequest } from '../tools/types.js';
+  type RuntimeSelectChoice,
+  type ToolPermissionRequest,
+} from '../runtime.js';
 import { AcpError, invalidParams } from './errors.js';
 import { mapRuntimeEventToAcpUpdates, taskUpdate } from './mapper.js';
 import {
@@ -52,9 +54,10 @@ const stderrLogger: AcpServerLogger = {
   error: (message) => process.stderr.write(`[xcompiler-acp] error: ${message}\n`),
 };
 
+const runtimeFacade = new XCompilerRuntime();
 const defaultRuntime: AcpRuntimeFacade = {
-  build: runBuildCommand,
-  run: runRunCommand,
+  build: (options) => runtimeFacade.buildCommand(options),
+  run: (options) => runtimeFacade.runCommand(options),
 };
 
 interface PendingClientRequest {
@@ -249,6 +252,7 @@ export class AcpServer {
       yes: params.requirePlanConfirmation === false,
       force: !!params.force,
       io: buildIo,
+      abortSignal: task.abortController.signal,
     };
     const build = await this.runtime.build(buildOpts);
     this.throwIfCancelled(task);
@@ -297,6 +301,7 @@ export class AcpServer {
       force: !!params.force,
       terminalOutput: false,
       io: runIo,
+      abortSignal: task.abortController.signal,
     };
     const run = await this.runtime.run(runOpts);
     this.throwIfCancelled(task);
@@ -317,6 +322,7 @@ export class AcpServer {
   private createRuntimeIO(session: AcpSession, task: AcpTask, phase: 'build' | 'run'): RuntimeIO {
     const io: RuntimeIO = {
       terminalOutput: false,
+      permissionPolicy: phase === 'run' ? 'request' : 'deny',
       emit: async (event) => {
         if (event.type === 'permission' && event.status === 'requested') return;
         if (event.type === 'result') {

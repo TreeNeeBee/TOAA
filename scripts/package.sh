@@ -9,7 +9,7 @@
 #   - dist/pkg/xcompiler-win-x64/xcompiler.exe          (Windows x86_64)
 #
 # 每个目录另外携带：README.md / LICENSE / NOTICE / config.example.yaml /
-#                  .env.example  以便用户开箱即用。
+#                  .env.example / debug-wiki / skills，以便用户开箱即用。
 # 最后将每个目录压缩成 tar.gz（linux/macos）或 zip（windows），放在 dist/pkg/。
 #
 # macOS 目标说明：
@@ -222,7 +222,8 @@ msg package.cross_compile
 
 mkdir -p "$OUT_ROOT"
 # 共享附件
-ASSETS=(README.md LICENSE NOTICE config.example.yaml .env.example debug-wiki)
+ASSETS=(README.md LICENSE NOTICE config.example.yaml .env.example debug-wiki skills)
+DOC_ASSETS=(docs/agent_skills.md)
 
 build_one() {
   local short="$1"               # linux-x64 / linux-arm64 / macos-arm64 / win-x64
@@ -256,6 +257,10 @@ build_one() {
   for f in "${ASSETS[@]}"; do
     [[ -f "$f" ]] && cp "$f" "$staging_dir/"
     [[ -d "$f" ]] && cp -R "$f" "$staging_dir/"
+  done
+  mkdir -p "$staging_dir/docs"
+  for f in "${DOC_ASSETS[@]}"; do
+    cp "$f" "$staging_dir/docs/"
   done
   printf '%s\n' "$VERSION" > "$staging_dir/VERSION"
 

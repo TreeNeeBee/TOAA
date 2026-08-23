@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ObjectEnvelopeSchema } from '../objects/object_envelope.js';
 import { ObjectIdSchema } from '../identity/object_id.js';
+import { DeliveryGateSchema } from '../quality/delivery_gate.js';
 
 export const ProjectPlanSchema = ObjectEnvelopeSchema.extend({
   objectType: z.literal('plan'),
@@ -26,6 +27,7 @@ export const PhasePlanSchema = ObjectEnvelopeSchema.extend({
   dependencyPhaseIds: z.array(ObjectIdSchema).default([]),
   stepIds: z.array(ObjectIdSchema).default([]),
   verificationGate: z.array(z.string().min(1)).min(1),
+  deliveryGate: DeliveryGateSchema.optional(),
   materialized: z.boolean(),
 }).strict();
 

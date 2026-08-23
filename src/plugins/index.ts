@@ -20,4 +20,4 @@ export type {
   XCompilerPluginManifest,
 } from './types.js';
 export type { Tool, ToolContext, ToolResult } from '../tools/types.js';
-export type { Skill } from '../skills/skill.js';
+export type { ActivatedAgentSkill, AgentSkillMetadata, SkillSource } from '../skills/types.js';

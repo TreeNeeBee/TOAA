@@ -1,4 +1,7 @@
+import { TEST_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
+import { isTestFilePath, normalizeGitPath } from './v_model_policy.js';
 import type { LanguageProfile } from '../../core/language.js';
+import type { Ticket } from '../../domain/tickets/ticket.js';
 import {
   PHASE_ORDER,
   V_MODEL_TEST_PHASES,
@@ -40,7 +43,7 @@ export function computeDebugAllowedWrites(
   step: Step,
   profile: LanguageProfile,
 ): string[] {
-  if (isVerification(step)) return [...new Set(step.outputs)];
+  if (isVerification(step)) return withTestFixtureAccess(step.outputs);
   const byId = new Map(plan.steps.map((candidate) => [candidate.id, candidate]));
   const seen = new Set<string>();
   const stack = [...step.dependsOn];
@@ -63,11 +66,63 @@ export function computeDebugAllowedWrites(
       if (output !== profile.manifestFile) outputs.add(output);
     }
   }
-  return [...outputs];
+  return withTestFixtureAccess([...outputs]);
+}
+
+/**
+ * Resolves the mutation scope for corrective work without granting every upstream deliverable.
+ *
+ * Enhancements carry the gate's exact affected artifacts. A CR carries the accepted upstream delta
+ * for inspection, so it writes only matching target artifacts when they exist and otherwise stays
+ * within the current Step's declared outputs. Bugs retain the broader debug scope because their
+ * failure evidence, not a quality finding, determines the root cause.
+ */
+export function computeIncrementalAllowedWrites(
+  plan: Plan,
+  step: Step,
+  profile: LanguageProfile,
+  ticket: Ticket,
+): string[] {
+  if (ticket.type === 'enhancement' && ticket.affectedArtifacts.length > 0) {
+    // Same floor the Change Request branch below already applies: an artifact list that names
+    // nothing this Step owns narrows the allowlist to nothing, and a Step that may write no file
+    // cannot act on any instruction it is given — it spends its whole round budget reporting that.
+    // A live Enhancement found at UNIT_TEST carried that Step's own documents and was routed to
+    // CODE, which owns none of them.
+    const owned = ownedAffectedArtifacts(step, ticket.affectedArtifacts);
+    return owned.length > 0 ? withTestFixtureAccess(owned) : computeStepAllowedWrites(step);
+  }
+  if (ticket.type === 'change-request') {
+    const owned = ownedAffectedArtifacts(step, ticket.contractDelta.affectedArtifacts);
+    return owned.length > 0 ? withTestFixtureAccess(owned) : computeStepAllowedWrites(step);
+  }
+  return computeDebugAllowedWrites(plan, step, profile);
+}
+
+/**
+ * Adds the fixture directory to any write scope that owns a test.
+ *
+ * One function because a Step and the Debugger repairing that same Step must be able to write the
+ * same files. They could not: the Step's own scope granted the fixture directory and the corrective
+ * scope did not, so a test the Step was allowed to create could not be repaired — and a Bug routed
+ * there spent six attempts rewriting four DBC samples into the identical denial before the
+ * non-convergence guard stopped the run.
+ *
+ * The whole directory, not only the recorded-response corner of it: what a test must read is decided
+ * by what it verifies, and a parser test needs a malformed sample as surely as a client test needs a
+ * captured response.
+ */
+function withTestFixtureAccess(scope: readonly string[]): string[] {
+  const paths = [...new Set(scope)];
+  if (!paths.some((path) => isTestFilePath(normalizeGitPath(path)))) return paths;
+  const grant = `${TEST_FIXTURE_DIR}/`;
+  return paths.includes(grant) ? paths : [...paths, grant];
 }
 
 export function computeStepAllowedWrites(step: Step): string[] {
-  return [...new Set(step.outputs)];
+  // No plan declares the fixture directory and the instructions name it, so withholding it tells a
+  // Step to write a fixture and then refuses the one path it was told to use.
+  return withTestFixtureAccess(step.outputs);
 }
 
 export function stepContextChars(plan: Plan, step: Step): number {
@@ -104,4 +159,16 @@ function transitivelyDependsOn(
 
 function isVerification(step: Step): boolean {
   return (V_MODEL_TEST_PHASES as readonly string[]).includes(step.phase);
+}
+
+function ownedAffectedArtifacts(step: Step, artifacts: readonly string[]): string[] {
+  return [...new Set(artifacts.map(normalizeGitPath))].filter((artifact) =>
+    step.outputs.some((output) => pathsOverlap(output, artifact))
+  );
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const a = normalizeGitPath(left);
+  const b = normalizeGitPath(right);
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }

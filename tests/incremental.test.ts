@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildPlan } from '../src/agents/planner.js';
-import { resolveCompileLanguage } from '../src/cli/compile.js';
+import { resolveCompileLanguage } from '../src/application/planning/requirement_intake.js';
 import { loadIncrementalBaseline } from '../src/core/incremental.js';
 import { PROJECT_MEMORY_PATH, refreshProjectMemory } from '../src/core/project_memory.js';
 import { renderPlanMarkdown } from '../src/core/render.js';
@@ -36,6 +36,7 @@ describe('incremental development support', () => {
   it('summarizes an existing workspace baseline', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-incremental-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     const plan = buildPlan(
       {
         requirementDigest: 'Add a reporting dashboard.',
@@ -68,7 +69,7 @@ describe('incremental development support', () => {
     await ws.writeFile('src/main.ts', 'export const main = () => "ok";\n');
     await ws.writeFile('tests/main.test.ts', 'import { expect, test } from "vitest";\n');
 
-    const baseline = await loadIncrementalBaseline(ws);
+    const baseline = await loadIncrementalBaseline(ws, state);
 
     expect(baseline.summary).toContain('## Existing phase plan summary');
     expect(baseline.summary).toContain('- language: typescript');
@@ -90,6 +91,7 @@ describe('incremental development support', () => {
   it('supports an explicit baseline plan outside the workspace', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-incremental-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     const externalDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-external-plan-'));
     const externalPlanPath = path.join(externalDir, 'baseline-plan.json');
     const externalPlan = buildPlan(
@@ -108,7 +110,7 @@ describe('incremental development support', () => {
 
     await fs.writeFile(externalPlanPath, `${JSON.stringify(externalPlan, null, 2)}\n`, 'utf8');
 
-    const baseline = await loadIncrementalBaseline(ws, { planPath: externalPlanPath });
+    const baseline = await loadIncrementalBaseline(ws, state, { planPath: externalPlanPath });
 
     expect(baseline.summary).toContain('## Existing plan summary');
     expect(baseline.summary).toContain('- intent: refactor');
@@ -119,11 +121,12 @@ describe('incremental development support', () => {
   it('reuses stored project memory when present', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-incremental-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile('docs/topic.md', 'Existing project supports invoice exports.');
     await ws.writeFile('src/exporter.ts', 'export function exportInvoices() { return "csv"; }\n');
-    await refreshProjectMemory(ws, { language: 'typescript', intent: 'feature' });
+    await refreshProjectMemory(ws, state, { language: 'typescript', intent: 'feature' });
 
-    const baseline = await loadIncrementalBaseline(ws);
+    const baseline = await loadIncrementalBaseline(ws, state);
 
     expect(baseline.summary).toContain('## Existing project memory');
     expect(baseline.summary).toContain('invoice exports');
@@ -134,13 +137,14 @@ describe('incremental development support', () => {
   it('refreshes project memory before incremental planning so stale snapshots are not reused', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-incremental-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile('docs/topic.md', 'Old topic');
     await ws.writeFile('src/exporter.ts', 'export function exportInvoices() { return "old"; }\n');
-    await refreshProjectMemory(ws, { language: 'typescript', intent: 'feature' });
+    await refreshProjectMemory(ws, state, { language: 'typescript', intent: 'feature' });
     await ws.writeFile('docs/topic.md', 'Fresh topic after manual edits');
     await ws.writeFile('src/exporter.ts', 'export function exportInvoices() { return "fresh"; }\n');
 
-    const baseline = await loadIncrementalBaseline(ws);
+    const baseline = await loadIncrementalBaseline(ws, state);
 
     expect(baseline.summary).toContain('Fresh topic after manual edits');
     expect(baseline.summary).toContain('return "fresh";');
@@ -150,6 +154,7 @@ describe('incremental development support', () => {
   it('strips previously embedded baseline blocks from topic.md when reloading baseline context', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-incremental-'));
     const ws = new Workspace(root);
+    const state = new Workspace(path.join(root, '.xcompiler'));
     await ws.writeFile(
       'docs/topic.md',
       [
@@ -165,7 +170,7 @@ describe('incremental development support', () => {
       ].join('\n'),
     );
 
-    const baseline = await loadIncrementalBaseline(ws);
+    const baseline = await loadIncrementalBaseline(ws, state);
 
     expect(baseline.summary).toContain('Add export support.');
     expect(baseline.summary).not.toContain('Old generated baseline that must not recurse.');

@@ -69,9 +69,12 @@ xcompiler --version
 ### 1.4 烟测
 
 ```bash
-# 1) 单测（不依赖 LLM/网络）
+# 1) 单测（不依赖 LLM）
 npm run typecheck
-npm test                           # 完整 Vitest 回归（含本机回环网络测试）
+npm test                           # 全部套件
+npm run test:core                  # 仅确定性套件；受限沙箱（禁止监听 127.0.0.1）中也能跑
+npm run test:integration           # 需要本机回环端口与真实子进程
+npm run test:e2e                   # 拉起真实 CLI/ACP 进程
 
 # 2) OpenRouter endpoint 烟测（需 .env 中 OPENROUTER_API_KEY 可用）
 set -a
@@ -350,32 +353,33 @@ docker rmi xcompiler:latest
 | `EACCES: /var/run/docker.sock` | `xcompiler` 用户不在宿主 docker 组 | `DOCKER_GID=$(stat -c '%g' /var/run/docker.sock) docker compose ...` |
 | 长时 LLM 调用后 `audit.jsonl` 没事件 | （已修）旧版异步 appendFile 排队丢失 | 升级到当前版本：审计已改为 `appendFileSync` |
 | `Plan schema 校验失败` | LLM 返回 plan 字段类型异常 | 查看 `<workspace>/docs/.draft/plan.invalid.json` 定位字段，必要时调高 `agent.max_rounds_per_step` 或换更强模型作为 Planner |
-| 测试阶段达到 Step attempt 上限 | Bug/CR 链未能通过配对验证 | 查看 Ticket 领域 Log 与 `<workspace>/.xcompiler/audit.jsonl` 的失败证据；修复配置或环境后重新执行 `xcompiler run`，Scheduler 会从精确的未完成 Ticket 恢复，不能跳过 Step |
+| 测试阶段达到 Step attempt 上限 | Bug/CR 链未能通过配对验证 | 先查看 `<project-root>/.xcompiler/audit/summary.md`，再按链接访问 `audit.jsonl` 和 Ticket revision；修复配置或环境后重新执行 `xcompiler run`，Scheduler 会从精确的未完成 Ticket 恢复，不能跳过 Step |
 
 ---
 
 ## 4. 目录约定
 
-部署完成后的工作区典型结构：
+部署完成后的 0.3 项目容器结构：
 
 ```
-<workspace>/
+<project-root>/
 ├── intake.md                # 需求输入（用户提供）
 ├── config.yaml              # 本次运行的配置
 ├── phasePlan.json           # 阶段总览与当前阶段指针
 ├── plan.P1.json             # 当前阶段的 V 模型执行计划
-├── requirements.txt         # 由 Plan dependencies 在 xcompiler run 启动时种入
-├── docs/
-│   ├── requirements.md
-│   ├── architecture.md
-│   ├── tasks.md
-│   ├── refactor.md
-│   ├── delivery.md
-│   ├── process_log.md       # AuditLogger 自动生成
-│   ├── history/             # 同名旧文档归档
-│   └── .draft/              # 失败 plan 等中间产物
-├── src/                     # CODE 阶段产出
-├── tests/                   # UNIT / INTEGRATION / MODULE / FUNCTIONAL 测试产出
-├── .sandbox/venv/           # subprocess 沙盒虚拟环境
-└── .xcompiler/audit.jsonl        # 审计事件流（同步落盘）
+├── <name>.xc                # 项目控制入口
+├── .xcompiler/
+│   ├── audit/
+│   │   ├── audit.jsonl      # 完整、只追加的机器审计真源
+│   │   ├── process_log.md   # 完整的人类可读过程记录
+│   │   └── summary.md       # 可重建摘要与详细记录链接
+│   ├── objects/             # 不可变领域对象 revision
+│   ├── registry/            # 对象索引与事件链
+│   ├── record-replay/
+│   └── history/docs/        # 同名旧文档归档
+└── worktrees/master/        # 唯一发布工程主线
+    ├── requirements.txt / package.json
+    ├── docs/
+    ├── src/
+    └── tests/
 ```

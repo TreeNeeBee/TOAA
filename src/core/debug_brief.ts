@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { Phase } from './plan.js';
 import { isLoopbackNetworkFailureLine } from './network_api_gate.js';
 
@@ -5,7 +7,7 @@ export type DebugFailureCategory = 'test_failure' | 'syntax_error' | 'import_err
   'network_api_failure' | 'missing_output' | 'tool_loop' | 'permission_denied' | 'llm_provider' | 'exception' | 'unknown';
 
 export interface DebugBrief {
-  version: 1;
+  version: 2;
   category: DebugFailureCategory;
   summary: string;
   primaryError: string;
@@ -23,11 +25,24 @@ export interface DebugBriefInput {
   failureLog?: string;
   phase?: Phase;
   targetPhase?: Phase;
+  typedFailure?: {
+    category: 'llm-provider' | 'tool' | 'test' | 'quality' | 'contract' | 'internal';
+    code: string;
+    statusCode?: number;
+  };
 }
 
 const MAX_EVIDENCE = 8;
 const MAX_EVIDENCE_LINE = 260;
 const MAX_TOOL_FAILURES = 6;
+
+/**
+ * The tools whose failures identify a failure. Declared once because `extractToolFailures` selects
+ * the lines and `toolFailureIdentity` names them: two lists would drift, and a tool missing from
+ * the second silently collapses to `tool:` for every failure it produces.
+ */
+const TOOL_NAME_PATTERN =
+  /\b(run_tests|run_program|write_file|replace_in_file|apply_patch|append_file|http_fetch|add_dependency|read_file)\b/u;
 const MAX_FAILED_TESTS = 8;
 const MAX_FILES = 10;
 
@@ -38,15 +53,21 @@ export function buildDebugBrief(input: DebugBriefInput): DebugBrief {
   const rootSignals = extractSignals(sections.root || raw);
   const latestSignals = sections.latest ? extractSignals(sections.latest) : undefined;
   const chosen = choosePrimarySignals(rootSignals, latestSignals);
-  const category = chosen.category;
+  const category = input.typedFailure
+    ? typedFailureCategory(input.typedFailure)
+    : chosen.category;
   const primaryError = chosen.primaryError || reason || 'Unknown failure';
   const failedTests = dedup([...(rootSignals.failedTests ?? []), ...(latestSignals?.failedTests ?? [])]).slice(0, MAX_FAILED_TESTS);
   const files = dedup([...(rootSignals.files ?? []), ...(latestSignals?.files ?? [])]).slice(0, MAX_FILES);
   const toolFailures = dedup([...(rootSignals.toolFailures ?? []), ...(latestSignals?.toolFailures ?? [])]).slice(0, MAX_TOOL_FAILURES);
-  const statusCodes = dedup([...(rootSignals.statusCodes ?? []), ...(latestSignals?.statusCodes ?? [])]).slice(0, 6);
+  const statusCodes = dedup([
+    ...(input.typedFailure?.statusCode ? [String(input.typedFailure.statusCode)] : []),
+    ...(rootSignals.statusCodes ?? []),
+    ...(latestSignals?.statusCodes ?? []),
+  ]).slice(0, 6);
   const evidence = selectEvidenceLines(raw, category, primaryError, failedTests, files, toolFailures);
   return {
-    version: 1,
+    version: 2,
     category,
     summary: buildSummary({ category, reason, primaryError, failedTests, files, phase: input.phase, targetPhase: input.targetPhase }),
     primaryError,
@@ -58,6 +79,17 @@ export function buildDebugBrief(input: DebugBriefInput): DebugBrief {
     evidence: evidence.lines,
     omittedEvidenceLines: evidence.omitted,
   };
+}
+
+function typedFailureCategory(failure: NonNullable<DebugBriefInput['typedFailure']>): DebugFailureCategory {
+  if (failure.category === 'llm-provider') return 'llm_provider';
+  if (failure.category === 'test') return 'test_failure';
+  if (failure.code.includes('permission')) return 'permission_denied';
+  if (failure.code.includes('missing_output')) return 'missing_output';
+  if (failure.code.includes('dependency')) return 'dependency_error';
+  if (failure.code.includes('network') || failure.code.includes('http')) return 'network_api_failure';
+  if (failure.code.includes('loop')) return 'tool_loop';
+  return 'exception';
 }
 
 export function renderDebugBriefForPrompt(brief: DebugBrief): string {
@@ -173,6 +205,20 @@ function classify(
   if (/could not find a version|no matching distribution|pip install|add_dependency/u.test(lower)) return 'dependency_error';
   if (/syntaxerror|indentationerror|taberror/u.test(lower)) return 'syntax_error';
   if (/outputs? (?:still )?missing|missing (?:required )?outputs?|outputs? \S*缺失|仍缺失/u.test(lower)) return 'missing_output';
+  // A runner that cannot find the test file is reporting unwritten work, not a failing test. Both
+  // runners say so in their own words — pytest exits 4 with `file or directory not found`, vitest
+  // reports `No test files found` — and both used to fall through to the `pytest exit=[1-9]` catch
+  // below, which answers with "fix the root implementation defect… do not rewrite fixtures". That
+  // sends the one repair that cannot apply: the implementation was fine and the files did not exist.
+  // A live dbc3 CODE Step burned ten rounds on it while owing five declared outputs.
+  // pytest exit=4 is the usage error itself, and the explanatory line is often trimmed out of a
+  // truncated log, so the exit code has to count on its own — 39 real failures across three runs
+  // carried the code without the sentence and were classified as ordinary test failures.
+  if (
+    /file or directory not found|no test files found|includes no test files|pytest exit=\s*4\b/u.test(lower)
+  ) {
+    return 'missing_output';
+  }
 
   // Assertion/test identities are root-cause evidence. Provider retry messages and
   // URLs commonly appear later in accumulated logs and must not replace them.
@@ -210,6 +256,22 @@ function classify(
 }
 
 function hasExplicitLLMProviderFailure(lower: string): boolean {
+  // The availability probe names a role and a configured provider, and its failure text is a bare
+  // `fetch failed` — which `hasConcreteNetworkFailure` below claims first. That sent our own outage
+  // to `network_api_failure`, whose demand tells the *generated project* to switch to a public
+  // no-key API and verify the integration: a rewrite of working code to repair something that was
+  // never broken. Live runs produced this text while no project request had been made at all.
+  if (/\b\w+ availability check failed for\b/u.test(lower)) return true;
+  if (/reasoning chars but no content|stream sent no response headers/u.test(lower)) return true;
+  // Anchored to the whole message on purpose. A bare `TypeError: fetch failed` with nothing else is
+  // undici reporting our own request; the same words inside a longer log usually belong to a request
+  // the generated project made, and claiming those would suppress a real project defect.
+  if (/^\s*typeerror:\s*fetch failed\s*$/u.test(lower)) return true;
+  // `OpenAI HTTP <code>` is the prefix our own client puts on a provider response. A rate limit or a
+  // capability rejection carrying it is the provider's, whatever status code it wraps — the project
+  // never produces this shape, and reading it as the project's API sends the one repair that cannot
+  // apply: switching an endpoint the project does not call.
+  if (/openai http\s*\d{3}/u.test(lower)) return true;
   return /all llm providers failed|openai-compatible provider request failed|provider_call_failed|llm provider|prefill_memory_exceeded|context window|token limit|prompt too long|openai stream (?:wall-clock|idle)|provider=\S+[^\n]*model=\S+[^\n]*base_url=/u.test(lower);
 }
 
@@ -223,6 +285,23 @@ function hasConcreteNetworkFailure(lower: string): boolean {
   });
 }
 
+/**
+ * The reason the runner printed beside the failing case, when it printed one.
+ *
+ * `primaryError` is a structured field, so it survives when the evidence block is trimmed to fit the
+ * context budget — and the reason is the half that says what to fix. Returning the case name alone
+ * hands the model the question without the symptom: a live Debugger received
+ * `failed test: ...::test_writes_signal_data` for 26 attempts while `assert None == ''` sat only in
+ * the compact-evidence block, which the budget dropped every time. It knew which test failed and
+ * never learned why, so it kept re-applying the fix named in the Ticket that opened the loop.
+ */
+function failureReasonFor(testId: string, text: string): string | undefined {
+  const escaped = testId.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  const summary = new RegExp(`FAILED[ \\t]+${escaped}[ \\t]*[-—][ \\t]*([^\\n]+)`, 'u').exec(text);
+  const reason = oneLine(summary?.[1] ?? '');
+  return reason.length > 0 ? reason : undefined;
+}
+
 function findPrimaryError(
   text: string,
   lines: string[],
@@ -230,7 +309,10 @@ function findPrimaryError(
   failedTests: string[],
   toolFailures: string[],
 ): string {
-  if (failedTests.length > 0 && category === 'test_failure') return `failed test: ${failedTests[0]}`;
+  if (failedTests.length > 0 && category === 'test_failure') {
+    const reason = failureReasonFor(failedTests[0]!, text);
+    return reason ? `failed test: ${failedTests[0]}: ${reason}` : `failed test: ${failedTests[0]}`;
+  }
   const compilerError = text.match(/[^\n]*\berror TS\d{4}:[^\n]+/u)?.[0];
   if (compilerError) return oneLine(compilerError);
   if (toolFailures.length > 0 && (category === 'tool_loop' || category === 'exception')) return toolFailures[0]!;
@@ -341,19 +423,52 @@ function shouldSuppressReasonInEvidence(reason?: string, failureLog?: string): b
   return /script exhausted|completed phase debug finished without|repeated read-only\/probe actions|read-only recovery mode|low-quality debugger response|openai http (?:400|401|403|408|409|429|5\d\d)|rate limit exceeded|free-models-per-day|stream (?:wall-clock|idle)|request timed out|provider_call_failed|all llm providers failed/u.test(lowerReason);
 }
 
+/**
+ * Whether a line reports a test failing, as opposed to merely naming a test.
+ *
+ * The bare-id pattern below matches a test id wherever it appears, and `pytest -v` prints the id
+ * followed by the case's own stdout on the same line:
+ *
+ *   tests/a.py::TestB::test_c Successfully wrote 1 signals to /tmp/...
+ *
+ * The outcome word is not on that line at all, so excluding lines that say PASSED cannot work —
+ * program output is arbitrary, and a negative filter can only remove the shapes it anticipated.
+ * Requiring a positive failure marker is the rule that holds. A live Ticket harvested five passing
+ * cases through this gap; they entered the failure signature, made an otherwise identical failure
+ * look new, and cost the recurrence guard four extra attempts before it fired.
+ *
+ * A line consisting of nothing but the id is kept: that is how summary sections list failures.
+ */
+const FAILURE_MARKER = /\b(?:FAILED|ERROR|FAIL)\b|[×✗]/u;
+const TEST_ID_ALONE = /^[^\s]+(?:\.py|\.ts|\.tsx|\.js|\.jsx)::[A-Za-z0-9_:[\].-]+$/u;
+
+function namesFailingTest(line: string): boolean {
+  return FAILURE_MARKER.test(line) || TEST_ID_ALONE.test(line.trim());
+}
+
 function extractFailedTests(text: string): string[] {
-  const patterns = [
-    /\bFAILED\s+([^\s]+(?:\.py|\.ts|\.tsx|\.js|\.jsx)(?:::[^\s]+)?)/gu,
-    /([^\s]+(?:\.py|\.ts|\.tsx|\.js|\.jsx)::[A-Za-z0-9_:[\].-]+)/gu,
+  const out: string[] = [];
+  const push = (value: string | undefined): void => {
+    const line = oneLine(value ?? '');
+    if (line) out.push(line);
+  };
+  // `[ \t]` rather than `\s`: `pytest -v` ends a line with the outcome and starts the next with the
+  // following case's id, so `\s` lets FAILED bind across the newline to a test that passed.
+  for (const match of text.matchAll(/\bFAILED[ \t]+([^\s]+(?:\.py|\.ts|\.tsx|\.js|\.jsx)(?:::[^\s]+)?)/gu)) {
+    push(match[1]);
+  }
+  // Bare ids only from lines that report a failure; see FAILURE_MARKER.
+  for (const line of text.split(/\r?\n/u)) {
+    if (!namesFailingTest(line)) continue;
+    for (const match of line.matchAll(/([^\s]+(?:\.py|\.ts|\.tsx|\.js|\.jsx)::[A-Za-z0-9_:[\].-]+)/gu)) {
+      push(match[1]);
+    }
+  }
+  for (const pattern of [
     /(?:^|\n)\s*(?:FAIL|❯)\s+([^\n]+?(?:\.py|\.ts|\.tsx|\.js|\.jsx)\s+>\s+[^\n]+)/gu,
     /[×x]\s+([^\n]+?>\s+[^\n]+)/gu,
-  ];
-  const out: string[] = [];
-  for (const pattern of patterns) {
-    for (const match of text.matchAll(pattern)) {
-      const value = oneLine(match[1] ?? '');
-      if (value) out.push(value);
-    }
+  ]) {
+    for (const match of text.matchAll(pattern)) push(match[1]);
   }
   return dedup(out);
 }
@@ -361,7 +476,12 @@ function extractFailedTests(text: string): string[] {
 function extractFiles(text: string): string[] {
   const out: string[] = [];
   const patterns = [
-    /\b((?:src|tests?|docs)\/[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|json|md|dbc|csv|xlsx?))/gu,
+    // Any extension, not a list of them. The precision here comes from the `src|tests|docs` prefix,
+    // which is XCompiler's own layout; the suffix only has to look like a file. The list this
+    // replaces had drifted to `dbc` and `xlsx` — formats from one past project — which is the shape
+    // of the problem: every project whose data format is absent loses file extraction entirely, and
+    // `files` feeds both the brief the Debugger reads and the fingerprints the wiki ranks on.
+    /\b((?:src|tests?|docs)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8})\b/gu,
     /File\s+["']([^"']+)["']/gu,
   ];
   for (const pattern of patterns) {
@@ -376,7 +496,7 @@ function extractFiles(text: string): string[] {
 function extractToolFailures(lines: string[]): string[] {
   return lines
     .filter((line) => /(?:\b(?:FAIL|failed|denied|exit=[1-9]|Error:)|失败)/iu.test(line))
-    .filter((line) => /\b(?:run_tests|run_program|write_file|replace_in_file|apply_patch|append_file|http_fetch|add_dependency|read_file)\b/u.test(line))
+    .filter((line) => TOOL_NAME_PATTERN.test(line))
     .map((line) => oneLine(line))
     .slice(0, MAX_TOOL_FAILURES);
 }
@@ -452,6 +572,67 @@ function truncateLine(text: string, max: number): string {
 
 function normalizePath(file: string): string {
   return file.replace(/\\/g, '/').replace(/^.*?((?:src|tests?|docs)\/)/u, '$1');
+}
+
+/**
+ * Stable identity of a failure, for the recurrence guard that decides whether corrective work is
+ * converging.
+ *
+ * The inputs deliberately exclude how the attempt happened to invoke its tools. A `toolFailures`
+ * line carries the whole command — `run_tests: pytest exit=1 args=tests/a.py tests/b.py -v` — so an
+ * attempt that swaps `-v` for `--tb=short`, or makes five tool calls where the last one made two,
+ * hashes differently for the identical failure. The guard reads that as "evidence is still
+ * changing" and grants another extension, which is the one outcome it exists to prevent: a live
+ * Ticket reached twelve attempts on ten consecutive identical pytest results (2 failed / 35 passed,
+ * the same two cases) because nine recorded failures produced seven distinct signatures.
+ *
+ * What survives is what a person would name when asked which failure this is — the category, the
+ * structured code, which tests failed, and which tool failed how. Never the argv that got there.
+ */
+export function buildFailureSignature(brief: DebugBrief, structuredCode?: string): string {
+  return createHash('sha256').update(JSON.stringify({
+    category: brief.category,
+    primaryError: withoutRunVaryingTokens(stableErrorText(brief.primaryError, brief.toolFailures)),
+    failedTests: [...brief.failedTests].sort(),
+    toolFailures: dedup(brief.toolFailures.map(toolFailureIdentity)).sort(),
+    structuredCode,
+  })).digest('hex');
+}
+
+/**
+ * Drop the tokens a rerun changes on its own.
+ *
+ * `primaryError` carries the reason the runner printed, which is what the repair needs to read — and
+ * for a filesystem error that reason is a path. pytest re-numbers its temporary directory every run
+ * (`pytest-of-ddk/pytest-0`, `pytest-1`, …), so six identical failures produced five distinct
+ * signatures on a live Ticket and the recurrence guard never saw a repeat. Object reprs carry an
+ * address for the same reason.
+ *
+ * Only the identity is normalized. The prompt keeps the concrete path, because the concrete path is
+ * what a person would look at first.
+ */
+function withoutRunVaryingTokens(text: string): string {
+  return text
+    .replace(/\bpytest-\d+\b/gu, 'pytest-<run>')
+    .replace(/0x[0-9a-f]{6,}/giu, '0x<addr>');
+}
+
+/** Which tool failed, and how — with the arguments that vary between attempts dropped. */
+function toolFailureIdentity(line: string): string {
+  const tool = TOOL_NAME_PATTERN.exec(line)?.[1] ?? 'tool';
+  const exit = /\bexit=(\d+)/u.exec(line)?.[1];
+  if (exit !== undefined) return `${tool}:exit=${exit}`;
+  if (/\bdenied\b/iu.test(line)) return `${tool}:denied`;
+  if (/\btimed?[ _-]?out\b/iu.test(line)) return `${tool}:timeout`;
+  return `${tool}:failed`;
+}
+
+/**
+ * `findPrimaryError` returns a tool-failure line verbatim for the tool_loop and exception
+ * categories, which would put the argv back into the signature through a second door.
+ */
+function stableErrorText(primaryError: string, toolFailures: string[]): string {
+  return toolFailures.includes(primaryError) ? toolFailureIdentity(primaryError) : primaryError;
 }
 
 function dedup<T>(items: T[]): T[] {

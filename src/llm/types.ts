@@ -11,8 +11,20 @@ export interface LLMProviderWindow {
 }
 
 export interface ChatOptions {
+  /** Cancels an in-flight provider request when the owning Runtime task is cancelled. */
+  signal?: AbortSignal;
   temperature?: number;
   maxTokens?: number;
+  /**
+   * Caps this one request's total budget, below whatever the provider is configured for.
+   *
+   * Exists for the non-streaming retry after a stream stalled. That path has no idle or first-token
+   * watchdog — a non-stream response sends nothing until it is whole — so it runs to the full
+   * `request_timeout_ms`. Handing a recovery attempt the same budget as a fresh request doubles the
+   * cost of one stall: a live Planner spent fifteen minutes there after its stream went idle at
+   * sixty seconds.
+   */
+  requestTimeoutMs?: number;
   /** Force JSON-only response if provider supports it. */
   responseFormat?: 'text' | 'json';
   /**
@@ -49,6 +61,19 @@ export interface ChatOptions {
    * 当前 provider 与模型；fallback 切换时会再次触发。
    */
   onProviderStart?: (name: string, model: string, window: LLMProviderWindow) => void;
+  /**
+   * Called once when no bytes at all have arrived from the provider for `stallDiagnosisAfterMs`.
+   *
+   * The transport is the only layer that can see the silence, and it must not be the layer that
+   * explains it — diagnosing means probing endpoints and reading config, which belongs to the
+   * caller. Whatever this returns is attached to the failure if the request goes on to fail, so a
+   * request that recovers reports nothing.
+   *
+   * Diagnostic only. A healthy verdict must never be read as permission to keep waiting: the probe
+   * opens a new connection, and a new connection can succeed while the one this request is blocked
+   * on stays black-holed.
+   */
+  onStall?: (info: { silentForMs: number; provider?: string; model?: string }) => Promise<string | undefined>;
 }
 
 export interface LLMClient {

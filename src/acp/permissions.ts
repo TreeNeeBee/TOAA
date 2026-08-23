@@ -1,4 +1,4 @@
-import type { ToolPermissionRequest } from '../tools/types.js';
+import type { ToolPermissionRequest } from '../runtime.js';
 
 export interface AcpPermissionChoice {
   approved: boolean;

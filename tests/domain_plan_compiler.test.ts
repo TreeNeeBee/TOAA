@@ -14,11 +14,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { Workspace } from '../src/workspace/workspace.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
-import { DomainAuditTrail } from '../src/domain/observability/audit_trail.js';
+import { ProjectGraphPersistenceService } from '../src/application/planning/project_graph_persistence_service.js';
+import { DomainAuditTrail } from '../src/application/observability/domain_audit_trail.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { generateProjectDevelopmentReport } from '../src/core/project_report.js';
-import { reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
+import { createObjectEnvelope, reviseObjectEnvelope } from '../src/domain/objects/object_envelope.js';
 import { PhaseSchema } from '../src/domain/phases/phase.js';
+import { StepSchema } from '../src/domain/steps/step.js';
+import { QualityAssessmentSchema } from '../src/domain/quality/quality.js';
 import { TicketSchema, type WorkTicket } from '../src/domain/tickets/ticket.js';
 
 describe('domain plan compiler', () => {
@@ -49,6 +52,42 @@ describe('domain plan compiler', () => {
     );
     expect(graph.steps.map((step) => step.type)).toEqual(STEP_TYPES);
     expect(new Set(graph.steps.map((step) => step.maxAttempts))).toEqual(new Set([9]));
+    expect(graph.steps.slice(0, 4).every((step) =>
+      step.deliveryGate?.kind === 'baseline-test' &&
+      step.deliveryGate.testAssetPolicy === 'generate-baseline' &&
+      step.deliveryGate.validationTypes.join(',') ===
+        'deliverable-validation,baseline-test'
+    )).toBe(true);
+    expect(graph.steps[0]?.deliveryGate?.checks.join(' ')).toContain('requirement deliverables');
+    expect(graph.steps[1]?.deliveryGate?.checks.join(' ')).toContain('architecture feasibility');
+    expect(graph.steps[2]?.deliveryGate?.checks.join(' ')).toContain('implementation solution');
+    expect(graph.steps[3]?.deliveryGate?.checks.join(' ')).toContain('build/static checks');
+    expect(graph.steps.slice(0, 3).every((step) =>
+      step.deliveryGate?.checks.some((check) => check.includes('initial pre-CODE pass'))
+    )).toBe(true);
+    expect(graph.steps[3]?.deliveryGate?.checks.some((check) =>
+      check.includes('Execute the paired unit baseline tests')
+    )).toBe(true);
+    expect(graph.steps.slice(0, 3).every((step) =>
+      step.deliveryGate?.baselineExecutionPolicy === 'defer-until-code'
+    )).toBe(true);
+    expect(graph.steps[3]?.deliveryGate?.baselineExecutionPolicy).toBe('required');
+    expect(graph.steps.slice(4).every((step) =>
+      step.deliveryGate?.kind === 'verification-acceptance' &&
+      step.deliveryGate.testAssetPolicy === 'inspect-supplement-freeze-execute' &&
+      step.deliveryGate.validationTypes.join(',') ===
+        'baseline-test,supplemental-functional-test' &&
+      step.deliveryGate.baselineExecutionPolicy === 'freeze-then-required' &&
+      step.deliveryGate.freezeBeforeExecution
+    )).toBe(true);
+    expect(graph.steps.at(-1)?.deliveryGate?.externalDataPolicy).toBe('record-replay');
+    expect(graph.phases.every((phase) =>
+      phase.deliveryGate?.kind === 'phase-delivery' &&
+      phase.deliveryGate.routeEachFinding &&
+      phase.deliveryGate.baselineExecutionPolicy === 'phase-aggregate' &&
+      phase.deliveryGate.externalDataPolicy === 'live' &&
+      phase.deliveryGate.scenarios.some((scenario) => scenario.name === 'real-user-entrypoint')
+    )).toBe(true);
     expect(validateDomainGraph(graph)).toEqual([]);
   });
 
@@ -74,13 +113,64 @@ describe('domain plan compiler', () => {
     expect(graph.tickets.some((ticket) => ['feature', 'sub-task'].includes(ticket.type))).toBe(false);
   });
 
+  // From a live run: three Tickets in one Phase were all named `P1-S004-T01S`, because a subtask was
+  // numbered within its own parent but named after the Step. Names are the identity every log line,
+  // audit entry, and evidence bundle shows.
+  it('gives every Ticket in the graph a unique name, including sibling subtasks', () => {
+    const draft = samplePlan();
+    const code = draft.steps.find((step) => step.phase === 'CODE')!;
+    // Two parent tasks, each with its own first subtask — the collision needs siblings to appear.
+    code.subTasks = [
+      {
+        id: 'M001',
+        title: 'Implement scraping',
+        description: 'Implement the scrapers.',
+        acceptance: 'Scrapers are implemented.',
+        outputs: ['src/scrape.ts'],
+        subTasks: [{
+          id: 'M001.1',
+          title: 'Implement the parser',
+          description: 'Implement the parser.',
+          acceptance: 'The parser is covered.',
+          outputs: ['src/parse.ts'],
+        }],
+      },
+      {
+        id: 'M002',
+        title: 'Implement rendering',
+        description: 'Implement the renderer.',
+        acceptance: 'The renderer is implemented.',
+        outputs: ['src/render.ts'],
+        subTasks: [{
+          id: 'M002.1',
+          title: 'Implement the template',
+          description: 'Implement the template.',
+          acceptance: 'The template is covered.',
+          outputs: ['src/template.ts'],
+        }],
+      },
+    ];
+    const graph = compileProjectGraph({
+      draft,
+      topic: 'Build a TypeScript news application.',
+      projectName: 'news',
+    });
+
+    const names = graph.tickets.map((ticket) => ticket.name);
+    const duplicates = names.filter((name, index) => names.indexOf(name) !== index);
+    expect(duplicates).toEqual([]);
+    // Each subtask still reads as belonging to its parent.
+    expect(names).toContain('P1-S004-T01S01');
+    expect(names).toContain('P1-S004-T02S01');
+  });
+
   it('pairs each development Step and Story with its verification side', () => {
     const graph = compileProjectGraph({
       draft: samplePlan(),
       topic: 'Build a TypeScript news application.',
       projectName: 'news',
     });
-    const coding = graph.steps.find((step) => step.type === 'CODING')!;
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
     const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
     const codingStory = graph.tickets.find((ticket) => ticket.type === 'story' && ticket.stepId === coding.id)!;
     const unitStory = graph.tickets.find((ticket) => ticket.type === 'story' && ticket.stepId === unit.id)!;
@@ -101,9 +191,12 @@ describe('domain plan compiler', () => {
     });
     const repository = new DomainObjectRepository(workspace);
     await repository.load();
-    await repository.persistCompiledGraph(graph);
+    await new ProjectGraphPersistenceService(repository).persistGraph(graph);
 
-    const expectedCount = 1 + 1 + graph.phasePlans.length + graph.phases.length +
+    // Project + ProjectPlan + the PM management plan, plus every Role Definition, every registered
+    // actor, and the graph.
+    const expectedCount = 1 + 1 + 1 + graph.roleDefinitions.length + graph.actors.length +
+      graph.phasePlans.length + graph.phases.length +
       graph.steps.length + graph.tickets.length + graph.kpis.length + graph.deliverables.length;
     expect(repository.registry.all()).toHaveLength(expectedCount);
     expect(await repository.registry.verifyIntegrity({ verifyContent: true })).toEqual([]);
@@ -152,6 +245,66 @@ describe('domain plan compiler', () => {
     expect(phaseWithReport.objectType === 'phase' && phaseWithReport.reportIds).toEqual([reports[0]!.id]);
   });
 
+  it('does not declare final delivery while a later Phase is incomplete', async () => {
+    const draft = samplePlan();
+    const graph = compileProjectGraph({ draft, topic: 'Build news.', projectName: 'news' });
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-report-'));
+    const workspace = new Workspace(root);
+    const repository = new DomainObjectRepository(workspace);
+    await repository.load();
+    await new ProjectGraphPersistenceService(repository).persistGraph(graph);
+    const p1 = graph.phases.find((phase) => phase.name === 'P1')!;
+
+    for (const step of graph.steps.filter((candidate) => candidate.phaseId === p1.id)) {
+      const assessment = QualityAssessmentSchema.parse({
+        ...createObjectEnvelope({
+          name: `${step.name}-quality`,
+          objectType: 'quality-assessment',
+          projectId: graph.project.id,
+        }),
+        subject: { id: step.id, objectType: 'step' },
+        observations: [], score: 1, passed: true, gaps: [], evidence: ['verified'],
+      });
+      await repository.commit([
+        assessment,
+        StepSchema.parse({
+          ...step,
+          ...reviseObjectEnvelope(step),
+          state: 'closed',
+          qualityAssessmentId: assessment.id,
+        }),
+      ]);
+    }
+    for (const ticket of graph.tickets.filter((candidate) => candidate.phaseId === p1.id)) {
+      await repository.update(TicketSchema.parse({
+        ...ticket,
+        ...reviseObjectEnvelope(ticket),
+        state: 'closed',
+      }), 'closed');
+    }
+    await repository.update(PhaseSchema.parse({
+      ...p1,
+      ...reviseObjectEnvelope(p1),
+      state: 'closed',
+    }), 'closed');
+    await repository.update(ProjectSchema.parse({
+      ...graph.project,
+      ...reviseObjectEnvelope(graph.project),
+      state: 'closed',
+    }), 'closed');
+
+    const report = await generateProjectDevelopmentReport({
+      workspace,
+      plan: draft,
+      finalDelivery: true,
+      repository,
+      projectAudit: { ok: true, warnings: 0, errors: 0, checks: [] },
+    });
+    const content = await workspace.readFile(report);
+    expect(content).toContain('Report scope: all phases');
+    expect(content).toContain('Verdict: **NOT READY**');
+  });
+
   it('appends rebased Phases without replacing the canonical Project identity', async () => {
     const originalDraft = samplePlan();
     originalDraft.implementationPhases = [originalDraft.implementationPhases[0]!];
@@ -163,7 +316,7 @@ describe('domain plan compiler', () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-domain-extension-'));
     const repository = new DomainObjectRepository(new Workspace(root));
     await repository.load();
-    await repository.persistCompiledGraph(original);
+    await new ProjectGraphPersistenceService(repository).persistGraph(original);
     const predecessorPhase = PhaseSchema.parse({
       ...original.phases[0]!,
       ...reviseObjectEnvelope(original.phases[0]!),
@@ -197,6 +350,10 @@ describe('domain plan compiler', () => {
       projectPlan: original.projectPlan,
       predecessorPhase,
       predecessorEpic,
+      // An incremental Phase reuses the Project's existing PM registrations rather than
+      // registering a second set of actors.
+      actors: original.actors,
+      managementPlan: original.managementPlan,
     });
 
     expect(extension.project.id).toBe(original.project.id);
@@ -211,7 +368,7 @@ describe('domain plan compiler', () => {
       ...original.project.phaseIds,
       ...extension.phases.map((phase) => phase.id),
     ]);
-    await repository.persistProjectExtension(extension);
+    await new ProjectGraphPersistenceService(repository).persistExtension(extension);
     expect((await repository.findProject())?.id).toBe(original.project.id);
     expect(await repository.registry.verifyIntegrity({ verifyContent: true })).toEqual([]);
   });

@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { t } from '../i18n/index.js';
 import { XCOMPILER_PLUGIN_API_VERSION, XCOMPILER_VERSION } from '../version.js';
 import { checkPluginCompatibility } from './compatibility.js';
+import { buildDefaultSkills } from '../skills/index.js';
 import type {
   PluginLoadOptions,
   PluginSource,
@@ -16,6 +17,7 @@ interface PreflightSource {
   manifest: XCompilerPluginManifest;
   manifestPath: string;
   entryPath: string;
+  skillDirectories: string[];
 }
 
 /**
@@ -29,6 +31,8 @@ export async function loadPluginSources(options: PluginLoadOptions): Promise<XCo
     pluginApiVersion: options.pluginApiVersion ?? XCOMPILER_PLUGIN_API_VERSION,
   };
   const preflight: PreflightSource[] = [];
+  // Include built-ins so a manifest cannot shadow a core Skill before its module is imported.
+  const preflightSkills = buildDefaultSkills();
 
   for (const source of options.sources) {
     const manifestPath = path.resolve(baseDir, source.manifestPath);
@@ -47,7 +51,25 @@ export async function loadPluginSources(options: PluginLoadOptions): Promise<XCo
       await auditRejected(options, report.pluginId, 'compatibility', message, { manifestPath, entryPath });
       throw new Error(message);
     }
-    preflight.push({ source, manifest: snapshotManifest(manifest), manifestPath, entryPath });
+    const pluginRoot = path.resolve(baseDir, source.rootPath ?? path.dirname(source.entryPath));
+    let skillDirectories: string[];
+    try {
+      skillDirectories = (manifest.skills ?? []).map((directory) => {
+        const resolved = path.resolve(pluginRoot, directory);
+        if (resolved !== pluginRoot && !resolved.startsWith(`${pluginRoot}${path.sep}`)) {
+          throw new Error(`Plugin ${manifest.id} Skill directory escapes its plugin root: ${directory}`);
+        }
+        return resolved;
+      });
+      for (const directory of skillDirectories) {
+        preflightSkills.registerDirectory(directory, { kind: 'plugin', pluginId: manifest.id });
+      }
+    } catch (error) {
+      const message = `Plugin ${manifest.id} Agent Skill preflight failed: ${errorMessage(error)}`;
+      await auditRejected(options, manifest.id, 'skill-preflight', message, { manifestPath, entryPath });
+      throw new Error(message, { cause: error });
+    }
+    preflight.push({ source, manifest: snapshotManifest(manifest), manifestPath, entryPath, skillDirectories });
   }
 
   const seen = new Set<string>();
@@ -82,7 +104,15 @@ export async function loadPluginSources(options: PluginLoadOptions): Promise<XCo
       await auditRejected(options, item.manifest.id, 'manifest-mismatch', message, item);
       throw new Error(message, { cause: new Error('plugin runtime manifest differs from preflight manifest') });
     }
-    plugins.push({ ...plugin, manifest: snapshotManifest(item.manifest) });
+    const setup = plugin.setup.bind(plugin);
+    plugins.push({
+      ...plugin,
+      manifest: snapshotManifest(item.manifest),
+      async setup(api) {
+        for (const directory of item.skillDirectories) api.registerSkillDirectory(directory);
+        await setup(api);
+      },
+    });
   }
   return plugins;
 }
@@ -97,11 +127,22 @@ function sameRuntimeManifest(actual: XCompilerPluginManifest, expected: XCompile
   return actual.id === expected.id &&
     actual.version === expected.version &&
     actual.apiVersion === expected.apiVersion &&
-    actual.minXCompilerVersion === expected.minXCompilerVersion;
+    actual.minXCompilerVersion === expected.minXCompilerVersion &&
+    sameStrings(actual.skills, expected.skills);
+}
+
+function sameStrings(actual: readonly string[] | undefined, expected: readonly string[] | undefined): boolean {
+  const left = actual ?? [];
+  const right = expected ?? [];
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function snapshotManifest(manifest: XCompilerPluginManifest): XCompilerPluginManifest {
-  return { ...manifest, keywords: manifest.keywords ? [...manifest.keywords] : undefined };
+  return {
+    ...manifest,
+    keywords: manifest.keywords ? [...manifest.keywords] : undefined,
+    skills: manifest.skills ? [...manifest.skills] : undefined,
+  };
 }
 
 function errorMessage(error: unknown): string {

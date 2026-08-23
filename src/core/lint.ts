@@ -122,6 +122,36 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
+  // A generated-project input must come from an upstream Step (or from the one build-owned topic
+  // document). Catching this after execution starts turns a planning typo into a repair the Agent
+  // cannot own, such as S2 requesting `requirements-specs.md` after S1 delivered
+  // `requirement-analysis.md`.
+  const externalInputs = new Set<string>([DOC_NAMES.topic]);
+  for (const step of plan.steps) {
+    const upstream = transitiveDependencyIds(step, stepByIdEarly);
+    for (const input of step.inputs) {
+      if (externalInputs.has(input)) continue;
+      const owner = outputOwners.get(input);
+      if (!owner) {
+        // Incremental plans may consume files already present in the accepted master baseline.
+        // When an owner does exist in this plan, dependency closure is still mandatory below.
+        if (plan.intent === 'greenfield') {
+          issues.push({
+            level: 'error',
+            stepId: step.id,
+            message: `Input ${input} is not produced by any Step and is not a build-owned project input.`,
+          });
+        }
+      } else if (!upstream.has(owner)) {
+        issues.push({
+          level: 'error',
+          stepId: step.id,
+          message: `Input ${input} is produced by ${owner}, but ${step.id} does not depend on it.`,
+        });
+      }
+    }
+  }
+
   // 4. phase order along dependency edges
   const stepById = new Map(plan.steps.map((s) => [s.id, s]));
   for (const s of plan.steps) {
@@ -225,8 +255,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
     }
   }
 
-  // 7. phase purity — 左侧需求/设计阶段可产出 tests/，但不得提前写 src/；
-  //    右侧测试阶段只写报告/交付文档，不得拥有 src/ 或可执行测试。
+  // 7. phase purity — 左侧需求/设计阶段可产出基线 tests/，但不得提前写 src/；
+  //    右侧计划不得把补充测试声明成普通输出。运行时补充测试只能进入隔离命名空间。
   const DESIGN_PHASES = new Set(['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN']);
   const TEST_PHASES = new Set(['UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST']);
   for (const s of plan.steps) {
@@ -242,7 +272,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
           stepId: s.id,
           message:
             TEST_PHASES.has(s.phase)
-              ? `${s.phase} is validation-only and must not output implementation/test code: ${out}`
+              ? `${s.phase} planned outputs must not own implementation or baseline test code; ` +
+                `risk supplements are runtime-owned under tests/verification/: ${out}`
               : `${s.phase} must not output implementation product code: ${out}`,
         });
       }
@@ -346,7 +377,8 @@ export function lintPlan(plan: Plan): LintIssue[] {
               level: 'error',
               stepId: testStep.id,
               message:
-                `${testPhase} is validation-only; move executable tests to ${sourcePhase}: ${ownedTestOutputs.join(', ')}`,
+                `${testPhase} planned outputs cannot own baseline tests; move them to ${sourcePhase}. ` +
+                `Risk supplements are created at runtime under tests/verification/: ${ownedTestOutputs.join(', ')}`,
             });
           }
           const missingInputs = sourceTestAssets.filter((asset) => !testStep.inputs.includes(asset));
@@ -511,6 +543,18 @@ function hasCycle(steps: Step[]): boolean {
 
   for (const s of steps) if (color.get(s.id) === WHITE && dfs(s.id)) return true;
   return false;
+}
+
+function transitiveDependencyIds(step: Step, byId: ReadonlyMap<string, Step>): Set<string> {
+  const seen = new Set<string>();
+  const pending = [...step.dependsOn];
+  while (pending.length > 0) {
+    const id = pending.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    pending.push(...(byId.get(id)?.dependsOn ?? []));
+  }
+  return seen;
 }
 
 /** 给 lint S004/S005 错误提示用：算出下一个未被占用的 S### id。 */

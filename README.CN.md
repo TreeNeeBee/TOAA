@@ -47,7 +47,7 @@ XCompiler 把 Phase 迭代模型和 V 模型结合起来。Planner 先生成总�
 V 模型行为：
 
 - 每个 Phase 固定包含八个领域 Step：需求分析、概要设计、详细设计、编码、单元测试、集成测试、系统测试、验收测试。
-- Planner JSON 是不可变的执行规格，不再保存运行状态。Runtime 将其编译为使用 UUIDv7 全局标识的 Project、Phase、Step、Ticket、KPI、Changelist、Checkpoint、Report、Log 和 AuditEvent 对象。
+- Planner JSON 是不可变的执行规格，不再保存运行状态。Runtime 将其编译为领域对象，只有这些对象持有生命周期状态。每个对象都带同一套 envelope —— UUIDv7 `id`、`objectType`、`projectId`、`revision` 和时间戳 —— 并统一经对象注册表提交：Project、ProjectPlan/PhasePlan、Phase、Step、Ticket、ActorRegistration、TicketAssignment、TicketTraceEvent、ProjectManagementPlan、Decision、Risk、InteractionRequest、KPI、QualityAssessment、Changelist、Checkpoint、Deliverable、Report、Log、AuditEvent 和 DomainEvent。
 - 需求分析、概要设计、详细设计、编码会同步生成对应的验收、系统、集成、单元测试计划和可执行用例。
 - `HIGH_LEVEL_DESIGN` 定义系统级接口、外部 API、第三方库选型和依赖确认。
 - `DETAILED_DESIGN` 定义模块内部结构和具体实现方案。
@@ -73,10 +73,10 @@ V 模型行为：
 - **Runtime**：Runtime API、Build Service、Run Service、Event Stream、Permission Broker，是唯一业务入口。
 - **Workflow and planning**：Planner 草案、领域图编译、Phase 迭代、V 模型依赖调度、失败路由、质量门禁、交付和精确恢复。
 - **State policy**：领域对象是唯一运行真相；Planner 文件不含执行状态，Adapter 和 Agent 不得直接修改持久化生命周期。
-- **Agents / Skills**：每个阶段的角色化 prompt 与工具白名单。
+- **Agents / Skills**：按 Agent Skills Specification 组织目录；Planner 只加载元数据，执行时再激活正文和按需资源，最终 Tool 仍受 Runtime 门禁约束。
 - **Tools**：文件编辑、程序/测试执行、API fetch、依赖修改、git 快照，全部受门禁约束。
 - **LLM Router**：角色链、动态评分、cluster fallback、OpenAI-compatible/Ollama 客户端、审计。
-- **Workspace**：Planner 计划文件、`<name>.xc` 清单、`.xcompiler/registry/` 注册表、`.xcompiler/objects/<type>/<uuid>.json` 领域对象、人类审计日志、Debug Wiki、Project memory 和交付报告。
+- **项目容器**：工程根 `control` 空间保存 `<name>.xc`、`phasePlan.json` 和 `plan.P<N>.json`；`.xcompiler/` 保存 PM 状态、不可变对象 revision、Record/Replay、Debug Wiki 和完整审计；`worktrees/master/` 是唯一权威产品树和发布来源，Ticket/Gate worktree 只是临时候选分支。
 
 注册表追加事件是恢复依据，快照索引可重建。每个条目记录对象 ID、类型、路径、父对象、revision、内容哈希和生命周期状态。
 
@@ -173,7 +173,9 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **Sandbox**：默认 `subprocess` 且隔离宿主环境变量（`inherit_env: false`）；可切换 `docker` 获得可执行的网络/资源隔离。subprocess 无法兑现 `network: off`，因此该组合会明确报错。
 - **Audit**：每次运行写入人类可读日志，并持久化带 correlation/causation ID 的领域 AuditEvent 和 Log 对象。
 - **Debug wiki**：Debugger 处理 Bug Ticket 时会基于压缩后的 `DebugBrief` 检索 LLM-wiki 风格的历史修复经验。wiki 是分层 Markdown 知识库：随包发布的 `wiki/system` 策略页、随包发布的 `wiki/agent` calibration 页、本地 `wiki/external` 真实 Bug 解决方案页。Runtime 会重新生成 `index.md` 供人工审阅、`index.json` 供检索使用，并追加 `log.md` 记录操作流水。默认复制到 XCompiler 路径（设置 `XC_PATH` 时为 `$XC_PATH/.xcompiler/debug-wiki`，否则为包/仓库根目录），也可用 `--debug-wiki-path <dir>` 指定共享根目录。Bug 的全部 CR 验证通过后才把 `bugResolutionPlan` 写入 `external`；复用方案失败会通过 feedback overlay 标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
-- **安全门禁**：项目文件访问受控，写工具限制在 Step 声明 outputs 内，敏感操作可通过 Adapter 暴露为权限事件。
+- **Record/Replay**：针对 HTTP、LLM 和 Tool 的外部数据提供记录与重放；当前工程的代码、构建和测试始终真实执行，Replay 只提供外部 fixture，不复用旧进程退出码。Phase 交付门禁中的真实用户场景会关闭 Replay。
+- **Agent Skills**：内置文件、Web、测试、Debug、Record/Replay、Debug Wiki、依赖、评审、安全、性能、CR 和交付工作流。Planner 只读取 `name + description`，Run 只激活所选 Skill 的正文与按需资源；Plugin API 3 可引入标准 Skill 目录，但不能绕过 Runtime 权限、路径、Ticket 或门禁。
+- **安全门禁**：项目文件访问受控，写工具限制在 Step 声明 outputs 内，每个敏感操作都必须经过 Adapter 的明确权限策略；缺少授权处理器时默认拒绝。
 
 ---
 
@@ -195,8 +197,11 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 | Planner `Step.maxAttempts` | 按复杂度自适应 | Step 事务尝试上限；随 simple/moderate/complex 和 Phase 数量增长 |
 | `--debug-wiki-path <dir>` | XCompiler 路径下的 `.xcompiler/debug-wiki` | 共享分层 Debug wiki 根目录路径 |
 | `max_edit_lines_per_step` | `auto` | EditGuard 单 Step 累计写入行数预算 |
-| `max_write_chunk_bytes` | `auto` | 单次写入 chunk 字节预算 |
+| `permissions.mode` / `--permission-mode` | `request` | 当前 Runtime task 的外部资源授权策略：`request`、`auto` 或 `deny`；工程内部操作不弹权限确认 |
+| `permissions.timeout_ms` | `0` | 权限等待超时；`0` 表示等待用户回答或取消 task |
 | `agent.sandboxes.<language>.<local\|docker>.limits.network` | `download-only` | Docker 可执行 `off`；subprocess 会拒绝 `off`，避免声称无法兑现的隔离 |
+
+审计不会为了控制体积裁剪原始数据：`.xcompiler/audit/audit.jsonl` 和 `process_log.md` 完整追加保存；`summary.md` 是独立的可重建摘要，保留原始行号和不可变对象 revision 链接，供按需访问详细记录。
 
 ---
 
@@ -206,6 +211,7 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 |---|---|
 | [docs/openrouter.md](docs/openrouter.md) | OpenRouter Free mode 与 OpenAI-compatible provider 配置 |
 | [docs/acp.md](docs/acp.md) | ACP Code Agent Adapter 协议说明 |
+| [docs/agent_skills.md](docs/agent_skills.md) | Agent Skills 标准、内置目录、安全边界与 Plugin API 3 |
 | [docs/XCompiler_design.md](docs/XCompiler_design.md) | 核心设计与 V 模型概念 |
 | [docs/plugin_api.md](docs/plugin_api.md) | Plugin API、生命周期 hooks、tools、skills |
 | [docs/versioning.md](docs/versioning.md) | 版本源、release 脚本、tag 策略 |
@@ -222,6 +228,15 @@ npm run typecheck
 npm run lint
 npm test
 npm run build
+```
+
+测试套件按所需能力分档，受限环境（例如禁止监听 127.0.0.1）仍可完整跑确定性门禁，
+而不会把环境限制误报成产品缺陷：
+
+```bash
+npm run test:core          # 仅确定性用例；不开端口、不拉子进程
+npm run test:integration   # 需要本机回环 HTTP 服务与真实子进程
+npm run test:e2e           # 拉起真实 CLI/ACP 进程
 ```
 
 Release gate 始终执行当前完整测试集，不使用固定的历史测试数量作为验收声明。

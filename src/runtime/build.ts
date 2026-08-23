@@ -6,7 +6,7 @@ import { LLMRouter } from '../llm/router.js';
 import { reportRoleModelAdvice } from '../llm/role_advice.js';
 import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { preflightProviders } from '../llm/preflight.js';
-import { Workspace } from '../workspace/workspace.js';
+import { ProjectContainer } from '../workspace/project_container.js';
 import { archiveIfExists } from '../workspace/doc_archive.js';
 import {
   Planner,
@@ -38,7 +38,7 @@ import {
   type CompiledProjectExtension,
   type CompiledProjectGraph,
 } from '../domain/planning/compiler.js';
-import { DomainAuditTrail } from '../domain/observability/audit_trail.js';
+import { DomainAuditTrail } from '../application/observability/domain_audit_trail.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
 import { AuditLogger } from '../audit/audit.js';
 import { acquireLock, LockError } from '../core/lock.js';
@@ -49,14 +49,48 @@ import type { XCompilerPlugin } from '../plugins/types.js';
 import { hasXcEnv, xcEnv } from '../config/env.js';
 import {
   requireRuntimeInteraction,
+  emitRuntimeEvent,
   runtimeLog,
   runtimeResult,
   silentRuntimeIO,
   type RuntimeIO,
 } from './io.js';
+import { createRuntimeRecordReplay } from './record_replay.js';
+import type { RecordReplayMode } from '../application/record_replay/types.js';
+import { ProjectGraphPersistenceService } from '../application/planning/project_graph_persistence_service.js';
+import { ProjectPlanningGovernanceService } from '../application/planning/project_planning_governance_service.js';
+import { FileProjectProjectionWriter } from '../infrastructure/projections/index.js';
+import { Workspace } from '../workspace/workspace.js';
+import { defaultRoleTemplatePath, loadRoleTemplates } from '../infrastructure/roles/role_template_store.js';
+import {
+  formatClarificationQuestion,
+  resolveClarificationAnswer,
+  resolveCompileLanguage,
+} from '../application/planning/requirement_intake.js';
+import { buildRuntimeCapabilities } from '../application/capabilities/runtime_capabilities.js';
+import { validateImplementationPhaseDraft } from '../agents/planning/phase_strategy.js';
+
+export {
+  formatClarificationQuestion,
+  inferCompileLanguageFromText,
+  resolveClarificationAnswer,
+  resolveCompileLanguage,
+} from '../application/planning/requirement_intake.js';
+export type {
+  CompileLanguageResolution,
+  CompileLanguageResolutionInput,
+} from '../application/planning/requirement_intake.js';
 
 export interface CompileOptions {
   workspace: string;
+  /**
+   * The Project's name.
+   *
+   * Carried as data rather than recovered from `workspace`. A name that round-trips through a
+   * directory path cannot be read back reliably: which component is the name depends on the layout,
+   * and under the container split the last component is the canonical branch, not the project.
+   */
+  name?: string;
   configPath?: string;
   inputFile?: string;
   /**
@@ -81,6 +115,14 @@ export interface CompileOptions {
   pluginStrict?: boolean;
   /** Runtime event and interaction adapter. CLI supplies a terminal implementation; SDKs may stay silent. */
   io?: RuntimeIO;
+  /** Override external-interaction fixture behavior for this invocation. */
+  recordReplayMode?: RecordReplayMode;
+  /** Workspace-relative fixture root override. */
+  recordReplayPath?: string;
+  /** Cancels active planning/provider requests. */
+  abortSignal?: AbortSignal;
+  /** Carried by evolve/append into their Run task; Build itself has no project tool permission loop. */
+  permissionMode?: import('./io.js').RuntimePermissionPolicy;
 }
 
 /** CLI 可映射为退出码、程序化调用方可捕获并安全收尾的编译终止。 */
@@ -91,139 +133,13 @@ export class CompileExitError extends Error {
   }
 }
 
-export function formatClarificationQuestion(q: ClarifyQuestion): string {
-  const choiceRange = formatClarificationChoiceRange(q.options);
-  const lines = [
-    `${q.id} [${q.category}] ${q.question}`,
-    `  ↳ ${q.why}`,
-  ];
-  for (const option of q.options) {
-    lines.push(`  ${option.label}. ${option.answer}`);
-  }
-  lines.push(`  ${t().compile.clarifyChoiceHint(choiceRange)}`);
-  return lines.join('\n');
-}
-
-function formatClarificationChoiceRange(options: ClarifyOption[]): string {
-  if (options.length === 0) return 'A-E';
-  const first = options[0]?.label ?? 'A';
-  const last = options[options.length - 1]?.label ?? first;
-  return first === last ? first : `${first}-${last}`;
-}
-
-export function resolveClarificationAnswer(q: ClarifyQuestion, rawAnswer: string): string {
-  const answer = rawAnswer.trim();
-  const label = answer.toUpperCase();
-  if (/^[A-E]$/u.test(label)) {
-    const option = q.options.find((candidate) => candidate.label === label);
-    if (option) return `${option.label}. ${option.answer}`;
-  }
-  return answer;
-}
-
-export interface CompileLanguageResolutionInput {
-  rawRequirement: string;
-  clarifications?: PlannerInput['clarifications'];
-  userAddenda?: string;
-  intent?: PlanIntent;
-  baseline?: { language?: Language; languageSource?: string; summary?: string };
-}
-
-export interface CompileLanguageResolution {
-  language: Language;
-  source: 'baseline' | 'topic' | 'clarification' | 'default';
-  ambiguous: boolean;
-}
-
-export function resolveCompileLanguage(
-  configuredLanguage: Language,
-  intent: PlanIntent,
-  baseline: { language?: Language },
-): Language;
-export function resolveCompileLanguage(input: CompileLanguageResolutionInput): CompileLanguageResolution;
-export function resolveCompileLanguage(
-  inputOrConfigured: CompileLanguageResolutionInput | Language,
-  intent?: PlanIntent,
-  baseline?: { language?: Language },
-): CompileLanguageResolution | Language {
-  if (typeof inputOrConfigured === 'string') {
-    return isIncrementalIntent(intent ?? 'greenfield')
-      ? baseline?.language ?? inputOrConfigured
-      : inputOrConfigured;
-  }
-  const input = inputOrConfigured;
-  if (isIncrementalIntent(input.intent ?? 'greenfield') && input.baseline?.language) {
-    return { language: input.baseline.language, source: 'baseline', ambiguous: false };
-  }
-  const topicInferred = inferCompileLanguageFromText(input.rawRequirement);
-  if (topicInferred) {
-    return {
-      language: topicInferred,
-      source: 'topic',
-      ambiguous: false,
-    };
-  }
-  const clarificationText = formatLanguageClarificationText(input.clarifications ?? []);
-  const clarifiedInferred = inferCompileLanguageFromText([
-    clarificationText,
-    input.userAddenda ?? '',
-  ].join('\n'));
-  if (clarifiedInferred) {
-    return { language: clarifiedInferred, source: 'clarification', ambiguous: false };
-  }
-  return { language: 'python', source: 'default', ambiguous: true };
-}
-
-export function inferCompileLanguageFromText(text: string): Language | undefined {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[，。；：、（）【】]/gu, ' ')
-    .replace(/\s+/gu, ' ');
-  const pythonStrong =
-    /\bpython\b/u.test(normalized) ||
-    /python\s*脚本/u.test(normalized) ||
-    /\.py\b/u.test(normalized) ||
-    /\bpytest\b/u.test(normalized) ||
-    /\bpip\b/u.test(normalized);
-  const typescriptStrong =
-    /\btypescript\b/u.test(normalized) ||
-    /\btype\s*script\b/u.test(normalized) ||
-    /(^|[^a-z0-9])ts\s*(程序|工程|项目|脚本|语言|实现)/u.test(normalized) ||
-    /\.tsx?\b/u.test(normalized) ||
-    /\btsx\b/u.test(normalized);
-  if (pythonStrong && !typescriptStrong) return 'python';
-  if (typescriptStrong && !pythonStrong) return 'typescript';
-  const pythonWeak =
-    /\bopenpyxl\b/u.test(normalized) ||
-    /\bpandas\b/u.test(normalized) ||
-    /\bfastapi\b/u.test(normalized) ||
-    /\bflask\b/u.test(normalized);
-  const typescriptWeak =
-    /\bnode(?:\.js)?\b/u.test(normalized) ||
-    /\bnpm\b/u.test(normalized) ||
-    /\bvitest\b/u.test(normalized) ||
-    /\bpackage\.json\b/u.test(normalized) ||
-    /\bjavascript\b/u.test(normalized) ||
-    /\bjs\s*(程序|工程|项目|脚本|语言|实现)\b/u.test(normalized);
-  if ((pythonStrong || pythonWeak) && !(typescriptStrong || typescriptWeak)) return 'python';
-  if ((typescriptStrong || typescriptWeak) && !(pythonStrong || pythonWeak)) return 'typescript';
-  return undefined;
-}
-
-function formatLanguageClarificationText(input: PlannerInput['clarifications']): string {
-  return input
-    .map((item) => [
-      item.question,
-      item.answer,
-      item.why ?? '',
-      ...(item.options ?? []).map((option) => option.answer),
-    ].join('\n'))
-    .join('\n\n');
-}
-
 export async function runCompile(opts: CompileOptions): Promise<{ planPath?: string }> {
   const io = opts.io ?? silentRuntimeIO;
-  const ws = new Workspace(path.resolve(opts.workspace));
+  // `-w <dir>` addresses the project container. Project state lives at <dir>/.xcompiler and the
+  // working copy at <dir>/worktrees/<branch>, so a sandbox mounting the working copy cannot reach
+  // XCompiler's own registry, audit trail, or fixtures.
+  const container = new ProjectContainer(path.resolve(opts.workspace));
+  const ws = container.canonical().workspace;
   const { config: cfg, path: cfgPath, missingEnv } = await loadConfigWithPath(opts.configPath);
   // Locale 必须在第一条输出之前生效，确保终端与审计文件从头到尾使用同一语言。
   if (!hasXcEnv('LANG')) setLocale(cfg.locale);
@@ -234,7 +150,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
 
   let lock;
   try {
-    lock = await acquireLock(ws.root, 'xcompiler_build', { force: !!opts.force });
+    lock = await acquireLock(container.state.root, 'xcompiler_build', { force: !!opts.force });
   } catch (err) {
     if (err instanceof LockError) {
       await runtimeLog(io, 'error', t().system.unhandledError(err.message));
@@ -249,7 +165,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   let scoreStore: ScoreStore | undefined;
   try {
   const M = t();
-  const audit = new AuditLogger({ root: ws.root, command: 'xcompiler_build' });
+  const audit = new AuditLogger({ root: container.root, stateRoot: container.state.root, command: 'xcompiler_build' });
   await audit.start({
     workspace: ws.root,
     config: opts.configPath ?? '(default)',
@@ -264,7 +180,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     strict: opts.pluginStrict,
     audit,
   });
-  await pluginHost.initialize();
+  const capabilities = await buildRuntimeCapabilities(pluginHost);
   if (opts.topicFile && opts.inputFile) {
     await runtimeLog(io, 'warning', M.compile.topicInputConflict);
   }
@@ -273,15 +189,21 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   await pluginHost.emit('compile.start', { workspace: ws.root, intent, topicMode });
   scoreStore = new ScoreStore(cfgPath, audit, scoreStoreOptionsFromConfig(cfg.llm));
   await scoreStore.load();
+  const recordReplay = createRuntimeRecordReplay(cfg, container.control, {
+    mode: opts.recordReplayMode,
+    path: opts.recordReplayPath,
+  });
   let unavailableProviders = new Set<string>();
   try {
-    const pf = await preflightProviders(cfg, scoreStore, audit);
-    unavailableProviders = new Set(pf.unreachable);
-    if (pf.zeroed.length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
-    }
-    if (Object.keys(pf.autoAdded).length > 0) {
-      await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+    if (recordReplay.mode !== 'replay') {
+      const pf = await preflightProviders(cfg, scoreStore, audit);
+      unavailableProviders = new Set(pf.unreachable);
+      if (pf.zeroed.length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightModelMissing(pf.zeroed.join(', ')));
+      }
+      if (Object.keys(pf.autoAdded).length > 0) {
+        await runtimeLog(io, 'warning', t().execute.preflightAutoAdded(Object.keys(pf.autoAdded).length));
+      }
     }
   } catch (err) {
     await runtimeLog(io, 'error', t().system.unhandledError((err as Error).message));
@@ -289,11 +211,22 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     await scoreStore.flush();
     throw new CompileExitError(7, (err as Error).message);
   }
-  const router = new LLMRouter(cfg, audit, scoreStore, unavailableProviders, pluginHost);
+  const router = new LLMRouter(
+    cfg,
+    audit,
+    scoreStore,
+    unavailableProviders,
+    pluginHost,
+    undefined,
+    recordReplay,
+    cfgPath,
+  );
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   const baseline =
     isIncrementalIntent(intent)
-      ? await loadIncrementalBaseline(ws, { planPath: opts.baselinePlanFile })
+      ? await loadIncrementalBaseline(ws, container.state, {
+          planPath: opts.baselinePlanFile ?? container.phasePlanPath(),
+        })
       : { summary: '', sources: [] };
   if (isIncrementalIntent(intent) && !baseline.summary) {
     const msg = M.compile.baselineMissing(ws.root);
@@ -305,6 +238,9 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     await runtimeLog(io, 'success', M.compile.baselineLoaded(intent, baseline.sources.join(', ')));
   }
   const plannerClient = router.for('Planner');
+  // Everything the user is asked or told comes from PM. It owns the project's conversation with
+  // its owner; a Step-executing role talking to the user is that role negotiating its own scope.
+  const pmClient = router.for('ProjectManager');
 
   const trace = (msg: string) => {
     if (xcEnv('TRACE') === '1') {
@@ -356,7 +292,14 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   let clarificationQuestions: ClarifyQuestion[] = [];
   trace(`clarify.section.flag yes=${opts.yes} topicMode=${topicMode}`);
   if (!opts.yes && !topicMode) {
-    const clarifyPlanner = new Planner(plannerClient, audit, initialLanguage.language, io.terminalOutput === true);
+    const clarifyPlanner = new Planner(
+      pmClient,
+      audit,
+      initialLanguage.language,
+      io.terminalOutput === true,
+      opts.abortSignal,
+      capabilities.skills,
+    );
     trace('ora.clarify.start');
     const spin = io.progress(M.compile.spinClarify, { animate: false });
     trace('ora.clarify.started');
@@ -417,19 +360,20 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   // 3. Draft topic.md + 确认门 1
   //   topic.md 是“需求澄清后的项目选题书”，作为后续 V 模型拆解的唯一输入。
   //   topic 模式下：rawRequirement 就是用户传入的 topic.md 全文，直接落盘，不再 render/Gate 1。
-  const draftDir = 'docs/.draft';
+  const draftWs = container.state;
+  const draftDir = 'drafts/build';
   const draftTopic = `${draftDir}/topic.md`;
-  trace('ws.ensure.draftDir');
-  await ws.ensure(draftDir);
+  trace('state.ensure.draftDir');
+  await draftWs.ensure(draftDir);
   let topicMd: string;
   if (topicMode) {
     topicMd = rawRequirement;
-    await ws.writeFile(draftTopic, topicMd);
+    await draftWs.writeFile(draftTopic, topicMd);
   } else {
     trace('renderTopicDraft');
     topicMd = renderTopicDraft(rawRequirement, clarifications, userAddenda);
     trace('ws.writeFile.draftTopic');
-    await ws.writeFile(draftTopic, topicMd);
+    await draftWs.writeFile(draftTopic, topicMd);
     trace('ws.writeFile.draftTopic.done');
 
     if (!opts.yes) {
@@ -447,7 +391,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       });
       await audit.userDecision(M.compile.gate1AuditLabel, decision);
       if (decision === 'cancel') {
-        await ws.remove(draftDir);
+        await draftWs.remove(draftDir);
         await runtimeLog(io, 'warning', M.compile.gate1Cancelled);
         await audit.end({ status: 'cancelled', gate: 1 });
         await runtimeResult(io, 'build', 'cancelled', { gate: 1 });
@@ -455,7 +399,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       }
       if (decision === 'edit') {
         const edited = await interaction.editor({ message: M.compile.editTopicMsg, default: topicMd, postfix: '.md' });
-        await ws.writeFile(draftTopic, edited);
+        await draftWs.writeFile(draftTopic, edited);
         await audit.userInput(M.compile.auditEditedTopic, edited);
       }
     }
@@ -465,7 +409,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   //   这样即使后续 decompose / lint 失败，已澄清的 topic 仍然落盘，
   //   下次可用 `xcompiler build --topic docs/topic.md` 直接重跑而不必再澄清一次。
   trace('ws.readFile.finalTopic');
-  const finalTopicMd = await ws.readFile(draftTopic);
+  const finalTopicMd = await draftWs.readFile(draftTopic);
   const languageResolution = resolveCompileLanguage({
     rawRequirement: finalTopicMd,
     clarifications,
@@ -480,7 +424,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     source: languageResolution.source,
     ambiguous: languageResolution.ambiguous,
   });
-  await archiveIfExists(ws, DOC_NAMES.topic, audit);
+  await archiveIfExists(ws, DOC_NAMES.topic, audit, container.state);
   await ws.writeFile(DOC_NAMES.topic, finalTopicMd);
   await audit.event('topic.persist', M.compile.auditTopicPersisted(ws.abs(DOC_NAMES.topic)), {
     messageId: 'compile.topic_persisted',
@@ -491,8 +435,8 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
 
   // 4. Decompose — with topic.md as the V-model input
   const phasePlanPath = opts.outputFile
-    ? path.resolve(opts.outputFile)
-    : defaultPhasePlanPath(ws.root);
+    ? assertControlFilePath(container, path.resolve(opts.outputFile), 'PhasePlan')
+    : defaultPhasePlanPath(container.control.root);
   const phasePlanSourceDigest = buildPhasePlanSourceDigest({
     topic: finalTopicMd,
     language,
@@ -507,7 +451,14 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   trace('ora.spin2.started');
   let draft;
   try {
-    const planner = new Planner(plannerClient, audit, language, io.terminalOutput === true);
+    const planner = new Planner(
+      plannerClient,
+      audit,
+      language,
+      io.terminalOutput === true,
+      opts.abortSignal,
+      capabilities.skills,
+    );
     const plannerInput: PlannerInput = {
       rawRequirement: finalTopicMd,
       clarifications,
@@ -517,11 +468,29 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     };
     const decomposeContext = { input: plannerInput };
     await pluginHost.emit('compile.beforeDecompose', decomposeContext);
+    const checkpointValidationIssue = existingPhasePlan
+      ? validateImplementationPhaseDraft(
+          existingPhasePlan.phases.map(({ planPath: _planPath, ...phase }) => phase),
+          existingPhasePlan.complexityAssessment,
+          {
+            language,
+            expectedCurrentPhaseId: existingPhasePlan.currentPhaseId,
+          },
+        )
+      : undefined;
     const reusableCheckpoint =
       !opts.force &&
       existingPhasePlan?.sourceDigest === phasePlanSourceDigest &&
       existingPhasePlan.language === language &&
-      existingPhasePlan.intent === intent;
+      existingPhasePlan.intent === intent &&
+      !checkpointValidationIssue;
+    if (checkpointValidationIssue && existingPhasePlan) {
+      await audit.event('note', `rejecting invalid PhasePlan checkpoint: ${checkpointValidationIssue}`, {
+        messageId: 'compile.phase_plan_checkpoint_rejected',
+        phasePlanPath,
+        reason: checkpointValidationIssue,
+      });
+    }
     let draftPhasePlan: DraftPhasePlan;
     if (reusableCheckpoint && existingPhasePlan) {
       draftPhasePlan = {
@@ -591,15 +560,17 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     intent,
     baselineSummary: baseline.summary,
   });
+  capabilities.skills.validateRefs(plan.steps.flatMap((step) => step.tools));
   const planContext = { plan };
   await pluginHost.emit('compile.afterPlan', planContext);
   plan = planContext.plan;
+  capabilities.skills.validateRefs(plan.steps.flatMap((step) => step.tools));
   const parsed = PlanSchema.safeParse(plan);
   if (!parsed.success) {
     await runtimeLog(io, 'error', M.compile.schemaFail);
     await runtimeLog(io, 'raw', JSON.stringify(parsed.error.format(), null, 2));
-    await ws.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
-    await runtimeLog(io, 'dim', M.compile.schemaInvalidSavedAt(ws.abs(`${draftDir}/plan.invalid.json`)));
+    await draftWs.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
+    await runtimeLog(io, 'dim', M.compile.schemaInvalidSavedAt(draftWs.abs(`${draftDir}/plan.invalid.json`)));
     throw new CompileExitError(2, M.compile.schemaFail);
   }
   const issues = lintPlan(parsed.data).filter((i) => i.level === 'error');
@@ -607,12 +578,13 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     await runtimeLog(io, 'error', M.compile.lintFail(issues.length));
     for (const i of issues) await runtimeLog(io, 'raw', M.compile.lintIssue(i.stepId ?? '*', i.message));
     // 落到 draft 便于排查
-    await ws.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
+    await draftWs.writeFile(`${draftDir}/plan.invalid.json`, JSON.stringify(plan, null, 2));
     throw new CompileExitError(3, M.compile.lintFail(issues.length));
   }
 
-  const repository = new DomainObjectRepository(ws);
+  const repository = new DomainObjectRepository(container.state);
   await repository.load();
+  const graphPersistence = new ProjectGraphPersistenceService(repository);
   const previousProject = await repository.findProject();
   let persistedPlan = parsed.data;
   if (isIncrementalIntent(intent)) {
@@ -642,7 +614,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   }
 
   const planMd = renderPlanMarkdown(persistedPlan);
-  await ws.writeFile(`${draftDir}/plan.md`, planMd);
+  await draftWs.writeFile(`${draftDir}/plan.md`, planMd);
 
   // 6. 确认门 2
   if (!opts.yes) {
@@ -657,7 +629,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     });
     await audit.userDecision(M.compile.gate2AuditLabel, ok ? 'confirm' : 'reject');
     if (!ok) {
-      await ws.remove(draftDir);
+      await draftWs.remove(draftDir);
       await runtimeLog(io, 'warning', M.compile.gate2Rejected);
       await audit.end({ status: 'rejected', gate: 2 });
       await runtimeResult(io, 'build', 'rejected', { gate: 2 });
@@ -678,14 +650,14 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   });
   await savePhasePlan(phasePlanPath, phasePlan);
   // 归档上一版本（如有），再写入新版本。topic.md 已在第 3.5 步落盘，这里只处理 plan.
-  await archiveIfExists(ws, DOC_NAMES.plan, audit);
+  await archiveIfExists(ws, DOC_NAMES.plan, audit, container.state);
   await ws.writeFile(DOC_NAMES.plan, planMd);
-  await refreshProjectMemory(ws, {
+  await refreshProjectMemory(ws, container.state, {
     planPath,
     language: persistedPlan.language,
     intent: persistedPlan.intent,
   });
-  await ws.remove(draftDir);
+  await draftWs.remove(draftDir);
   await audit.event('plan.persist', M.compile.auditPlanPersisted(planPath), {
     messageId: 'compile.plan_persisted',
     planPath,
@@ -707,7 +679,18 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     if (predecessorEpicObject.objectType !== 'ticket' || predecessorEpicObject.type !== 'epic') {
       throw new Error(`Phase ${predecessorPhaseObject.name} does not reference an Epic Ticket`);
     }
-    graph = compileProjectExtension({
+    const managementPlanObject = await repository.read(previousProject.managementPlanId);
+    if (managementPlanObject.objectType !== 'project-management-plan') {
+      throw new Error(`Project ${previousProject.name} does not reference a Project Management Plan`);
+    }
+    const actorObjects = await repository.list({
+      objectType: 'actor-registration',
+      projectId: previousProject.id,
+    });
+    const actors = actorObjects.filter(
+      (object) => object.objectType === 'actor-registration',
+    );
+    const extension = compileProjectExtension({
       draft: persistedPlan,
       topic: finalTopicMd,
       topicSourceRef: DOC_NAMES.topic,
@@ -716,18 +699,39 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
       projectPlan: projectPlanObject,
       predecessorPhase: predecessorPhaseObject,
       predecessorEpic: predecessorEpicObject,
+      actors,
+      managementPlan: managementPlanObject,
     });
-    await repository.persistProjectExtension(graph);
+    await graphPersistence.persistExtension(extension);
+    graph = extension;
   } else {
-    graph = compileProjectGraph({
+    const compiled = compileProjectGraph({
       draft: persistedPlan,
       topic: finalTopicMd,
       topicSourceRef: DOC_NAMES.topic,
-      projectName: path.basename(ws.root) || 'project',
+      // The container directory is the fallback, never the working copy underneath it: that is
+      // always the canonical branch, so naming a Project after it would call every project "master".
+      projectName: opts.name ?? path.basename(container.root) ?? 'project',
+      roleTemplates: await loadRoleTemplates(defaultRoleTemplatePath(ws.root)),
     });
-    await repository.persistCompiledGraph(graph);
+    await graphPersistence.persistGraph(compiled);
     if (previousProject) await repository.retireProject(previousProject.id);
+    graph = compiled;
   }
+  await new ProjectPlanningGovernanceService(
+    repository,
+    // Container state, not the working copy: see the note at the run-time writer.
+    new FileProjectProjectionWriter(new Workspace(container.state.root)),
+  ).baseline({
+    project: graph.project,
+    plan: persistedPlan,
+    clarifications: clarifications.map((item) => ({
+      question: item.question,
+      answer: item.answer,
+      why: item.why,
+      options: item.options?.map((option) => `${option.label}. ${option.answer}`),
+    })),
+  });
   await new DomainAuditTrail(repository).recordEvent({
     projectId: graph.project.id,
     subject: { id: graph.projectPlan.activePhaseId, objectType: 'phase' },
@@ -747,7 +751,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     phaseIds: graph.phases.map((phase) => phase.id),
     activePhaseId: graph.projectPlan.activePhaseId,
   });
-  await io.emit({
+  await emitRuntimeEvent(io, {
     type: 'workflow',
     event: 'project_planned',
     projectId: graph.project.id,
@@ -757,6 +761,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   });
   const projectFile = await updateProjectFile({
     workspace: ws.root,
+    container: container.root,
     planPath: phasePlanPath,
     configPath: cfgPath,
     projectFilePath: opts.projectFilePath,
@@ -780,6 +785,13 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     try { await scoreStore?.flush(); } catch { /* never block release */ }
     await lock.release();
   }
+}
+
+function assertControlFilePath(container: ProjectContainer, target: string, label: string): string {
+  if (path.dirname(target) !== container.control.root) {
+    throw new Error(`${label} must be stored in the project root ${container.control.root}: ${target}`);
+  }
+  return target;
 }
 
 function buildPhasePlanSourceDigest(input: {

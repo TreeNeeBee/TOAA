@@ -78,6 +78,8 @@ describe('DebugWiki', () => {
     expect(matches[0]?.entry.solution).toContain('scale conversion');
     expect(renderDebugWikiMatchesForPrompt(matches)).toContain('debug wiki matches');
     expect(renderDebugWikiMatchesForPrompt(matches)).toContain('priorPlan');
+    expect(renderDebugWikiMatchesForPrompt(matches)).toContain('candidateSolution');
+    expect(renderDebugWikiMatchesForPrompt(matches)).not.toContain('confirmedSolution');
   });
 
   it('marks a used entry for review when the solution fails', async () => {
@@ -186,7 +188,7 @@ describe('DebugWiki', () => {
     expect(externalPage).toContain('Switch to a maintained no-key public API');
   });
 
-  it('corrects a reviewed entry after a later successful repair', async () => {
+  it('creates a replacement instead of reactivating another Bug\'s reviewed entry', async () => {
     const root = await tmpRoot();
     const wiki = new DebugWiki(root);
     const brief = buildDebugBrief({
@@ -214,7 +216,7 @@ describe('DebugWiki', () => {
       reason: 'HTTP 403 remained',
     });
 
-    await wiki.recordResolution({
+    const replacement = await wiki.recordResolution({
       brief,
       ticketId: 'BUG-2',
       stepId: 'S002',
@@ -225,11 +227,114 @@ describe('DebugWiki', () => {
     });
 
     const reloaded = new DebugWiki(root);
-    const stored = (await reloaded.search(brief, { language: 'python' }))
-      .find((match) => match.entry.id === id)?.entry;
-    expect(stored?.status).toBe('active');
-    expect(stored?.solution).toContain('Corrected/confirmed resolution');
-    expect(stored?.stats.successes).toBe(2);
-    expect(stored?.feedback.map((item) => item.kind)).toContain('corrected');
+    await reloaded.load();
+    const index = JSON.parse(await fs.readFile(path.join(root, 'index.json'), 'utf8')) as {
+      entries: Array<{ id: string; status: string }>;
+    };
+    expect(replacement.created).toMatch(/^external\./u);
+    expect(index.entries.find((entry) => entry.id === id)?.status).toBe('needs_review');
+    const oldPage = await fs.readFile(path.join(root, 'wiki', 'external', `${id}.md`), 'utf8');
+    const replacementPage = await fs.readFile(
+      path.join(root, 'wiki', 'external', `${replacement.created}.md`),
+      'utf8',
+    );
+    expect(oldPage).toContain('Retry the same old API.');
+    expect(oldPage).not.toContain('Switch to a maintained no-key public API');
+    expect(replacementPage).toContain('Switch to a maintained no-key public API');
+    expect(replacementPage).toContain(id);
+  });
+
+  it('does not merge a different Bug into an active retrieved entry', async () => {
+    const root = await tmpRoot();
+    const wiki = new DebugWiki(root);
+    const firstBrief = buildDebugBrief({
+      reason: 'functional test failed',
+      failureLog: 'tests/functional/cli.test.ts: CLI exited with status 1',
+      phase: 'FUNCTIONAL_TEST',
+      targetPhase: 'REQUIREMENT_ANALYSIS',
+    });
+    const first = await wiki.recordResolution({
+      brief: firstBrief,
+      ticketId: 'BUG-1',
+      stepId: 'S001',
+      phase: 'REQUIREMENT_ANALYSIS',
+      language: 'typescript',
+      solution: 'Correct the CLI acceptance contract.',
+    });
+    const firstId = first.created!;
+    const secondBrief = buildDebugBrief({
+      reason: 'another functional test failed',
+      failureLog: 'tests/functional/network.test.ts: live HTTP request timed out',
+      phase: 'FUNCTIONAL_TEST',
+      targetPhase: 'REQUIREMENT_ANALYSIS',
+    });
+
+    await wiki.recordUse([firstId], {
+      brief: secondBrief,
+      ticketId: 'BUG-2',
+      stepId: 'S001',
+      phase: 'REQUIREMENT_ANALYSIS',
+      language: 'typescript',
+      solution: 'retrieved as a hypothesis',
+    });
+    const second = await wiki.recordResolution({
+      brief: secondBrief,
+      ticketId: 'BUG-2',
+      stepId: 'S001',
+      phase: 'REQUIREMENT_ANALYSIS',
+      language: 'typescript',
+      solution: 'Replace live HTTP calls in tests with deterministic recorded fixtures.',
+      usedEntryIds: [firstId],
+    });
+
+    expect(second.created).toMatch(/^external\./u);
+    expect(second.updated).toEqual([]);
+    const firstPage = await fs.readFile(path.join(root, 'wiki', 'external', `${firstId}.md`), 'utf8');
+    const secondPage = await fs.readFile(path.join(root, 'wiki', 'external', `${second.created}.md`), 'utf8');
+    expect(firstPage).toContain('Correct the CLI acceptance contract.');
+    expect(firstPage).not.toContain('deterministic recorded fixtures');
+    expect(secondPage).toContain('deterministic recorded fixtures');
+    expect(secondPage).not.toContain('supersedes:');
+  });
+
+  it('quarantines legacy pages that merged several unrelated solutions', async () => {
+    const root = await tmpRoot();
+    const wiki = new DebugWiki(root);
+    const brief = buildDebugBrief({
+      reason: 'functional test failed',
+      failureLog: 'tests/functional/cli.test.ts exited with status 1',
+      phase: 'FUNCTIONAL_TEST',
+      targetPhase: 'REQUIREMENT_ANALYSIS',
+    });
+    const first = await wiki.recordResolution({
+      brief,
+      ticketId: 'BUG-LEGACY',
+      stepId: 'S001',
+      phase: 'REQUIREMENT_ANALYSIS',
+      solution: 'First unrelated guess.',
+    });
+    await wiki.recordResolution({
+      brief,
+      ticketId: 'BUG-LEGACY',
+      stepId: 'S001',
+      phase: 'REQUIREMENT_ANALYSIS',
+      solution: 'Second unrelated guess.',
+    });
+    await wiki.recordResolution({
+      brief,
+      ticketId: 'BUG-LEGACY',
+      stepId: 'S001',
+      phase: 'REQUIREMENT_ANALYSIS',
+      solution: 'Third unrelated guess.',
+    });
+
+    const reloaded = new DebugWiki(root);
+    const match = (await reloaded.search(brief)).find((item) => item.entry.id === first.created)!;
+    expect(match.entry.status).toBe('needs_review');
+    const rendered = renderDebugWikiMatchesForPrompt([match]);
+    expect(rendered).toContain('disputedSolution: hidden');
+    expect(rendered).not.toContain('First unrelated guess.');
+    await expect(fs.readFile(path.join(root, 'wiki', 'external', `${first.created}.md`), 'utf8'))
+      .resolves.toContain('status: needs_review');
   });
 });

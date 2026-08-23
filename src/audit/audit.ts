@@ -1,14 +1,15 @@
 import { promises as fs, appendFileSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { t } from '../i18n/index.js';
 import { xcEnv } from '../config/env.js';
+import { rebuildAuditSummary } from './summary.js';
 
 /**
  * AuditLogger 把开发流水线中的所有交互/执行动作记录到两份产物：
  *
- *  - `docs/process_log.md` —— 人类可读的过程记录，用于交付时汇总。
- *  - `.xcompiler/audit.jsonl`   —— 机器可读的逐行 JSON，便于后续分析与回放。
+ *  - `<stateRoot>/audit/process_log.md` —— 完整的人类可读过程记录。
+ *  - `<stateRoot>/audit/audit.jsonl` —— 机器可读的逐行 JSON，原始审计真源。
+ *  - `<stateRoot>/audit/summary.md` —— 可从 JSONL 重建的轻量索引。
  *
  * 设计原则：
  *  - 追加写入，永不删除。
@@ -46,6 +47,7 @@ export type AuditKind =
   | 'quality.gate.passed'
   | 'quality.gate.enhancement'
   | 'quality.gate.bug'
+  | 'phase.delivery_gate'
   | 'project.report.generated'
   | 'note';
 
@@ -58,25 +60,30 @@ export interface AuditEvent {
 }
 
 export interface AuditLoggerOptions {
-  /** workspace 根目录（绝对路径） */
+  /** Fallback audit root for standalone callers. Runtime supplies stateRoot explicitly. */
   root: string;
+  /** 容器状态根（绝对路径）；结构化审计属于项目状态，不进 Git；独立调用默认使用 root。 */
+  stateRoot?: string;
   /** 命令名，例如 `xcompiler_build` / `xcompiler_run` */
   command: string;
-  /** markdown 文件相对路径，默认 docs/process_log.md */
+  /** 详细 markdown 文件相对 stateRoot 的路径，默认 audit/process_log.md。 */
   mdRelPath?: string;
-  /** jsonl 文件相对路径，默认 .xcompiler/audit.jsonl */
+  /** jsonl 相对 stateRoot 的路径，默认 audit/audit.jsonl。 */
   jsonlRelPath?: string;
-  /** full=完整内容；redacted=保留内容但遮蔽凭据（默认）；metadata=仅保留长度与摘要。 */
+  /** full=完整内容；redacted=保留内容但遮蔽凭据（默认）。原始审计不支持省略正文。 */
   contentMode?: AuditContentMode;
+  /** 摘要相对 stateRoot 的路径，默认 audit/summary.md。 */
+  summaryRelPath?: string;
 }
 
-export type AuditContentMode = 'full' | 'redacted' | 'metadata';
+export type AuditContentMode = 'full' | 'redacted';
 
 export class AuditLogger {
   private readonly mdAbs: string;
   private readonly jsonlAbs: string;
   private readonly command: string;
   private readonly contentMode: AuditContentMode;
+  private readonly summaryAbs: string;
   private startTs = '';
   /** 串行化 markdown 追加，防止并发 appendFile 交错。 */
   private mdQueue: Promise<void> = Promise.resolve();
@@ -86,8 +93,10 @@ export class AuditLogger {
     this.contentMode = resolveContentMode(
       opts.contentMode ?? xcEnv('AUDIT_CONTENT_MODE'),
     );
-    this.mdAbs = path.resolve(opts.root, opts.mdRelPath ?? 'docs/process_log.md');
-    this.jsonlAbs = path.resolve(opts.root, opts.jsonlRelPath ?? '.xcompiler/audit.jsonl');
+    const auditRoot = opts.stateRoot ?? opts.root;
+    this.mdAbs = path.resolve(auditRoot, opts.mdRelPath ?? 'audit/process_log.md');
+    this.jsonlAbs = path.resolve(auditRoot, opts.jsonlRelPath ?? 'audit/audit.jsonl');
+    this.summaryAbs = path.resolve(auditRoot, opts.summaryRelPath ?? 'audit/summary.md');
   }
 
   async start(meta: Record<string, unknown> = {}): Promise<void> {
@@ -128,19 +137,49 @@ export class AuditLogger {
         '',
       ].join('\n'),
     );
+    try {
+      await rebuildAuditSummary(this.jsonlAbs, this.summaryAbs);
+    } catch (error) {
+      console.warn(`Failed to rebuild audit summary: ${(error as Error).message}`);
+    }
+  }
+
+  /** Stable location for detailed runtime evidence outside the generated product tree. */
+  artifactPath(relativePath: string): string {
+    if (!relativePath || path.isAbsolute(relativePath)) {
+      throw new Error('Audit artifact path must be a non-empty relative path');
+    }
+    const normalized = path.normalize(relativePath);
+    if (normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+      throw new Error('Audit artifact path cannot leave the audit directory');
+    }
+    return path.resolve(path.dirname(this.jsonlAbs), 'artifacts', normalized);
   }
 
   /** 通用事件，jsonl + 简短 markdown 一行。 */
   async event(kind: AuditKind, message: string, data?: Record<string, unknown>): Promise<void> {
     await this.ensureFiles();
-    const ev: AuditEvent = { ts: new Date().toISOString(), kind, message };
+    const protectedMessage = protectAuditContent(message, this.contentMode);
+    const ev: AuditEvent = {
+      ts: new Date().toISOString(),
+      kind,
+      message: typeof protectedMessage === 'string' ? protectedMessage : String(protectedMessage),
+    };
     if (data) {
       const { messageId, ...payload } = data;
       if (typeof messageId === 'string') ev.messageId = messageId;
-      if (Object.keys(payload).length > 0) ev.data = payload;
+      if (Object.keys(payload).length > 0) {
+        ev.data = protectAuditContent(payload, this.contentMode) as Record<string, unknown>;
+      }
     }
     await this.appendJsonl(ev);
-    await this.appendMd(`- \`${ev.ts}\` **${kind}** — ${escapeMd(message)}\n`);
+    await this.appendMd([
+      `- \`${ev.ts}\` **${kind}** — ${escapeMd(ev.message)}`,
+      ...(ev.data
+        ? ['', '<details><summary>Event data</summary>', '', '```json', safeStringify(ev.data), '```', '', '</details>']
+        : []),
+      '',
+    ].join('\n'));
   }
 
   /** 用户输入 / 决策。会把内容以引用块写入 markdown。 */
@@ -200,12 +239,13 @@ export class AuditLogger {
 
   async llmResponse(role: string, model: string, content: string, meta?: Record<string, unknown>): Promise<void> {
     const storedContent = protectAuditContent(content, this.contentMode);
+    const storedMeta = protectAuditContent(meta, this.contentMode) as Record<string, unknown> | undefined;
     await this.appendJsonl({
       ts: new Date().toISOString(),
       kind: 'llm.response',
       message: t().audit.eventLlmResponse(role, model),
       messageId: 'audit.llm_response',
-      data: { role, model, content: storedContent, contentMode: this.contentMode, ...redactValue(meta) as Record<string, unknown> },
+      data: { ...storedMeta, role, model, content: storedContent, contentMode: this.contentMode },
     });
     await this.appendMd(
       [
@@ -254,7 +294,7 @@ export class AuditLogger {
       messageId: 'audit.executor_turn',
       data: { ...storedPayload, role, contentMode: this.contentMode },
     });
-    const summary = (payload.thoughts ?? '').trim().slice(0, 200) || t().audit.noThoughts;
+    const summary = (payload.thoughts ?? '').trim() || t().audit.noThoughts;
     const actCount = Array.isArray(payload.actions) ? payload.actions.length : 0;
     await this.appendMd(
       [
@@ -282,12 +322,13 @@ export class AuditLogger {
   ): Promise<void> {
     const provider = meta?.provider;
     const storedContent = protectAuditContent(content, this.contentMode);
+    const storedMeta = protectAuditContent(meta, this.contentMode) as Record<string, unknown> | undefined;
     await this.appendJsonl({
       ts: new Date().toISOString(),
       kind: 'planner.thought',
       message: t().audit.eventPlannerThought(stage, provider ?? ''),
       messageId: 'audit.planner_thought',
-      data: { stage, content: storedContent, contentMode: this.contentMode, ...redactValue(meta) as Record<string, unknown> },
+      data: { ...storedMeta, stage, content: storedContent, contentMode: this.contentMode },
     });
     await this.appendMd(
       [
@@ -370,18 +411,12 @@ function safeStringify(v: unknown): string {
 }
 
 function resolveContentMode(value: string | undefined): AuditContentMode {
-  return value === 'full' || value === 'metadata' || value === 'redacted' ? value : 'redacted';
+  return value === 'full' || value === 'redacted' ? value : 'redacted';
 }
 
 function protectAuditContent(value: unknown, mode: AuditContentMode): unknown {
   if (mode === 'full') return value;
-  if (mode === 'redacted') return redactValue(value);
-  const serialized = safeStringify(value);
-  return {
-    omitted: true,
-    bytes: Buffer.byteLength(serialized, 'utf8'),
-    sha256: createHash('sha256').update(serialized).digest('hex'),
-  };
+  return redactValue(value);
 }
 
 function renderAuditContent(value: unknown): string {
@@ -417,5 +452,5 @@ function redactText(value: string): string {
   return value
     .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/giu, 'Bearer [REDACTED]')
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, 'sk-[REDACTED]')
-    .replace(/((?:api[-_]?key|password|passwd|secret|token)\s*[:=]\s*)[^\s,;]+/giu, '$1[REDACTED]');
+    .replace(/((?:api[-_]?key|authorization|password|passwd|secret|token)\s*[:=]\s*)[^\s,;]+/giu, '$1[REDACTED]');
 }

@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildDebugBrief,
+  buildFailureSignature,
   compactFailureEvidence,
   renderDebugBriefForPrompt,
 } from '../src/core/debug_brief.js';
+import { evaluateAttemptExtension } from '../src/domain/tickets/retry_policy.js';
 
 describe('debug brief extraction', () => {
   it('keeps the root test failure ahead of noisy retry history', () => {
@@ -230,5 +232,356 @@ describe('debug brief extraction', () => {
     expect(brief.primaryError).toContain('missing outputs');
     expect(brief.primaryError).toContain('docs/tests/unit-test-plan.md');
     expect(brief.debugDemand).toContain('Create or repair the declared output files');
+  });
+});
+
+/**
+ * A runner that cannot find the test file is reporting unwritten work, not a failing test.
+ *
+ * Both runners say so in their own words, and both used to fall through to the generic
+ * `pytest exit=[1-9]` catch, which answers `test_failure` — whose demand is "fix the root
+ * implementation/contract defect… do not rewrite fixtures". That is the one repair that cannot
+ * apply here: the implementation was fine and the files did not exist. A live dbc3 CODE Step spent
+ * all ten of its rounds on that advice while owing five declared outputs.
+ */
+describe('runner cannot find the test file', () => {
+  const categoryOf = async (failureLog: string) => {
+    const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+    return buildDebugBrief({ failureLog, phase: 'CODE' }).category;
+  };
+
+  it('reads a pytest usage error as unwritten outputs', async () => {
+    expect(await categoryOf(
+      'pytest exit=4 args=tests/test_dbc_parser.py\nERROR: file or directory not found: tests/test_dbc_parser.py',
+    )).toBe('missing_output');
+  });
+
+  it('reads vitest finding nothing the same way', async () => {
+    expect(await categoryOf('npm test exit=1\nNo test files found, exiting with code 1'))
+      .toBe('missing_output');
+  });
+
+  it('gives that failure the demand that names the action', async () => {
+    const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+    const brief = buildDebugBrief({
+      failureLog: 'pytest exit=4\nERROR: file or directory not found: tests/test_main.py',
+      phase: 'CODE',
+    });
+    expect(brief.debugDemand).toMatch(/Create or repair the declared output files/u);
+    // The advice that used to arrive and could not apply.
+    expect(brief.debugDemand).not.toMatch(/do not rewrite fixtures/iu);
+  });
+
+  // A suite that ran and failed is still a test failure; this must not swallow the ordinary case.
+  it('leaves a genuinely failing suite classified as a test failure', async () => {
+    expect(await categoryOf('pytest exit=1\n1 failed, 3 passed\nE   assert 2 == 3'))
+      .toBe('test_failure');
+  });
+});
+
+// The explanatory line is often trimmed out of a truncated log, so the exit code must count alone.
+// Across three live runs, 39 failures carried `pytest exit=4` without the sentence that explains it.
+it('reads a bare pytest exit=4 as unwritten outputs even without the explanation', async () => {
+  const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+  expect(buildDebugBrief({
+    failureLog: 'run_tests failed: pytest exit=4 args=tests/test_main.py',
+  }).category).toBe('missing_output');
+});
+
+/**
+ * Our provider's outage and the generated project's API failure look alike and need opposite
+ * answers. `network_api_failure` tells the project to switch APIs and verify the integration —
+ * a rewrite of working code when the request that failed was ours, not the project's.
+ */
+describe('provider outage is not a project API failure', () => {
+  const categoryOf = async (failureLog: string) => {
+    const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+    return buildDebugBrief({ failureLog }).category;
+  };
+
+  it('reads an availability probe failure as ours', async () => {
+    expect(await categoryOf(
+      'Architect availability check failed for openai:deepseek/deepseek-v4-flash: fetch failed',
+    )).toBe('llm_provider');
+  });
+
+  it('reads a reasoning-only stream as ours', async () => {
+    expect(await categoryOf(
+      'OpenAI stream sent 4293 reasoning chars but no content within 900000ms; aborting',
+    )).toBe('llm_provider');
+  });
+
+  // The project's own failing request must still become a project defect.
+  it('leaves the project\'s own API failure classified as a network failure', async () => {
+    expect(await categoryOf(
+      'http_fetch https://api.example.com/v1/items failed: HTTP 503',
+    )).toBe('network_api_failure');
+  });
+});
+
+/**
+ * File extraction must not depend on knowing the project's data format.
+ *
+ * The extension list had accumulated `dbc` and `xlsx` from one past project. Any project whose
+ * format was absent lost file extraction entirely — and `files` feeds both the brief the Debugger
+ * reads and the fingerprints the wiki ranks on, so the loss is silent and compounding.
+ */
+describe('file extraction is format-agnostic', () => {
+  const filesIn = async (failureLog: string) => {
+    const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+    return buildDebugBrief({ failureLog }).files;
+  };
+
+  it('finds paths whose extension nobody enumerated', async () => {
+    const files = await filesIn([
+      'error while reading src/schema/user.proto',
+      'migration failed: src/db/0007_add_index.sql',
+      'config rejected: src/deploy/values.yaml',
+      'asset missing: tests/fixtures/frame.parquet',
+    ].join('\n'));
+    expect(files).toContain('src/schema/user.proto');
+    expect(files).toContain('src/db/0007_add_index.sql');
+    expect(files).toContain('src/deploy/values.yaml');
+    expect(files).toContain('tests/fixtures/frame.parquet');
+  });
+
+  it('still finds the ordinary source and test paths', async () => {
+    const files = await filesIn('File "tests/test_main.py", line 3\nsrc/parser.py:12: error');
+    expect(files).toContain('tests/test_main.py');
+    expect(files).toContain('src/parser.py');
+  });
+
+  // The precision comes from the layout prefix, not from the extension.
+  it('does not treat every dotted token as a file', async () => {
+    const files = await filesIn('installed cantools 42.0.3 and openpyxl 3.1.5 from pypi.org');
+    expect(files).toEqual([]);
+  });
+});
+
+describe('primary error', () => {
+  // `primaryError` is structured and survives the context budget; the compact-evidence block does
+  // not. A live Debugger was handed `failed test: ...::test_writes_signal_data` for 26 attempts
+  // while `assert None == ''` sat only in the evidence block, which was trimmed every time — it
+  // knew which test failed and never learned why.
+  it('carries the reason the runner printed beside the case', () => {
+    const brief = buildDebugBrief({
+      reason: 'attempt failed',
+      failureLog: [
+        'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py',
+        "FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data - assert None == ''",
+        '1 failed, 36 passed',
+      ].join('\n'),
+      phase: 'HIGH_LEVEL_DESIGN',
+      targetPhase: 'HIGH_LEVEL_DESIGN',
+    });
+    expect(brief.primaryError).toContain('test_writes_signal_data');
+    expect(brief.primaryError).toContain("assert None == ''");
+  });
+
+  it('still names the case when the runner printed no reason', () => {
+    const brief = buildDebugBrief({
+      reason: 'attempt failed',
+      failureLog: [
+        'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py',
+        'FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+        '1 failed, 36 passed',
+      ].join('\n'),
+      phase: 'HIGH_LEVEL_DESIGN',
+      targetPhase: 'HIGH_LEVEL_DESIGN',
+    });
+    expect(brief.primaryError).toBe(
+      'failed test: tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+    );
+  });
+});
+
+describe('failure signature stability', () => {
+  const FAILED_CASES = [
+    'FAILED tests/modules/test_dbc_parser_module.py::TestDBCParserContract::test_signal_attributes_extraction - ValueError: Failed to parse DBC',
+    "FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data - assert None == ''",
+  ];
+
+  const attemptLog = (invocations: string[]): string => [
+    'verification command repeated without a successful mutation: run_tests',
+    ...invocations,
+    ...FAILED_CASES,
+    '2 failed, 35 passed',
+  ].join('\n');
+
+  const signatureFor = (invocations: string[]): string =>
+    buildFailureSignature(
+      buildDebugBrief({
+        reason: 'attempt failed',
+        failureLog: attemptLog(invocations),
+        phase: 'HIGH_LEVEL_DESIGN',
+        targetPhase: 'HIGH_LEVEL_DESIGN',
+      }),
+      'test_command_failed',
+    );
+
+  // A live Ticket reached twelve attempts on ten consecutive identical pytest results because the
+  // signature hashed the whole `run_tests: ... args=... -v` line: the agent varied its flags and
+  // its call count, so nine failures produced seven distinct signatures and the recurrence guard
+  // that exists to stop exactly this never saw a repeat.
+  it('ignores the pytest flags an attempt happened to use', () => {
+    expect(signatureFor([
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py tests/modules/test_excel_writer_module.py -v',
+    ])).toBe(signatureFor([
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py tests/modules/test_excel_writer_module.py --tb=short',
+    ]));
+  });
+
+  it('ignores how many times the attempt reran the same failing command', () => {
+    expect(signatureFor([
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py -v',
+    ])).toBe(signatureFor([
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py -v',
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py --tb=short',
+      'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py -q',
+    ]));
+  });
+
+  it('stops extending a Ticket whose failure keeps coming back under a varying command', () => {
+    const evidence = [
+      ['run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py -v'],
+      ['run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py --tb=short'],
+      ['run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py -q'],
+    ].map((invocations) => ({
+      signature: signatureFor(invocations),
+      category: 'test_failure',
+      toolchainBuildId: 'build-under-test',
+    }));
+    expect(evaluateAttemptExtension(evidence, 'build-under-test')).toMatchObject({ extend: false });
+  });
+
+  it('still separates a genuinely different failure', () => {
+    const parserOnly = buildFailureSignature(
+      buildDebugBrief({
+        reason: 'attempt failed',
+        failureLog: [
+          'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py -v',
+          FAILED_CASES[0]!,
+          '1 failed, 36 passed',
+        ].join('\n'),
+        phase: 'HIGH_LEVEL_DESIGN',
+        targetPhase: 'HIGH_LEVEL_DESIGN',
+      }),
+      'test_command_failed',
+    );
+    expect(parserOnly).not.toBe(signatureFor([
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py -v',
+    ]));
+  });
+
+  // `pytest -v` prints the case id and then the case's own stdout on the same line, so the outcome
+  // word is not on the line at all. A live Ticket harvested five passing cases this way; excluding
+  // lines that say PASSED does not stop it, because program output is arbitrary.
+  it('does not count passing cases named by a verbose run', () => {
+    const verbose = [
+      'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py -v',
+      'tests/modules/test_main_module.py::TestParseArgs::test_parse_args_minimal PASSED',
+      'tests/modules/test_main_module.py::TestMainFunction::test_main_success_flow Successfully wrote 1 signals to /tmp/out.xlsx',
+      'tests/modules/test_main_module.py::TestParseArgs::test_parse_args_help usage: dbc2excel [-h] --ecus ECUS [ECUS ...]',
+      "FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data - assert None == ''",
+      '1 failed, 36 passed',
+    ].join('\n');
+    const quiet = [
+      'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py --tb=short',
+      "FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data - assert None == ''",
+      '1 failed, 36 passed',
+    ].join('\n');
+    const brief = (log: string) => buildDebugBrief({
+      reason: 'attempt failed',
+      failureLog: log,
+      phase: 'HIGH_LEVEL_DESIGN',
+      targetPhase: 'HIGH_LEVEL_DESIGN',
+    });
+    expect(brief(verbose).failedTests).toEqual([
+      'tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+    ]);
+    expect(buildFailureSignature(brief(verbose), 'test_command_failed'))
+      .toBe(buildFailureSignature(brief(quiet), 'test_command_failed'));
+  });
+
+  // `pytest -v` writes the outcome at the end of a line and the next case's id at the start of the
+  // following one, so a `FAILED\s+<id>` pattern binds across the newline and reports the case that
+  // passed. The two cases here are adjacent in exactly that order.
+  it('does not let a line-ending FAILED claim the following test', () => {
+    const brief = buildDebugBrief({
+      reason: 'attempt failed',
+      failureLog: [
+        'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py -v',
+        'tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data FAILED',
+        'tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_handles_empty_signals_list PASSED',
+        '1 failed, 36 passed',
+      ].join('\n'),
+      phase: 'HIGH_LEVEL_DESIGN',
+      targetPhase: 'HIGH_LEVEL_DESIGN',
+    });
+    expect(brief.failedTests).toEqual([
+      'tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+    ]);
+  });
+
+  it('still reads a failing test id that a summary lists on its own line', () => {
+    const brief = buildDebugBrief({
+      reason: 'attempt failed',
+      failureLog: [
+        'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py',
+        'short test summary info',
+        'tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+      ].join('\n'),
+      phase: 'HIGH_LEVEL_DESIGN',
+      targetPhase: 'HIGH_LEVEL_DESIGN',
+    });
+    expect(brief.failedTests).toEqual([
+      'tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+    ]);
+  });
+
+  // pytest re-numbers its temporary directory every run, and a filesystem error quotes the path.
+  // A live Ticket produced five distinct signatures from six identical results because of that
+  // counter alone — the reason text was right, and the number inside it was not part of the failure.
+  it('ignores the temporary directory a rerun happens to get', () => {
+    const run = (n: number) => buildFailureSignature(
+      buildDebugBrief({
+        reason: 'attempt failed',
+        failureLog: [
+          'run_tests: pytest exit=1 args=tests/verification/p1/functional-test/S8/test_risk_supplement.py',
+          `FAILED tests/verification/p1/functional-test/S8/test_risk_supplement.py::TestErrorCSV::test_error_csv_content_rows - FileNotFoundError: [Errno 2] No such file or directory: '/tmp/pytest-of-ddk/pytest-${n}/test_error_csv_content_rows0/out.errors.csv'`,
+          '1 failed, 24 passed',
+        ].join('\n'),
+        phase: 'FUNCTIONAL_TEST',
+        targetPhase: 'FUNCTIONAL_TEST',
+      }),
+      'test_command_failed',
+    );
+    expect(run(0)).toBe(run(1));
+    expect(run(1)).toBe(run(47));
+  });
+
+  it('still separates two different files failing the same way', () => {
+    const forFile = (file: string) => buildFailureSignature(
+      buildDebugBrief({
+        reason: 'attempt failed',
+        failureLog: [
+          'run_tests: pytest exit=1 args=tests/verification/p1/functional-test/S8/test_risk_supplement.py',
+          `FAILED tests/verification/p1/functional-test/S8/test_risk_supplement.py::TestErrorCSV::test_error_csv_content_rows - FileNotFoundError: [Errno 2] No such file or directory: '/tmp/pytest-of-ddk/pytest-0/case0/${file}'`,
+          '1 failed, 24 passed',
+        ].join('\n'),
+        phase: 'FUNCTIONAL_TEST',
+        targetPhase: 'FUNCTIONAL_TEST',
+      }),
+      'test_command_failed',
+    );
+    expect(forFile('out.errors.csv')).not.toBe(forFile('out.xlsx'));
+  });
+
+  it('separates a different tool failing the same way', () => {
+    expect(signatureFor([
+      'run_tests: pytest exit=1 args=tests/modules/test_dbc_parser_module.py -v',
+    ])).not.toBe(signatureFor([
+      'write_file: denied tests/modules/test_dbc_parser_module.py',
+    ]));
   });
 });

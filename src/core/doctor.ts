@@ -21,7 +21,7 @@ import {
 import { execRaw } from '../sandbox/subprocess.js';
 import { isRunningInContainer } from '../sandbox/factory.js';
 import { buildDefaultRegistry } from '../tools/index.js';
-import { buildDefaultSkills } from '../skills/skill.js';
+import { buildDefaultSkills } from '../skills/index.js';
 import { ScoreStore, scoreStoreOptionsFromConfig } from '../llm/scores.js';
 import { t } from '../i18n/index.js';
 import type { Language } from './plan.js';
@@ -378,22 +378,29 @@ async function checkDockerSandbox(sec: CheckSection, bin: string, skipNetwork: b
 function checkSkills(): CheckSection {
   const M = t().doctor;
   const sec: CheckSection = { title: M.sectionSkills, items: [] };
-  const tools = buildDefaultRegistry();
-  const known = new Set(tools.list().map((t) => t.name));
-  const skills = buildDefaultSkills().list();
-  let referenced = 0;
-  let bad = 0;
-  for (const s of skills) {
-    for (const tn of s.tools) {
-      referenced++;
-      if (!known.has(tn)) {
-        bad++;
-        sec.items.push({ level: 'fail', message: M.skillToolMissing(s.name, tn) });
+  try {
+    const tools = buildDefaultRegistry();
+    const known = new Set(tools.list().map((t) => t.name));
+    const skills = buildDefaultSkills().list();
+    let referenced = 0;
+    let bad = 0;
+    for (const s of skills) {
+      for (const tn of s.allowedTools) {
+        referenced++;
+        if (!known.has(tn)) {
+          bad++;
+          sec.items.push({ level: 'fail', message: M.skillToolMissing(s.name, tn) });
+        }
       }
     }
-  }
-  if (bad === 0) {
-    sec.items.push({ level: 'ok', message: M.skillOk(skills.length, referenced) });
+    if (bad === 0) {
+      sec.items.push({ level: 'ok', message: M.skillOk(skills.length, referenced) });
+    }
+  } catch (error) {
+    sec.items.push({
+      level: 'fail',
+      message: M.skillInvalid(error instanceof Error ? error.message : String(error)),
+    });
   }
   return sec;
 }

@@ -1,6 +1,6 @@
 {
   "name": "@xcompiler/cli",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "XCompiler — AI Software Factory: V-model driven, multi-LLM orchestrated software development agent.",
   "license": "Apache-2.0",
   "type": "module",
@@ -43,8 +43,10 @@
     "config.example.yaml",
     ".env.example",
     "debug-wiki",
+    "skills",
     "docs/assets",
     "docs/acp.md",
+    "docs/agent_skills.md",
     "docs/XCompiler_design.md",
     "docs/deploy.md",
     "docs/openrouter.md",
@@ -68,6 +70,9 @@
     "dev:run": "tsx src/cli/xcompiler_run.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:core": "vitest run --project core",
+    "test:integration": "vitest run --project integration",
+    "test:e2e": "vitest run --project e2e",
     "test:watch": "vitest",
     "smoke:ollama": "node --import tsx scripts/smoke_ollama.ts",
     "lint": "eslint \"src/**/*.ts\"",
@@ -89,14 +94,14 @@
     "jsonrepair": "^3.15.0",
     "ora": "^9.4.1",
     "simple-git": "^3.27.0",
-    "undici": "^7.28.0",
+    "undici": "^7.29.0",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.13.2",
-    "@yao-pkg/pkg": "^6.21.0",
+    "@yao-pkg/pkg": "6.21.0",
     "eslint": "^10.6.0",
     "tsup": "^8.3.5",
     "tsx": "^4.23.0",
@@ -106,12 +111,12 @@
   },
   "overrides": {
     "esbuild": "0.28.1",
-    "tar": "7.5.19"
+    "tar": "7.5.22"
   },
   "engines": {
     "node": ">=24"
   },
   "xcompiler": {
-    "pluginApiVersion": 1
+    "pluginApiVersion": 3
   }
 }

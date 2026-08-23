@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Planner } from '../src/agents/planner.js';
+import { LLMRequestError } from '../src/llm/errors.js';
 import type { ChatMessage, ChatOptions, LLMClient } from '../src/llm/types.js';
 
 function fakeLLM(reply: string | string[]): LLMClient {
@@ -12,6 +13,53 @@ function fakeLLM(reply: string | string[]): LLMClient {
       calls += 1;
       // 模拟 router/Fallback 的行为：先跑 validate，失败立即抛出（让 FallbackClient 切换 provider）。
       if (options?.validate) options.validate(current);
+      return current;
+    },
+  };
+}
+
+function observingLLM(reply: string, seen: ChatMessage[][]): LLMClient {
+  return {
+    name: 'observing',
+    async chat(messages, options): Promise<string> {
+      seen.push(messages);
+      if (options?.validate) options.validate(reply);
+      return reply;
+    },
+  };
+}
+
+/**
+ * Mimics the provider router: a validate failure is not raised as itself, it is aggregated into one
+ * `all LLM providers failed` error carrying the last underlying failure as `cause`. `fakeLLM` above
+ * raises the underlying error directly, which is why the repair loop looked covered while never
+ * firing in a real run.
+ */
+function routedLLM(reply: string[]): LLMClient {
+  const replies = reply;
+  let calls = 0;
+  return {
+    name: 'routed',
+    async chat(_messages: ChatMessage[], options?: ChatOptions): Promise<string> {
+      const current = replies[Math.min(calls, replies.length - 1)]!;
+      calls += 1;
+      if (options?.validate) {
+        try {
+          options.validate(current);
+        } catch (error) {
+          throw new LLMRequestError(
+            `all LLM providers failed for role Planner: primary: ${(error as Error).message}`,
+            {
+              code: 'all_providers_failed',
+              mode: 'router',
+              retryable: true,
+              switchProvider: true,
+              details: { contentRejectedOnly: true },
+            },
+            { cause: error },
+          );
+        }
+      }
       return current;
     },
   };
@@ -52,6 +100,36 @@ function iterationTestPlan(iterationId: string, basename: string): string {
   return iterationId === 'P1' ? `docs/tests/${basename}` : `docs/iterations/${iterationId}/tests/${basename}`;
 }
 
+function testPhaseDeliveryGate(name: string) {
+  return {
+    kind: 'phase-delivery' as const,
+    summary: `${name} real-user delivery gate`,
+    checks: ['Run the primary real-user flow.'],
+    testAssetPolicy: 'phase-aggregate' as const,
+    externalDataPolicy: 'live' as const,
+    scenarios: [{
+      name: `${name.toLowerCase()}-primary-flow`,
+      description: 'Exercise the fixture as a real user.',
+      operation: 'Run the primary fixture command.',
+      environment: 'live' as const,
+      expected: 'The command succeeds.',
+      execution: { command: 'python', args: ['-c', 'print("ok")'] },
+    }],
+    freezeBeforeExecution: true,
+    routeEachFinding: true as const,
+  };
+}
+
+function withDeliveryGates<T extends { implementationPhases: readonly Record<string, unknown>[] }>(plan: T): T {
+  return {
+    ...plan,
+    implementationPhases: plan.implementationPhases.map((phase) => ({
+      ...phase,
+      deliveryGate: phase.deliveryGate ?? testPhaseDeliveryGate(String(phase.id ?? 'phase')),
+    })),
+  } as T;
+}
+
 function vModelSteps(iterationId = 'P1', start = 1, sourcePath = 'src/x.py', moduleTestPath = 'tests/test_x.py') {
   const functionalDocs = iterationId === 'P1'
     ? ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md']
@@ -90,6 +168,7 @@ const planMetadata = {
       scope: ['Core fixture'],
       deliverables: ['Valid draft plan'],
       dependsOn: [],
+      deliveryGate: testPhaseDeliveryGate('P1'),
     },
   ],
 };
@@ -318,7 +397,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       architectureModules,
     };
     const p = new Planner(fakeLLM([
-      JSON.stringify(phasePlan),
+      JSON.stringify(withDeliveryGates(phasePlan)),
       JSON.stringify(invalidStepPlan),
       JSON.stringify(validStepPlan),
     ]));
@@ -443,6 +522,79 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     ).rejects.toThrow(/projectType/);
   });
 
+  it('拒绝没有可执行真实用户场景的 PhasePlan', async () => {
+    const phaseWithoutGate = { ...planMetadata.implementationPhases[0]!, deliveryGate: undefined };
+    const phasePlan = {
+      requirementDigest: 'Build a runnable command.',
+      globalPrompt: '',
+      projectType: 'application',
+      complexityAssessment: planMetadata.complexityAssessment,
+      implementationPhases: [phaseWithoutGate],
+    };
+    const planner = new Planner(fakeLLM(JSON.stringify(phasePlan)));
+
+    await expect(planner.decompose({ rawRequirement: 'Build a runnable command.', clarifications: [] }))
+      .rejects.toThrow(/deliveryGate with executable real-user scenarios/);
+  });
+
+  it('拒绝把完整 shell 命令塞进 TypeScript Phase 交付场景的 command 字段', async () => {
+    const invalid = withDeliveryGates({
+      requirementDigest: 'Build a small TypeScript command.',
+      globalPrompt: '',
+      projectType: 'application',
+      complexityAssessment: planMetadata.complexityAssessment,
+      implementationPhases: planMetadata.implementationPhases,
+    });
+    invalid.implementationPhases[0]!.deliveryGate.scenarios[0]!.execution = {
+      command: 'npx ts-node src/main.ts',
+      args: [],
+    };
+    const planner = new Planner(fakeLLM(JSON.stringify(invalid)), undefined, 'typescript');
+
+    await expect(planner.planPhasePlan({
+      rawRequirement: 'Build a small TypeScript command.',
+      clarifications: [],
+    })).rejects.toThrow(/execution\.command must contain one executable only/);
+  });
+
+  it('拒绝 StepPlan 未交付 Phase 真实场景引用的 TypeScript 入口', async () => {
+    const phasePlan = withDeliveryGates({
+      requirementDigest: 'Build a small TypeScript command.',
+      globalPrompt: '',
+      projectType: 'application',
+      complexityAssessment: planMetadata.complexityAssessment,
+      implementationPhases: planMetadata.implementationPhases,
+    });
+    phasePlan.implementationPhases[0]!.deliveryGate.scenarios[0]!.execution = {
+      command: 'npx',
+      args: ['tsx', 'src/main.ts'],
+    };
+    const stepPlan = {
+      requirementDigest: phasePlan.requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'tsx', 'vitest'],
+      architectureModules: [{
+        id: 'M001',
+        name: 'CliEntrypoint',
+        responsibility: 'Own the complete command entrypoint and its observable behavior.',
+        sourcePaths: ['src/cli.ts'],
+        testPaths: ['tests/cli.test.ts'],
+        dependencies: [],
+      }],
+      steps: vModelSteps('P1', 1, 'src/cli.ts', 'tests/cli.test.ts'),
+    };
+    const planner = new Planner(
+      fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]),
+      undefined,
+      'typescript',
+    );
+
+    await expect(planner.decompose({
+      rawRequirement: phasePlan.requirementDigest,
+      clarifications: [],
+    })).rejects.toThrow(/src\/main\.ts.*not delivered|not delivered.*src\/main\.ts/);
+  });
+
   it('多阶段需求先生成 PhasePlan，再只展开当前 P1 的 V 模型 StepPlan', async () => {
     const requirementDigest = 'Build a staged number formatting utility. Phase 1 core, Phase 2 polish, Phase 3 scale.';
     const phasePlan = {
@@ -491,7 +643,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       dependencies: ['pytest'],
       steps: vModelSteps('P1', 1, 'src/main.py', 'tests/test_main.py'),
     };
-    const p = new Planner(fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]));
+    const p = new Planner(fakeLLM([JSON.stringify(withDeliveryGates(phasePlan)), JSON.stringify(stepPlan)]));
     const plan = await p.decompose({ rawRequirement: requirementDigest, clarifications: [] });
     expect(plan.implementationPhases?.map((phase) => phase.id)).toEqual(['P1', 'P2', 'P3']);
     expect(plan.steps).toHaveLength(8);
@@ -541,13 +693,39 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     const plan = await planner.decomposePhase(
       { rawRequirement: requirementDigest, clarifications: [], intent: 'feature' },
-      phasePlan,
+      withDeliveryGates(phasePlan),
       'P2',
     );
 
     expect(plan.implementationPhases?.map((phase) => `${phase.id}:${phase.status}`))
       .toEqual(['P1:complete', 'P2:current']);
     expect(plan.steps.every((step) => step.iterationId === 'P2')).toBe(true);
+  });
+
+  it('StepPlan receives Skill metadata but not inactive instructions', async () => {
+    const seen: ChatMessage[][] = [];
+    const stepPlan = {
+      requirementDigest: 'Build the core fixture.',
+      globalPrompt: '',
+      dependencies: ['pytest'],
+      steps: vModelSteps('P1', 1, 'src/main.py', 'tests/test_main.py'),
+    };
+    const planner = new Planner(observingLLM(JSON.stringify(stepPlan), seen));
+    await planner.decomposePhase(
+      { rawRequirement: 'Build the core fixture.', clarifications: [] },
+      withDeliveryGates({
+        requirementDigest: 'Build the core fixture.',
+        globalPrompt: '',
+        ...planMetadata,
+      }),
+      'P1',
+    );
+
+    const system = seen[0]?.find((message) => message.role === 'system')?.content ?? '';
+    expect(system).toContain('skill:systematic-debugging');
+    expect(system).toContain('Investigate and repair reproducible software failures');
+    expect(system).not.toContain('## 1. Establish Evidence');
+    expect(system).not.toContain('Treat Debug Wiki matches as hypotheses');
   });
 
   it('PhasePlan 校验失败时会把错误反馈给 Planner 并重试', async () => {
@@ -597,8 +775,8 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     };
 
     const p = new Planner(fakeLLM([
-      JSON.stringify(invalidPhasePlan),
-      JSON.stringify(repairedPhasePlan),
+      JSON.stringify(withDeliveryGates(invalidPhasePlan)),
+      JSON.stringify(withDeliveryGates(repairedPhasePlan)),
       JSON.stringify(stepPlan),
     ]));
     const plan = await p.decompose({ rawRequirement: requirementDigest, clarifications: [] });
@@ -662,12 +840,201 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     const plan = await planner.decomposePhase(
       { rawRequirement: requirementDigest, clarifications: [] },
-      phasePlan,
+      withDeliveryGates(phasePlan),
       'P1',
     );
 
     expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain(moduleTestPath);
     expect(plan.architectureModules?.[0]?.testPaths).toEqual([moduleTestPath]);
+  });
+
+  // From a live run: the planner gave README.md to both CODE and FUNCTIONAL_TEST, and the plan rules
+  // only ran after decompose returned — so the build died with exit 3 after two model calls, and the
+  // one party able to repair the plan was never told. The rules now run inside the repair loop.
+  it('两个 Step 抢同一个 output 时会带反馈重试，而不是让 build 直接失败', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = {
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'one bounded CLI',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [
+        {
+          id: 'P1',
+          title: 'Core',
+          objective: 'Deliver the CLI.',
+          status: 'current' as const,
+          scope: ['CLI'],
+          deliverables: ['Runnable CLI'],
+          dependsOn: [],
+        },
+      ],
+    };
+    const moduleTestPath = 'tests/modules/cli-contract.test.ts';
+    const module = {
+      id: 'M001',
+      name: 'CLI',
+      responsibility: 'Own command parsing and dispatch.',
+      sourcePaths: ['src/main.ts'],
+      testPaths: [moduleTestPath],
+      dependencies: [],
+    };
+    // S008 FUNCTIONAL_TEST already owns README.md; CODE claiming it too is the live failure.
+    const contendedSteps = vModelSteps('P1', 1, 'src/main.ts', moduleTestPath);
+    contendedSteps[3] = {
+      ...contendedSteps[3]!,
+      outputs: [...contendedSteps[3]!.outputs, 'README.md'],
+    };
+    const contended = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [module],
+      steps: contendedSteps,
+    };
+    const repaired = { ...contended, steps: vModelSteps('P1', 1, 'src/main.ts', moduleTestPath) };
+    const planner = new Planner(
+      fakeLLM([JSON.stringify(contended), JSON.stringify(repaired)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      withDeliveryGates(phasePlan),
+      'P1',
+    );
+
+    expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain('README.md');
+    expect(plan.steps.find((step) => step.phase === 'FUNCTIONAL_TEST')?.outputs).toContain('README.md');
+  });
+
+  // The repair loop keys on the failure being repairable. The router wraps every per-provider
+  // failure in one aggregate error, so reading only the outer message matched nothing and the loop
+  // rethrew immediately — a whole live build died at decompose with a plan the planner could have
+  // fixed.
+  it('修复轮次在 router 包装错误后仍然触发', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = {
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'one bounded CLI',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [
+        {
+          id: 'P1',
+          title: 'Core',
+          objective: 'Deliver the CLI.',
+          status: 'current' as const,
+          scope: ['CLI'],
+          deliverables: ['Runnable CLI'],
+          dependsOn: [],
+        },
+      ],
+    };
+    const moduleTestPath = 'tests/modules/cli-contract.test.ts';
+    const module = {
+      id: 'M001',
+      name: 'CLI',
+      responsibility: 'Own command parsing and dispatch.',
+      sourcePaths: ['src/main.ts'],
+      testPaths: [moduleTestPath],
+      dependencies: [],
+    };
+    const contendedSteps = vModelSteps('P1', 1, 'src/main.ts', moduleTestPath);
+    contendedSteps[3] = {
+      ...contendedSteps[3]!,
+      outputs: [...contendedSteps[3]!.outputs, 'README.md'],
+    };
+    const contended = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [module],
+      steps: contendedSteps,
+    };
+    const repaired = { ...contended, steps: vModelSteps('P1', 1, 'src/main.ts', moduleTestPath) };
+    const planner = new Planner(
+      routedLLM([JSON.stringify(contended), JSON.stringify(repaired)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      withDeliveryGates(phasePlan),
+      'P1',
+    );
+
+    expect(plan.steps.find((step) => step.phase === 'CODE')?.outputs).not.toContain('README.md');
+  });
+
+  it('router 聚合的不完整 JSON 仍会进入 Planner 外层结构修复', async () => {
+    const requirementDigest = 'Build a small TypeScript CLI.';
+    const phasePlan = withDeliveryGates({
+      requirementDigest,
+      globalPrompt: '',
+      projectType: 'application' as const,
+      complexityAssessment: {
+        level: 'simple' as const,
+        rationale: 'One compact CLI.',
+        splitRecommended: false,
+        userForcedPhaseSplit: false,
+      },
+      implementationPhases: [{
+        id: 'P1',
+        title: 'Core CLI',
+        objective: requirementDigest,
+        status: 'current' as const,
+        scope: ['CLI'],
+        deliverables: ['CLI'],
+        dependsOn: [],
+        verificationGate: {
+          summary: 'Run all gates.',
+          checks: ['npm test'],
+          failurePolicy: 'Repair through the paired V-model phase.',
+        },
+      }],
+    });
+    const moduleTestPath = 'tests/modules/main.test.ts';
+    const valid = {
+      requirementDigest,
+      globalPrompt: '',
+      dependencies: ['typescript', 'vitest'],
+      architectureModules: [{
+        id: 'M001',
+        name: 'main',
+        responsibility: 'Parse CLI arguments and start the application workflow.',
+        sourcePaths: ['src/main.ts'],
+        assetPaths: [],
+        testPaths: [moduleTestPath],
+        dependencies: [],
+      }],
+      steps: vModelSteps('P1', 1, 'src/main.ts', moduleTestPath),
+    };
+    const planner = new Planner(
+      routedLLM(['{"requirementDigest":"truncated"', JSON.stringify(valid)]),
+      undefined,
+      'typescript',
+    );
+
+    const plan = await planner.decomposePhase(
+      { rawRequirement: requirementDigest, clarifications: [] },
+      phasePlan,
+      'P1',
+    );
+
+    expect(plan.steps).toHaveLength(8);
   });
 
   it('当前 phase 的架构规模门禁不被后续 planned phase 的 surface 误伤', async () => {
@@ -752,7 +1119,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       steps,
     };
 
-    const p = new Planner(fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]), undefined, 'typescript');
+    const p = new Planner(fakeLLM([JSON.stringify(withDeliveryGates(phasePlan)), JSON.stringify(stepPlan)]), undefined, 'typescript');
     const plan = await p.decompose({ rawRequirement, clarifications: [] });
 
     expect(plan.architectureModules).toHaveLength(4);
@@ -809,9 +1176,43 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       dependencies: ['pytest'],
       steps: vModelSteps('P1', 1, 'src/main.py', 'tests/test_main.py'),
     };
-    const p = new Planner(fakeLLM([JSON.stringify(phasePlan), JSON.stringify(stepPlan)]));
+    const p = new Planner(fakeLLM([JSON.stringify(withDeliveryGates(phasePlan)), JSON.stringify(stepPlan)]));
     await expect(
       p.decompose({ rawRequirement: requirementDigest, clarifications: [] }),
     ).rejects.toThrow(/omitted architectureModules/);
+  });
+});
+
+/**
+ * `userForcedPhaseSplit` is about the user, so only the user's words may decide it.
+ *
+ * The check scanned the model's own `requirementDigest` alongside the user's request, and the
+ * trigger word is one the system prompt teaches: a rationale reading "建议分阶段交付：P1 …, P2 …"
+ * was read as a user mandate, the model answered `false` because that was true, and the contract
+ * rejected it. A live build lost both providers to it — the second then spent fifteen minutes in a
+ * non-stream retry — and produced no plan at all.
+ */
+describe('forced phase split reads user sources only', () => {
+  it('does not fire on the model\'s own wording', async () => {
+    const { hasForcedPhaseSplit } = await import('../src/agents/planning/phase_strategy.js');
+    // What the model wrote about its own recommendation.
+    expect(hasForcedPhaseSplit('建议分阶段交付：P1 完成基础解析，P2 完善异常处理')).toBe(true);
+    // The detector itself is unchanged and still recognises the phrase; what changed is whose text
+    // reaches it. The planner now passes only rawRequirement and userAddenda.
+    const { readFile } = await import('node:fs/promises');
+    const planner = await readFile(new URL('../src/agents/planner.ts', import.meta.url), 'utf8');
+    const calls = [...planner.matchAll(/hasForcedPhaseSplit\(\[([\s\S]*?)\]/gu)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call[1]).toContain('rawRequirement');
+      expect(call[1]).not.toContain('digest');
+    }
+  });
+
+  // A user who does ask for phases must still be honoured.
+  it('still fires on the user\'s own request', async () => {
+    const { hasForcedPhaseSplit } = await import('../src/agents/planning/phase_strategy.js');
+    expect(hasForcedPhaseSplit('请分两期交付，第一阶段先做解析')).toBe(true);
+    expect(hasForcedPhaseSplit('写一个解析 DBC 并导出 Excel 的脚本')).toBe(false);
   });
 });

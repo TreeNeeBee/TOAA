@@ -7,7 +7,15 @@ import type { Language, PlanIntent, Step } from './plan.js';
 import { DEFAULT_PHASE_PLAN_FILE } from './phase_plan.js';
 import { loadPlanTarget } from './storage.js';
 
-export const PROJECT_MEMORY_PATH = '.xcompiler/project_memory.json';
+/**
+ * Relative to the container state root, beside the PM projection.
+ *
+ * Project memory is a derived read model of the codebase, not authored knowledge: every run
+ * recomputes it from the workspace, so it is rebuildable and needs no revision model. That is also
+ * why it must not live inside a worktree — worktree-local state is never canonical and a parallel
+ * worktree would each keep its own divergent copy.
+ */
+export const PROJECT_MEMORY_PATH = 'cache/project-memory.json';
 
 export interface ProjectMemoryFile {
   path: string;
@@ -31,7 +39,7 @@ export interface ProjectMemoryContract {
 }
 
 export interface ProjectMemory {
-  version: '1';
+  version: '2';
   updatedAt: string;
   language?: Language;
   intent?: PlanIntent;
@@ -42,20 +50,25 @@ export interface ProjectMemory {
   contracts: ProjectMemoryContract[];
 }
 
+/**
+ * Scans `ws` — the code — and writes the result to `state` — the container. The two are distinct
+ * workspaces under the container/worktree split and must not be conflated.
+ */
 export async function refreshProjectMemory(
   ws: Workspace,
+  state: Workspace,
   opts: { planPath?: string; language?: Language; intent?: PlanIntent; maxChars?: number } = {},
 ): Promise<ProjectMemory> {
   const memory = await buildProjectMemory(ws, opts);
-  await ws.writeFile(PROJECT_MEMORY_PATH, JSON.stringify(memory, null, 2) + '\n');
+  await state.writeFile(PROJECT_MEMORY_PATH, JSON.stringify(memory, null, 2) + '\n');
   return memory;
 }
 
-export async function loadProjectMemory(ws: Workspace): Promise<ProjectMemory | null> {
+export async function loadProjectMemory(state: Workspace): Promise<ProjectMemory | null> {
   try {
-    const raw = await ws.readFile(PROJECT_MEMORY_PATH);
+    const raw = await state.readFile(PROJECT_MEMORY_PATH);
     const parsed = JSON.parse(raw) as ProjectMemory;
-    if (!parsed || parsed.version !== '1' || typeof parsed.summary !== 'string' || !Array.isArray(parsed.keyFiles)) {
+    if (!parsed || parsed.version !== '2' || typeof parsed.summary !== 'string' || !Array.isArray(parsed.keyFiles)) {
       return null;
     }
     if (!Array.isArray(parsed.modules)) parsed.modules = [];
@@ -164,7 +177,7 @@ export async function buildProjectMemory(
   }
 
   return {
-    version: '1',
+    version: '2',
     updatedAt: new Date().toISOString(),
     language,
     intent,

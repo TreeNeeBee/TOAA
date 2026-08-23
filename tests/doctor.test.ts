@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import YAML from 'yaml';
+import { ROLES } from '../src/core/plan.js';
 import { runDoctor } from '../src/core/doctor.js';
 import { setLocale } from '../src/i18n/index.js';
 
@@ -15,6 +16,7 @@ function allRoles(provider: string): Record<string, string[]> {
     Coder: [provider],
     Tester: [provider],
     Debugger: [provider],
+    ProjectManager: [provider],
   };
 }
 
@@ -182,7 +184,10 @@ describe('doctor', () => {
     const r = await runDoctor({ configPath: cfgPath, probeTimeoutMs: 100 });
     const llm = r.sections.find((s) => s.title === '[LLM]')!;
     expect(llm.items.some((i) => i.level === 'fail' && /models check failed/i.test(i.message))).toBe(true);
-    expect(llm.items.filter((i) => i.level === 'fail' && /no live provider/i.test(i.message))).toHaveLength(5);
+    // One per configured role: the point is that an unreachable provider is reported for every
+    // role that names it, not that there happen to be a particular number of roles.
+    expect(llm.items.filter((i) => i.level === 'fail' && /no live provider/i.test(i.message)))
+      .toHaveLength(ROLES.length);
     expect(llm.items.some((i) => i.level === 'ok' && /role .* ->/i.test(i.message))).toBe(false);
   });
 

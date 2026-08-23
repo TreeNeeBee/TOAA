@@ -8,7 +8,6 @@ const CONTEXT_SAFETY_RATIO = 0.05;
 export interface OperationWindowInput {
   contextWindowTokens?: number | null;
   promptChars?: number;
-  configuredWriteChunkBytes?: number | 'auto';
 }
 
 export interface SkillOperationWindow {
@@ -45,7 +44,8 @@ export function estimateTextTokens(chars: number): number {
  *
  * `context_window` is an input+output capacity. The prompt and a safety margin
  * are removed first; response and tool-feedback windows then share what remains.
- * Explicit max_write_chunk_bytes remains a hard user override.
+ * Read, write, response, and feedback windows are all derived from the active
+ * provider context. No independent byte-limit configuration is accepted.
  */
 export function resolveSkillOperationWindow(input: OperationWindowInput = {}): SkillOperationWindow {
   const contextWindowTokens = normalizeContextWindowTokens(input.contextWindowTokens);
@@ -69,14 +69,10 @@ export function resolveSkillOperationWindow(input: OperationWindowInput = {}): S
   );
   const feedbackCharBudget = feedbackTokens * ESTIMATED_CHARS_PER_TOKEN;
   const readChunkBytes = Math.max(1024, Math.floor(feedbackCharBudget * 0.7));
-  const automaticWriteChunkBytes = Math.max(
+  const writeChunkBytes = Math.max(
     1024,
     Math.floor(responseTokenBudget * ESTIMATED_CHARS_PER_TOKEN * 0.72),
   );
-  const writeChunkBytes =
-    typeof input.configuredWriteChunkBytes === 'number'
-      ? input.configuredWriteChunkBytes
-      : automaticWriteChunkBytes;
 
   return {
     contextWindowTokens,

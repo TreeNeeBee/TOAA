@@ -1,6 +1,6 @@
-import path from 'node:path';
+import { writeWorkspaceFile } from './workspace_write.js';
 import { promises as fs } from 'node:fs';
-import { isAllowedWrite, type Tool } from './types.js';
+import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import { suspiciousTextTruncationError } from './content_guard.js';
 
@@ -29,7 +29,7 @@ export const applyPatchTool: Tool<{ patch: string }, { changedFiles: string[] }>
       });
       if (!resolved.ok) return { ok: false, error: resolved.error };
       if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
-        return { ok: false, error: `write denied: ${resolved.rel} not in step writable allowlist` };
+        return deniedWrite('write', resolved.rel, ctx.allowedWrites);
       }
       const abs = resolved.abs;
       let original = '';
@@ -47,8 +47,7 @@ export const applyPatchTool: Tool<{ patch: string }, { changedFiles: string[] }>
         replacementBytes: Buffer.byteLength(next.content),
       });
       if (truncationError) return { ok: false, error: truncationError };
-      await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, next.content, 'utf8');
+      await writeWorkspaceFile(abs, next.content, { tree: ctx.fileTree, root: ctx.ws.root });
       changed.push(resolved.rel);
     }
     return { ok: true, data: { changedFiles: changed }, summary: `patched ${changed.join(', ')}` };

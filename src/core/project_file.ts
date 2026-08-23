@@ -7,11 +7,12 @@ import type { Project } from '../domain/projects/project.js';
 import type { Step, StepState } from '../domain/steps/step.js';
 import { DomainObjectRepository } from '../infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../workspace/workspace.js';
+import { ProjectContainer } from '../workspace/project_container.js';
 import type { PlanIntent } from './plan.js';
 
 export const XCOMPILER_PROJECT_FILE_EXTENSION = '.xc';
 export const XCOMPILER_PROJECT_MANIFEST_KIND = 'xcompiler.project-manifest';
-export const XCOMPILER_PROJECT_MANIFEST_VERSION = 1;
+export const XCOMPILER_PROJECT_MANIFEST_VERSION = 2;
 
 const ProjectProgressStepSchema = z.object({
   id: ObjectIdSchema,
@@ -58,6 +59,15 @@ export const XCompilerProjectFileSchema = z.object({
   projectId: ObjectIdSchema,
   name: z.string().min(1),
   workspace: z.string().min(1),
+  /**
+   * The project container, relative to this manifest.
+   *
+   * Recorded separately from `workspace` because 0.3 keeps project state outside every worktree:
+   * the manifest sits at the container root, beside the registry in `<container>/.xcompiler`.
+   * Deriving one from the other would break for a Ticket or gate worktree, which sit at a different
+   * depth under the same container.
+   */
+  container: z.string().min(1),
   planPath: z.string().min(1),
   configPath: z.string().nullable().optional(),
   lastCommand: z.string().optional(),
@@ -71,6 +81,8 @@ export type XCompilerProjectProgress = z.infer<typeof ProjectProgressSchema>;
 
 export interface UpdateProjectFileOptions {
   workspace: string;
+  /** Container root. Domain state is read from `<container>/.xcompiler`, never from the worktree. */
+  container: string;
   planPath: string;
   configPath?: string;
   projectFilePath?: string;
@@ -86,6 +98,8 @@ export interface LoadedXCompilerProject {
   filePath: string;
   data: XCompilerProjectFile;
   workspace: string;
+  /** Container root; its `.xcompiler` holds the registry this project's objects live in. */
+  container: string;
   planPath: string;
   configPath?: string;
   project: Project;
@@ -120,8 +134,16 @@ export async function loadXCompilerProject(projectFilePath: string): Promise<Loa
   const data = XCompilerProjectFileSchema.parse(JSON.parse(await fs.readFile(filePath, 'utf8')));
   const base = path.dirname(filePath);
   const workspace = path.resolve(base, data.workspace);
+  const container = path.resolve(base, data.container);
+  if (base !== container) {
+    throw new Error(`XCompiler project file must be directly inside its declared container ${container}`);
+  }
+  const expectedWorkspace = new ProjectContainer(container).canonical().workspace.root;
+  if (workspace !== expectedWorkspace) {
+    throw new Error(`XCompiler project workspace must be canonical ${expectedWorkspace}: ${workspace}`);
+  }
   await assertSafeProjectWorkspace(filePath, workspace);
-  const repository = new DomainObjectRepository(new Workspace(workspace));
+  const repository = new DomainObjectRepository(new ProjectContainer(container).state);
   await repository.load();
   const object = await repository.read(data.projectId);
   if (object.objectType !== 'project') {
@@ -134,6 +156,7 @@ export async function loadXCompilerProject(projectFilePath: string): Promise<Loa
     filePath,
     data,
     workspace,
+    container,
     planPath: path.resolve(base, data.planPath),
     configPath: data.configPath ? path.resolve(base, data.configPath) : undefined,
     project: object,
@@ -142,16 +165,13 @@ export async function loadXCompilerProject(projectFilePath: string): Promise<Loa
 
 export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise<string> {
   const workspace = path.resolve(opts.workspace);
-  const filePath = path.resolve(
-    opts.projectFilePath ?? (await findProjectFile(workspace)) ?? defaultProjectFilePath(workspace),
-  );
-  assertProjectFileExtension(filePath);
-  const base = path.dirname(filePath);
-  if (base !== workspace && !base.startsWith(workspace + path.sep)) {
-    throw new Error(`XCompiler project file must be inside its workspace: ${filePath}`);
-  }
-  const existing = await readExistingProjectFile(filePath);
-  const repository = new DomainObjectRepository(new Workspace(workspace));
+  const container = path.resolve(opts.container);
+  const known = opts.projectFilePath
+    ? path.resolve(opts.projectFilePath)
+    : await findProjectFile(container);
+  if (known) assertProjectFileExtension(known);
+  const existing = known ? await readExistingProjectFile(known) : undefined;
+  const repository = new DomainObjectRepository(new ProjectContainer(container).state);
   await repository.load();
   const project = opts.projectId
     ? await requireProject(repository, opts.projectId)
@@ -163,6 +183,14 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
   }
   if (existing && existing.projectId !== project.id && !opts.projectId) {
     throw new Error(`Project manifest cannot switch from ${existing.projectId} to ${project.id}`);
+  }
+  // The launcher is a control-plane object. Product worktrees can be replaced, forked, or cleaned;
+  // putting the launcher in one of them made the project's own entry point disappear with a branch.
+  const filePath = known ?? defaultProjectFilePath(container, project.name);
+  assertProjectFileExtension(filePath);
+  const base = path.dirname(filePath);
+  if (base !== container) {
+    throw new Error(`XCompiler project file must be directly inside the project root ${container}: ${filePath}`);
   }
   const steps = (await repository.list({ objectType: 'step', projectId: project.id }))
     .filter((object): object is Step => object.objectType === 'step');
@@ -186,7 +214,8 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
     version: XCOMPILER_PROJECT_MANIFEST_VERSION,
     projectId: project.id,
     name: project.name,
-    workspace,
+    workspace: relativeFrom(base, workspace),
+    container: relativeFrom(base, container),
     planPath: relativeFrom(base, planPath),
     configPath: opts.configPath !== undefined
       ? relativeFrom(base, path.resolve(opts.configPath))
@@ -196,8 +225,8 @@ export async function updateProjectFile(opts: UpdateProjectFileOptions): Promise
     history: nextHistory,
     updatedAt: now,
   });
-  await new Workspace(workspace).writeFileAtomic(
-    relativeFrom(workspace, filePath),
+  await new Workspace(container).writeFileAtomic(
+    relativeFrom(container, filePath),
     `${JSON.stringify(data, null, 2)}\n`,
   );
   return filePath;
@@ -220,10 +249,14 @@ export function buildProjectProgress(
   const current = ordered.find((step) => step.state === 'in_progress') ??
     ordered.find((step) => step.state === 'pending' || step.state === 'reopened' || step.state === 'created');
   const done = counts.delivered + counts.closed;
+  const failedSteps = ordered.filter((step) =>
+    step.state === 'pending' && (step.pendingReason === 'defect' || step.pendingReason === 'quality-gap'));
   const status = project.state === 'closed' || project.state === 'delivered'
     ? 'complete'
-    : counts.pending > 0
+    : failedSteps.length > 0
       ? 'failed'
+      : counts.pending > 0
+        ? 'pending'
       : counts.in_progress > 0
         ? 'running'
         : done > 0
@@ -235,10 +268,10 @@ export function buildProjectProgress(
     done,
     pending: counts.created + counts.pending + counts.reopened,
     running: counts.in_progress,
-    failed: counts.pending,
+    failed: failedSteps.length,
     percent: ordered.length === 0 ? 0 : Math.round((done / ordered.length) * 100),
     currentStepId: current?.id,
-    failedStepId: ordered.find((step) => step.state === 'pending')?.id,
+    failedStepId: failedSteps[0]?.id,
     steps: ordered.map((step) => ({
       id: step.id,
       name: step.name,
@@ -277,8 +310,8 @@ async function assertSafeProjectWorkspace(projectFilePath: string, workspace: st
   if (!stat.isDirectory()) throw new Error(`XCompiler project workspace is not a directory: ${workspace}`);
   const realWorkspace = await fs.realpath(workspace).catch(() => workspace);
   const realProjectDir = await fs.realpath(path.dirname(projectFilePath)).catch(() => path.dirname(projectFilePath));
-  if (realProjectDir !== realWorkspace && !realProjectDir.startsWith(realWorkspace + path.sep)) {
-    throw new Error(`XCompiler project file ${projectFilePath} is outside its declared workspace ${workspace}`);
+  if (realProjectDir !== realWorkspace && !realWorkspace.startsWith(realProjectDir + path.sep)) {
+    throw new Error(`XCompiler project workspace ${workspace} is outside manifest root ${realProjectDir}`);
   }
   try {
     await fs.access(workspace, fsConstants.W_OK);

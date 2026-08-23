@@ -6,8 +6,6 @@ import { Workspace } from '../src/workspace/workspace.js';
 import { writeFileTool, appendFileTool, readFileTool } from '../src/tools/fs.js';
 import { EditGuard, resolveEditGuardMaxLines } from '../src/tools/guard.js';
 import type { ToolContext } from '../src/tools/types.js';
-import { SkillRegistry, buildDefaultSkills } from '../src/skills/skill.js';
-import { renderExecutionPromptPolicy } from '../src/agents/prompt_policy.js';
 
 let tmp: string;
 let ws: Workspace;
@@ -93,44 +91,5 @@ describe('EditGuard', () => {
     expect(r1.ok).toBe(true);
     const r2 = await wrapped.run({ path: 'src/b.py', content: 'y\n' }, ctx);
     expect(r2.ok).toBe(true);
-  });
-});
-
-describe('SkillRegistry', () => {
-  it('expands skill: refs to underlying tools and collects hints', () => {
-    const reg = buildDefaultSkills();
-    const { resolvedToolNames, hints } = reg.resolve(['skill:patcher', 'run_tests']);
-    expect(resolvedToolNames).toContain('apply_patch');
-    expect(resolvedToolNames).toContain('replace_in_file');
-    expect(resolvedToolNames).toContain('run_tests');
-    expect(hints[0]).toMatch(/patcher/);
-  });
-
-  it('exposes chunked write tools in author tester debugger and refactorer skills', () => {
-    const reg = buildDefaultSkills();
-    for (const skill of ['skill:author', 'skill:tester', 'skill:debugger', 'skill:refactorer']) {
-      const tools = reg.resolve([skill]).resolvedToolNames;
-      expect(tools).toContain('write_file');
-      expect(tools).toContain('append_file');
-    }
-  });
-
-  it('centralizes the path contract while keeping edit-specific skill guidance', () => {
-    const reg = buildDefaultSkills();
-    const policy = renderExecutionPromptPolicy({ debug: true });
-    expect(policy).toMatch(/workspace-relative|workspace 相对/u);
-    for (const skill of ['skill:patcher', 'skill:author', 'skill:tester', 'skill:refactorer']) {
-      const hints = reg.resolve([skill]).hints.join('\n');
-      expect(hints).toContain('args.path');
-      expect(hints).toMatch(/workspace-relative|workspace 相对/u);
-    }
-    expect(reg.resolve(['skill:patcher']).hints.join('\n')).toContain('args.find');
-    expect(reg.resolve(['skill:debugger']).hints.join('\n')).toContain('run_tests');
-  });
-
-  it('ignores unknown skill but keeps bare tools', () => {
-    const reg = new SkillRegistry();
-    const { resolvedToolNames } = reg.resolve(['skill:nope', 'read_file']);
-    expect(resolvedToolNames).toEqual(['read_file']);
   });
 });

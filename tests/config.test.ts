@@ -13,6 +13,7 @@ function allRoles(provider: string): Record<string, string[]> {
     Coder: [provider],
     Tester: [provider],
     Debugger: [provider],
+    ProjectManager: [provider],
   };
 }
 
@@ -62,6 +63,30 @@ describe('config locale', () => {
     await expect(loadConfigWithPath(cfgPath)).rejects.toThrow(/ui_language/);
   });
 
+  it('explains removed 0.2 keys instead of dumping the schema error', async () => {
+    // 0.3 does not migrate old config, so the failure has to say what to do about it.
+    const cfgPath = await writeConfig(
+      baseConfig({ agent: { max_steps: 50, max_debug_retries: 3 } }),
+    );
+    const failure = await loadConfigWithPath(cfgPath).catch((error: Error) => error.message);
+    expect(failure).toContain('agent.max_steps');
+    expect(failure).toContain('agent.max_debug_retries');
+    expect(failure).toContain('config.example.yaml');
+    expect(failure).not.toContain('unrecognized_keys');
+  });
+
+  it('rejects sandbox modes that have no runtime implementation', async () => {
+    const config = baseConfig();
+    const agent = config.agent as Record<string, unknown>;
+    agent.sandboxes = {
+      python: { mode: 'firejail' },
+      typescript: { mode: 'subprocess' },
+    };
+    await expect(loadConfigWithPath(await writeConfig(config))).rejects.toThrow(
+      /agent\.sandboxes\.python\.mode.*subprocess.*docker/su,
+    );
+  });
+
   it('parses the optional Ollama think flag', async () => {
     const cfg = baseConfig();
     const llm = cfg.llm as Record<string, unknown>;
@@ -97,10 +122,15 @@ describe('config locale', () => {
     expect(config.agent.max_edit_lines_per_step).toBe('auto');
   });
 
-  it('defaults write chunk byte budget to auto', async () => {
+  it('defaults Record/Replay to external data channels, not process exit codes', async () => {
+    const { config } = await loadConfigWithPath(await writeConfig(baseConfig()));
+    expect(config.record_replay.channels).toEqual(['http', 'llm']);
+  });
+
+  it('derives write chunk bytes from context_window instead of accepting a fixed config field', async () => {
     const cfgPath = await writeConfig(baseConfig());
     const { config } = await loadConfigWithPath(cfgPath);
-    expect(config.agent.max_write_chunk_bytes).toBe('auto');
+    expect('max_write_chunk_bytes' in config.agent).toBe(false);
   });
 
   it('keeps numeric-looking provider env vars as strings', async () => {
@@ -123,6 +153,7 @@ llm:
     Coder:     [openai]
     Tester:    [openai]
     Debugger:  [openai]
+    ProjectManager:  [openai]
   fallbacks: []
   role_fallbacks: {}
 agent:
@@ -245,6 +276,7 @@ llm:
     Coder:     [openrouter_free]
     Tester:    [openrouter_free]
     Debugger:  [openrouter_free]
+    ProjectManager:  [openrouter_free]
   fallbacks: []
   role_fallbacks: {}
 agent:
@@ -356,5 +388,34 @@ agent:
       if (oldLong === undefined) delete process.env.XCOMPILER_PATH;
       else process.env.XCOMPILER_PATH = oldLong;
     }
+  });
+});
+
+// PM judges outcomes on the project's behalf and never executes a Step. Letting it be assigned as a
+// Step's role would put the judge in the position of doing the work it later assesses.
+describe('ProjectManager is a judging role, not an executing one', () => {
+  it('is configurable as an LLM role', async () => {
+    const { ROLES } = await import('../src/core/plan.js');
+    expect(ROLES).toContain('ProjectManager');
+  });
+
+  // No silent degradation: a project with no judge configured must not proceed believing it has
+  // one. The gate that would have caught a wrong delivery is the thing being left unconfigured.
+  it('is rejected at load time when no provider is configured for it', async () => {
+    const { loadConfig } = await import('../src/config/config.js');
+    const config = baseConfig() as { llm: { roles: Record<string, unknown> } };
+    delete config.llm.roles.ProjectManager;
+    const cfgPath = await writeConfig(config);
+    await expect(loadConfig(cfgPath)).rejects.toThrow(/ProjectManager/u);
+  });
+
+  it('cannot be assigned as the role that runs a Step', async () => {
+    const { StepSchema } = await import('../src/core/plan.js');
+    const step = {
+      id: 'S001', iterationId: 'P1', phase: 'REQUIREMENT_ANALYSIS', title: 't', description: 'd',
+      systemPrompt: 'p', acceptance: 'a', maxAttempts: 3,
+    };
+    expect(StepSchema.safeParse({ ...step, role: 'Coder' }).success).toBe(true);
+    expect(StepSchema.safeParse({ ...step, role: 'ProjectManager' }).success).toBe(false);
   });
 });

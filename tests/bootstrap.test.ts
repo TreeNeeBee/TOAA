@@ -9,7 +9,7 @@ import {
   qualifyBootstrapCandidate,
   renderBootstrapReport,
   type BootstrapResult,
-} from '../src/cli/bootstrap.js';
+} from '../src/runtime/bootstrap.js';
 
 const cleanup: string[] = [];
 
@@ -37,11 +37,12 @@ describe('self-bootstrap worktree', () => {
     await fs.rm(worktree, { recursive: true, force: true });
     cleanup.push(worktree);
     const prepared = await prepareBootstrapWorkspace(repository, worktree);
+    const candidate = prepared.worktree;
 
     expect(prepared.worktree).not.toBe(repository);
     expect(prepared.branch).toMatch(/^xcompiler\/bootstrap\//u);
-    await fs.writeFile(path.join(worktree, 'candidate.txt'), 'N+1\n');
-    const candidateGit = simpleGit({ baseDir: worktree });
+    await fs.writeFile(path.join(candidate, 'candidate.txt'), 'N+1\n');
+    const candidateGit = simpleGit({ baseDir: candidate });
     await candidateGit.add(['candidate.txt']);
     await candidateGit.commit('candidate');
     const candidateCommit = (await candidateGit.revparse(['HEAD'])).trim();
@@ -56,13 +57,14 @@ describe('self-bootstrap worktree', () => {
     await fs.rm(worktree, { recursive: true, force: true });
     cleanup.push(worktree);
     const prepared = await prepareBootstrapWorkspace(repository, worktree);
-    const candidateGit = simpleGit({ baseDir: worktree });
-    await fs.writeFile(path.join(worktree, 'candidate.txt'), 'qualified\n');
+    const candidate = prepared.worktree;
+    const candidateGit = simpleGit({ baseDir: candidate });
+    await fs.writeFile(path.join(candidate, 'candidate.txt'), 'qualified\n');
     await candidateGit.add(['candidate.txt']);
     await candidateGit.commit('qualified candidate');
     const qualifiedCommit = (await candidateGit.revparse(['HEAD'])).trim();
 
-    await fs.writeFile(path.join(worktree, 'candidate.txt'), 'changed later\n');
+    await fs.writeFile(path.join(candidate, 'candidate.txt'), 'changed later\n');
     await candidateGit.add(['candidate.txt']);
     await candidateGit.commit('move candidate branch');
 
@@ -76,9 +78,10 @@ describe('self-bootstrap worktree', () => {
     await fs.rm(worktree, { recursive: true, force: true });
     cleanup.push(worktree);
     const prepared = await prepareBootstrapWorkspace(repository, worktree);
-    const candidateGit = simpleGit({ baseDir: worktree });
+    const candidate = prepared.worktree;
+    const candidateGit = simpleGit({ baseDir: candidate });
     const candidateCommit = (await candidateGit.revparse(['HEAD'])).trim();
-    await fs.writeFile(path.join(worktree, 'uncommitted.txt'), 'dirty\n');
+    await fs.writeFile(path.join(candidate, 'uncommitted.txt'), 'dirty\n');
 
     await expect(promoteBootstrapCandidate(prepared, candidateCommit)).rejects.toThrow(/uncommitted|未提交/u);
   });

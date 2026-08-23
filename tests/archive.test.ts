@@ -14,11 +14,11 @@ beforeEach(async () => {
 });
 
 describe('archiveIfExists', () => {
-  it('moves existing docs/* file into docs/history with a timestamp', async () => {
+  it('copies an existing product document into container history without removing the source', async () => {
     await ws.writeFile('docs/plan.md', 'v1');
     const archived = await archiveIfExists(ws, 'docs/plan.md');
-    expect(archived).toMatch(/^docs\/history\/plan-\d{8}-\d{6}\.md$/);
-    expect(await ws.exists('docs/plan.md')).toBe(false);
+    expect(archived).toMatch(/^history\/docs\/plan-\d{8}-\d{6}\.md$/);
+    expect(await ws.exists('docs/plan.md')).toBe(true);
     expect(await ws.exists(archived!)).toBe(true);
     expect(await ws.readFile(archived!)).toBe('v1');
   });
