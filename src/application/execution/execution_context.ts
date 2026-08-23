@@ -1,4 +1,4 @@
-import { RECORDED_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
+import { TEST_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
 import { isTestFilePath, normalizeGitPath } from './v_model_policy.js';
 import type { LanguageProfile } from '../../core/language.js';
 import type { Ticket } from '../../domain/tickets/ticket.js';
@@ -43,7 +43,7 @@ export function computeDebugAllowedWrites(
   step: Step,
   profile: LanguageProfile,
 ): string[] {
-  if (isVerification(step)) return [...new Set(step.outputs)];
+  if (isVerification(step)) return withTestFixtureAccess(step.outputs);
   const byId = new Map(plan.steps.map((candidate) => [candidate.id, candidate]));
   const seen = new Set<string>();
   const stack = [...step.dependsOn];
@@ -66,7 +66,7 @@ export function computeDebugAllowedWrites(
       if (output !== profile.manifestFile) outputs.add(output);
     }
   }
-  return [...outputs];
+  return withTestFixtureAccess([...outputs]);
 }
 
 /**
@@ -90,24 +90,39 @@ export function computeIncrementalAllowedWrites(
     // A live Enhancement found at UNIT_TEST carried that Step's own documents and was routed to
     // CODE, which owns none of them.
     const owned = ownedAffectedArtifacts(step, ticket.affectedArtifacts);
-    return owned.length > 0 ? owned : computeStepAllowedWrites(step);
+    return owned.length > 0 ? withTestFixtureAccess(owned) : computeStepAllowedWrites(step);
   }
   if (ticket.type === 'change-request') {
     const owned = ownedAffectedArtifacts(step, ticket.contractDelta.affectedArtifacts);
-    return owned.length > 0 ? owned : computeStepAllowedWrites(step);
+    return owned.length > 0 ? withTestFixtureAccess(owned) : computeStepAllowedWrites(step);
   }
   return computeDebugAllowedWrites(plan, step, profile);
 }
 
+/**
+ * Adds the fixture directory to any write scope that owns a test.
+ *
+ * One function because a Step and the Debugger repairing that same Step must be able to write the
+ * same files. They could not: the Step's own scope granted the fixture directory and the corrective
+ * scope did not, so a test the Step was allowed to create could not be repaired — and a Bug routed
+ * there spent six attempts rewriting four DBC samples into the identical denial before the
+ * non-convergence guard stopped the run.
+ *
+ * The whole directory, not only the recorded-response corner of it: what a test must read is decided
+ * by what it verifies, and a parser test needs a malformed sample as surely as a client test needs a
+ * captured response.
+ */
+function withTestFixtureAccess(scope: readonly string[]): string[] {
+  const paths = [...new Set(scope)];
+  if (!paths.some((path) => isTestFilePath(normalizeGitPath(path)))) return paths;
+  const grant = `${TEST_FIXTURE_DIR}/`;
+  return paths.includes(grant) ? paths : [...paths, grant];
+}
+
 export function computeStepAllowedWrites(step: Step): string[] {
-  const outputs = [...new Set(step.outputs)];
-  // A Step that owns paired tests may also write the responses those tests replay. The rule that
-  // UNIT/INTEGRATION/MODULE must verify against data captured from the real dependency is useless
-  // without somewhere to put it: no plan declares this directory, so the Step would be told to
-  // record a fixture and then denied the write — a refusal it cannot act on.
-  return outputs.some((output) => isTestFilePath(normalizeGitPath(output)))
-    ? [...outputs, `${RECORDED_FIXTURE_DIR}/`]
-    : outputs;
+  // No plan declares the fixture directory and the instructions name it, so withholding it tells a
+  // Step to write a fixture and then refuses the one path it was told to use.
+  return withTestFixtureAccess(step.outputs);
 }
 
 export function stepContextChars(plan: Plan, step: Step): number {

@@ -21,13 +21,11 @@ export interface ScenarioArtifactReader {
 /**
  * Who judges the outcome.
  *
- * The finding this produces is routed through PM's problem-intake boundary, but PM is a domain
- * actor and not one of the configured LLM roles — naming a new role here would make every existing
- * configuration fail at the gate with `provider_not_configured`. `Planner` is the role that wrote
- * the expectation being judged, which makes it the closest reader of it. One line to change if a
- * ProjectManager role is later configured.
+ * PM, because the question is whether the project got what it asked for — and no role that executed
+ * the work should answer that about its own output. The finding this produces is routed through
+ * PM's problem-intake boundary, so judgement and routing now name the same owner.
  */
-const SCENARIO_JUDGE_ROLE = 'Planner' as const;
+const SCENARIO_JUDGE_ROLE = 'ProjectManager' as const;
 
 const MAX_ARTIFACTS = 3;
 const MAX_ARTIFACT_BYTES = 4_000;

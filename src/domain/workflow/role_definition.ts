@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { STEP_TYPES } from '../steps/step.js';
 import { TICKET_TYPES } from '../tickets/ticket.js';
-import { DomainRoleSchema, ExecutionAgentSchema, type DomainRole } from './role.js';
+import { DomainRoleSchema, RoleSchema, type DomainRole } from './role.js';
 import {
   capabilitiesForRole,
   defaultAgentForRole,
@@ -32,7 +32,8 @@ export const RoleDefinitionSchema = ObjectEnvelopeSchema.extend({
   supportedStepTypes: z.array(z.enum(STEP_TYPES)).default([]),
   supportedTicketTypes: z.array(z.enum(TICKET_TYPES)).default([]),
   /** The prompt persona used when this role talks to a model. */
-  defaultAgent: ExecutionAgentSchema,
+  // Any role: PM registers through this same definition and speaks as itself.
+  defaultAgent: RoleSchema,
   allowedTools: z.array(z.string().min(1)).default([]),
   prohibitions: z.array(z.string().min(1)).default([]),
 }).strict();

@@ -5,6 +5,7 @@ import type { Ticket, TicketWorkspaceBinding } from '../../domain/tickets/ticket
 import type { ContextRecord } from '../../domain/context/context_record.js';
 import type { DebugBrief } from '../../core/debug_brief.js';
 import type { DebugWikiMatch } from '../../core/debug_wiki.js';
+import { isCorrectiveTicket } from '../../domain/tickets/ticket.js';
 import { ContextService } from './context_service.js';
 
 /** Guards against a malformed parent chain turning assembly into an unbounded walk. */
@@ -157,7 +158,10 @@ export class ContextAssembler {
     current: Ticket | undefined,
     request: ContextAssemblyRequest,
   ): Promise<DebugWikiMatch[]> {
-    if (!current || current.type !== 'bug') return [];
+    // Every corrective type, not only Bug. A Change Request repairing a contract and an Enhancement
+    // closing a quality shortfall are both debugging something, and the wiki holds what previous
+    // runs learned about exactly those failures.
+    if (!current || !isCorrectiveTicket(current.type)) return [];
     if (!this.options.wiki || !request.debugBrief) return [];
     return this.options.wiki.search(request.debugBrief, {
       limit: this.options.wikiLimit ?? 3,

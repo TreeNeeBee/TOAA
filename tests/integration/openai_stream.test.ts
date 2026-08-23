@@ -721,3 +721,230 @@ describe('OpenAI-compatible streaming', () => {
     }
   });
 });
+
+/**
+ * A reasoning model streams its thinking on `delta.reasoning` and its answer on `delta.content`.
+ *
+ * Counting only `content` made every reasoning chunk invisible: `streamedContentChars` stayed 0
+ * while hundreds of chunks arrived, the first-token watchdog fired on a fully active stream, and
+ * the error told the operator to raise a timeout that could never be reached. Two live runs of the
+ * dbc2excel project died this way — 300s per streaming attempt, 900s per non-stream retry.
+ */
+describe('reasoning-model streams', () => {
+  const reasoningServer = (opts: { reasoningChunks: number; then?: string }) => createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    let sent = 0;
+    const tick = setInterval(() => {
+      if (sent < opts.reasoningChunks) {
+        sent += 1;
+        // Exactly what OpenRouter sends: empty content beside the reasoning text.
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '', reasoning: 'thinking ' } }] })}\n\n`);
+        return;
+      }
+      clearInterval(tick);
+      if (opts.then) {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: opts.then } }] })}\n\n`);
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }, 20);
+  });
+
+  const clientFor = async (server: ReturnType<typeof createServer>, firstTokenTimeoutMs: number) => {
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    return new OpenAIClient({
+      apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'reasoner',
+      requestTimeoutMs: 10_000,
+      streamFirstTokenTimeoutMs: firstTokenTimeoutMs,
+      streamIdleTimeoutMs: 10_000,
+    });
+  };
+
+  it('stays alive while only reasoning arrives, then returns the content', async () => {
+    // Ten chunks at 20ms apart outlast a 60ms first-token budget: only a watchdog that reasoning
+    // resets can survive to see the answer.
+    const server = reasoningServer({ reasoningChunks: 10, then: '{"ok":true}' });
+    const client = await clientFor(server, 60);
+    try {
+      const tokens: string[] = [];
+      const out = await client.chat([{ role: 'user', content: 'hi' }], { onToken: (c) => tokens.push(c) });
+      expect(out).toBe('{"ok":true}');
+      // Thinking is not output: it must not reach the caller or the parsed result.
+      expect(tokens).toEqual(['{"ok":true}']);
+      expect(out).not.toContain('thinking');
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it('names reasoning-without-content as its own fault, not as an idle stream', async () => {
+    // Never produces content, so the run must still end — and say something the operator can act on.
+    const server = reasoningServer({ reasoningChunks: 10_000 });
+    const client = await clientFor(server, 200);
+    try {
+      // Streaming, because that is the path a reasoning model stalls on. The message must name the
+      // reasoning, not the timer: raising the timeout is the one action that cannot help here.
+      await expect(client.chat([{ role: 'user', content: 'hi' }], { onToken: () => undefined }))
+        .rejects.toThrow(/sent \d+ reasoning chars but no content/u);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 20_000);
+});
+
+/**
+ * Two faults produce one message: a dead network and a model still thinking both surface as a
+ * timeout, and they need opposite responses. Two live dbc2excel runs died 15 minutes apart with
+ * `request timed out after 900000ms`, and nothing in the failure said which one it was.
+ *
+ * The diagnosis never ends the request — the timeouts own that. It exists so the failure can name
+ * what an operator should do next.
+ */
+describe('stall diagnosis', () => {
+  it('asks the caller to explain total silence, and does not end the request', async () => {
+    const stalls: Array<{ silentForMs: number; provider?: string }> = [];
+    let release: (() => void) | undefined;
+    const server = createServer((_req, res) => {
+      release = () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: 'late but fine' } }] }));
+      };
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'slow',
+        requestTimeoutMs: 10_000,
+        stallDiagnosisAfterMs: 80,
+      });
+      const out = await client.chat([{ role: 'user', content: 'hi' }], {
+        onStall: async (info) => {
+          stalls.push(info);
+          // Answering late must not matter: the diagnosis is not something the request waits on.
+          release?.();
+          return 'endpoint reachable from a new connection';
+        },
+      });
+      // The request completed. A diagnosis is not a failure.
+      expect(out).toBe('late but fine');
+      expect(stalls).toHaveLength(1);
+      expect(stalls[0]!.silentForMs).toBe(80);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 20_000);
+
+  it('carries the diagnosis into the failure, so the reason and the evidence arrive together', async () => {
+    const server = createServer(() => { /* never answers */ });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'silent',
+        requestTimeoutMs: 400,
+        stallDiagnosisAfterMs: 80,
+      });
+      await expect(client.chat([{ role: 'user', content: 'hi' }], {
+        onStall: async () => 'every check passed; the endpoint answered a new connection',
+      })).rejects.toThrow(/answered a new connection/u);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 20_000);
+
+  // Bytes, not tokens: a stream that is sending reasoning or SSE comments is not silent, so the
+  // diagnosis must not fire on it. Firing there would call doctor on a perfectly healthy stream.
+  it('does not fire while the peer is sending anything at all', async () => {
+    let stalled = false;
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      let n = 0;
+      const tick = setInterval(() => {
+        n += 1;
+        if (n > 12) {
+          clearInterval(tick);
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'done' } }] })}\n\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+        res.write(': keepalive\n\n');
+      }, 20);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'chatty',
+        requestTimeoutMs: 10_000, streamFirstTokenTimeoutMs: 5_000, streamIdleTimeoutMs: 5_000,
+        stallDiagnosisAfterMs: 100,
+      });
+      const out = await client.chat([{ role: 'user', content: 'hi' }], {
+        onToken: () => undefined,
+        onStall: async () => { stalled = true; return 'should not happen'; },
+      });
+      expect(out).toBe('done');
+      expect(stalled).toBe(false);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 20_000);
+});
+
+/**
+ * What a stream delivered, carried as a value rather than as a sentence.
+ *
+ * The router decides whether a non-stream retry is worth one attempt, and it used to recover that
+ * from English: `stream idle before first token` had to be excluded before `stream idle` was
+ * accepted, so the entire policy rested on one sentence being a prefix of the other. Both sentences
+ * were rewritten this week — for reasoning models and for the headers timeout — and nothing would
+ * have failed.
+ */
+describe('stream progress travels structurally', () => {
+  const failureOf = async (server: ReturnType<typeof createServer>, cfg: Record<string, unknown> = {}) => {
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    const client = new OpenAIClient({
+      apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'probe',
+      requestTimeoutMs: 900, streamFirstTokenTimeoutMs: 250, streamIdleTimeoutMs: 250,
+      streamHeadersTimeoutMs: 0, ...cfg,
+    });
+    try {
+      await client.chat([{ role: 'user', content: 'hi' }], { onToken: () => undefined });
+      return undefined;
+    } catch (err) {
+      return err as { failure?: { streamProgress?: string } };
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  };
+
+  it('reports no-bytes when the peer sent nothing', async () => {
+    const err = await failureOf(createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+    }));
+    expect(err?.failure?.streamProgress).toBe('no-bytes');
+  });
+
+  it('reports reasoning-only when the peer was thinking and never answered', async () => {
+    const err = await failureOf(createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const tick = setInterval(() => {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '', reasoning: 'think ' } }] })}\n\n`);
+      }, 20);
+      res.on('close', () => clearInterval(tick));
+    }));
+    expect(err?.failure?.streamProgress).toBe('reasoning-only');
+  });
+
+  it('reports content-started when the answer had begun', async () => {
+    const err = await failureOf(createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: 'partial' } }] })}\n\n`);
+      // then goes quiet, so the idle watchdog ends it
+    }));
+    expect(err?.failure?.streamProgress).toBe('content-started');
+  });
+});

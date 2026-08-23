@@ -491,7 +491,14 @@ export class DebugWiki {
           reasons.push(`category:${entry.category}`);
         }
         if (language && entry.language === language) score += 1;
-        const exact = entry.fingerprints.filter((fp) => queryFingerprints.includes(fp));
+        // `cat:` is already scored above, and it is the one fingerprint a human can write by hand
+        // that reliably matches — every other form is a whole normalized error sentence. Counting it
+        // twice gave every entry in a category the same guaranteed score there, so the most specific
+        // entry could not outrank the most generic one: a plain assertion failure retrieved three
+        // unrelated test_failure entries at 7.0 while the entry written for it scored the same.
+        const exact = entry.fingerprints.filter(
+          (fp) => !fp.startsWith('cat:') && queryFingerprints.includes(fp),
+        );
         if (exact.length > 0) {
           score += exact.length * 3;
           reasons.push(`fingerprint:${exact.length}`);

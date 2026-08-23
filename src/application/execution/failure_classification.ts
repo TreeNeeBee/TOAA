@@ -116,7 +116,17 @@ export function classifyFailure(
  * must stay `execution` so it still becomes a Bug, per the failure-routing rules.
  */
 const PROVIDER_FAILURE_TEXT =
-  /\ball LLM providers failed\b|\bOpenAI-compatible provider request failed\b|\bstream idle before first token\b|\bprovider_call_failed\b/iu;
+  /\ball LLM providers failed\b|\bOpenAI-compatible provider request failed\b|\bprovider_call_failed\b|\bOpenAI stream \b/iu;
+// Every alternative here is a prefix the runtime composes, never a description of the fault.
+//
+// `stream idle before first token` used to be the fourth, and it was one sentence out of the several
+// a stream watchdog can produce. The same watchdog now also says "sent N reasoning chars but no
+// content" and "sent no response headers" — cases it could not tell apart before — and neither would
+// have matched. `OpenAI stream ` covers all of them because the transport puts it in front of every
+// message it composes about a stream it ended, whatever the reason turns out to be.
+//
+// Most of these arrive already wrapped in `OpenAI-compatible provider request failed …`, but not
+// all: some paths record only the inner message, and that is the path this alternative exists for.
 
 const AGENT_EXECUTION_STALL_TEXT =
   /repeated read-only\/probe actions|read-only recovery mode repeated probe actions|model returned actions=\[\] and done=false|invalid completion loop|max rounds exceeded|low-quality (?:debugger )?response/iu;

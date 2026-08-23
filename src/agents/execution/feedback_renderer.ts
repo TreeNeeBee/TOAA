@@ -300,18 +300,27 @@ export function missingQualityAssessmentFields(
   // retries surfaced as an infrastructure failure that stopped the run. Enumerating what an empty
   // assessment would still be missing turns the rejection into the field list to fill in.
   if (!assessment) {
+    // Fresh, always: an assessment that was never made cannot be out of date, and asking for a
+    // re-assessment beside "there is no assessment" spends a line of the instruction contradicting
+    // the one above it. Producing one is the whole action here, and it is necessarily post-tool.
     return [
       'qualityAssessment',
-      ...missingQualityAssessmentFields(
-        step,
-        normalizeQualityAssessment({}),
-        freshAfterTools,
-        context,
-      ),
+      ...missingQualityAssessmentFields(step, normalizeQualityAssessment({}), true, context),
     ];
   }
   const missing: string[] = [];
-  if (!freshAfterTools) missing.push('qualityAssessment.postToolEvidence');
+  // Staleness is not an absent field, and naming it like one names a field that does not exist.
+  //
+  // `freshAfterTools` is false when the assessment was produced in an earlier round than the last
+  // tool call — a fact about ordering, not about the payload. Reporting it as
+  // `qualityAssessment.postToolEvidence` told the model to add a key that `StageQualityAssessment`
+  // has no room for, and adding it changes no round number, so the same rejection came back and the
+  // Step burned its rounds on it. The comment above records the same lesson for the absent-object
+  // case; this line reintroduced it with an invented field name, which is harder to spot because it
+  // reads like a real one.
+  if (!freshAfterTools) {
+    missing.push('a qualityAssessment measured after the last tool call (the one supplied predates it — re-assess now and answer again)');
+  }
   if ((V_MODEL_DEVELOPMENT_PHASES as readonly string[]).includes(step.phase)) {
     if (typeof assessment.completion !== 'number') missing.push('qualityAssessment.completion');
     if (typeof assessment.upstreamAlignment !== 'number') {

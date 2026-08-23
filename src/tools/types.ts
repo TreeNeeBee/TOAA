@@ -231,6 +231,17 @@ export function isAllowedWrite(rel: string, allowed: string[]): boolean {
  * A denial the model cannot act on costs a full round every time it guesses again; the allowlist is
  * in the system prompt but many rounds back and possibly trimmed, so it is repeated here.
  */
+export function deniedRuntimeOwnedWrite<T>(
+  action: 'write' | 'append',
+  owned: { path: string; remedy: string },
+): ToolResult<T> {
+  return {
+    ok: false,
+    code: 'write_denied',
+    error: `${action} denied: ${owned.path} is not written by a Step. ${owned.remedy}`,
+  };
+}
+
 export function deniedWrite<T>(
   action: 'write' | 'append',
   rel: string,

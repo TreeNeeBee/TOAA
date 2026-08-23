@@ -13,6 +13,7 @@ function allRoles(provider: string): Record<string, string[]> {
     Coder: [provider],
     Tester: [provider],
     Debugger: [provider],
+    ProjectManager: [provider],
   };
 }
 
@@ -152,6 +153,7 @@ llm:
     Coder:     [openai]
     Tester:    [openai]
     Debugger:  [openai]
+    ProjectManager:  [openai]
   fallbacks: []
   role_fallbacks: {}
 agent:
@@ -274,6 +276,7 @@ llm:
     Coder:     [openrouter_free]
     Tester:    [openrouter_free]
     Debugger:  [openrouter_free]
+    ProjectManager:  [openrouter_free]
   fallbacks: []
   role_fallbacks: {}
 agent:
@@ -385,5 +388,34 @@ agent:
       if (oldLong === undefined) delete process.env.XCOMPILER_PATH;
       else process.env.XCOMPILER_PATH = oldLong;
     }
+  });
+});
+
+// PM judges outcomes on the project's behalf and never executes a Step. Letting it be assigned as a
+// Step's role would put the judge in the position of doing the work it later assesses.
+describe('ProjectManager is a judging role, not an executing one', () => {
+  it('is configurable as an LLM role', async () => {
+    const { ROLES } = await import('../src/core/plan.js');
+    expect(ROLES).toContain('ProjectManager');
+  });
+
+  // No silent degradation: a project with no judge configured must not proceed believing it has
+  // one. The gate that would have caught a wrong delivery is the thing being left unconfigured.
+  it('is rejected at load time when no provider is configured for it', async () => {
+    const { loadConfig } = await import('../src/config/config.js');
+    const config = baseConfig() as { llm: { roles: Record<string, unknown> } };
+    delete config.llm.roles.ProjectManager;
+    const cfgPath = await writeConfig(config);
+    await expect(loadConfig(cfgPath)).rejects.toThrow(/ProjectManager/u);
+  });
+
+  it('cannot be assigned as the role that runs a Step', async () => {
+    const { StepSchema } = await import('../src/core/plan.js');
+    const step = {
+      id: 'S001', iterationId: 'P1', phase: 'REQUIREMENT_ANALYSIS', title: 't', description: 'd',
+      systemPrompt: 'p', acceptance: 'a', maxAttempts: 3,
+    };
+    expect(StepSchema.safeParse({ ...step, role: 'Coder' }).success).toBe(true);
+    expect(StepSchema.safeParse({ ...step, role: 'ProjectManager' }).success).toBe(false);
   });
 });

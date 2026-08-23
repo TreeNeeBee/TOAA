@@ -99,6 +99,11 @@ requirement.
   permission outcomes. Route each through its defined Ticket or control path.
 - Fix root causes. Do not suppress exceptions, weaken gates, fabricate outputs, mark incomplete work
   successful, or add retries that merely conceal a deterministic failure.
+- Branch control flow on a channel the producer sets deliberately — a typed code, an enumerated
+  kind, a structured field — never on message text. Prose is presentation: it is rewritten for
+  clarity by people who cannot see who is matching it, and the match then fails silently while its
+  own test keeps passing, because the test supplies the wording the pattern was written against.
+  This repository has lost a repair loop and a recovery path to exactly that, twice.
 - A repair is complete only when the failing behavior is reproduced, the correction is applied, and
   focused evidence demonstrates the changed outcome. Also test the closest sibling path when the
   root cause is shared.
@@ -118,6 +123,20 @@ requirement.
   affected suite, typecheck, lint, build, and package/release checks appropriate to its blast radius.
 - Never modify production behavior solely to make a brittle test pass. Correct the test when the
   test contradicts the approved contract.
+- Cover the call site, not only the unit. A check that is never invoked passes every test written
+  against the check itself; deleting its call from the production path must fail something. Verify
+  this the same way you verify the fix — remove the call, watch a test fail, restore it.
+- Falsify the wiring, not the logic. Most changes have two halves — a function, and the line that
+  calls it — and the function is the half that was never in doubt. Reverting it proves only that the
+  test runs. The rule above says to remove the call too, and knowing it is not enough: it was in this
+  file, and five changes in a single session still shipped with a test that passed either way,
+  because each time the natural revert was the interesting half. Two tells that you picked the wrong
+  one: the test names the new function rather than the behaviour a caller would notice, and it was
+  easy to write. Revert the call first; if nothing fails, the test is aimed at the wrong half,
+  whatever else it proves.
+- Verify a heuristic against the case that motivated it before keeping it. A rule inferred from a
+  defect but never run against that defect is unevidenced; if it does not catch its own motivating
+  example, delete it rather than shipping a check that only appears to help.
 
 ## Configuration And Security
 

@@ -12,8 +12,27 @@ export type LLMFailureCode =
   | 'all_providers_failed'
   | 'request_failed';
 
+/**
+ * What a stream had delivered when it stopped.
+ *
+ * The transport knows this exactly — it counts content and reasoning as they arrive — and the
+ * decision that needs it, whether a non-stream retry is worth attempting, is three layers away. It
+ * used to travel as English: the watchdog picked one of two sentences and the router recovered the
+ * boolean with `msg.includes('stream idle before first token')`, relying on one sentence being a
+ * prefix of the other. Rewording either one silently changed a retry policy.
+ */
+export type StreamProgress =
+  /** Nothing arrived at all. A blind retry is very unlikely to do better. */
+  | 'no-bytes'
+  /** The peer was alive and thinking, but never began answering. */
+  | 'reasoning-only'
+  /** Content had started and then stopped; the rest may still be obtainable. */
+  | 'content-started';
+
 export interface LLMFailureDetails {
   code: LLMFailureCode;
+  /** Set by the streaming transport when it ends a stream itself. */
+  streamProgress?: StreamProgress;
   provider?: string;
   model?: string;
   endpoint?: string;

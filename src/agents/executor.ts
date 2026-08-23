@@ -71,6 +71,26 @@ import { verifyOutputs } from './execution/output_verifier.js';
 export { isCompleteTurnJson } from './execution/turn_parser.js';
 export { verifyOutputs } from './execution/output_verifier.js';
 
+/**
+ * Names the outputs still owed, so a repeat-command ticket carries its cause and not just its shape.
+ *
+ * "You reran a command" is the symptom; "you have not written the files that command runs" is the
+ * reason, and only the reason tells the role receiving the ticket what to do. A live dbc3 Bug landed
+ * on a Debugger saying the command had been repeated, while the five unwritten outputs it was
+ * repeating over sat in a separate feedback line the ticket did not carry.
+ */
+async function owedOutputsSuffix(inp: ExecutorRunInput): Promise<string> {
+  try {
+    const verify = await verifyOutputs(inp);
+    return verify.missing.length > 0
+      ? ` This Step has not produced its declared outputs yet: ${verify.missing.join(', ')} — write those first.`
+      : '';
+  } catch {
+    // The ticket text is worth more than the extra detail; a failed check must not lose it.
+    return '';
+  }
+}
+
 const MISSING_OUTPUT_STALL_ROUND_LIMIT = 3;
 const INVALID_COMPLETION_ROUND_LIMIT = 2;
 const RECOVERY_PROBE_ACTIONS_PER_ROUND = 4;
@@ -185,6 +205,16 @@ export interface ExecutorRunResult {
   changeRequestDisposition?: ChangeRequestDisposition;
   /** A role found a semantic test/contract defect backed by current or inherited executable evidence. */
   validationDefect?: string;
+  /**
+   * Who authored `validationDefect`, because the two authors mean opposite things.
+   *
+   * `role-asserted` is a claim: the role read the evidence and says the contract it was handed is
+   * defective. `gate-rendered` is not a claim at all — the runtime formatted a failing `run_tests`
+   * into text because the role said nothing about fault. Routing read only whether the field was
+   * set, so a plain gate failure was treated as a role contradicting the active Change Request's
+   * diagnosis and was filed against that chain's origin Step instead of the Step that failed.
+   */
+  validationDefectSource?: 'role-asserted' | 'gate-rendered';
   /** Structured completion/alignment/coverage evidence evaluated by the Runtime quality gate. */
   qualityAssessment?: StageQualityAssessment;
   error?: string;
@@ -879,7 +909,8 @@ export class StepExecutor {
           repeatedVerificationFailure =
             `verification command repeated without a successful mutation: ${verificationActionLabel(a)}; ` +
             `latest failure: ${truncate(previousExactVerificationFailure, 1000)}; ` +
-            'the duplicate command was not executed again; next attempt must patch/write before rerunning this command.';
+            'the duplicate command was not executed again; next attempt must patch/write before rerunning this command.' +
+            await owedOutputsSuffix(inp);
           turnResults.push({
             tool: a.tool,
             ok: false,
@@ -1043,7 +1074,8 @@ export class StepExecutor {
               repeatedVerificationFailure =
                 `verification command repeated without a successful mutation: ${verificationActionLabel(a)}; ` +
                 `latest failure: ${truncate(r.error ?? r.summary ?? 'unknown error', 1000)}; ` +
-                'next attempt must patch/write before rerunning this command.';
+                'next attempt must patch/write before rerunning this command.' +
+                await owedOutputsSuffix(inp);
             }
           }
         }
@@ -1107,7 +1139,8 @@ export class StepExecutor {
       }
       if (testGateFailure) {
         const verify = await verifyOutputs(inp);
-        const validationDefect = extractValidationDefect(turn) ??
+        const assertedValidationDefect = extractValidationDefect(turn);
+        const validationDefect = assertedValidationDefect ??
           validationDefectFromTestFailure(inp.step.phase, testGateFailure, inp.ctx.testGateArgs ?? []);
         const metrics = computeMetrics({
           rounds: actualRounds,
@@ -1136,6 +1169,7 @@ export class StepExecutor {
           finalThought,
           bugResolutionPlan,
           validationDefect,
+          validationDefectSource: assertedValidationDefect ? 'role-asserted' : 'gate-rendered',
           error: `validation defect reported: ${validationDefect}`,
           metrics,
         };
@@ -1228,6 +1262,7 @@ export class StepExecutor {
           finalThought,
           bugResolutionPlan,
           validationDefect,
+          validationDefectSource: 'role-asserted',
           error: `validation defect reported: ${validationDefect}`,
           metrics,
         };

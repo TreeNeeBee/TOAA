@@ -62,3 +62,31 @@ describe('capability vocabulary', () => {
     }
   });
 });
+
+// PM registers through the same flow as every other domain role, so the one thing that made it
+// different was invisible: `defaultAgentForRole` fell through to `Planner`, which meant the actor
+// that judges delivery drew from the same configured model pool as the actor that plans the work.
+// A judgement made in the planner's voice is the planner reviewing the planner.
+describe('every domain role speaks as itself', () => {
+  it('gives PM its own configured role rather than the planner fallback', async () => {
+    const { defaultAgentForRole } = await import('../src/domain/workflow/role_profile.js');
+    expect(defaultAgentForRole('project-manager')).toBe('ProjectManager');
+    expect(defaultAgentForRole('requirements-engineer')).toBe('Planner');
+  });
+
+  it('names a configured role for every domain role, with no gaps', async () => {
+    const { defaultAgentForRole } = await import('../src/domain/workflow/role_profile.js');
+    const { DOMAIN_ROLES } = await import('../src/domain/workflow/role.js');
+    const { ROLES } = await import('../src/core/plan.js');
+    for (const role of DOMAIN_ROLES) {
+      expect(ROLES).toContain(defaultAgentForRole(role));
+    }
+  });
+
+  // Only PM is outside the executing set: every other domain role runs Steps.
+  it('keeps PM out of the roles a Step can be handed to', async () => {
+    const { ExecutingRoleSchema } = await import('../src/domain/workflow/role.js');
+    expect(ExecutingRoleSchema.safeParse('Coder').success).toBe(true);
+    expect(ExecutingRoleSchema.safeParse('ProjectManager').success).toBe(false);
+  });
+});

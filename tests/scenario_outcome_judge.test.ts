@@ -39,6 +39,20 @@ describe('scenario outcome judgement', () => {
     expect(seen.join('\n')).toContain('each record carries a distinct summary');
   });
 
+  // The finding this produces is routed to PM. Judging in an executing role's voice would put the
+  // verdict and the owner of the verdict in two different places, and only the routing is visible
+  // downstream — so a drift back to a borrowed role would be silent.
+  it('judges in PM\'s voice, the same role the finding is routed to', async () => {
+    const roles: string[] = [];
+    await judgeScenarioOutcome({
+      router: router([], '{"ok": true, "reason": "fine"}', roles),
+      before: [],
+      artifacts: { snapshot: async () => [], read: async () => undefined },
+      scenario, scene,
+    });
+    expect(roles).toEqual(['ProjectManager']);
+  });
+
   it('passes when the artifact meets the expectation', async () => {
     const verdict = await judgeScenarioOutcome({
       router: router([], '{"ok": true, "reason": "records are distinct"}'),
@@ -84,14 +98,17 @@ describe('scenario outcome judgement', () => {
   });
 });
 
-function router(seen: string[], answer: string) {
+function router(seen: string[], answer: string, roles: string[] = []) {
   return {
-    for: () => ({
-      chat: async (messages: { content: string }[]) => {
-        seen.push(...messages.map((m) => m.content));
-        return answer;
-      },
-    }),
+    for: (role: string) => {
+      roles.push(role);
+      return {
+        chat: async (messages: { content: string }[]) => {
+          seen.push(...messages.map((m) => m.content));
+          return answer;
+        },
+      };
+    },
   } as never;
 }
 

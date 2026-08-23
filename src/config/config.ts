@@ -58,10 +58,24 @@ const ProviderSchema = z.object({
   request_timeout_ms: z.number().int().nonnegative().optional(),
   /** OpenAI-compatible DNS/TCP/TLS 建连超时（毫秒）。默认 60 秒。0 = 不限制。 */
   connect_timeout_ms: z.number().int().nonnegative().optional(),
+  /**
+   * 内核在连接静默多久后开始发 TCP 探活包（毫秒）。默认 30 秒。0 = 关闭。
+   *
+   * 检测的是路径而非进度：断网留下的 socket 收不到 RST/FIN，应用层无从察觉，只有探活能把它变成
+   * 连接错误。不需要 provider 做任何配合 —— 对端内核会回应探活，哪怕它的模型还在推理。
+   */
+  tcp_keepalive_ms: z.number().int().nonnegative().optional(),
   /** 收到首个 token 后的流式空闲超时（毫秒）。默认值由 transport 决定。0 = 不限制。 */
   stream_idle_timeout_ms: z.number().int().nonnegative().optional(),
   /** 等待首个流式 token 的超时（毫秒）。默认 5 分钟。0 = 不限制。 */
   stream_first_token_timeout_ms: z.number().int().nonnegative().optional(),
+  /**
+   * 流式请求等待响应头的超时（毫秒）。默认 30 秒。0 = 不限制。仅对流式生效。
+   *
+   * 流式服务端先写响应头、再开始思考，所以「头没来」是连接问题（秒级），「头来了但 token 慢」是
+   * 模型问题（分钟级）。这两件事此前共用同一个 5 分钟预算，死掉的端点和正在作答的模型无从区分。
+   */
+  stream_headers_timeout_ms: z.number().int().nonnegative().optional(),
   /** 流式异常保护阈值。真实有效输出不会因长度本身被截断；0 = 关闭该阈值。 */
   max_output_chars: z.number().int().nonnegative().optional(),
   /**
@@ -192,6 +206,15 @@ const LlmSchema = z.object({
    */
   cluster_score_min: z.number().min(0.1).max(1).optional(),
   cluster_score_max: z.number().min(0.1).max(1).optional(),
+  /**
+   * How long a provider may send nothing at all before the runtime diagnoses the silence.
+   *
+   * Separate from the timeouts, and deliberately not one of them: this does not end the request. It
+   * runs the environment check once so the eventual failure can say whether the endpoint was
+   * reachable, rather than leaving an operator to guess between a dead network and a slow model —
+   * two faults that produce the same timeout and need opposite responses. 0 disables it.
+   */
+  stall_diagnosis_after_ms: z.number().int().nonnegative().default(600_000),
 }).strict().superRefine((llm, ctx) => {
   for (const role of ROLES) {
     const explicit = llm.role_fallbacks[role] ?? [];

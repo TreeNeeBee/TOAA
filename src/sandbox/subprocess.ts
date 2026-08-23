@@ -16,7 +16,7 @@ import type {
   ExecProgressWatch,
 } from './types.js';
 import { normalizeTypeScriptTestArgs } from './test_args.js';
-import { resolveTypeScriptProgramCommand } from './program_args.js';
+import { resolveTypeScriptProgramCommand, stripPythonInterpreterPrefix } from './program_args.js';
 
 export type { SandboxLimits, ExecResult } from './types.js';
 
@@ -405,7 +405,7 @@ export class SubprocessSandbox implements Sandbox {
       const command = resolveTypeScriptProgramCommand(args);
       return this.exec(command.cmd, command.argv, extra);
     }
-    return this.exec(this.pythonInVenv, args, extra);
+    return this.exec(this.pythonInVenv, stripPythonInterpreterPrefix(args), extra);
   }
 
   /** 运行测试。Python → pytest；TypeScript → npm test（Vitest）。 */

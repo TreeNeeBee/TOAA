@@ -23,6 +23,13 @@ let ctx: ToolContext;
 beforeEach(async () => {
   tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-tools-'));
   ws = new Workspace(tmp);
+  // These cases are about how gate selectors and caller flags compose into one argument list, not
+  // about whether the files exist. run_tests now refuses selectors nobody has written — a Step
+  // cannot pass a suite it has not authored — so the selectors they compose have to be real.
+  for (const rel of ['tests/unit/parser.test.ts', 'tests/module/parser.test.ts']) {
+    await ws.ensure(path.posix.dirname(rel));
+    await ws.writeFile(rel, 'export {};\n');
+  }
   ctx = {
     ws,
     sandbox: undefined as never,
@@ -1181,5 +1188,49 @@ describe('file tree indexing through the tools', () => {
     const result = await writeFileTool.run({ path: 'src/c.py', content: 'c = 1\n' }, ctx);
     expect(result.ok).toBe(true);
     expect(await fs.readFile(path.join(tmp, 'src/c.py'), 'utf8')).toBe('c = 1\n');
+  });
+});
+
+/**
+ * `run_program` supplies the interpreter, so a caller that repeats it runs `python python …`.
+ *
+ * The TypeScript side already normalises `npm|npx|node|tsx|tsc` prefixes and its tool description
+ * advertises them, so a model that learned the shape there applies it to Python and is punished for
+ * the asymmetry. The cost is not one wasted round: in a live run the model diagnosed the duplication
+ * correctly and then filed it as a contract change — CR-CR-001 named five artifacts, the Step it
+ * reached owned none of them and filed CR-CR-002, which reached a third role and produced
+ * CR-CR-003. A tool-level ambiguity became three Change Requests across three roles.
+ */
+describe('python run_program argument normalisation', () => {
+  it('drops a repeated interpreter so the real arguments survive', async () => {
+    const { stripPythonInterpreterPrefix } = await import('../src/sandbox/program_args.js');
+    expect(stripPythonInterpreterPrefix(['python', '-m', 'py_compile', 'tests/x.py']))
+      .toEqual(['-m', 'py_compile', 'tests/x.py']);
+    expect(stripPythonInterpreterPrefix(['python3', 'src/main.py'])).toEqual(['src/main.py']);
+    expect(stripPythonInterpreterPrefix(['python3.12', 'src/main.py'])).toEqual(['src/main.py']);
+  });
+
+  it('leaves a correctly formed invocation untouched', async () => {
+    const { stripPythonInterpreterPrefix } = await import('../src/sandbox/program_args.js');
+    expect(stripPythonInterpreterPrefix(['-m', 'py_compile', 'x.py'])).toEqual(['-m', 'py_compile', 'x.py']);
+    expect(stripPythonInterpreterPrefix(['src/main.py', '--once'])).toEqual(['src/main.py', '--once']);
+  });
+
+  // A file that happens to be named for the interpreter is an argument, not a duplicated prefix.
+  it('does not eat an argument that merely looks like the interpreter', async () => {
+    const { stripPythonInterpreterPrefix } = await import('../src/sandbox/program_args.js');
+    expect(stripPythonInterpreterPrefix(['python.py'])).toEqual(['python.py']);
+    expect(stripPythonInterpreterPrefix(['python'])).toEqual(['python']);
+  });
+
+  // Both sandboxes run Python the same way, so both have to normalise; the docker path carried an
+  // identical line and would have reproduced the defect there.
+  it('normalises in the subprocess and docker sandboxes alike', async () => {
+    const { readFile } = await import('node:fs/promises');
+    for (const file of ['subprocess.ts', 'docker.ts']) {
+      const source = await readFile(new URL(`../src/sandbox/${file}`, import.meta.url), 'utf8');
+      const runProgram = source.slice(source.indexOf('async runProgram'));
+      expect(runProgram.slice(0, 400)).toContain('stripPythonInterpreterPrefix');
+    }
   });
 });

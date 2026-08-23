@@ -14,6 +14,7 @@ import {
   type TicketSolution,
   type TicketWorkspaceBinding,
   type WorkTicket,
+  changeRequestHopKey,
 } from '../../domain/tickets/ticket.js';
 import { ChangelistSchema, type Changelist } from '../../domain/evidence/evidence.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
@@ -451,13 +452,30 @@ export class TicketWorkflow {
     if (!parent || !['story', 'task', 'change-request'].includes(parent.type)) {
       throw new Error(`Source Ticket ${source.id} does not belong to executable work`);
     }
-    const existing = (await this.list()).find((ticket): ticket is ChangeRequestTicket =>
-      ticket.type === 'change-request' &&
-      ticket.state !== 'cancelled' &&
+    const hopKey = changeRequestHopKey({
+      sourceStepId: input.sourceStepId,
+      targetStepId: input.targetStepId,
+      originFailedStepId: source.type === 'bug' ? source.failure.failedStepId : undefined,
+      parentChangeRequestId: input.parentChangeRequestId,
+    });
+    const open = (await this.list()).filter((ticket): ticket is ChangeRequestTicket =>
+      ticket.type === 'change-request' && ticket.state !== 'cancelled',
+    );
+    const sameSource = open.find((ticket) =>
       ticket.sourceTicketId === source.id &&
       ticket.parentChangeRequestId === input.parentChangeRequestId,
     );
-    if (existing) return existing;
+    if (sameSource) return sameSource;
+    const sameHop = open.find((ticket) =>
+      ticket.state !== 'closed' &&
+      changeRequestHopKey({
+        sourceStepId: ticket.sourceStepId,
+        targetStepId: ticket.targetStepId,
+        originFailedStepId: ticket.originFailure?.failedStepId,
+        parentChangeRequestId: ticket.parentChangeRequestId,
+      }) === hopKey,
+    );
+    if (sameHop) return await this.mergeChangeRequestHop(sameHop, source, input.contractDelta);
     const envelope = createObjectEnvelope({
       name: await this.nextName('CR', parent.name.split('-')[0] ?? 'P'),
       objectType: 'ticket',
@@ -524,6 +542,47 @@ export class TicketWorkflow {
       : await this.prepareSourceChangeRequest(source, request);
     await this.repository.commit([request, ...sourceObjects]);
     return request;
+  }
+
+  /**
+   * Fold a second Bug's propagation into the hop that already carries it.
+   *
+   * The two chains are the same correction arriving at the same Step from the same failure, so the
+   * target Step should verify the combined contract once rather than twice. Nothing is discarded:
+   * the incoming source is cross-referenced, its changelists join the union the target will apply,
+   * and its summary is kept alongside the existing one when the two disagree — two Bugs can reach
+   * one Step for reasons that are not the same reason, and the Step needs both to know what it is
+   * verifying. When they agree, repeating the sentence would only cost context.
+   */
+  private async mergeChangeRequestHop(
+    existing: ChangeRequestTicket,
+    source: BugTicket | EnhancementTicket,
+    incoming: ChangeRequestTicket['contractDelta'],
+  ): Promise<ChangeRequestTicket> {
+    const summaries = dedupeStrings([existing.contractDelta.summary, incoming.summary]);
+    const merged = TicketSchema.parse({
+      ...existing,
+      ...reviseObjectEnvelope(existing),
+      relatedTicketIds: dedupeStrings([...existing.relatedTicketIds, source.id]),
+      changelistIds: dedupeStrings([...existing.changelistIds, ...source.changelistIds]),
+      contractDelta: {
+        ...existing.contractDelta,
+        summary: summaries.join('\n'),
+        before: dedupeStrings([...existing.contractDelta.before, ...incoming.before]),
+        after: dedupeStrings([...existing.contractDelta.after, ...incoming.after]),
+        affectedArtifacts: dedupeStrings([
+          ...existing.contractDelta.affectedArtifacts,
+          ...incoming.affectedArtifacts,
+        ]),
+      },
+    }) as ChangeRequestTicket;
+    // The incoming source still has to be handed off. Its Bug is blocked behind this hop exactly as
+    // it would be behind a hop of its own, and the `changeRequestTicketIds` back-link is what makes
+    // that true — without it the Bug stays schedulable forever and the merge trades one redundant
+    // CR for one immortal Bug.
+    const sourceObjects = await this.prepareSourceChangeRequest(source, merged);
+    await this.repository.commit([merged, ...sourceObjects]);
+    return merged;
   }
 
   async setSolution(ticketId: ObjectId, solution: TicketSolution): Promise<Ticket> {
@@ -1088,4 +1147,8 @@ function canonicalJson(value: unknown): string {
 
 export function verificationStepTypeForFailure(type: StepType): StepType {
   return type;
+}
+
+function dedupeStrings<T extends string>(values: readonly T[]): T[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
 }

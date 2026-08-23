@@ -4,7 +4,8 @@ import { xcompilerBuildId } from '../../core/build_identity.js';
 import { resolveFileTreeService } from '../workspace/file_tree_resolver.js';
 import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
 import { ensureEssentialToolRefs } from '../../agents/calibration.js';
-import { buildDebugBrief } from '../../core/debug_brief.js';
+import { buildDebugBrief, buildFailureSignature, type DebugBrief } from '../../core/debug_brief.js';
+import type { DomainLog } from '../../domain/observability/records.js';
 import { DebugWiki, defaultDebugWikiPath, type DebugWikiMatch } from '../../core/debug_wiki.js';
 import {
   ContextAssembler,
@@ -22,7 +23,7 @@ import {
   mergePairedSourceTestQuality,
 } from '../../core/paired_test_contract.js';
 import { normalizeGitPath } from './v_model_policy.js';
-import { RECORDED_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
+import { TEST_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
 import { getLanguageProfile, type LanguageProfile } from '../../core/language.js';
 import type { Plan, Step as ExecutionStep } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
@@ -61,7 +62,6 @@ import {
 } from '../../tools/index.js';
 import type { Workspace } from '../../workspace/workspace.js';
 import type { GitService } from '../../workspace/git.js';
-import { createHash } from 'node:crypto';
 import { isCancellationError } from '../../core/cancellation.js';
 import {
   classifyFailure,
@@ -73,6 +73,7 @@ import type { RecordReplayController } from '../record_replay/controller.js';
 import {
   reconcileMeasuredQualityAssessment,
   reconcileDeferredSourceQualityAssessment,
+  briefForAttemptFailure,
   renderAttemptRetryFeedback,
   prioritizeAttemptFailureEvidence,
   selectActionableAttemptFailure,
@@ -350,9 +351,14 @@ export class DomainAttemptRunner {
 
       // One assembly per attempt: it is both the context the role sees and the single Debug Wiki
       // retrieval, so the snapshot below records exactly what reached the model.
-      const assembled = await this.assembleContext(input);
+      // Resolved once and handed to both consumers. Retrieval and the prompt are two questions about
+      // the same failure, and answering them from two sources is how they came apart: lookup followed
+      // the top of the stack while the prompt kept describing the failure that opened the Ticket. A
+      // live Debugger spent 26 attempts re-fixing an import error the Ticket was created for, which
+      // an earlier round had already fixed, while the assertion actually failing never reached it.
+      const { assembled, debugBrief } = await this.assembleContext(input);
       const debugContext = input.ticket.type === 'bug'
-        ? debugContextFrom(input.ticket, input.executionStep, assembled.debugWikiMatches)
+        ? debugContextFrom(input.ticket, debugBrief!, assembled.debugWikiMatches)
         : undefined;
       const retryFeedback = input.ticket.type === 'bug'
         ? await this.latestAttemptFailure(input)
@@ -691,7 +697,7 @@ export class DomainAttemptRunner {
       : undefined;
     const allowedWrites = [...new Set([
       ...baseWrites,
-      ...(supplementalTestRoot ? [supplementalTestRoot, `${RECORDED_FIXTURE_DIR}/`] : []),
+      ...(supplementalTestRoot ? [supplementalTestRoot, `${TEST_FIXTURE_DIR}/`] : []),
     ])];
     const retryFeedback = await this.latestAttemptFailure(input);
     const rewriteExistingFiles = input.mode === 'debug'
@@ -796,16 +802,22 @@ export class DomainAttemptRunner {
       'docs/02-high-level-design.md',
       'docs/03-detailed-design.md',
     ]);
-    const snippets: Array<{ path: string; content: string }> = [{
-      path: `.xcompiler/objects/ticket/${input.ticket.id}.json`,
-      content: JSON.stringify(input.ticket, null, 2),
-    }];
+    // Top of the stack first, then the Ticket. The renderer caps each snippet, so whichever comes
+    // first is what survives: a live Bug's Ticket carried 43KB of the pytest output from the day it
+    // was opened, the cap kept the first 3000 characters of that, and the failure actually in hand
+    // reached the model only as a one-line summary further down. The Ticket still travels — its
+    // state, acceptance and routing are needed — with the prose that crowded them out bounded.
+    const snippets: Array<{ path: string; content: string }> = [];
     if (retryFeedback) {
       snippets.push({
         path: `.xcompiler/retry/${input.ticket.name}.md`,
         content: retryFeedback,
       });
     }
+    snippets.push({
+      path: `.xcompiler/objects/ticket/${input.ticket.id}.json`,
+      content: JSON.stringify(ticketContextSnapshot(input.ticket), null, 2),
+    });
     if (input.mode === 'debug' || input.mode === 'change-request') {
       const failureEvidence = input.ticket.type === 'bug'
         ? [input.ticket.failure.summary, input.ticket.failure.message, retryFeedback ?? ''].join('\n')
@@ -863,6 +875,24 @@ export class DomainAttemptRunner {
     return [...new Set(targets)];
   }
 
+  /** The brief for the failure being repaired now, or undefined before the first one is recorded. */
+  private async latestFailureBrief(input: AttemptInput) {
+    const log = await this.latestFailureLog(input);
+    return log ? briefForAttemptFailure(log, input.executionStep.phase) : undefined;
+  }
+
+  /** One definition of "the failure in hand", shared by retrieval and by the retry feedback. */
+  private async latestFailureLog(input: AttemptInput): Promise<DomainLog | undefined> {
+    const failures = [];
+    for (const logId of input.ticket.logIds) {
+      const object = await this.options.repository.read(logId);
+      if (object.objectType !== 'log' || object.level !== 'error') continue;
+      if (object.data.stepId !== input.domainStep.id) continue;
+      failures.push(object);
+    }
+    return selectActionableAttemptFailure(failures);
+  }
+
   private async latestAttemptFailure(input: AttemptInput): Promise<string | undefined> {
     const failures = [];
     for (const logId of input.ticket.logIds) {
@@ -913,16 +943,26 @@ export class DomainAttemptRunner {
    * can only be re-run against the context it actually saw if the revisions of every source and the
    * wiki entries retrieved survive the run.
    */
-  private async assembleContext(input: AttemptInput): Promise<AssembledContext> {
+  private async assembleContext(
+    input: AttemptInput,
+  ): Promise<{ assembled: AssembledContext; debugBrief: DebugBrief | undefined }> {
+    const debugBrief = input.ticket.type === 'bug'
+      ? (await this.latestFailureBrief(input)) ?? debugBriefFor(input.ticket, input.executionStep)
+      : undefined;
     const assembled = await this.context.assemble({
       projectId: input.domainStep.projectId,
       phaseId: input.domainStep.phaseId,
       stepId: input.domainStep.id,
       ticketId: input.ticket.id,
       budgetChars: this.options.contextBudgetChars,
-      debugBrief: input.ticket.type === 'bug'
-        ? debugBriefFor(input.ticket, input.executionStep)
-        : undefined,
+      // Top of the stack, not the bottom. The Ticket's own `failure` is the one that opened it, and
+      // a repair loop moves through several: unwritten tests, then an import error, then a failing
+      // assertion. Keying retrieval on the opening failure answers the first question for the rest
+      // of the Ticket's life — a live run retrieved one entry 51 times while the entry matching the
+      // current error never appeared, and the Ticket ran out of attempts on advice for a problem it
+      // had already moved past. The history stays in the prompt as context; only lookup follows the
+      // top.
+      debugBrief,
     });
     await this.traces.recordLog({
       projectId: input.domainStep.projectId,
@@ -938,7 +978,7 @@ export class DomainAttemptRunner {
       },
       correlationId: input.ticket.source.correlationId,
     });
-    return assembled;
+    return { assembled, debugBrief };
   }
 
   private testValidator(scope: ExecutionScope): TestPhaseValidator {
@@ -1026,12 +1066,15 @@ export class DomainAttemptRunner {
       ? classifyFailure(failure.reason)
       : classifyFailure(failure.failureLog, { trustProviderText: false }));
     const failureKind = failure.failureKind ?? classified.kind;
+    const status = await scope.git.raw().status();
+    const changedFiles = status.files.map((file) => normalizeGitPath(file.path));
+    // Read the working copy before deciding, so "did this attempt achieve anything" is answered by
+    // the files it left rather than by the label on how it ended.
     const preserveCandidate = shouldPreserveFailedCandidate(
       classified,
       failure.dependencyRequest !== undefined,
+      changedFiles.length,
     );
-    const status = await scope.git.raw().status();
-    const changedFiles = status.files.map((file) => normalizeGitPath(file.path));
     const changes = status.files.map((file) => ({
       path: normalizeGitPath(file.path),
       operation: gitChangeOperation(file.index, file.working_dir),
@@ -1070,13 +1113,7 @@ export class DomainAttemptRunner {
       targetPhase: input.executionStep.phase,
       typedFailure: classified,
     });
-    const failureSignature = createHash('sha256').update(JSON.stringify({
-      category: brief.category,
-      primaryError: brief.primaryError,
-      failedTests: brief.failedTests,
-      toolFailures: brief.toolFailures,
-      structuredCode: classified.code,
-    })).digest('hex');
+    const failureSignature = buildFailureSignature(brief, classified.code);
     await this.options.audit.event('note', `attempt failed for ${input.domainStep.name}: ${failure.reason}`, {
       messageId: 'domain.attempt_failed',
       projectId: input.domainStep.projectId,
@@ -1222,6 +1259,45 @@ function gitChangeOperation(index: string, workingDirectory: string): Changelist
   return 'update';
 }
 
+/** Prose fields on a Ticket that carry a captured failure rather than a description of one. */
+const TICKET_PROSE_FIELDS = ['description', 'summary', 'message', 'failureLog', 'finding'] as const;
+
+/**
+ * How much of one captured failure the Ticket may carry into the prompt.
+ *
+ * Counting records is not enough on its own: one live Bug held a single 43KB pytest dump, so a
+ * per-record cap is what actually bounds it. Head and tail are both kept because a pytest run puts
+ * the first error at the top and the summary of what failed at the bottom, and either half alone
+ * reads as a different failure.
+ */
+const TICKET_PROSE_BUDGET = 1200;
+
+export function ticketContextSnapshot<T>(ticket: T): T {
+  return trimTicketProse(ticket, new Set<unknown>()) as T;
+}
+
+function trimTicketProse(value: unknown, seen: Set<unknown>): unknown {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map((item) => trimTicketProse(item, seen));
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = typeof item === 'string' && (TICKET_PROSE_FIELDS as readonly string[]).includes(key)
+      ? clampProse(item)
+      : trimTicketProse(item, seen);
+  }
+  return out;
+}
+
+function clampProse(text: string): string {
+  if (text.length <= TICKET_PROSE_BUDGET) return text;
+  const head = text.slice(0, Math.floor(TICKET_PROSE_BUDGET * 0.6));
+  const tail = text.slice(-Math.floor(TICKET_PROSE_BUDGET * 0.4));
+  return `${head}\n... [ticket history trimmed ${text.length - head.length - tail.length} chars]\n${tail}`;
+}
+
 function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {
   return buildDebugBrief({
     reason: ticket.failure.summary,
@@ -1232,9 +1308,9 @@ function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {
   });
 }
 
-function debugContextFrom(ticket: BugTicket, step: ExecutionStep, matches: DebugWikiMatch[]) {
+function debugContextFrom(ticket: BugTicket, brief: DebugBrief, matches: DebugWikiMatch[]) {
   return {
-    brief: debugBriefFor(ticket, step),
+    brief,
     matches,
     suggestions: matches.length === 0 ? undefined : [
       'Relevant debug-wiki entries (validate before applying):',

@@ -222,6 +222,15 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     }
   }
 
+  // Whatever a suite needs before it can import the product at all. For Python that is
+  // `tests/conftest.py` putting the project root and `src/` on sys.path; TypeScript needs nothing.
+  //
+  // The profile has carried this method since the language layer was written and nothing called it,
+  // so the file was never created: every Python project's tests failed to import `src/` until some
+  // Step happened to invent a fix. Two live runs lost Tickets to `ModuleNotFoundError` that way, and
+  // one of them was refused permission to write the very file Runtime had not written either.
+  await profile.ensureTestBootstrap?.(ws, audit);
+
   const order = topoSort(plan.steps);
   await audit.event('plan.persist', t().execute.auditPlanLoaded(planAbs), {
     messageId: 'execute.plan_loaded',
@@ -279,6 +288,7 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
     pluginHost,
     undefined,
     recordReplay,
+    cfgPath,
   );
   const phaseProgression = new PhaseProgressionService(
     ws,

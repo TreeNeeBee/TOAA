@@ -30,8 +30,17 @@ llm:
       tags: [cluster]
       # If a provider rejects json_object, set: json_response_format: json_schema
       connect_timeout_ms: 60000
+      # 内核在连接静默这么久后开始发 TCP 探活包。断网留下的 socket 收不到 RST/FIN，应用层
+      # 无从察觉；探活是唯一能把它变成真正连接错误的机制，且不需要 provider 做任何配合。
+      # Node 只能设置「何时开始探活」，探活间隔与次数由内核决定（macOS: 75s x 8）。
+      # 0 = 关闭（仅当中间设备会掐掉被探活的连接时才需要）。
+      tcp_keepalive_ms: 30000
       request_timeout_ms: 900000
       stream_first_token_timeout_ms: 300000
+      # 仅对流式生效：流式服务端先写响应头再开始思考，所以「头没来」是连接问题（秒级），
+      # 「头来了但 token 慢」是模型问题（分钟级）。非流式的响应头要等整个答案生成完才发，
+      # 这道闸不会加在它上面。0 = 不限制。
+      stream_headers_timeout_ms: 30000
       stream_idle_timeout_ms: 60000
 
     # Backup: local OpenAI-compatible endpoint, e.g. mlx-server or vLLM.
@@ -74,6 +83,8 @@ llm:
     Coder:     [openrouter_free]
     Tester:    [openrouter_free]
     Debugger:  [openrouter_free]
+    # Judges delivery outcomes on the project's behalf; never executes a Step.
+    ProjectManager: [openrouter_free]
 
   # 动态评分快照由 XCompiler 自动维护，落盘到同目录的 llm_scores.yaml，请勿手工编辑。
   # 用户手动指定 provider 分数时，请在 config.yaml 同目录创建 llm_scores_user.yaml；
@@ -82,6 +93,10 @@ llm:
   # 可按需调整动态上下限（min 最低 0.1，max 最高 1.0）。用户覆盖文件不受 cluster 动态上限限制。
   cluster_score_min: 0.2
   cluster_score_max: 0.5
+  # 对端连续这么久没有送来任何字节时，主动跑一次环境诊断（doctor 同源）并把结论写进
+  # 最终报错与审计。它不结束请求 —— 超时决定何时放弃，这个决定放弃时说得出原因：
+  # 「网络断了」和「模型还在思考」会产生同一条超时，却需要相反的处置。0 = 关闭。
+  stall_diagnosis_after_ms: 600000
   # 全局 fallback 链：默认不启用本地备选；如已取消 provider 注释，可设为 [local_openai] 或 [local_openai, ollama_code]。
   fallbacks: []
   role_fallbacks: {}

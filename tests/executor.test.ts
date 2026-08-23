@@ -534,6 +534,69 @@ describe('StepExecutor system prompt assembly', () => {
     await expect(ws.readFile('docs/05-unit-test.md')).resolves.toBe('# Unit test\n47 passed\n');
   });
 
+  // Who wrote the defect text decides who is held to have failed. Routing treats a role-authored
+  // defect as a role disproving the active Change Request's diagnosis and files it against that
+  // chain's origin; a runtime-rendered one makes no claim about fault and belongs to the Step whose
+  // gate failed. Presence of the field cannot tell them apart, so the provenance travels with it.
+  it('marks a runtime-rendered gate failure as gate-rendered, not a role claim', async () => {
+    class ReportingLLM implements LLMClient {
+      readonly name = 'reporting';
+
+      async chat(): Promise<string> {
+        return JSON.stringify({
+          thoughts: 'run the declared baseline suite',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 1, skippedTests: 0, warnings: 0 },
+            evidence: ['pytest exit=1'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+            findings: [{
+              category: 'test-defect',
+              summary: 'run_cli returns int while every assertion reads result.returncode',
+              evidence: ["AttributeError: 'int' object has no attribute 'returncode'"],
+              target: 'paired-source',
+              affectedArtifacts: ['tests/unit/x.test.ts'],
+              dependencyPackages: [],
+            }],
+          },
+          actions: [{ tool: 'run_tests', args: { args: ['tests/unit/x.test.ts'] } }],
+          done: false,
+        });
+      }
+    }
+    await ws.writeFile('tests/unit/x.test.ts', 'test("x", () => {});\n');
+    const tests: Tool = {
+      name: 'run_tests',
+      description: 'run exact unit tests',
+      argsSchema: {},
+      async run() {
+        return { ok: false, summary: 'pytest exit=1', error: 'AttributeError' };
+      },
+    };
+    const step: Step = {
+      ...baseStep,
+      id: 'S005',
+      phase: 'UNIT_TEST',
+      role: 'Tester',
+      tools: ['run_tests'],
+      outputs: ['tests/unit/x.test.ts'],
+    };
+    const result = await new StepExecutor({ llm: new ReportingLLM(), maxRounds: 2 }).run({
+      step,
+      tools: [tests],
+      ctx: { ...ctx, allowedWrites: [], stepId: step.id, testGateArgs: ['tests/unit/x.test.ts'] },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.validationDefect).toBeDefined();
+    // The runtime rendered the text; the role never claimed the contract was at fault.
+    expect(result.validationDefectSource).toBe('gate-rendered');
+  });
+
   it('reuses a successful verification gate when the model only changes test arguments', async () => {
     class RepeatingGateLLM implements LLMClient {
       readonly name = 'repeating-gate';
@@ -2831,7 +2894,9 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain('npx tsc --noEmit exit=2');
-    expect(result.error).not.toContain('qualityAssessment.postToolEvidence');
+    // The staleness note must not ride along on an unrelated validation failure. Matched on the
+    // phrasing the model actually receives, not on a field name — the field name was the defect.
+    expect(result.error).not.toContain('predates it');
   });
 
   it('keeps empty or whitespace-only declared artifacts in the missing-output set', async () => {
@@ -5074,5 +5139,134 @@ describe('design-phase policy', () => {
     });
     expect(llm.lastSystem).not.toContain('Design Step');
     expect(llm.lastSystem).toContain('DEBUG mode');
+  });
+});
+
+/**
+ * A rejection has to name something the model can change.
+ *
+ * `freshAfterTools` is false when the assessment was produced before the last tool call — a fact
+ * about round ordering. It was reported as a missing field, `qualityAssessment.postToolEvidence`,
+ * which `StageQualityAssessment` has no room for; supplying it changes no round number, so the same
+ * rejection returns and the Step spends its rounds on it. A live dbc2excel S003 opened a Bug against
+ * the generated project for it — an XCompiler wording defect charged to the product.
+ */
+describe('stale quality assessment feedback', () => {
+  const stepWithGate = () => ({
+    phase: 'DETAILED_DESIGN',
+    qualityGate: { metrics: {} },
+    outputs: ['docs/03-detailed-design.md'],
+  }) as never;
+
+  it('asks for a re-assessment instead of naming a field that does not exist', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const { normalizeQualityAssessment } = await import('../src/core/quality_gate.js');
+    const complete = normalizeQualityAssessment({
+      completion: 1, upstreamAlignment: 1, metrics: {}, evidence: ['docs written'],
+    })!;
+
+    const stale = missingQualityAssessmentFields(stepWithGate(), complete, false);
+    expect(stale.join(' ')).toMatch(/re-assess/u);
+    // The invented field name is what made the rejection unactionable.
+    expect(stale.join(' ')).not.toContain('postToolEvidence');
+    // And an assessment that is fresh reports nothing at all.
+    expect(missingQualityAssessmentFields(stepWithGate(), complete, true)).toEqual([]);
+  });
+
+  /**
+   * The condition cannot be cleared from the payload, which is why naming a payload field was wrong:
+   * a model that does exactly what the message said still gets the same message back.
+   */
+  it('is not silenced by adding the field the old message named', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const { normalizeQualityAssessment } = await import('../src/core/quality_gate.js');
+    const obedient = normalizeQualityAssessment({
+      completion: 1, upstreamAlignment: 1, metrics: {}, evidence: ['docs written'],
+      postToolEvidence: 'run_tests passed after the write',
+    })!;
+
+    expect(missingQualityAssessmentFields(stepWithGate(), obedient, false).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * An absent assessment and a stale one need different instructions, and only one applies at a time.
+ *
+ * When no assessment was produced at all, the whole action is producing one — and a produced one is
+ * necessarily post-tool. Emitting the re-assessment line beside "there is no assessment" spends a
+ * line of the instruction contradicting the one above it, and a live dbc3 S001 got a six-item list
+ * whose first and second entries disagreed.
+ */
+describe('absent versus stale quality assessment', () => {
+  const stepWithGate = () => ({
+    phase: 'REQUIREMENT_ANALYSIS',
+    qualityGate: { metrics: {} },
+    outputs: ['docs/01-requirement-analysis.md'],
+  }) as never;
+
+  it('does not ask for a re-assessment when none was made', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const missing = missingQualityAssessmentFields(stepWithGate(), undefined, false);
+    expect(missing[0]).toBe('qualityAssessment');
+    expect(missing.join(' ')).not.toMatch(/re-assess/u);
+  });
+
+  // The staleness line still has to appear where it is the actual problem.
+  it('still asks for one when an assessment exists but predates the tools', async () => {
+    const { missingQualityAssessmentFields } = await import('../src/agents/execution/feedback_renderer.js');
+    const { normalizeQualityAssessment } = await import('../src/core/quality_gate.js');
+    const complete = normalizeQualityAssessment({
+      completion: 1, upstreamAlignment: 1, metrics: {}, evidence: ['written'],
+    })!;
+    expect(missingQualityAssessmentFields(stepWithGate(), complete, false).join(' ')).toMatch(/re-assess/u);
+  });
+});
+
+/**
+ * A repeat-command ticket has to carry why the command kept failing.
+ *
+ * "You reran a command" is the shape; "you have not written the files that command runs" is the
+ * cause, and only the cause tells the role receiving the ticket what to do. A live dbc3 Bug reached
+ * a Debugger describing the repetition while the five unwritten outputs sat in a separate feedback
+ * line the ticket did not carry.
+ */
+describe('repeat-verification ticket carries the owed outputs', () => {
+  class RepeatingVerificationLLM implements LLMClient {
+    readonly name = 'repeat-verify';
+    async chat(): Promise<string> {
+      // The same verification command every round, never writing the declared output.
+      return JSON.stringify({
+        thoughts: 'rerun the suite',
+        actions: [{ tool: 'run_tests', args: { cwd: '.' } }],
+        done: false,
+      });
+    }
+  }
+
+  it('names the declared outputs the Step still owes', async () => {
+    const exec = new StepExecutor({ llm: new RepeatingVerificationLLM(), maxRounds: 4 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        outputs: ['tests/test_main.py', 'docs/tests/unit-test-plan.md'],
+      },
+      stepName: 'P1-S004',
+      tools: [runTestsTool],
+      ctx: {
+        ...ctx,
+        sandbox: {
+          async runTests() {
+            return { exitCode: 4, stdout: '', stderr: 'ERROR: file or directory not found', timedOut: false, durationMs: 1 };
+          },
+          async runProgram() { throw new Error('not used'); },
+          async installDeps() { throw new Error('not used'); },
+        } as never,
+      },
+    });
+
+    expect(result.success).toBe(false);
+    // The shape was always reported; the cause is what the ticket used to lose.
+    expect(result.error).toMatch(/tests\/test_main\.py/u);
+    expect(result.error).toMatch(/docs\/tests\/unit-test-plan\.md/u);
   });
 });

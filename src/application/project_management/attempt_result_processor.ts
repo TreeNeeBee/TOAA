@@ -243,10 +243,19 @@ export class AttemptResultProcessor {
     // defect. Route that Bug before the broader "test suite may be incomplete" fallback; otherwise
     // the discoverer's evidence is downgraded to an Enhancement and the original failed gate is
     // never repaired.
+    //
+    // Only a role can disprove a diagnosis, so only a role-authored defect may be routed to the
+    // chain's origin. A `gate-rendered` defect is the runtime restating a failing `run_tests`: it
+    // makes no claim about fault, and attributing it to whatever failure started the chain files it
+    // against a Step that never ran the gate. A live run sent a FUNCTIONAL_TEST failure discovered
+    // at P1-S008 to P1-S002 that way; P1-S002 diagnosed it correctly, wrote the right patch, and was
+    // refused because the file belongs to P1-S001. Such a failure belongs to its discoverer, which
+    // the fallback below already routes correctly.
     if (
       work.mode === 'change-request' &&
       work.ticket.type === 'change-request' &&
       result.executor?.validationDefect &&
+      result.executor.validationDefectSource !== 'gate-rendered' &&
       work.ticket.originFailure &&
       !await this.alreadyContradicted(work.ticket)
     ) {

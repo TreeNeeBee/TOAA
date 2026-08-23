@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { writeWorkspaceFile } from './workspace_write.js';
 import { promises as fs } from 'node:fs';
-import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
+import { deniedRuntimeOwnedWrite, deniedWrite, isAllowedWrite, type Tool } from './types.js';
+import { runtimeOwnedFile } from '../core/runtime_owned_files.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import { suspiciousTextTruncationError } from './content_guard.js';
 
@@ -31,6 +32,12 @@ export const replaceInFileTool: Tool<
       relativePathHints: ctx.allowedWrites,
     });
     if (!resolved.ok) return { ok: false, error: resolved.error };
+    // replace_in_file rewrites in place, so an append-owned file is still out of reach here: the
+    // bootstrap block it would be free to overwrite is the reason the file is owned at all.
+    // replace_in_file needs the file to exist anyway, so an owned path here always has content to
+    // protect — no existence check can widen this.
+    const owned = runtimeOwnedFile(resolved.rel, ctx.language);
+    if (owned) return deniedRuntimeOwnedWrite('write', owned);
     if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
       return deniedWrite('write', resolved.rel, ctx.allowedWrites);
     }

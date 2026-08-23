@@ -1182,3 +1182,37 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     ).rejects.toThrow(/omitted architectureModules/);
   });
 });
+
+/**
+ * `userForcedPhaseSplit` is about the user, so only the user's words may decide it.
+ *
+ * The check scanned the model's own `requirementDigest` alongside the user's request, and the
+ * trigger word is one the system prompt teaches: a rationale reading "建议分阶段交付：P1 …, P2 …"
+ * was read as a user mandate, the model answered `false` because that was true, and the contract
+ * rejected it. A live build lost both providers to it — the second then spent fifteen minutes in a
+ * non-stream retry — and produced no plan at all.
+ */
+describe('forced phase split reads user sources only', () => {
+  it('does not fire on the model\'s own wording', async () => {
+    const { hasForcedPhaseSplit } = await import('../src/agents/planning/phase_strategy.js');
+    // What the model wrote about its own recommendation.
+    expect(hasForcedPhaseSplit('建议分阶段交付：P1 完成基础解析，P2 完善异常处理')).toBe(true);
+    // The detector itself is unchanged and still recognises the phrase; what changed is whose text
+    // reaches it. The planner now passes only rawRequirement and userAddenda.
+    const { readFile } = await import('node:fs/promises');
+    const planner = await readFile(new URL('../src/agents/planner.ts', import.meta.url), 'utf8');
+    const calls = [...planner.matchAll(/hasForcedPhaseSplit\(\[([\s\S]*?)\]/gu)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call[1]).toContain('rawRequirement');
+      expect(call[1]).not.toContain('digest');
+    }
+  });
+
+  // A user who does ask for phases must still be honoured.
+  it('still fires on the user\'s own request', async () => {
+    const { hasForcedPhaseSplit } = await import('../src/agents/planning/phase_strategy.js');
+    expect(hasForcedPhaseSplit('请分两期交付，第一阶段先做解析')).toBe(true);
+    expect(hasForcedPhaseSplit('写一个解析 DBC 并导出 Excel 的脚本')).toBe(false);
+  });
+});

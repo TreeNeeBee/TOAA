@@ -525,6 +525,86 @@ describe('ProjectOrchestrator', () => {
     expect(calls.filter((call) => call === 'P1-S001:debug')).toHaveLength(2);
   });
 
+  // The same shape as the test above, with one field changed: the defect text is rendered by the
+  // runtime rather than asserted by the role. That single difference decides who is held to have
+  // failed. A live run lost 22 Change Requests to the old answer — a FUNCTIONAL_TEST gate failure
+  // discovered at P1-S008 was filed against P1-S002 because P1-S002 happened to start the Change
+  // Request chain, and P1-S002 has no write access to the file the failure names.
+  it('files a runtime-rendered gate failure against its discoverer, not the CR chain origin', async () => {
+    const setup = await fixture();
+    let failedFunctional = false;
+    let renderedGateFailure = false;
+    const runner = {
+      initialize: async () => undefined,
+      run: async (input: AttemptInput): Promise<AttemptResult> => {
+        if (input.domainStep.type === 'FUNCTIONAL_TEST' && input.mode === 'normal' && !failedFunctional) {
+          failedFunctional = true;
+          return {
+            ok: false,
+            reason: 'functional CLI acceptance failed',
+            failureLog: 'npm test exit=1 args=tests/functional/cli.test.ts',
+            changedFiles: [],
+            wikiEntryIds: [],
+            testOutcomes: [],
+          };
+        }
+        if (input.domainStep.type === 'CODE' && input.mode === 'change-request' && !renderedGateFailure) {
+          renderedGateFailure = true;
+          const rendered = 'CODE executable test gate failed:\nCases under test: tests/unit/cli.test.ts';
+          return {
+            ok: false,
+            reason: `validation defect reported: ${rendered}`,
+            failureLog: rendered,
+            changedFiles: [],
+            wikiEntryIds: [],
+            testOutcomes: [{
+              status: 'failed',
+              stepType: 'CODE',
+              tool: 'run_tests',
+              args: ['tests/unit/cli.test.ts'],
+              exitCode: 1,
+              timedOut: false,
+              recordedAt: new Date().toISOString(),
+            }],
+            executor: {
+              success: false,
+              rounds: 1,
+              toolCalls: [],
+              validationDefect: rendered,
+              validationDefectSource: 'gate-rendered',
+              metrics: {
+                rounds: 1,
+                parseFailures: 0,
+                repeatedTurns: 0,
+                toolFailRatio: 0,
+                progressRatio: 1,
+                healthScore: 1,
+                providers: ['test'],
+              },
+            },
+          };
+        }
+        return passingAttempt(setup.repository, input.domainStep);
+      },
+    };
+    const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
+    const result = await engine.run(setup.graph.phases[0]!.id);
+
+    expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
+    const tickets = (await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id }))
+      .filter((ticket) => ticket.objectType === 'ticket');
+    const code = setup.graph.steps.find((step) => step.type === 'CODE')!;
+    const functional = setup.graph.steps.find((step) => step.type === 'FUNCTIONAL_TEST')!;
+    const discovered = tickets.find((ticket) =>
+      ticket.type === 'bug' && ticket.description.includes('CODE executable test gate failed'));
+
+    expect(discovered, JSON.stringify(tickets.map((ticket) => ticket.name))).toBeDefined();
+    // The Step that ran the gate owns the failure. Attributing it to the chain's origin is what
+    // handed the repair to a Step that could not perform it.
+    expect(discovered?.type === 'bug' && discovered.failure.failedStepId).toBe(code.id);
+    expect(discovered?.type === 'bug' && discovered.failure.failedStepId).not.toBe(functional.id);
+  });
+
   it('routes a CR quality shortfall through a linked Enhancement instead of a Bug', async () => {
     const setup = await fixture();
     const calls: string[] = [];

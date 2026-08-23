@@ -72,3 +72,23 @@ describe('Runtime architecture boundary', () => {
     expect(`${config}\n${router}`).not.toMatch(/console\.(log|error|warn)|process\.(stdout|stderr)\.write/u);
   });
 });
+
+/**
+ * A hook with no caller is the same as no hook.
+ *
+ * `ensureTestBootstrap` sat on the language profile from the day the layer was written, fully
+ * implemented and never invoked, so `tests/conftest.py` was never created and every Python project's
+ * tests failed to import `src/`. Asserted at the call site rather than on the profile, because the
+ * profile method was always correct — it was the absence of the call that cost two live runs their
+ * Tickets.
+ */
+it('runs the language test bootstrap before executing a plan', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const run = await readFile(new URL('../src/runtime/run.ts', import.meta.url), 'utf8');
+  expect(run).toMatch(/ensureTestBootstrap\?\.\(/u);
+  // Before the Steps run, or the first suite still executes without it.
+  const bootstrapAt = run.indexOf('ensureTestBootstrap');
+  const executeAt = run.indexOf('topoSort(plan.steps)');
+  expect(bootstrapAt).toBeGreaterThan(0);
+  expect(bootstrapAt).toBeLessThan(executeAt);
+});

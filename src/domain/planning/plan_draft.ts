@@ -1,5 +1,5 @@
 import type { StepType } from '../steps/step.js';
-import type { ExecutionAgent } from '../workflow/role.js';
+import type { ExecutingRole } from '../workflow/role.js';
 import type { DeliveryGate } from '../quality/delivery_gate.js';
 
 /**
@@ -75,7 +75,7 @@ export interface PlanDraftStep {
   title: string;
   description: string;
   systemPrompt: string;
-  role: ExecutionAgent;
+  role: ExecutingRole;
   tools: readonly string[];
   inputs: readonly string[];
   outputs: readonly string[];

@@ -1,7 +1,8 @@
 import path from 'node:path';
 import { recordWorkspaceWrite, writeWorkspaceFile } from './workspace_write.js';
 import { promises as fs } from 'node:fs';
-import { deniedWrite, isAllowedWrite, type Tool } from './types.js';
+import { deniedRuntimeOwnedWrite, deniedWrite, isAllowedWrite, type Tool } from './types.js';
+import { runtimeOwnedAllows, runtimeOwnedFile } from '../core/runtime_owned_files.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import {
   DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -147,14 +148,13 @@ export const writeFileTool: Tool<{ path: string; content: string }, WriteFileDat
       relativePathHints: ctx.allowedWrites,
     });
     if (!resolved.ok) return { ok: false, error: resolved.error };
-    if (resolved.rel === 'requirements.txt' || resolved.rel.endsWith('/requirements.txt')) {
-      return {
-        ok: false,
-        error:
-          'write denied: requirements.txt 由 plan.dependencies 在 xcompiler run 启动时种入并由 add_dependency 工具维护；请改用 add_dependency 工具新增依赖（一行一包，不要再 write_file 直接覆盖）。',
-      };
+    // A Runtime-owned path is decided by ownership, not by the Step's allowlist: the allowlist can
+    // only report that the path is absent from it, which is the one thing the Step cannot act on.
+    const owned = runtimeOwnedFile(resolved.rel, ctx.language);
+    if (owned && !runtimeOwnedAllows(owned, 'write', await ctx.ws.exists(resolved.rel))) {
+      return deniedRuntimeOwnedWrite('write', owned);
     }
-    if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
+    if (!owned && !isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
       return deniedWrite('write', resolved.rel, ctx.allowedWrites);
     }
     const size = Buffer.byteLength(args.content);
@@ -251,10 +251,14 @@ export const appendFileTool: Tool<{ path: string; content: string }, { bytes: nu
       relativePathHints: ctx.allowedWrites,
     });
     if (!resolved.ok) return { ok: false, error: resolved.error };
-    if (resolved.rel === 'requirements.txt' || resolved.rel.endsWith('/requirements.txt')) {
-      return { ok: false, error: 'append denied: requirements.txt 由 add_dependency 维护。' };
+    const owned = runtimeOwnedFile(resolved.rel, ctx.language);
+    if (owned && !runtimeOwnedAllows(owned, 'append')) {
+      return deniedRuntimeOwnedWrite('append', owned);
     }
-    if (!isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
+    // Append-owned paths are reachable without being in the allowlist: no plan declares conftest.py,
+    // and requiring both the grant and the declaration is how the permission drifted from the
+    // instruction the first time.
+    if (!owned && !isAllowedWrite(resolved.rel, ctx.allowedWrites)) {
       return deniedWrite('append', resolved.rel, ctx.allowedWrites);
     }
     const size = Buffer.byteLength(args.content);

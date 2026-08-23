@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { Tool, ToolContext, ToolFailureCode } from './types.js';
+import { isPathPattern, type Tool, type ToolContext, type ToolFailureCode } from './types.js';
 import type { StepType } from '../domain/steps/step.js';
 import { detectNetworkApiFailureInExec } from '../core/network_api_gate.js';
 import { normalizeTypeScriptTestArgs } from '../sandbox/test_args.js';
@@ -85,7 +85,9 @@ export const runProgramTool: Tool<
 > = {
   name: 'run_program',
   description:
-    '在沙盒内运行工程入口程序或常见项目命令（Python: python <args>；TypeScript: 默认 npx tsx <entry>，也支持 npm/npx/node/tsx/tsc 前缀）。',
+    '在沙盒内运行工程入口程序或常见项目命令。' +
+    'Python：解释器由 Runtime 提供，args 直接从解释器之后写起（例如 ["-m", "py_compile", "x.py"] 或 ["src/main.py"]）；' +
+    '多写一个 python 前缀会被忽略。TypeScript：默认 npx tsx <entry>，也支持 npm/npx/node/tsx/tsc 前缀。',
   argsSchema: { args: 'string[]', cwd: 'string?', timeoutMs: 'number?' },
   async run(args, ctx) {
     const cwd = await resolveSandboxCwd(ctx, args.cwd, 'run_program.cwd');
@@ -112,6 +114,27 @@ export const runProgramTool: Tool<
   },
 };
 
+/**
+ * Declared test selectors that have no file behind them yet.
+ *
+ * Selectors come from the plan, not the filesystem — `pairedTestAssetPaths` derives them from the
+ * paired source Step's declared outputs — so nothing else reconciles the two. Only gate selectors
+ * are checked: a caller's own extra arguments may legitimately be flags or patterns, and the
+ * verification supplement root is created at runtime.
+ */
+async function unwrittenSelectors(ctx: ToolContext, gateSelectors: readonly string[]): Promise<string[]> {
+  const missing: string[] = [];
+  for (const selector of gateSelectors) {
+    // Flags are not paths, and a pattern names files that need not exist yet for the pattern itself
+    // to be correct — refusing either would block invocations that are perfectly well formed.
+    if (selector.startsWith('-')) continue;
+    if (isPathPattern(selector)) continue;
+    if (await ctx.ws.exists(selector)) continue;
+    missing.push(selector);
+  }
+  return missing;
+}
+
 export const runTestsTool: Tool<
   { args?: string[]; cwd?: string; timeoutMs?: number },
   { exitCode: number; stdout: string; stderr: string; timedOut: boolean; passed: boolean }
@@ -132,6 +155,24 @@ export const runTestsTool: Tool<
     // Runtime owns the exact paired selectors. S005-S008 add only their isolated supplement root;
     // neighbouring undeclared tests remain an incomplete-suite Enhancement instead of leaking in.
     const gateArgs = await appendVerificationSupplements(ctx, ctx.testGateArgs ?? []);
+    // A selector naming a file the Step has not written yet describes a run that cannot pass, and
+    // the runner reports it as a usage error — `file or directory not found`, which reads as a
+    // broken environment rather than as unfinished work. A live dbc3 CODE Step spent all ten of its
+    // rounds re-issuing that same invocation while Runtime told it, correctly and repeatedly, which
+    // five outputs it still owed; the run stopped on the non-convergence guard. Refusing here turns
+    // those rounds into one refusal that names the files to write.
+    const unwritten = await unwrittenSelectors(ctx, ctx.testGateArgs ?? []);
+    if (unwritten.length > 0) {
+      // Deliberately no `code`: those mark conditions a Step does not own, and this one it does —
+      // the files are its own declared outputs, so the ordinary repairable path is correct.
+      return {
+        ok: false,
+        error:
+          `run_tests refused: this Step's declared test files do not exist yet: ${unwritten.join(', ')}. ` +
+          'Write them first — the suite cannot run, let alone pass, until they exist. ' +
+          'Author each file with its real assertions against the product module it verifies.',
+      };
+    }
     const runArgs = mergeTestGateArgs(gateArgs, requestedEffectiveArgs);
     const r = await ctx.sandbox.runTests(runArgs, { cwd: cwd.abs, timeoutMs: args.timeoutMs });
     // A test runner's verdict is its exit code. Network text inside a passing suite is the suite's

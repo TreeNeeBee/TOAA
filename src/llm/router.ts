@@ -19,7 +19,7 @@ import {
   normalizeContextWindowTokens,
   resolveSkillOperationWindow,
 } from './window.js';
-import { LLMRequestError } from './errors.js';
+import { isLLMRequestError, LLMRequestError } from './errors.js';
 import type { RecordReplayController } from '../application/record_replay/controller.js';
 import { isCancellationError } from '../core/cancellation.js';
 
@@ -54,9 +54,12 @@ export class LLMRouter {
     private readonly probe: ProviderAvailabilityProbe = (name, provider) =>
       probeLLMProviderAvailability(provider, resolveLLMProbeTimeoutMs(provider)),
     private readonly recordReplay?: RecordReplayController,
+    /** The config this run loaded. A diagnosis that re-resolves the default path would report on a
+     *  different configuration than the one that just went silent. */
+    private readonly configPath?: string,
   ) {
     for (const [name, p] of Object.entries(cfg.llm.providers)) {
-      const client = createClient(name, p);
+      const client = createClient(name, p, cfg.llm.stall_diagnosis_after_ms);
       if (client) this.clients.set(name, recordReplay?.enabled('llm')
         ? recordReplayClient(name, client, recordReplay)
         : client);
@@ -93,6 +96,45 @@ export class LLMRouter {
    * 排序：按 ScoreStore 的评分降序；评分 = 0 的 provider 直接剔除。
    * 链中第一个调用成功即返回；失败 → 自动降评分并尝试下一个。
    */
+  /**
+   * Explains a silent provider, once, without ending the request.
+   *
+   * Runs the same environment check an operator would run by hand, because the two faults that
+   * produce this silence — a dead network and a model still thinking — need opposite responses and
+   * are indistinguishable from the timeout alone.
+   *
+   * Diagnostic only, and deliberately never consulted to decide whether to keep waiting: this opens
+   * a new connection, and a new connection can succeed while the socket the request is blocked on
+   * stays black-holed. A healthy verdict here narrows the cause; it does not clear the request.
+   */
+  private async diagnoseStall(info: { silentForMs: number; provider?: string; model?: string }): Promise<string | undefined> {
+    try {
+      const { runDoctor } = await import('../core/doctor.js');
+      const report = await runDoctor({ configPath: this.configPath, probeTimeoutMs: 10_000 });
+      const bad = report.sections
+        .flatMap((section) => section.items
+          .filter((item) => item.level !== 'ok')
+          .map((item) => `[${section.title}] ${item.level}: ${item.message}`))
+        .slice(0, 6);
+      const silentFor = `${Math.round(info.silentForMs / 1000)}s`;
+      const summary = bad.length > 0
+        ? bad.join(' | ')
+        : 'every check passed, so the endpoint was reachable from a new connection while this request stayed silent';
+      await this.audit?.event('llm.error', `stall diagnosis after ${silentFor}: ${summary}`, {
+        messageId: 'llm.stall_diagnosis',
+        provider: info.provider,
+        model: info.model,
+        silentForMs: info.silentForMs,
+        fails: report.fails,
+        warns: report.warns,
+      });
+      return `after ${silentFor} of silence — ${summary}`;
+    } catch {
+      // A diagnosis that fails must not become the failure. The request's own error still stands.
+      return undefined;
+    }
+  }
+
   for(role: Role, options: { providerPool?: readonly string[] } = {}): LLMClient {
     const candidates = this.resolveChain(role, options.providerPool);
     if (candidates.length === 0) {
@@ -126,6 +168,7 @@ export class LLMRouter {
       String(role),
       this.scores,
       (name, maxAgeMs) => this.availability(name, maxAgeMs),
+      (info) => this.diagnoseStall(info),
     );
     const observable = this.audit
       ? wrapWithAudit(composite, String(role), this.audit)
@@ -227,6 +270,8 @@ class FallbackClient implements LLMClient {
     private readonly role: string,
     private readonly scores?: ScoreStore,
     private readonly availability?: (name: string, maxAgeMs?: number) => Promise<LLMProbeResult | undefined>,
+    /** Explains total provider silence. Supplied by the router, which may import the checks. */
+    private readonly diagnoseStall?: (info: { silentForMs: number; provider?: string; model?: string }) => Promise<string | undefined>,
   ) {
     this.name = chain.length === 1
       ? chain[0]!.client.name
@@ -314,6 +359,9 @@ class FallbackClient implements LLMClient {
             typeof attemptOptions?.maxTokens === 'number'
               ? Math.min(attemptOptions.maxTokens, operationWindow.responseTokenBudget)
               : operationWindow.responseTokenBudget,
+          // The caller supplies the explanation because the transport may not import it. A caller
+          // that already wants its own stall handling keeps it.
+          onStall: attemptOptions?.onStall ?? this.diagnoseStall,
         };
         try {
           out = await c.client.chat(providerMessages, providerOptions);
@@ -493,16 +541,42 @@ function validationOutputForRetry(text: string, feedbackBudget: number): string 
   return truncateFailure(text, max);
 }
 
+/** How long a post-stall non-stream retry may run. */
+const NON_STREAM_RETRY_TIMEOUT_MS = 180_000;
+
 function withoutStreamingOptions(options?: ChatOptions): ChatOptions | undefined {
   if (!options?.onToken) return options;
   const next: ChatOptions = { ...options };
   delete next.onToken;
   delete next.streamStopWhen;
+  // The non-stream path has no idle or first-token watchdog, so it runs to the full configured
+  // budget with nothing to observe. That budget is sized for a fresh request; this is a recovery
+  // attempt after a stream already stalled, and giving it the same allowance doubles the cost of one
+  // stall — a live Planner spent fifteen minutes here after its stream went idle at sixty seconds.
+  next.requestTimeoutMs = Math.min(next.requestTimeoutMs ?? Infinity, NON_STREAM_RETRY_TIMEOUT_MS);
   return next;
 }
 
+/**
+ * Whether dropping to a non-streaming request is worth one attempt.
+ *
+ * Reads what the stream delivered, not how the failure was worded. The transport records that on
+ * `LLMFailureDetails.streamProgress`; it used to be recoverable only by matching English, where
+ * `stream idle before first token` had to be excluded before `stream idle` was accepted — two
+ * sentences whose prefix relationship carried the entire policy. Both were rewritten this week for
+ * unrelated reasons, and nothing would have failed.
+ *
+ * A stream that produced nothing is not worth retrying blind: the non-stream path has no idle or
+ * first-token watchdog, only the wall clock, so a provider that sent no bytes gets the full timeout
+ * to send none again. A stream that had started producing may well finish without streaming.
+ *
+ * The prose fallback stays for transports that do not record progress, and only for failures whose
+ * wording this repository owns.
+ */
 function shouldRetryWithoutStreaming(err: unknown, options?: ChatOptions): boolean {
   if (!options?.onToken) return false;
+  const progress = isLLMRequestError(err) ? err.failure.streamProgress : undefined;
+  if (progress) return progress !== 'no-bytes';
   const msg = errorMessage(err).toLowerCase();
   if (msg.includes('stream idle before first token')) return false;
   return (
@@ -590,6 +664,7 @@ function wrapWithAudit(inner: LLMClient, role: string, audit: AuditLogger): LLMC
 function createClient(
   name: string,
   p: ProviderConfig,
+  stallDiagnosisAfterMs?: number,
 ): LLMClient | null {
   if (isOllamaProvider(p)) {
     return new OllamaClient({
@@ -610,9 +685,12 @@ function createClient(
       jsonResponseFormat: p.json_response_format,
       requestTimeoutMs: p.request_timeout_ms,
       connectTimeoutMs: p.connect_timeout_ms,
+      tcpKeepAliveMs: p.tcp_keepalive_ms,
       streamIdleTimeoutMs: p.stream_idle_timeout_ms,
       streamFirstTokenTimeoutMs: p.stream_first_token_timeout_ms,
+      streamHeadersTimeoutMs: p.stream_headers_timeout_ms,
       maxOutputChars: p.max_output_chars,
+      stallDiagnosisAfterMs,
     });
   }
   return null;

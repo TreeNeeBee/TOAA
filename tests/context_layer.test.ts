@@ -152,7 +152,7 @@ describe('context assembly', () => {
     expect(assembled.text).toContain('every file-tool path is relative to this workspace root');
   });
 
-  it('retrieves Debug Wiki entries only when a Bug is the Ticket in scope', async () => {
+  it('retrieves Debug Wiki entries only when a corrective Ticket is in scope', async () => {
     const { repository, graph, story } = await fixture();
     const projectId = graph.project.id;
     const wiki = new RecordingWiki();
@@ -172,6 +172,38 @@ describe('context assembly', () => {
     expect(wiki.searches).toBe(1);
     expect(forBug.snapshot.debugWikiEntryIds).toEqual(['WIKI-1']);
     expect(forBug.text).toContain('restart the fixture between cases');
+  });
+
+  // An Enhancement is repairing something too, and the wiki holds what earlier runs learned about
+  // the failures that raise them. Restricting retrieval to Bug withheld it from exactly the Tickets
+  // two live runs died on. Driven through `assemble` rather than through the predicate, because the
+  // predicate can be right while the call site still asks the old question.
+  it('retrieves for a corrective Ticket that is not a Bug', async () => {
+    const { repository, graph } = await fixture();
+    const projectId = graph.project.id;
+    const wiki = new RecordingWiki();
+    const assembler = new ContextAssembler(repository, { wiki, language: 'typescript' });
+    const brief = { reason: 'coverage shortfall', failureLog: 'boom' } as never;
+
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
+    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
+    const enhancement = await new TicketWorkflow(repository).openEnhancement({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      sourceStep: unit,
+      targetStep: coding,
+      verificationStep: unit,
+      kind: 'quality-shortfall',
+      finding: 'unit coverage below the declared gate',
+      correlationId: createObjectId(),
+    });
+
+    const assembled = await assembler.assemble({
+      projectId,
+      ticketId: enhancement.id,
+      debugBrief: brief,
+    });
+    expect(wiki.searches).toBe(1);
+    expect(assembled.snapshot.debugWikiEntryIds).toEqual(['WIKI-1']);
   });
 
   it('records no wiki entries when a Bug is in scope but no wiki is available', async () => {

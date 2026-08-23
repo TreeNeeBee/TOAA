@@ -21,6 +21,9 @@ import type { ScheduledWork } from './work_scheduler.js';
 import { TicketWorkflow } from './ticket_workflow.js';
 import { TicketRegistrationService } from './ticket_registration_service.js';
 import { TicketBlockerService } from './ticket_blocker_service.js';
+import { buildDebugBrief } from '../../core/debug_brief.js';
+import { VERIFICATION_SUPPLEMENT_DIR } from '../../core/test_assets.js';
+import { normalizeGitPath } from '../execution/v_model_policy.js';
 
 export class CorrectiveWorkflowService {
   private readonly tickets: TicketWorkflow;
@@ -123,7 +126,9 @@ export class CorrectiveWorkflowService {
     let target = input.targetStepId
       ? await this.state.requireStep(input.targetStepId)
       : isVerificationStep(failed)
-        ? await this.state.requireStep(failed.pairedStepId)
+        ? failureConfinedToSupplement(failed, input.message)
+          ? failed
+          : await this.state.requireStep(failed.pairedStepId)
         : failed;
     const verification = isVerificationStep(target)
       ? target
@@ -698,4 +703,37 @@ function ticketClosurePath(ticket: Ticket): Array<'in_progress' | 'resolved' | '
 
 function isVerificationStep(step: Step): boolean {
   return (VERIFICATION_STEP_TYPES as readonly string[]).includes(step.type);
+}
+
+/**
+ * Whether a verification Step's failure is confined to the supplement it owns.
+ *
+ * A verification Step adds risk cases under its own root while the paired baseline belongs to its
+ * source Step, and its gate runs both. Routing the whole gate failure to the source is right for the
+ * baseline and wrong for the supplement: the source owns neither the file nor the write scope for
+ * it. A live FUNCTIONAL_TEST failure — `test_error_csv_content_rows`, a supplement case calling
+ * `write_error_csv` with a path the implementation appends its own suffix to — was routed to
+ * REQUIREMENT_ANALYSIS, whose allowlist held neither that file nor the implementation. It delivered
+ * nine times without touching either, and the run looped until it was stopped by hand.
+ *
+ * Every failing case must be in the supplement, not merely some: a baseline failure means the
+ * product does not satisfy the contract its source defined, and that is the source's to answer no
+ * matter what else failed alongside it. A supplement that correctly exposes a product defect lands
+ * here first and reports it onward from here, which is how a verification Step raises one anyway.
+ */
+function failureConfinedToSupplement(step: Step, evidence: string): boolean {
+  const failing = buildDebugBrief({
+    failureLog: evidence,
+    phase: step.type,
+    targetPhase: step.type,
+  }).failedTests;
+  if (failing.length === 0) return false;
+  // Matched by directory and Step id rather than by rebuilding the exact root: the path is composed
+  // from the execution Step while routing holds the domain Step, and the two agreeing on an id is a
+  // property of the current wiring, not something this decision should depend on.
+  const owned = `${VERIFICATION_SUPPLEMENT_DIR}/`;
+  return failing.every((test) => {
+    const path = normalizeGitPath(test);
+    return path.startsWith(owned) && path.includes(step.id);
+  });
 }

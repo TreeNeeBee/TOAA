@@ -102,7 +102,7 @@ export async function inspectPairedSourceTests(
       ? Math.min(2, expectedSources.length)
       : 1;
     const behaviorRisks = sourceStep.phase === 'DETAILED_DESIGN'
-      ? duplicatedIntegrationBehavior(content, plan.language)
+      ? swallowedFailureRisks(content, plan.language)
       : [];
     const contractAlignmentRisks = sourceStep.phase === 'REQUIREMENT_ANALYSIS'
       ? requirementTestAlignmentRisks(content, plan.language, requiredContractIdentifiers)
@@ -248,20 +248,80 @@ function importedNoArgumentAwaitCalls(content: string): string[] {
   });
 }
 
-function duplicatedIntegrationBehavior(content: string, language: Plan['language']): string[] {
+/**
+ * Catch blocks that leave the test unable to fail.
+ *
+ * The property being checked is whether a test can report a failure at all, not what it looks like.
+ * A handler that neither asserts anything about the exception nor rethrows it converts a product
+ * failure into a passing test — that is the harm, and it is visible: the block body either mentions
+ * an assertion or a rethrow, or it does not.
+ *
+ * This replaces a check that reported "duplicates orchestration/failure-handling control flow"
+ * whenever a file contained both a loop and a try. Those are what an integration test is made of —
+ * reading the artifact the product produced needs a loop, proving a failure propagates needs a try —
+ * and the same contract that ran the check also demanded both. A live DETAILED_DESIGN Enhancement
+ * died on it: the test referenced three declared product modules, called the real entry point, and
+ * asserted its exit code; its only loop read the produced workbook and its only try wrapped that
+ * call with `finally` restoring a permission. The finding recurred seven times word for word, since
+ * the sole way to satisfy it was to delete correct code.
+ *
+ * The motivating case for the old check still fails here, and for its real reason: it wrote
+ * `catch { /* copied fallback *\/ }`, which swallows whatever the product did.
+ */
+function swallowedFailureRisks(content: string, language: Plan['language']): string[] {
   const code = stripCommentsAndStrings(content);
-  const hasLoop = language === 'typescript'
-    ? /\b(?:for\s*(?:await\s*)?\(|while\s*\()/u.test(code)
-    : /^\s*(?:async\s+)?(?:for|while)\b/mu.test(code);
-  const hasFailurePolicy = language === 'typescript'
-    ? /\btry\s*\{|\bcatch\s*(?:\([^)]*\))?\s*\{/u.test(code)
-    : /^\s*(?:try|except)\s*(?::|\b)/mu.test(code);
-  if (!hasLoop || !hasFailurePolicy) return [];
+  const handlers = language === 'typescript'
+    ? [...code.matchAll(/\bcatch\s*(?:\([^)]*\))?\s*\{([\s\S]*?)\}/gu)].map((m) => m[1] ?? '')
+    : pythonExceptBlocks(code);
+  const swallowing = handlers.filter((body) => !/\b(?:expect|assert|raise|throw|fail)\b/u.test(body));
+  if (swallowing.length === 0) return [];
   return [
-    'duplicates orchestration/failure-handling control flow inside the integration test; ' +
-      'invoke the real product orchestration or entry boundary and mock only its external collaborators',
+    `catches a failure without asserting or rethrowing it (${swallowing.length} handler(s)), so the ` +
+      'test passes whatever the product did; assert on the raised error, use pytest.raises / ' +
+      'expect(...).toThrow, or let it propagate',
   ];
 }
+
+/** Bodies of `except` clauses, delimited by the next line at or below the clause's indentation. */
+function pythonExceptBlocks(code: string): string[] {
+  const lines = code.split('\n');
+  const bodies: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^(\s*)except\b[^\n]*:\s*$/u.exec(lines[index] ?? '');
+    if (!match) continue;
+    const indent = (match[1] ?? '').length;
+    const body: string[] = [];
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const line = lines[cursor] ?? '';
+      if (line.trim() === '') continue;
+      const lineIndent = line.length - line.trimStart().length;
+      if (lineIndent <= indent) break;
+      body.push(line);
+    }
+    bodies.push(body.join('\n'));
+  }
+  return bodies;
+}
+
+/**
+ * Removed: `duplicatedIntegrationBehavior`.
+ *
+ * It reported "duplicates orchestration/failure-handling control flow" whenever a test file contained
+ * both a loop and a try/except. Those two constructs are what an integration test is made of: reading
+ * the artifact the product produced needs a loop, and proving that a failure propagates needs a
+ * try — and the same V-model contract that ran this check also required both.
+ *
+ * A live DETAILED_DESIGN Enhancement died on it. The test referenced three declared product modules,
+ * called the real entry point, and asserted its exit code; its only loop read the produced workbook
+ * and its only try wrapped that entry-point call. The finding recurred seven times word for word,
+ * because the sole way to satisfy it was to delete correct code, and the Ticket stopped
+ * unconverged.
+ *
+ * The question it meant to ask — does this test invoke the product or reimplement it — is already
+ * answered structurally a few lines above by `matched.length >= requiredReferences`, which counts
+ * references to the product sources the plan declares. That count is a fact; a loop next to a try is
+ * a guess about intent, and the two were a second opinion about one question.
+ */
 
 function ownersForTest(
   plan: Plan,

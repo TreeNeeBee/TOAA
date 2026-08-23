@@ -4,6 +4,7 @@ import {
   buildDebugBrief,
   compactFailureEvidence,
   renderDebugBriefForPrompt,
+  type DebugBrief,
   type DebugBriefInput,
 } from '../../core/debug_brief.js';
 import type { Plan, Step } from '../../core/plan.js';
@@ -214,16 +215,28 @@ export function reconcileDeferredSourceQualityAssessment(
   };
 }
 
+/**
+ * The brief for one recorded failure, so lookup keys on the failure being repaired now.
+ *
+ * A Ticket's own `failure` is the one that opened it, and a repair loop moves: unwritten tests, then
+ * an import error, then a failing assertion. Keying retrieval on the opening failure answers the
+ * first question for the rest of the Ticket's life — a live run retrieved the same entry 51 times
+ * while the entry that matched the current error never appeared.
+ */
+export function briefForAttemptFailure(log: DomainLog, phase: Step['phase']): DebugBrief {
+  return buildDebugBrief({
+    reason: log.message,
+    failureLog: typeof log.data.failureLog === 'string' ? log.data.failureLog : log.message,
+    phase,
+    targetPhase: phase,
+    typedFailure: structuredFailureEvidence(log.data.structuredFailure),
+  });
+}
+
 export function renderAttemptRetryFeedback(log: DomainLog, phase: Step['phase']): string {
   const failureLog = typeof log.data.failureLog === 'string' ? log.data.failureLog : log.message;
   const typedFailure = structuredFailureEvidence(log.data.structuredFailure);
-  const brief = buildDebugBrief({
-    reason: log.message,
-    failureLog,
-    phase,
-    targetPhase: phase,
-    typedFailure,
-  });
+  const brief = briefForAttemptFailure(log, phase);
   const evidence = compactFailureEvidence({
     reason: log.message,
     failureLog,
@@ -250,12 +263,25 @@ export function renderAttemptRetryFeedback(log: DomainLog, phase: Step['phase'])
 /**
  * Project defects keep the exact failed candidate so the routed role can repair it incrementally.
  * Conditions outside the project and incomplete agent turns return to the clean attempt baseline.
+ *
+ * Work already on disk is kept whatever the category says. The category describes why the attempt
+ * ended, not whether it achieved anything, and an attempt that wrote real files and then ended on a
+ * tool-usage complaint has both: discarding it throws away correct work for a procedural fault, and
+ * the next attempt starts from a baseline that makes the same complaint inevitable.
+ *
+ * A live CODE Step spent six attempts in that shape. Each one wrote test files the Step owed, each
+ * one then ran the same verification command twice, and each rejection rolled the files away — so
+ * the identical "these declared test files do not exist yet" refusal came back six times and the
+ * non-convergence guard stopped the run. The model's work was right every time; only the bookkeeping
+ * lost it.
  */
 export function shouldPreserveFailedCandidate(
   failure: AttemptFailure,
   hasDependencyRequest = false,
+  changedFileCount = 0,
 ): boolean {
   if (hasDependencyRequest || failure.kind !== 'execution') return false;
+  if (changedFileCount > 0) return true;
   return ['tool', 'test', 'quality', 'contract'].includes(failure.category);
 }
 

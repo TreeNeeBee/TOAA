@@ -8,7 +8,7 @@ import type { Language } from '../core/plan.js';
 import type { Sandbox, SandboxBuildOptions, SandboxLimits, ExecResult, ExecExtra } from './types.js';
 import { SANDBOX_GUEST_ENVIRONMENT_DIR } from './environment.js';
 import { normalizeTypeScriptTestArgs } from './test_args.js';
-import { resolveTypeScriptProgramCommand } from './program_args.js';
+import { resolveTypeScriptProgramCommand, stripPythonInterpreterPrefix } from './program_args.js';
 import { createInstallProgressWatch, execRaw, formatExecFailure } from './subprocess.js';
 
 export interface DockerSandboxOptions {
@@ -340,7 +340,7 @@ export class DockerSandbox implements Sandbox {
       const command = resolveTypeScriptProgramCommand(args);
       return this.exec(command.cmd, command.argv, extra);
     }
-    return this.exec(this.pythonInContainer, args, extra);
+    return this.exec(this.pythonInContainer, stripPythonInterpreterPrefix(args), extra);
   }
 
   async runTests(args: string[] = [], extra?: ExecExtra): Promise<ExecResult> {

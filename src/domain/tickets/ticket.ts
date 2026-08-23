@@ -1,8 +1,9 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { assertStateTransition, type StateTransitions } from '../../util/state_machine.js';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { ObjectIdSchema, type ObjectId } from '../identity/object_id.js';
-import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
+import { DomainRoleSchema, ExecutingRoleSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import { STEP_TYPES } from '../steps/step.js';
 import { WORKSPACE_KINDS } from '../workspace/change_set.js';
@@ -16,6 +17,21 @@ export const TICKET_TYPES = [
   'change-request',
 ] as const;
 export type TicketType = (typeof TICKET_TYPES)[number];
+
+/**
+ * The Ticket types that exist because something went wrong.
+ *
+ * Epics, Stories and Tasks describe planned work; these three describe a defect, a shortfall, or a
+ * contract that has to change. Stated once because more than one place needs "is this corrective" —
+ * and the first consumer, Debug Wiki retrieval, originally asked `type === 'bug'`, which meant the
+ * accumulated repair knowledge was unavailable to exactly the Tickets that a Change Request or an
+ * Enhancement opens. Two live runs died on failures raised as CRs and never saw a wiki entry.
+ */
+export const CORRECTIVE_TICKET_TYPES = ['bug', 'enhancement', 'change-request'] as const;
+
+export function isCorrectiveTicket(type: TicketType): boolean {
+  return (CORRECTIVE_TICKET_TYPES as readonly TicketType[]).includes(type);
+}
 
 export const TICKET_STATES = [
   'created',
@@ -128,7 +144,7 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   phaseId: ObjectIdSchema,
   stepId: ObjectIdSchema.optional(),
   role: DomainRoleSchema,
-  agent: ExecutionAgentSchema,
+  agent: ExecutingRoleSchema,
   creatorActorId: ObjectIdSchema,
   requiredCapabilities: z.array(z.string().min(1)).default([]),
   priority: z.number().int().min(TICKET_PRIORITY_MIN).max(TICKET_PRIORITY_MAX),
@@ -250,6 +266,34 @@ export const ChangeRequestApplicationDecisionSchema = z.object({
   inspectedArtifacts: z.array(z.string().min(1)).default([]),
   evidence: z.array(z.string().min(1)).default([]),
 }).strict();
+
+/**
+ * Identity of a propagation hop: the same correction, arriving at the same Step, from the same
+ * failure.
+ *
+ * Two Bugs on one Step each open their own chain along the identical route — a live run produced
+ * four such pairs (`S004→S005`, `S005→S006`, `S006→S007`, `S007→S008`), created one to two minutes
+ * apart, carrying the same delta to the same owner. The existing guard keys on `sourceTicketId`, so
+ * it never sees them: they differ precisely in the field it compares. What actually makes a hop
+ * redundant is where it comes from, where it goes, and which failure started it — so that is what
+ * the key is built from.
+ *
+ * `parentChangeRequestId` participates because it distinguishes the head of a chain from a
+ * continuation along the same route; merging those would collapse two different hops.
+ */
+export function changeRequestHopKey(input: {
+  sourceStepId: ObjectId;
+  targetStepId: ObjectId;
+  originFailedStepId?: ObjectId;
+  parentChangeRequestId?: ObjectId;
+}): string {
+  return createHash('sha256').update(JSON.stringify([
+    input.sourceStepId,
+    input.targetStepId,
+    input.originFailedStepId ?? '',
+    input.parentChangeRequestId ?? '',
+  ])).digest('hex');
+}
 
 export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   type: z.literal('change-request'),

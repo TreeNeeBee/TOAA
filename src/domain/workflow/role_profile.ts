@@ -1,6 +1,6 @@
 import type { StepType } from '../steps/step.js';
 import type { TicketType } from '../tickets/ticket.js';
-import type { DomainRole, ExecutionAgent } from './role.js';
+import type { DomainRole, Role } from './role.js';
 
 const ROLE_CAPABILITIES: Readonly<Record<DomainRole, readonly string[]>> = {
   'project-manager': ['project-management', 'phase-control', 'ticket-routing', 'delivery-control'],
@@ -67,7 +67,16 @@ export function roleForStepType(type: StepType): DomainRole {
   }
 }
 
-export function defaultAgentForRole(role: DomainRole): ExecutionAgent {
+/**
+ * Which configured role a registered actor speaks as.
+ *
+ * PM names its own. It registers through the same flow as every other domain role, so the one
+ * thing that made it different was invisible: falling through to `Planner` meant the actor that
+ * judges delivery and the actor that plans the work drew from the same configured model pool, and
+ * a judgement made in the planner's voice is the planner reviewing the planner.
+ */
+export function defaultAgentForRole(role: DomainRole): Role {
+  if (role === 'project-manager') return 'ProjectManager';
   if (role === 'system-engineer') return 'Architect';
   if (role === 'developer') return 'Coder';
   if (role === 'integrator' || role === 'tester') return 'Tester';

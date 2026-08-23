@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { assertStateTransition, type StateTransitions } from '../../util/state_machine.js';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { ObjectIdSchema, type ObjectId } from '../identity/object_id.js';
-import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
+import { DomainRoleSchema, ExecutingRoleSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import {
   DeliveryGateSchema,
@@ -82,7 +82,7 @@ export const StepSchema = ObjectEnvelopeSchema.extend({
   title: z.string().min(1),
   description: z.string().min(1),
   role: DomainRoleSchema,
-  agent: ExecutionAgentSchema,
+  agent: ExecutingRoleSchema,
   state: z.enum(STEP_STATES),
   pendingReason: PendingReasonSchema.optional(),
   dependencyStepIds: z.array(ObjectIdSchema).default([]),

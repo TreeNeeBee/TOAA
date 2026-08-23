@@ -605,8 +605,13 @@ function parsePhasePlanJson(text: string, context: DraftParseContext): DraftPhas
     },
     context.language,
   );
+  // User sources only. The field is `userForcedPhaseSplit`, so the question is what the *user*
+  // asked for — and `digest` is the model's own summary from this very response. Including it let
+  // the model's wording decide what the user had demanded, and the trigger word is one the system
+  // prompt teaches: a rationale reading "建议分阶段交付：P1 …, P2 …" was read as a user mandate, the
+  // model answered `false` because that was true, and the contract check rejected it.
+  // `inferComplexityAssessment` still reads the digest — it synthesises an answer, not verifies one.
   const forcedPhaseSplit = hasForcedPhaseSplit([
-    digest,
     context.rawRequirement,
     context.userAddenda,
   ].join('\n'));
@@ -825,8 +830,13 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
       architectureDemandInputForDraft(context, digest, globalPrompt),
       context.language,
     );
+    // User sources only. The field is `userForcedPhaseSplit`, so the question is what the *user*
+    // asked for — and `digest` is the model's own summary from this very response. Including it let
+    // the model's wording decide what the user had demanded, and the trigger word is one the system
+    // prompt teaches: a rationale reading "建议分阶段交付：P1 …, P2 …" was read as a user mandate, the
+    // model answered `false` because that was true, and the contract check rejected it.
+    // `inferComplexityAssessment` still reads the digest — it synthesises an answer, not verifies one.
     const forcedPhaseSplit = hasForcedPhaseSplit([
-      digest,
       context.rawRequirement,
       context.userAddenda,
     ].join('\n'));

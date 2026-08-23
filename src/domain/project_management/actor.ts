@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { ObjectEnvelopeSchema, reviseObjectEnvelope } from '../objects/object_envelope.js';
 import { ObjectIdSchema } from '../identity/object_id.js';
-import { DomainRoleSchema, ExecutionAgentSchema } from '../workflow/role.js';
+import { DomainRoleSchema, RoleSchema } from '../workflow/role.js';
 
 export const ACTOR_STATES = ['active', 'paused', 'unavailable', 'retired'] as const;
 export type ActorState = (typeof ACTOR_STATES)[number];
@@ -19,7 +19,9 @@ export const ActorRegistrationSchema = ObjectEnvelopeSchema.extend({
    * different model bindings and run concurrently.
    */
   roleDefinitionId: ObjectIdSchema,
-  agent: ExecutionAgentSchema.optional(),
+  // Any role, not only the executing ones: PM registers through this same flow and speaks as
+  // itself rather than borrowing a planner's voice.
+  agent: RoleSchema.optional(),
   /**
    * Which models this actor may use, in order.
    *

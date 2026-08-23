@@ -219,6 +219,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     pluginHost,
     undefined,
     recordReplay,
+    cfgPath,
   );
   await reportRoleModelAdvice(router, audit, (message) => runtimeLog(io, 'warning', message));
   const baseline =
@@ -237,6 +238,9 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
     await runtimeLog(io, 'success', M.compile.baselineLoaded(intent, baseline.sources.join(', ')));
   }
   const plannerClient = router.for('Planner');
+  // Everything the user is asked or told comes from PM. It owns the project's conversation with
+  // its owner; a Step-executing role talking to the user is that role negotiating its own scope.
+  const pmClient = router.for('ProjectManager');
 
   const trace = (msg: string) => {
     if (xcEnv('TRACE') === '1') {
@@ -289,7 +293,7 @@ export async function runCompile(opts: CompileOptions): Promise<{ planPath?: str
   trace(`clarify.section.flag yes=${opts.yes} topicMode=${topicMode}`);
   if (!opts.yes && !topicMode) {
     const clarifyPlanner = new Planner(
-      plannerClient,
+      pmClient,
       audit,
       initialLanguage.language,
       io.terminalOutput === true,

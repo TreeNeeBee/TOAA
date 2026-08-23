@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { renderDebugBriefForPrompt } from '../src/core/debug_brief.js';
 import {
   reconcileMeasuredQualityAssessment,
   reconcileDeferredSourceQualityAssessment,
@@ -16,6 +17,9 @@ import {
   shouldPreserveExistingFiles,
   deliveredManifest,
   isAttemptCancellation,
+  DomainAttemptRunner,
+  type AttemptInput,
+  ticketContextSnapshot,
 } from '../src/application/execution/attempt_runner.js';
 import type { DomainLog } from '../src/domain/observability/records.js';
 import { classifyAttemptFailure, classifyFailure } from '../src/application/execution/failure_classification.js';
@@ -46,8 +50,13 @@ describe('corrective write scope', () => {
       } as Ticket,
     );
 
-    expect(allowed).toEqual(['tests/modules/domain.test.ts']);
+    // Narrowing is the point: the named artifact, and none of the Step's unrelated deliverables.
+    expect(allowed).toContain('tests/modules/domain.test.ts');
     expect(allowed).not.toContain('package.json');
+    expect(allowed).not.toContain('docs/02-high-level-design.md');
+    // The fixture directory rides along because the named artifact is a test, and a test that cannot
+    // write the data it reads cannot be repaired. Everything else stays out.
+    expect(allowed.filter((path) => !path.startsWith('tests/'))).toEqual([]);
   });
 
   // An artifact list naming nothing this Step owns narrows the allowlist to nothing, and a Step
@@ -637,5 +646,280 @@ describe('quality gaps a Step does not own', () => {
       [{ tool: 'run_tests', ok: false, error: '1 failing' }],
     );
     expect(real?.gaps).toEqual(['the renderer has no tests']);
+  });
+});
+
+/**
+ * Every watchdog wording, not one of them.
+ *
+ * `PROVIDER_FAILURE_TEXT` used to list `stream idle before first token`, which was one sentence out
+ * of several a stream watchdog composes. Two more were added this week — reasoning-only stalls and a
+ * missing response header — and neither matched, so an outage of our own provider would have been
+ * charged to the generated project as a Bug. The predicate now keys on the prefix the transport puts
+ * in front of all of them.
+ */
+describe('every stream watchdog wording is our infrastructure', () => {
+  const wordings = [
+    'OpenAI stream idle before first token for 300000ms; aborting',
+    'OpenAI stream idle for 60000ms; aborting',
+    'OpenAI stream sent 4293 reasoning chars but no content for 300000ms; aborting',
+    'OpenAI stream sent no response headers for 30000ms; aborting',
+    'OpenAI stream wall-clock 900000ms exceeded; aborting',
+  ];
+
+  for (const wording of wordings) {
+    it(`classifies "${wording.slice(0, 42)}…" as infrastructure`, () => {
+      expect(classifyAttemptFailure(wording)).toBe('infrastructure');
+    });
+  }
+
+  // The other direction is what the narrow predicate was protecting, and it still has to hold.
+  it('leaves a failure the generated project produced as execution', () => {
+    expect(classifyAttemptFailure('run_tests failed: external API returned HTTP 429')).toBe('execution');
+    expect(classifyAttemptFailure('pytest exit=1: 3 failed')).toBe('execution');
+  });
+});
+
+/**
+ * Lookup follows the top of the failure stack; the history stays in the prompt.
+ *
+ * A Ticket's own `failure` is the one that opened it, and a repair loop moves through several —
+ * unwritten tests, then an import error, then a failing assertion. Keying Debug Wiki retrieval on
+ * the opening failure answers the first question for the rest of the Ticket's life: a live dbc4 Bug
+ * received the same entry 51 times while the entry matching its current `ModuleNotFoundError` never
+ * appeared once, and the Ticket ran out of attempts on advice for a problem it had already left.
+ */
+describe('debug lookup keys on the failure in hand', () => {
+  const importFailure = {
+    message: 'Step executor reached max rounds',
+    data: {
+      failureLog: [
+        'pytest exit=2 args=tests/test_models.py',
+        "ImportError while importing test module 'tests/test_models.py'.",
+        'tests/test_models.py:3: in <module>',
+        '    from models import SignalInfo',
+        "E   ModuleNotFoundError: No module named 'models'",
+      ].join('\n'),
+    },
+  } as unknown as DomainLog;
+
+  it('builds the brief from the recorded failure, not from the Ticket that opened', async () => {
+    const { briefForAttemptFailure } = await import('../src/application/execution/attempt_policy.js');
+    const brief = briefForAttemptFailure(importFailure, 'CODE');
+    expect(brief.category).toBe('import_error');
+    expect(brief.primaryError).toContain('ModuleNotFoundError');
+  });
+
+  /**
+   * The consequence, asserted through retrieval: the same failure has to reach the entry written for
+   * it. Keying on the Ticket's opening text instead yields `test_failure` and a different entry.
+   */
+  it('retrieves the entry that matches the current error', async () => {
+    const { briefForAttemptFailure } = await import('../src/application/execution/attempt_policy.js');
+    const { DebugWiki, bundledDebugWikiPath } = await import('../src/core/debug_wiki.js');
+    const wiki = new DebugWiki(bundledDebugWikiPath());
+
+    const current = await wiki.search(briefForAttemptFailure(importFailure, 'CODE'), { limit: 3 });
+    expect(current[0]?.entry.id).toBe('agent.calibration.python-imports');
+
+    // What the Ticket carries once the loop has moved on: a description of the loop's shape, whose
+    // own text says nothing about imports.
+    const { buildDebugBrief } = await import('../src/core/debug_brief.js');
+    const opening = buildDebugBrief({
+      reason: 'verification command repeated without a successful mutation',
+      failureLog: 'run_tests:{"cwd":"."}; the duplicate command was not executed again',
+      phase: 'CODE',
+    });
+    const stale = await wiki.search(opening, { limit: 3 });
+    expect(stale.map((match) => match.entry.id)).not.toContain('agent.calibration.python-imports');
+  });
+});
+
+/**
+ * An attempt that wrote real files keeps them, whatever ended it.
+ *
+ * The failure category describes why an attempt stopped, not whether it achieved anything, and an
+ * attempt can be both: a live CODE Step wrote the test files it owed and then ran the same
+ * verification command twice, so each rejection rolled the files away and the identical "these
+ * declared test files do not exist yet" refusal came back six times until the non-convergence guard
+ * stopped the run. The work was correct every time; only the bookkeeping lost it.
+ */
+describe('failed attempts keep the work they produced', () => {
+  const internalFailure = { kind: 'execution', category: 'internal', code: 'agent_execution_stalled' } as never;
+
+  it('preserves the candidate when files changed, whatever the category', async () => {
+    const { shouldPreserveFailedCandidate } = await import('../src/application/execution/attempt_policy.js');
+    expect(shouldPreserveFailedCandidate(internalFailure, false, 3)).toBe(true);
+  });
+
+  it('still rolls back an attempt that produced nothing', async () => {
+    const { shouldPreserveFailedCandidate } = await import('../src/application/execution/attempt_policy.js');
+    expect(shouldPreserveFailedCandidate(internalFailure, false, 0)).toBe(false);
+  });
+
+  // Conditions outside the project return to the baseline no matter what is on disk: a dependency
+  // request is answered by another Step, and infrastructure failures are not the project's work.
+  it('does not preserve work when the failure is not the project\'s to repair', async () => {
+    const { shouldPreserveFailedCandidate } = await import('../src/application/execution/attempt_policy.js');
+    expect(shouldPreserveFailedCandidate(internalFailure, true, 5)).toBe(false);
+    const infra = { kind: 'infrastructure', category: 'llm-provider', code: 'provider_call_failed' } as never;
+    expect(shouldPreserveFailedCandidate(infra, false, 5)).toBe(false);
+  });
+});
+
+/**
+ * A Step is told the metrics its own gate asks for, not a phase table it has to match itself
+ * against. CODE has no entry in that table, so a live run measured coverage nobody required, could
+ * not collect it, reported the shortfall honestly in `gaps` — and the gate failed it for
+ * volunteering, after its suite had already passed.
+ */
+describe('the prompt states this Step\'s metric contract', () => {
+  const stepWith = (metrics: Record<string, number>) => ({
+    id: 'S004', title: 'implement', phase: 'CODE', role: 'Coder',
+    acceptance: 'a', description: 'd', outputs: [], inputs: [], tools: [],
+    qualityGate: { metrics },
+  }) as never;
+
+  const render = async (metrics: Record<string, number>) => {
+    const { renderExecutionUserPrompt } = await import('../src/agents/execution/prompt_renderer.js');
+    return renderExecutionUserPrompt({
+      step: stepWith(metrics),
+      ctx: { contextWindowTokens: 128 * 1024, allowedWrites: ['src/'] },
+      contextSnippets: [],
+      architectureModules: [],
+      dependencies: [],
+    } as never, '');
+  };
+
+  it('names the required metrics when the gate has them', async () => {
+    const text = await render({ lineCoverage: 0.8 });
+    expect(text).toContain('lineCoverage');
+    expect(text).toMatch(/unavailableMetrics with its cause in\s+blockedBy/u);
+    expect(text).toMatch(/never in gaps/u);
+  });
+
+  it('says plainly that no metric is owed when the gate requires none', async () => {
+    const text = await render({});
+    expect(text).toMatch(/requires no metrics/u);
+    expect(text).toMatch(/do not record a gap about metrics/u);
+  });
+});
+
+/**
+ * The instruction and the gate have to name the same field.
+ *
+ * The prompt told a Step to put the cause of an unmeasurable metric in `gaps`, and the gate fails a
+ * Step for every gap it declares — so following the instruction was the failure. The rescue that
+ * exists for exactly this case, `reconcileMeasuredQualityAssessment`, keys on `blockedBy`, which the
+ * instruction never mentioned here. A live CODE Step passed its whole suite, honestly reported that
+ * coverage could not be collected, and was failed for saying so.
+ */
+describe('the unmeasurable-metric instruction names the non-failing field', () => {
+  for (const locale of ['zh', 'en'] as const) {
+    it(`points ${locale} at blockedBy rather than gaps`, async () => {
+      const { readFile } = await import('node:fs/promises');
+      const text = await readFile(new URL(`../src/i18n/${locale}.ts`, import.meta.url), 'utf8');
+      const line = text.split('\n').find((candidate) => candidate.includes('unavailableMetrics') && candidate.includes('Enhancement'));
+      expect(line).toBeDefined();
+      expect(line).toContain('blockedBy');
+      // The old wording sent the cause to the one field that fails the Step.
+      expect(line).not.toMatch(/(?:in|说明原因，并在) gaps 说明原因|explain the cause in gaps/u);
+    });
+  }
+});
+
+/**
+ * Retrieval and the prompt ask the same question — which failure is in hand — and answering it from
+ * two sources is how they came apart. Lookup followed the top of the stack while the prompt kept
+ * describing the failure the Ticket was opened for, so a live Debugger spent 26 attempts re-fixing
+ * an ImportError an earlier round had already fixed; the assertion actually failing never reached
+ * the model. `debugContextFrom` now takes the resolved brief rather than re-deriving one from the
+ * Ticket, which makes the two answers structurally the same value; what remains to guard is that the
+ * value follows the newest failure.
+ */
+describe('failure in hand', () => {
+  const importError = [
+    'pytest exit=2 args=tests/modules/test_main_module.py',
+    "E   ImportError: cannot import name 'validate_args' from 'src.main'",
+  ].join('\n');
+  const assertionFailure = [
+    'pytest exit=1 args=tests/modules/test_excel_writer_module.py',
+    'FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data',
+    "E   assert None == ''",
+  ].join('\n');
+
+  const runnerFor = (logs: unknown[]): DomainAttemptRunner => new DomainAttemptRunner({
+    workspace: {}, git: {}, router: {}, audit: {}, plugins: { size: 0 },
+    debugWikiPath: '/tmp/xcompiler-brief-wiki',
+    repository: { read: async (id: string) => logs.find((log) => (log as { id: string }).id === id) },
+  } as never, 'python');
+
+  const attempt = (logIds: string[]): AttemptInput => ({
+    ticket: {
+      id: 'BUG-1', type: 'bug', logIds,
+      failure: { summary: 'collection failed', message: importError, category: 'test', code: 'test_command_failed' },
+    },
+    domainStep: { id: 'step-1' },
+    executionStep: { phase: 'HIGH_LEVEL_DESIGN' },
+  } as never);
+
+  const log = (id: string, failureLog: string) => ({
+    id, objectType: 'log', level: 'error', message: 'attempt failed',
+    data: { stepId: 'step-1', failureLog },
+  });
+
+  const briefFor = async (runner: DomainAttemptRunner, input: AttemptInput) =>
+    await (runner as unknown as {
+      latestFailureBrief(value: AttemptInput): Promise<unknown>;
+    }).latestFailureBrief(input);
+
+  it('follows the newest failure, not the one the Ticket was opened for', async () => {
+    const runner = runnerFor([log('l1', importError), log('l2', assertionFailure)]);
+    const brief = await briefFor(runner, attempt(['l1', 'l2']));
+    const rendered = renderDebugBriefForPrompt(brief as never);
+    expect(rendered).toContain('test_writes_signal_data');
+    expect(rendered).not.toContain('validate_args');
+    expect(rendered).not.toContain('ImportError');
+  });
+
+  it('falls back to the Ticket failure while no attempt has failed yet', async () => {
+    const brief = await briefFor(runnerFor([]), attempt([]));
+    expect(brief).toBeUndefined();
+  });
+});
+
+/**
+ * What the Ticket carries into the prompt. The renderer caps each snippet, so the order and the size
+ * of what goes in decides what the model actually reads: a live Bug's Ticket held 43KB of the pytest
+ * output from the day it was opened, the cap kept the first 3000 characters of that, and the failure
+ * in hand reached the model only as a one-line summary further down. It spent 26 attempts re-fixing
+ * the ImportError it could read in full.
+ */
+describe('ticket context snapshot', () => {
+  const openingDump = ['ImportError: cannot import name validate_args', 'x'.repeat(43_000)].join('\n');
+
+  const snapshot = (ticket: unknown): Record<string, unknown> =>
+    ticketContextSnapshot(ticket) as Record<string, unknown>;
+
+  it('bounds a captured failure so it cannot crowd out the Ticket fields', () => {
+    const trimmed = snapshot({
+      id: 'BUG-1', state: 'in_progress',
+      description: openingDump,
+      acceptance: ['Repair P1-S002 without unrelated rewrites.'],
+      failure: { summary: 'collection failed', message: openingDump, code: 'test_command_failed' },
+    });
+    expect(String(trimmed.description).length).toBeLessThan(1400);
+    expect(String(trimmed.description)).toContain('ImportError');
+    expect(String(trimmed.description)).toContain('ticket history trimmed');
+    expect((trimmed.failure as Record<string, string>).message.length).toBeLessThan(1400);
+    // The fields the routed role needs survive intact.
+    expect(trimmed.acceptance).toEqual(['Repair P1-S002 without unrelated rewrites.']);
+    expect((trimmed.failure as Record<string, string>).code).toBe('test_command_failed');
+  });
+
+  it('leaves a short failure untouched', () => {
+    const trimmed = snapshot({ description: 'assert None == \'\'', failure: { message: 'short' } });
+    expect(trimmed.description).toBe('assert None == \'\'');
+    expect((trimmed.failure as Record<string, string>).message).toBe('short');
   });
 });

@@ -786,6 +786,7 @@ describe('Coder and Debugger model advice', () => {
       roles: {
         Coder: ['ollama_code'],
         Debugger: ['ollama_code', 'ollama_design'],
+        ProjectManager: ['ollama_code', 'ollama_design'],
       },
     });
     const scores = new ScoreStore('/tmp/x/config.yaml');
@@ -807,4 +808,74 @@ describe('Coder and Debugger model advice', () => {
       log.mockRestore();
     }
   });
+});
+
+/**
+ * A recovery attempt does not get a fresh request's budget.
+ *
+ * The non-stream path has no idle or first-token watchdog — a non-stream response sends nothing
+ * until it is whole — so it runs to the configured `request_timeout_ms` with nothing to observe.
+ * That budget is sized for a first attempt; this one follows a stream that already stalled, and
+ * handing it the same allowance doubles the cost of a single stall. A live Planner spent fifteen
+ * minutes there after its stream went idle at sixty seconds, and the build failed on the wait.
+ */
+describe('non-stream retry after a stalled stream', () => {
+  // Asserted at the call site: the client accepting a cap proves nothing about whether the retry
+  // path applies one, and that is the half that was missing.
+  it('applies the cap when the router drops streaming', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const router = await readFile(new URL('../src/llm/router.ts', import.meta.url), 'utf8');
+    const start = router.indexOf('function withoutStreamingOptions');
+    expect(start).toBeGreaterThan(0);
+    const body = router.slice(start, router.indexOf('\n}', start));
+    expect(body).toContain('requestTimeoutMs');
+    expect(body).toMatch(/Math\.min\(/u);
+    expect(body).toContain('NON_STREAM_RETRY_TIMEOUT_MS');
+  });
+
+  it('caps the retry below the provider budget', async () => {
+    // Exercised through the client, since the helper is module-private.
+    const { OpenAIClient } = await import('../src/llm/openai.js');
+    const { createServer } = await import('node:http');
+    let served = 0;
+    const server = createServer((_req, res) => {
+      served += 1;
+      // Never answers: the request can only end on whichever clock is shorter.
+      void res;
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as import('node:net').AddressInfo;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'slow',
+        requestTimeoutMs: 60_000,
+      });
+      const started = Date.now();
+      await expect(client.chat([{ role: 'user', content: 'hi' }], { requestTimeoutMs: 300 }))
+        .rejects.toThrow(/timed out after 300ms/u);
+      expect(Date.now() - started).toBeLessThan(20_000);
+      expect(served).toBe(1);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 30_000);
+
+  // A caller may narrow one request; it may never widen it past what the provider is configured for.
+  it('never raises the budget above the provider configuration', async () => {
+    const { OpenAIClient } = await import('../src/llm/openai.js');
+    const { createServer } = await import('node:http');
+    const server = createServer(() => { /* never answers */ });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address() as import('node:net').AddressInfo;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'slow',
+        requestTimeoutMs: 250,
+      });
+      await expect(client.chat([{ role: 'user', content: 'hi' }], { requestTimeoutMs: 60_000 }))
+        .rejects.toThrow(/timed out after 250ms/u);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 30_000);
 });

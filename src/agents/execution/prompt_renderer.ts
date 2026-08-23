@@ -1,4 +1,5 @@
 import type { Step } from '../../core/plan.js';
+import { resolveQualityGate } from '../../core/quality_gate.js';
 import { VALIDATION_CONTRACT_DEFECT_CODE } from '../../domain/tickets/ticket.js';
 import { t } from '../../i18n/index.js';
 import type { ExecutorRunInput } from '../executor.js';
@@ -210,12 +211,30 @@ export function renderExecutionUserPrompt(
         ].join('\n')
     : '';
 
+  // The metrics this Step's own gate asks for, rather than the phase table the model has to match
+  // itself against. A CODE Step has no entry in that table, so a live run improvised: it measured
+  // coverage nobody asked for, could not collect it, honestly reported the shortfall in `gaps`, and
+  // the gate failed it — for volunteering. Saying "no metrics" is what makes the empty case explicit
+  // instead of unstated.
+  const requiredMetrics = Object.keys(resolveQualityGate(input.step).metrics);
+  const metricContract = [
+    '## quality metrics this Step must report',
+    requiredMetrics.length > 0
+      ? `qualityAssessment.metrics must carry: ${requiredMetrics.join(', ')}. ` +
+        'A metric a concrete probe could not produce goes in unavailableMetrics with its cause in ' +
+        'blockedBy — never in gaps, which the gate reads as a shortfall in this Step\'s own work.'
+      : 'This Step\'s gate requires no metrics. Do not measure or report any, and do not record a ' +
+        'gap about metrics — gaps are shortfalls in the work this Step owes, and no metric is owed.',
+    '',
+  ].join('\n');
+
   return [
     `# Step ${input.step.id} — ${input.step.title}`,
     `phase: ${input.step.phase}`,
     `role: ${role}`,
     `acceptance: ${input.step.acceptance}`,
     '',
+    metricContract,
     missingOutputPriority,
     workTicketBlock,
     baselineGateBlock,

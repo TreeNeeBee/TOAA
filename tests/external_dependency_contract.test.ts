@@ -109,9 +109,12 @@ describe('external boundary contract per V-model level', () => {
 
     // The exact paired suite a UNIT_TEST runs is owned by CODE.
     expect(pairedTestAssetPaths(plan.steps, unit, plan.language)).toContain('tests/unit/scrapers.test.ts');
-    // And whoever owns paired tests may store the responses those tests replay.
+    // And whoever owns paired tests may store the inputs those tests read. Asserted as reaching the
+    // recorded-response path rather than as one literal directory: the grant is the fixture root, and
+    // pinning the subdirectory is what let the permission drift away from the instruction before.
     const code = plan.steps.find((candidate) => candidate.phase === 'CODE')!;
-    expect(computeStepAllowedWrites(code)).toContain('tests/fixtures/network/');
+    const { isAllowedWrite } = await import('../src/tools/types.js');
+    expect(isAllowedWrite('tests/fixtures/network/baidu.html', computeStepAllowedWrites(code))).toBe(true);
   });
 
   it('still refuses a verification level that claims a test the paired phase does not own', async () => {
@@ -285,5 +288,78 @@ describe('executable test gate failure', () => {
       { ok: false, error: 'assertion failed', tool: 'run_tests' },
       ['tests/unit/scrapers.test.ts'],
     )).not.toContain('reach the product with');
+  });
+});
+
+/**
+ * The instruction and the permission must name the same path.
+ *
+ * The prompts tell a Step to put a fixture in `tests/fixtures/<name>`; only `tests/fixtures/network/`
+ * was writable. A live dbc2excel Ticket died on the gap: its module tests needed DBC samples, the
+ * Debugger wrote four of them, each was denied by name, and after six attempts the non-convergence
+ * guard stopped the whole run. A denial that names the path the Step was told to use leaves it
+ * nothing to try next.
+ */
+describe('test fixture write access', () => {
+  const stepWithTest = (over: Record<string, unknown> = {}) => ({
+    id: 'S002',
+    phase: 'HIGH_LEVEL_DESIGN',
+    outputs: ['docs/02-high-level-design.md', 'tests/modules/test_dbc_parser_module.py'],
+    dependsOn: [],
+    ...over,
+  }) as never;
+
+  const canWrite = async (path: string, scope: string[]) => {
+    const { isAllowedWrite } = await import('../src/tools/types.js');
+    return isAllowedWrite(path, scope);
+  };
+
+  it('lets a Step that owns a test write the samples that test reads', async () => {
+    const { computeStepAllowedWrites } = await import('../src/application/execution/execution_context.js');
+    const scope = computeStepAllowedWrites(stepWithTest());
+    // The exact paths the live run was refused.
+    for (const fixture of ['basic_signals.dbc', 'multiplex_signals.dbc', 'ecu_filter_test.dbc', 'error_cases.dbc']) {
+      expect(await canWrite(`tests/fixtures/${fixture}`, scope)).toBe(true);
+    }
+  });
+
+  // Not a blanket grant: a Step owning no test has no fixture to write, and product paths stay out.
+  it('grants nothing extra to a Step that owns no test', async () => {
+    const { computeStepAllowedWrites } = await import('../src/application/execution/execution_context.js');
+    const scope = computeStepAllowedWrites(stepWithTest({ outputs: ['docs/03-detailed-design.md'] }));
+    expect(await canWrite('tests/fixtures/anything.dbc', scope)).toBe(false);
+  });
+
+  /**
+   * The path the live failure actually took. A Bug routed to the Step goes through the corrective
+   * scope, not the Step's own — so granting only the latter fixes the report and not the run.
+   */
+  it('gives the Debugger repairing a test the same fixture access the Step had', async () => {
+    const { computeIncrementalAllowedWrites, computeStepAllowedWrites } =
+      await import('../src/application/execution/execution_context.js');
+    const step = stepWithTest();
+    const plan = { steps: [step], language: 'python' } as never;
+    const profile = { id: 'python', manifestFile: 'requirements.txt' } as never;
+    const bug = { type: 'bug', affectedArtifacts: [], contractDelta: { affectedArtifacts: [] } } as never;
+
+    const corrective = computeIncrementalAllowedWrites(plan, step, profile, bug);
+    expect(await canWrite('tests/fixtures/basic_signals.dbc', corrective)).toBe(true);
+    // Stated as a relationship, because the two scopes drifting apart is the defect itself.
+    const owned = computeStepAllowedWrites(step);
+    expect(await canWrite('tests/fixtures/basic_signals.dbc', owned)).toBe(true);
+  });
+
+  it('gives a Change Request narrowed to a test the same access', async () => {
+    const { computeIncrementalAllowedWrites } = await import('../src/application/execution/execution_context.js');
+    const step = stepWithTest();
+    const plan = { steps: [step], language: 'python' } as never;
+    const profile = { id: 'python', manifestFile: 'requirements.txt' } as never;
+    const cr = {
+      type: 'change-request',
+      contractDelta: { affectedArtifacts: ['tests/modules/test_dbc_parser_module.py'] },
+    } as never;
+
+    const scope = computeIncrementalAllowedWrites(plan, step, profile, cr);
+    expect(await canWrite('tests/fixtures/basic_signals.dbc', scope)).toBe(true);
   });
 });

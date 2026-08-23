@@ -3,6 +3,7 @@ import {
   PLAN_DRAFT_COMPLEXITY_LEVELS,
   type PlanDraftComplexityLevel,
 } from '../domain/planning/plan_draft.js';
+import { ExecutingRoleSchema, ROLES as DOMAIN_DEFINED_ROLES } from '../domain/workflow/role.js';
 import {
   DEVELOPMENT_STEP_TYPES,
   SOURCE_TO_VERIFICATION_STEP,
@@ -74,13 +75,21 @@ export type ComplexityLevel = PlanDraftComplexityLevel;
 export const IMPLEMENTATION_PHASE_STATUSES = ['current', 'planned', 'complete', 'deferred'] as const;
 export type ImplementationPhaseStatus = (typeof IMPLEMENTATION_PHASE_STATUSES)[number];
 
-export const ROLES = [
-  'Planner',
-  'Architect',
-  'Coder',
-  'Tester',
-  'Debugger',
-] as const;
+/**
+ * Every role a model can be configured for.
+ *
+ * Built from the agents that execute Steps plus `ProjectManager`, which does not. Keeping the two
+ * lists as one derivation rather than two parallel constants is deliberate: a Step's `role` must
+ * only ever name something that executes, and a second hand-maintained list is where that stops
+ * being true.
+ *
+ * PM's other capabilities — ticket routing, phase control, problem intake — are decided from
+ * structural fields and stay that way: replacing a capability table or a state machine with a model
+ * would trade working logic for a guess. What PM alone can answer is whether a finished result is
+ * what the project asked for, which is a judgement no executing role should make about its own work.
+ */
+export const ROLES = DOMAIN_DEFINED_ROLES;
+
 export type Role = (typeof ROLES)[number];
 
 /**
@@ -218,7 +227,10 @@ export const StepSchema = z
      * xcompiler_run 会拼接到 Executor 的通用 system prompt 后，以防止 LLM 发散。
      */
     systemPrompt: z.string().min(1, 'systemPrompt must be non-empty (xcompiler_build must populate)'),
-    role: z.enum(ROLES),
+    // Executing agents only. `ROLES` also carries ProjectManager, which judges outcomes on the
+    // project's behalf and never runs a Step; letting it be assigned here would put the judge in
+    // the position of doing the work it later assesses.
+    role: ExecutingRoleSchema,
     tools: z.array(z.string()).default([]),
     inputs: z.array(z.string()).default([]),
     outputs: z.array(z.string()).default([]),

@@ -244,7 +244,7 @@ describe('paired source test product-reference contract', () => {
     expect(integrated.ok).toBe(true);
   });
 
-  it('rejects integration tests that copy orchestration and failure policy around product calls', async () => {
+  it('rejects an integration test whose catch swallows whatever the product did', async () => {
     const plan = contractPlan(
       'typescript',
       'tests/integration/renderer-pipeline.test.ts',
@@ -276,7 +276,8 @@ describe('paired source test product-reference contract', () => {
     const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
 
     expect(result.ok).toBe(false);
-    expect(result.invalid.join('\n')).toContain('duplicates orchestration/failure-handling');
+    // The real defect in this shape: `run` can throw and the test still passes.
+    expect(result.invalid.join('\n')).toContain('without asserting or rethrowing');
   });
 
   it('accepts a Python import and rejects a local-only stand-in', async () => {
@@ -330,6 +331,104 @@ describe('paired source test product-reference contract', () => {
     expect(merged.findings?.[0]?.evidence.join('\n'))
       .toContain('imports may target planned source paths that do not exist yet');
     expect(merged.findings?.[0]?.evidence.join('\n')).toContain('Do not create src/** stubs');
+  });
+});
+
+/**
+ * The shape a real integration test has, which the removed heuristic could not distinguish from a
+ * defect.
+ *
+ * A live DETAILED_DESIGN Enhancement stopped unconverged on exactly this file shape: it referenced
+ * three declared product modules, called the real entry point, and asserted its exit code. Its only
+ * loop read the workbook the product produced and its only `try` wrapped that call with `finally`
+ * restoring a permission — no handler swallowed anything. The old check saw a loop beside a try and
+ * reported "duplicates orchestration/failure-handling" seven times word for word, because the only
+ * way to satisfy it was to delete correct code.
+ */
+describe('integration tests that assert on real failures', () => {
+  let root = '';
+  let workspace: Workspace;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-swallow-'));
+    workspace = new Workspace(root);
+  });
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it('accepts a loop that reads the produced artifact beside a try that asserts the failure', async () => {
+    const plan = contractPlan('python', 'tests/test_integration.py', 'DETAILED_DESIGN');
+    plan.architectureModules!.push({
+      id: 'M002',
+      name: 'Exporter',
+      responsibility: 'Write the parsed records to a workbook.',
+      sourcePaths: ['src/exporter.py'],
+      testPaths: ['tests/modules/test_exporter.py'],
+      dependencies: ['M001'],
+    });
+    await workspace.writeFile(
+      'tests/test_integration.py',
+      [
+        'from src.renderer.render import render',
+        'from src.exporter import export_to_excel',
+        '',
+        'def _read_rows(path):',
+        '    rows = []',
+        '    for index in range(2, 5):',
+        '        rows.append(index)',
+        '    return rows',
+        '',
+        'def test_export_writes_rows(tmp_path):',
+        '    out = tmp_path / "out.xlsx"',
+        '    export_to_excel(render("news"), out)',
+        '    assert _read_rows(out) == [2, 3, 4]',
+        '',
+        'def test_readonly_target_fails(tmp_path):',
+        '    target = tmp_path / "ro"',
+        '    target.mkdir()',
+        '    target.chmod(0o444)',
+        '    try:',
+        '        code = export_to_excel(render("news"), target / "out.xlsx")',
+        '        assert code != 0',
+        '    finally:',
+        '        target.chmod(0o755)',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(result.invalid.join('\n')).not.toMatch(/without asserting or rethrowing/u);
+    expect(result.ok).toBe(true);
+  });
+
+  // The other direction, in Python: an except that says nothing leaves the test unable to fail.
+  it('rejects an except block that neither asserts nor reraises', async () => {
+    const plan = contractPlan('python', 'tests/test_integration.py', 'DETAILED_DESIGN');
+    plan.architectureModules!.push({
+      id: 'M002',
+      name: 'Exporter',
+      responsibility: 'Write the parsed records to a workbook.',
+      sourcePaths: ['src/exporter.py'],
+      testPaths: ['tests/modules/test_exporter.py'],
+      dependencies: ['M001'],
+    });
+    await workspace.writeFile(
+      'tests/test_integration.py',
+      [
+        'from src.renderer.render import render',
+        'from src.exporter import export_to_excel',
+        '',
+        'def test_export(tmp_path):',
+        '    try:',
+        '        export_to_excel(render("news"), tmp_path / "out.xlsx")',
+        '    except Exception:',
+        '        pass',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+    expect(result.ok).toBe(false);
+    expect(result.invalid.join('\n')).toContain('without asserting or rethrowing');
   });
 });
 

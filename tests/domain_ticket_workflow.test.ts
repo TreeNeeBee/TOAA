@@ -827,3 +827,235 @@ async function completeDependencyHop(
     verification: ['sandbox rebuilt'],
   });
 }
+
+/**
+ * Two Bugs on one Step each open their own propagation along the identical route. A live run
+ * produced four such pairs — `S004→S005`, `S005→S006`, `S006→S007`, `S007→S008` — created one to two
+ * minutes apart, carrying the same delta to the same owner, because the guard keyed on
+ * `sourceTicketId` and they differ in exactly that field. 41 Change Requests served 8 Bugs.
+ *
+ * The Bugs are opened one after the other, as they are in a run: the first is handed off through its
+ * hop before the second is routed, which is also what frees the single owning actor.
+ */
+describe('Change Request hop merging', () => {
+  const bugOn = async (
+    workflow: TicketWorkflow,
+    registration: TicketRegistrationService,
+    graph: { steps: Step[]; actors: Array<{ id: string; role: string }> },
+    message: string,
+  ) => {
+    const integration = graph.steps.find((step) => step.type === 'INTEGRATION_TEST')!;
+    const detailed = graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
+    const bug = await workflow.openBug({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      failedStep: integration,
+      targetStep: detailed,
+      verificationStep: integration,
+      kind: 'test-failure',
+      severity: 'high',
+      message,
+      summary: message,
+      category: 'test',
+      code: 'integration_contract_mismatch',
+      retryable: true,
+      switchProvider: false,
+      rawEvidenceRef: '.xcompiler/failures/integration.log',
+      correlationId: createObjectId(),
+    });
+    await registration.routeAndAssign(bug.id);
+    await workflow.setSolution(bug.id, {
+      status: 'applied',
+      approach: 'Correct the contract.',
+      rationale: 'The implementation followed an ambiguous contract.',
+      changes: ['docs/03-detailed-design.md'],
+      verification: [],
+      updatedAt: new Date().toISOString(),
+    });
+    return bug;
+  };
+
+  const hopFor = (graph: { steps: Step[]; actors: Array<{ id: string; role: string }> }, targetType: string) => {
+    const integration = graph.steps.find((step) => step.type === 'INTEGRATION_TEST')!;
+    const detailed = graph.steps.find((step) => step.type === 'DETAILED_DESIGN')!;
+    return {
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      triggerStepId: integration.id,
+      sourceStepId: detailed.id,
+      targetStepId: graph.steps.find((step) => step.type === targetType)!.id,
+      implementationPlan: ['Update the detailed design.'],
+      verificationGate: ['All affected Step gates pass.'],
+    };
+  };
+
+  it('folds a second Bug propagating the same hop into the one already carrying it', async () => {
+    const { graph, workflow, registration } = await setup();
+    const first = await bugOn(workflow, registration, graph, 'Adapter contract mismatch.');
+    const a = await workflow.openChangeRequest({
+      ...hopFor(graph, 'DETAILED_DESIGN'),
+      sourceTicketId: first.id,
+      contractDelta: {
+        summary: 'Align the adapter contract.',
+        before: ['adapter may omit source'],
+        after: ['adapter always includes source'],
+        affectedArtifacts: ['docs/03-detailed-design.md'],
+      },
+    });
+    const second = await bugOn(workflow, registration, graph, 'Result contract mismatch.');
+    const b = await workflow.openChangeRequest({
+      ...hopFor(graph, 'DETAILED_DESIGN'),
+      sourceTicketId: second.id,
+      contractDelta: {
+        summary: 'Align the result contract.',
+        before: ['result may omit source'],
+        after: ['result always includes source'],
+        affectedArtifacts: ['src/service.ts'],
+      },
+    });
+
+    expect(b.id).toBe(a.id);
+    expect(b.relatedTicketIds).toContain(first.id);
+    expect(b.relatedTicketIds).toContain(second.id);
+    // Both reasons survive, because two Bugs can reach one Step for reasons that are not the same.
+    expect(b.contractDelta.summary).toContain('Align the adapter contract.');
+    expect(b.contractDelta.summary).toContain('Align the result contract.');
+    expect(b.contractDelta.affectedArtifacts).toEqual(
+      expect.arrayContaining(['docs/03-detailed-design.md', 'src/service.ts']),
+    );
+    expect(b.contractDelta.after).toEqual(
+      expect.arrayContaining(['adapter always includes source', 'result always includes source']),
+    );
+  });
+
+  it('hands off the folded Bug too, so it does not stay schedulable forever', async () => {
+    const { graph, repository, workflow, registration } = await setup();
+    const delta = {
+      summary: 'Align the contract.',
+      before: [],
+      after: ['contract is explicit'],
+      affectedArtifacts: ['docs/03-detailed-design.md'],
+    };
+    const first = await bugOn(workflow, registration, graph, 'Adapter contract mismatch.');
+    const a = await workflow.openChangeRequest({
+      ...hopFor(graph, 'DETAILED_DESIGN'), sourceTicketId: first.id, contractDelta: delta,
+    });
+    const second = await bugOn(workflow, registration, graph, 'Result contract mismatch.');
+    await workflow.openChangeRequest({
+      ...hopFor(graph, 'DETAILED_DESIGN'), sourceTicketId: second.id, contractDelta: delta,
+    });
+
+    const folded = await repository.read(second.id) as Ticket;
+    expect(folded.state).toBe('pending');
+    expect((folded as Ticket & { changeRequestTicketIds: string[] }).changeRequestTicketIds)
+      .toContain(a.id);
+  });
+
+  it('keeps a different route as its own hop', async () => {
+    const { graph, workflow, registration } = await setup();
+    const delta = {
+      summary: 'Align the contract.',
+      before: [],
+      after: ['contract is explicit'],
+      affectedArtifacts: ['docs/03-detailed-design.md'],
+    };
+    const first = await bugOn(workflow, registration, graph, 'Adapter contract mismatch.');
+    const a = await workflow.openChangeRequest({
+      ...hopFor(graph, 'DETAILED_DESIGN'), sourceTicketId: first.id, contractDelta: delta,
+    });
+    const second = await bugOn(workflow, registration, graph, 'Result contract mismatch.');
+    const b = await workflow.openChangeRequest({
+      ...hopFor(graph, 'CODE'), sourceTicketId: second.id, contractDelta: delta,
+    });
+    expect(b.id).not.toBe(a.id);
+  });
+});
+
+/**
+ * A verification Step's gate runs two ownership domains: the paired baseline its source Step wrote,
+ * and the risk supplement it wrote itself. Routing the whole gate failure to the source is right for
+ * the first and wrong for the second — the source owns neither the file nor the write scope for it.
+ *
+ * A live FUNCTIONAL_TEST failure did exactly that. `test_error_csv_content_rows`, a supplement case
+ * calling `write_error_csv` with a path the implementation appends its own suffix to, was routed to
+ * REQUIREMENT_ANALYSIS, whose allowlist held neither the supplement nor `src/excel_writer.py`. It
+ * delivered nine times without touching either file and the run had to be stopped by hand.
+ */
+describe('verification supplement routing', () => {
+  const supplementCase = (stepId: string) =>
+    `FAILED tests/verification/p1/functional-test/${stepId}/test_risk_supplement.py::TestErrorCsv::test_error_csv_content_rows - FileNotFoundError`;
+  const baselineCase =
+    'FAILED tests/test_functional_acceptance.py::TestNormalParsing::test_single_ecu_filtering - AssertionError';
+
+
+
+  it('keeps a failure confined to the Step own supplement in that Step', async () => {
+    const { graph, repository } = await setup();
+    const controller = new CorrectiveWorkflowService(repository);
+    const functional = graph.steps.find((step) => step.type === 'FUNCTIONAL_TEST')!;
+    const evidence = [
+      'pytest exit=1 args=tests/test_functional_acceptance.py',
+      supplementCase(functional.id),
+      '1 failed, 36 passed',
+    ].join('\n');
+    const bug = await controller.routeFailure({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      failedStepId: functional.id,
+      message: evidence,
+      summary: 'FUNCTIONAL_TEST executable test gate failed',
+      failure: {
+        kind: 'execution', category: 'test', code: 'test_command_failed',
+        message: evidence, retryable: true, switchProvider: false,
+      },
+      correlationId: createObjectId(),
+    });
+    expect(bug.failure.targetStepId).toBe(functional.id);
+  });
+
+  it('returns a baseline failure to the paired source', async () => {
+    const { graph, repository } = await setup();
+    const controller = new CorrectiveWorkflowService(repository);
+    const functional = graph.steps.find((step) => step.type === 'FUNCTIONAL_TEST')!;
+    const evidence = [
+      'pytest exit=1 args=tests/test_functional_acceptance.py',
+      baselineCase,
+      '1 failed, 36 passed',
+    ].join('\n');
+    const bug = await controller.routeFailure({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      failedStepId: functional.id,
+      message: evidence,
+      summary: 'FUNCTIONAL_TEST executable test gate failed',
+      failure: {
+        kind: 'execution', category: 'test', code: 'test_command_failed',
+        message: evidence, retryable: true, switchProvider: false,
+      },
+      correlationId: createObjectId(),
+    });
+    expect(bug.failure.targetStepId).toBe(functional.pairedStepId);
+  });
+
+  // A supplement that exposes a real product defect fails alongside the baseline; the source answers
+  // for the contract it defined, whatever else failed next to it.
+  it('returns to the paired source when the baseline fails too', async () => {
+    const { graph, repository } = await setup();
+    const controller = new CorrectiveWorkflowService(repository);
+    const functional = graph.steps.find((step) => step.type === 'FUNCTIONAL_TEST')!;
+    const evidence = [
+      'pytest exit=1 args=tests/test_functional_acceptance.py',
+      baselineCase,
+      supplementCase(functional.id),
+      '2 failed, 35 passed',
+    ].join('\n');
+    const bug = await controller.routeFailure({
+      creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
+      failedStepId: functional.id,
+      message: evidence,
+      summary: 'FUNCTIONAL_TEST executable test gate failed',
+      failure: {
+        kind: 'execution', category: 'test', code: 'test_command_failed',
+        message: evidence, retryable: true, switchProvider: false,
+      },
+      correlationId: createObjectId(),
+    });
+    expect(bug.failure.targetStepId).toBe(functional.pairedStepId);
+  });
+});
