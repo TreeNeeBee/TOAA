@@ -1,6 +1,11 @@
 # Change Request propagation: from one multi-Step Ticket to a PM-routed chain
 
 Status: implemented and converging — see §7
+Superseded in part: §2's decision that the next Step is recomputed at each hop no longer holds. A
+Change Request now carries `propagationStepIds`, decided when the chain opens, because a repair that
+touched only the paired baseline tests must reach its verification Step directly and skip the hops
+between — which a per-hop neighbour walk cannot express. See
+[`../XCompiler_design.md`](../XCompiler_design.md) §9.5.
 Target release: v0.3.0
 Supersedes: the `affectedStepIds` propagation model in
 [the worktree/MR/context plan](./XCompiler_worktree_mr_context_plan.md) §6

@@ -1,6 +1,8 @@
 # Dependencies: one owning phase, and a Change Request to reach it
 
-Status: in implementation
+Status: implemented — HIGH_LEVEL_DESIGN owns the manifest, `add_dependency` refuses elsewhere, and a
+need raised outside it travels there as a Change Request. See `corrective_workflow_service.ts` and
+`tests/manifest_sandbox_sync.test.ts`.
 Target release: v0.3.0
 
 ## 1. Why

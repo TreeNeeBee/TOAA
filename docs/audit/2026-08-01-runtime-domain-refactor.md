@@ -386,7 +386,7 @@ After the final commit is recorded above, restore that commit, install dependenc
 
 ## Related Evidence
 
-- [Domain refactor plan](../domain-refactor-plan.md)
+- [Domain refactor plan](../archive/domain-refactor-plan.md)
 - [Current architecture design](../XCompiler_design.md)
 - [Runtime architecture diagram](../assets/system-architecture.svg)
 - [Iterative V-model diagram](../assets/iterative-v-model-pipeline.svg)

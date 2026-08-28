@@ -63,9 +63,15 @@ V-model behavior:
 - Tickets exist only inside a Phase. A Phase-external gate or future post-delivery adapter can submit problems, data, and captured scenes through the PM intake boundary; PM alone converts a validated report into a Phase-local Ticket, registers it, routes it upstream-first, and restarts the V-model correction flow. Post-delivery reactivation is reserved for a later release.
 - Each Phase compiles to one `epic`, eight Step `story` Tickets, optional `task` Tickets with at most two nested task levels, and one delivery `story`. Dependencies are UUID references, never array positions or display names.
 - Globally unique UUIDv7 `id` values own identity. Human labels such as `P1-S004` are stored in `name`; they are never foreign keys.
-- A Bug routes to the paired source Step for Debug. Its root-cause fix produces a `change-request` carrying the contract delta, affected Step IDs, implementation plan, changelists, commits, and verification gates.
+- A failure is filed against the Step that discovered it, and the V-model pairing picks the target; it never inherits the origin of whichever Change Request chain happened to be active. A Bug then routes to the paired source Step for Debug, and its root-cause fix produces a `change-request` carrying the contract delta, affected Step IDs, implementation plan, changelists, commits, and verification gates.
+- A verification Step's gate runs two ownership domains — the paired baseline and the supplement the Step wrote itself. A defect confined to that supplement stays in the Step that wrote it; routing it to the paired source would hand that source a file it has no write access to. One failing baseline case is enough to send the whole finding back to the source.
+- Two Change Requests propagating the same hop — same source Step, same target Step, same origin failure — fold into the one already carrying it rather than opening parallel chains.
+- Repeated identical failures stop the Ticket instead of exhausting its budget. Recurrence is judged by a structural signature built from what the failure *is* — the failing cases, the failure kind, the stable part of the reason — and never from how the attempt happened to run: tool argv, the temporary directory a rerun is given, addresses, and counters all change between otherwise identical failures.
 - Downstream CR work is incremental. A CR failure creates a linked Bug, blocks the parent CR, executes the paired-source repair and child CR verification, then resumes only the parent's remaining applications.
+- A Bug closes only after the failure that opened it has been replayed at the Step that observed it and passed. Each Bug carries a verification contract naming that Step and the selectors to re-run; satisfying it appends an immutable verification record. An unsatisfied contract refuses the closure rather than raising: an unfinished corrective chain leaves the Bug open and its Story blocked, where the next chain to reach that gate can still finish it.
 - Bug closure order is fixed: source repair -> all affected CR gates -> verified solution -> debug-wiki persistence. Retrieved fixes that fail are marked for review rather than accumulated as trusted context.
+- Every report of a failure stays its own Ticket. PM compares registered Bugs before assignment and parks a structural duplicate — same target Step, same failure identity — against the earliest such Ticket, recording the routing decision. A parked duplicate is never scheduled and follows the original into whichever terminal state it reaches.
+- A Change Request carries the propagation scope decided when its chain opened, so a repair confined to the paired baseline tests reaches its verification Step directly instead of walking every Step between.
 - The PM application service owns Project/Phase/V-model advancement. It registers every Ticket, routes it to a registered role by capability, monitors state, records decisions, and caches a rebuildable project-status projection. Domain transition policies remain the final authority.
 - PM normally creates project-context `epic` and `story` Tickets. Inside a Phase, the role that discovers technical work creates `task`, `bug`, `enhancement`, or `change-request`; at the Phase boundary, only PM may materialize a corrective Ticket from a structured problem report.
 - Ticket ownership is an accepted Assignment. Every handoff appends an immutable, hash-chained trace event carrying actor, role, reason, assignment, correlation, and causation data.
@@ -191,7 +197,7 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **Languages**: Python and TypeScript project generation, testing, execution, and entry checks.
 - **Sandbox**: `subprocess` by default with an isolated environment (`inherit_env: false`); optional `docker` mode for enforceable network/resource isolation. `network: off` is rejected in subprocess mode because a host child process cannot enforce it.
 - **Audit**: every run appends complete records to `.xcompiler/audit/audit.jsonl` and `.xcompiler/audit/process_log.md`. A separate, rebuildable `.xcompiler/audit/summary.md` indexes high-signal events and links to raw lines and immutable object revisions; it never replaces or truncates the source records.
-- **Debug wiki**: Bug Ticket repairs retrieve LLM-wiki style prior fixes by compact `DebugBrief`. The wiki is a layered Markdown knowledge base: bundled `wiki/system` policy pages, bundled `wiki/agent` calibration pages, and local `wiki/external` resolved-Bug knowledge. Runtime regenerates `index.md` for review, `index.json` for retrieval, and `log.md` for append-only operations. By default it is copied to the XCompiler path (`$XC_PATH/.xcompiler/debug-wiki` when `XC_PATH` is set, otherwise the package/repo root); use `--debug-wiki-path <dir>` to share a different root. A Bug closes only after its `bugResolutionPlan` and evidence are persisted; failed reused fixes are marked `needs_review`.
+- **Debug wiki**: Bug Ticket repairs retrieve LLM-wiki style prior fixes by compact `DebugBrief`. The wiki is a layered Markdown knowledge base: bundled `wiki/system` policy pages, bundled `wiki/agent` calibration pages, and local `wiki/external` resolved-Bug knowledge. Runtime regenerates `index.md` for review and `index.json` for retrieval, while `log.md` remains local append-only operational history. By default it is copied to the XCompiler path (`$XC_PATH/.xcompiler/debug-wiki` when `XC_PATH` is set, otherwise the package/repo root); use `--debug-wiki-path <dir>` to share a different root. A Bug closes only after its `bugResolutionPlan` and evidence are persisted; failed reused fixes are marked `needs_review`.
 - **Security gates**: internal project operations are governed by Step outputs, tool allowlists, EditGuard, Ticket, sandbox, and Git gates without repeated external prompts. External resources are authorized once per Runtime task with `permissions.mode: request|auto|deny`; paths outside the project container are always denied, including in `auto` mode.
 - **Record/replay**: external HTTP, LLM, and tool data support `off`, `record`, `replay`, `auto`, and `refresh`. Current project code, builds, and tests always execute; Replay supplies their external fixtures rather than reusing an old process exit code. S1-S4 may capture controlled data for baseline tests; S5-S8 use Record/Replay for deterministic supplements and frozen execution. The Phase delivery gate alone disables Replay for declared real-user scenarios. Fixture inspection validates hash chains and redaction and fails explicitly on missing, ambiguous, or corrupt records.
 - **Agent Skills**: bundled file, web, test, debug, Record/Replay, Debug Wiki, dependency, review, security, profiling, CR, and delivery workflows follow the Agent Skills Specification. Planner sees metadata only; Run loads instructions and resources only for selected Skills. Plugin API 3 can add standard Skill directories without bypassing Runtime gates.
@@ -204,7 +210,7 @@ LLM routing is configured under `config.yaml -> llm.*`.
 
 | Field | Default | Effect |
 |---|---|---|
-| `roles.<Role>` | role dependent | Ordered/scored provider chain for Planner, Architect, Coder, Tester, Debugger |
+| `roles.<Role>` | role dependent | Ordered/scored provider chain for `Planner`, `Architect`, `Coder`, `Tester`, `Debugger`, and `ProjectManager`. Every role is configured here; `ProjectManager` judges delivery outcomes on the project's behalf and never executes a Step |
 | `providers.<name>.context_window` | `128K` | Model input+output context capacity; accepts token counts such as `131072`, `128K`, or an empty value for the default |
 | `llm_scores_user.yaml` | absent | Local user score overrides; `0` disables, `0.1..1` fixes effective priority |
 | `cluster_score_min/max` | `0.2..0.5` | Dynamic score band for providers tagged `cluster`; user overrides may still use `0.1..1` |
@@ -219,6 +225,9 @@ LLM routing is configured under `config.yaml -> llm.*`.
 | `permissions.timeout_ms` | `0` | Permission wait timeout; `0` waits until the user answers or cancels |
 | `max_edit_lines_per_step` | `auto` | Adaptive EditGuard cumulative write-line budget |
 | `agent.sandboxes.<language>.<local\|docker>.limits.network` | `download-only` | Docker supports enforceable `off`; subprocess rejects `off` instead of claiming isolation it cannot provide |
+| `providers.<name>.tcp_keepalive_ms` | `30000` | Idle time before the kernel probes the connection. A socket left by a dropped network never receives RST/FIN, so probing is what turns it into a real connection error; `0` disables |
+| `providers.<name>.stream_headers_timeout_ms` | `30000` | Streaming only: a response-header deadline. A streaming server writes headers before it starts thinking, so missing headers is a connection problem while slow tokens are a model problem; `0` removes the limit |
+| `stall_diagnosis_after_ms` | `600000` | Run one environment diagnosis when a peer sends no bytes for this long, and attach the verdict to the failure |
 
 ---
 
@@ -230,10 +239,14 @@ LLM routing is configured under `config.yaml -> llm.*`.
 | [docs/acp.md](docs/acp.md) | ACP code-agent adapter protocol notes |
 | [docs/agent_skills.md](docs/agent_skills.md) | Agent Skills contract, built-in catalog, security boundaries, and Plugin API 3 |
 | [docs/XCompiler_design.md](docs/XCompiler_design.md) | Core design and V-model concepts |
+| [docs/XCompiler_project_constraints.md](docs/XCompiler_project_constraints.md) | Architecture, ownership, lifecycle, and layout constraints the project must preserve |
+| [docs/XCompiler_project_constraints.md](docs/XCompiler_project_constraints.md) | Current architecture, PM/Ticket lifecycle, workspace, and release constraints |
 | [docs/plugin_api.md](docs/plugin_api.md) | Plugin API, lifecycle hooks, tools, skills |
 | [docs/versioning.md](docs/versioning.md) | Version sources, release script, tag policy |
 | [docs/self_bootstrap.md](docs/self_bootstrap.md) | Self-bootstrap and qualification gates |
 | [docs/deploy.md](docs/deploy.md) | Local, Docker, and native package deployment |
+| [docs/XCompiler_user_fixture_plan.md](docs/XCompiler_user_fixture_plan.md) | Open design: supplying a real user fixture to a run (`--fixture`); decided, not yet implemented |
+| [docs/archive/](docs/archive/) | Delivered design and refactor plans, kept for the reasoning behind decisions the code no longer explains. Not current documentation |
 
 ---
 

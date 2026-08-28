@@ -48,6 +48,7 @@
     "docs/acp.md",
     "docs/agent_skills.md",
     "docs/XCompiler_design.md",
+    "docs/XCompiler_project_constraints.md",
     "docs/deploy.md",
     "docs/openrouter.md",
     "docs/plugin_api.md",
