@@ -20,6 +20,7 @@ import {
   DomainAttemptRunner,
   type AttemptInput,
   ticketContextSnapshot,
+  advisoryFailuresForStage,
 } from '../src/application/execution/attempt_runner.js';
 import type { DomainLog } from '../src/domain/observability/records.js';
 import { classifyAttemptFailure, classifyFailure } from '../src/application/execution/failure_classification.js';
@@ -922,5 +923,27 @@ describe('ticket context snapshot', () => {
     const trimmed = snapshot({ description: 'assert None == \'\'', failure: { message: 'short' } });
     expect(trimmed.description).toBe('assert None == \'\'');
     expect((trimmed.failure as Record<string, string>).message).toBe('short');
+  });
+});
+
+describe('advisoryFailuresForStage', () => {
+  it('exempts the compile check from Steps that run before any product source exists', () => {
+    // S001-S003 deliver documents and the paired baseline tests; `src/` is S004's output. A
+    // whole-project typecheck therefore fails for the absence of inputs, and holding that against
+    // the Step blocks a completion no role there can earn.
+    for (const type of ['REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN'] as const) {
+      expect(advisoryFailuresForStage(type)).toEqual([
+        { tool: 'run_program', errorIncludes: 'TS18003' },
+      ]);
+    }
+  });
+
+  it('holds every later Step to the compile check', () => {
+    // From CODE onward the sources exist, so the same failure is a real defect of the Step.
+    for (const type of [
+      'CODE', 'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST',
+    ] as const) {
+      expect(advisoryFailuresForStage(type)).toEqual([]);
+    }
   });
 });

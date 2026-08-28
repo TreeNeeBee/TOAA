@@ -1,5 +1,6 @@
 import type { ToolCallRecord } from '../../agents/executor.js';
 import type { StepType } from '../../domain/steps/step.js';
+import { isTestRunnerInvocation } from '../../tools/sandbox.js';
 
 export type TestOutcomeStatus =
   | 'passed'
@@ -12,7 +13,7 @@ export type TestOutcomeStatus =
 export interface TestOutcome {
   status: TestOutcomeStatus;
   stepType: StepType;
-  tool: 'run_tests';
+  tool: 'run_tests' | 'run_program';
   callId?: string;
   args: string[];
   exitCode?: number;
@@ -29,7 +30,15 @@ export function collectTestOutcomes(
   calls: readonly ToolCallRecord[],
   stepType: StepType,
 ): TestOutcome[] {
-  return calls.filter((call) => call.tool === 'run_tests').map((call) => {
+  // What was executed decides, not which tool executed it. A Step holding `run_tests` may still run
+  // its suite through `run_program` to get a specific invocation, and keying this on the tool name
+  // meant those runs produced no outcomes at all: a live HIGH_LEVEL_DESIGN attempt ran every test
+  // through `npx vitest` and recorded nothing, which leaves a Bug whose verification contract names
+  // that Step unable to ever be proven. The sibling check in `run_program` already reads the command
+  // rather than the tool; this is the same rule, applied where the evidence is collected.
+  return calls.filter((call) =>
+    call.tool === 'run_tests' ||
+    (call.tool === 'run_program' && isTestRunnerInvocation(toolArgList(call)))).map((call) => {
     const data = isRecord(call.data) ? call.data : {};
     const timedOut = data.timedOut === true;
     const exitCode = typeof data.exitCode === 'number' ? data.exitCode : undefined;
@@ -40,13 +49,11 @@ export function collectTestOutcomes(
     return {
       status: timedOut ? 'timed_out' : call.ok ? 'passed' : 'failed',
       stepType,
-      tool: 'run_tests',
+      tool: call.tool === 'run_program' ? 'run_program' : 'run_tests',
       callId: call.callId,
       args: Array.isArray(data.effectiveArgs)
         ? data.effectiveArgs.filter((value): value is string => typeof value === 'string')
-        : Array.isArray(call.args?.args)
-          ? call.args.args.filter((value): value is string => typeof value === 'string')
-          : [],
+        : toolArgList(call),
       exitCode,
       timedOut,
       passedTests: numericMatch(call.summary, /Tests\s+(\d+)\s+passed/iu),
@@ -66,4 +73,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function numericMatch(value: string | undefined, expression: RegExp): number | undefined {
   const match = value ? expression.exec(value) : undefined;
   return match?.[1] ? Number.parseInt(match[1], 10) : undefined;
+}
+
+/** The argument list a tool call was invoked with, whichever tool it was. */
+function toolArgList(call: ToolCallRecord): string[] {
+  return Array.isArray(call.args?.args)
+    ? call.args.args.filter((value): value is string => typeof value === 'string')
+    : [];
 }

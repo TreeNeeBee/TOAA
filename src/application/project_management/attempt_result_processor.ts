@@ -600,7 +600,21 @@ export function correctivePropagationStepIds(
     affectedArtifacts.every((path) => isExecutableTestPath(path, language));
   if (developmentSide && baselineTestOnly && source.pairedStepId) {
     const paired = steps.find((step) => step.id === source.pairedStepId);
-    if (paired && STEP_TYPE_ORDER[paired.type] > STEP_TYPE_ORDER[source.type]) return [paired.id];
+    // Reaching the paired Step directly is only a shortcut if it can actually run. A verification
+    // Step has nothing to verify until the Steps it sits above have delivered, and sending the delta
+    // there first schedules a gate whose subject does not exist yet: a live run took a
+    // HIGH_LEVEL_DESIGN test-only repair straight to MODULE_TEST before CODE had run, the gate failed
+    // for the absence of `src/`, and the Bug it opened named MODULE_TEST as the discoverer — which
+    // told the baseline policy that a product baseline existed and left HIGH_LEVEL_DESIGN required to
+    // execute tests against code nobody had written. When the path is not clear, the delta walks it.
+    const reachable = paired && steps
+      .filter((step) =>
+        STEP_TYPE_ORDER[step.type] > STEP_TYPE_ORDER[source.type] &&
+        STEP_TYPE_ORDER[step.type] < STEP_TYPE_ORDER[paired.type])
+      .every((step) => step.state === 'delivered' || step.state === 'closed');
+    if (paired && reachable && STEP_TYPE_ORDER[paired.type] > STEP_TYPE_ORDER[source.type]) {
+      return [paired.id];
+    }
   }
   return downstream;
 }

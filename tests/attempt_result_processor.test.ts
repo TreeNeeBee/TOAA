@@ -3,10 +3,42 @@ import type { AttemptResult } from '../src/application/execution/attempt_runner.
 import {
   AttemptResultProcessor,
   correctiveAffectedArtifacts,
+  correctivePropagationStepIds,
   isAgentExecutionStall,
   renderFindingMessage,
 } from '../src/application/project_management/attempt_result_processor.js';
 import type { Step } from '../src/domain/steps/step.js';
+
+describe('correctivePropagationStepIds shortcut reachability', () => {
+  const step = (id: string, type: string, state: string, pairedStepId?: string) =>
+    ({ id, name: id, type, state, pairedStepId, projectId: 'p', phaseId: 'ph', outputs: [] } as unknown as Step);
+
+  // Every Step between the source and its paired verification, since MODULE_TEST sits above all of
+  // them: the delta may only skip a Step that has already delivered.
+  const steps = (between: string) => [
+    step('s2', 'HIGH_LEVEL_DESIGN', 'in_progress', 's7'),
+    step('s3', 'DETAILED_DESIGN', between),
+    step('s4', 'CODE', between),
+    step('s5', 'UNIT_TEST', between),
+    step('s6', 'INTEGRATION_TEST', between),
+    step('s7', 'MODULE_TEST', 'created'),
+  ];
+
+  it('walks the ordinary path while the Steps before the paired one are unfinished', () => {
+    // MODULE_TEST cannot verify a module that CODE has not written. A live run sent the delta there
+    // anyway, the gate failed for the absence of src/, and the Bug it raised convinced the baseline
+    // policy that product code existed.
+    const all = steps('created');
+    expect(correctivePropagationStepIds(all, all[0]!, ['tests/modules/a.test.ts'], 'typescript'))
+      .toEqual(['s3', 's4', 's5', 's6', 's7']);
+  });
+
+  it('reaches the paired Step directly once the path to it is clear', () => {
+    const all = steps('delivered');
+    expect(correctivePropagationStepIds(all, all[0]!, ['tests/modules/a.test.ts'], 'typescript'))
+      .toEqual(['s7']);
+  });
+});
 
 describe('correctiveAffectedArtifacts', () => {
   it('carries exact downstream outputs named by the Bug resolution into the CR', () => {
@@ -58,12 +90,14 @@ describe('correctiveAffectedArtifacts', () => {
       outputs: ['docs/01-requirements.md', 'tests/functional/baseline.test.ts'],
       pairedStepId: 'functional-step',
     } as Step;
+    // Delivered, because the shortcut only skips a Step that has already done its work: sending the
+    // delta past one that has not schedules a gate with nothing to verify.
     const design = {
-      id: 'design-step', name: 'P1-S002', type: 'HIGH_LEVEL_DESIGN',
+      id: 'design-step', name: 'P1-S002', type: 'HIGH_LEVEL_DESIGN', state: 'delivered',
       projectId: 'project-id', phaseId: 'phase-id', outputs: ['docs/02-design.md'],
     } as Step;
     const code = {
-      id: 'code-step', name: 'P1-S004', type: 'CODE',
+      id: 'code-step', name: 'P1-S004', type: 'CODE', state: 'delivered',
       projectId: 'project-id', phaseId: 'phase-id', outputs: ['src/main.ts'],
     } as Step;
     const functional = {

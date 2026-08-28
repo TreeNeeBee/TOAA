@@ -2,7 +2,12 @@ import type { AuditLogger } from '../../audit/audit.js';
 import type { WorkspaceKind } from '../../domain/workspace/change_set.js';
 import { xcompilerBuildId } from '../../core/build_identity.js';
 import { resolveFileTreeService } from '../workspace/file_tree_resolver.js';
-import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
+import {
+  StepExecutor,
+  type AdvisoryFailureRule,
+  type ExecutorRunResult,
+  type ToolCallRecord,
+} from '../../agents/executor.js';
 import { ensureEssentialToolRefs } from '../../agents/calibration.js';
 import { buildDebugBrief, buildFailureSignature, type DebugBrief } from '../../core/debug_brief.js';
 import type { DomainLog } from '../../domain/observability/records.js';
@@ -27,7 +32,7 @@ import { TEST_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
 import { getLanguageProfile, type LanguageProfile } from '../../core/language.js';
 import type { Plan, Step as ExecutionStep } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
-import type { Step } from '../../domain/steps/step.js';
+import { STEP_TYPE_ORDER, type Step, type StepType } from '../../domain/steps/step.js';
 import {
   TicketSchema,
   appendTicketCommit,
@@ -782,6 +787,7 @@ export class DomainAttemptRunner {
         signal: this.options.abortSignal,
         streamOutput: this.options.terminalOutput === true,
         maxRounds: rounds,
+        advisoryFailureRules: advisoryFailuresForStage(input.domainStep.type),
       }),
       tools,
       context,
@@ -1309,6 +1315,25 @@ function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {
     targetPhase: step.phase,
     typedFailure: ticket.failure,
   });
+}
+
+/**
+ * Failures a Step is held to that only a later Step could clear.
+ *
+ * Before CODE runs there is no product source tree — that is the V-model's ordering, not a defect of
+ * the Step that notices. A whole-project compile check therefore fails for the absence of inputs, and
+ * the Step is left holding a blocking failure it has no way to resolve. A live run lost every round
+ * of P1-S002 this way: `npx tsc --noEmit` reported TS18003 against a tsconfig whose `src/**` inputs
+ * were not due until S004, and the Architect spent the attempt re-reading files trying to repair a
+ * configuration that was already correct.
+ *
+ * The same reasoning already exempts another Step's missing declared outputs; this states it for the
+ * compile check.
+ */
+export function advisoryFailuresForStage(type: StepType): AdvisoryFailureRule[] {
+  if (STEP_TYPE_ORDER[type] >= STEP_TYPE_ORDER.CODE) return [];
+  // TypeScript names this case explicitly. Python has no equivalent: an empty package checks clean.
+  return [{ tool: 'run_program', errorIncludes: 'TS18003' }];
 }
 
 function debugContextFrom(ticket: BugTicket, brief: DebugBrief, matches: DebugWikiMatch[]) {

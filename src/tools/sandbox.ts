@@ -332,7 +332,7 @@ function isProductAuthoringPending(phase: StepType | undefined): boolean {
  * suite's subject matter. Running the product is different: there, output describing a failed
  * request describes the product's own behaviour, which is what the network detector exists for.
  */
-function isTestRunnerInvocation(args: readonly string[]): boolean {
+export function isTestRunnerInvocation(args: readonly string[]): boolean {
   const flat = args.join(' ');
   return /\b(?:vitest|jest|mocha|pytest|ava|tap)\b/u.test(flat) ||
     /\bnpm\s+(?:run\s+)?test\b/u.test(flat) ||

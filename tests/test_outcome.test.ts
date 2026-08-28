@@ -37,3 +37,33 @@ describe('collectTestOutcomes', () => {
     expect(outcome?.failedTests).toEqual([]);
   });
 });
+
+describe('collectTestOutcomes by what was executed', () => {
+  it('records a suite the Step ran through run_program', () => {
+    // A Step holding run_tests may still shell out for a specific invocation. Keying collection on
+    // the tool name recorded nothing for those runs, which leaves a Bug whose verification contract
+    // names that Step impossible to prove.
+    const outcomes = collectTestOutcomes([{
+      tool: 'run_program',
+      args: { args: ['npx', 'vitest', 'run', 'tests/modules/baidu-hot-search.test.ts'] },
+      ok: true,
+      summary: 'npx vitest run exit=0',
+      data: { exitCode: 0, timedOut: false },
+    }], 'HIGH_LEVEL_DESIGN');
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.status).toBe('passed');
+    expect(outcomes[0]!.tool).toBe('run_program');
+    expect(outcomes[0]!.args).toContain('tests/modules/baidu-hot-search.test.ts');
+  });
+
+  it('ignores a run_program call that ran something other than a test suite', () => {
+    const outcomes = collectTestOutcomes([{
+      tool: 'run_program',
+      args: { args: ['npx', 'tsc', '--noEmit'] },
+      ok: false,
+      summary: 'npx tsc --noEmit exit=2',
+      data: { exitCode: 2, timedOut: false },
+    }], 'HIGH_LEVEL_DESIGN');
+    expect(outcomes).toEqual([]);
+  });
+});
