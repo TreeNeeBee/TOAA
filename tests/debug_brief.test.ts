@@ -584,4 +584,15 @@ describe('failure signature stability', () => {
       'write_file: denied tests/modules/test_dbc_parser_module.py',
     ]));
   });
+
+  it('separates identical write failures against different target files', () => {
+    const signatureForPath = (target: string) => buildFailureSignature(buildDebugBrief({
+      reason: 'write failed',
+      failureLog: `write_file: permission denied while writing ${target}`,
+      phase: 'CODE',
+      targetPhase: 'CODE',
+    }), 'write_permission_denied');
+
+    expect(signatureForPath('src/adapter-a.ts')).not.toBe(signatureForPath('src/adapter-b.ts'));
+  });
 });

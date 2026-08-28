@@ -136,6 +136,8 @@ export const DELIVERY_GATE_FINDING_TARGETS = [
  */
 export const DeliveryGateFindingSchema = z.object({
   category: z.enum(DELIVERY_GATE_FINDING_CATEGORIES),
+  /** Stable machine code: reuse it for the same problem and change it for an independent problem. */
+  code: z.string().min(1),
   summary: z.string().min(1),
   evidence: z.array(z.string().min(1)).min(1),
   target: z.enum(DELIVERY_GATE_FINDING_TARGETS),
@@ -230,7 +232,7 @@ export function phaseDeliveryGate(name: string, plannedChecks: readonly string[]
     kind: 'phase-delivery',
     summary: `${name} passes complete deliverable and real-scenario acceptance.`,
     checks: [
-      'Every V-model Step and corrective Ticket is closed.',
+      'Every V-model Step is closed and every corrective Ticket is closed or cancelled as a recorded duplicate.',
       'All declared deliverables exist and satisfy their acceptance contracts.',
       'The integrated project passes build, test, and entrypoint checks.',
       'The real user scenario passes against live external dependencies.',

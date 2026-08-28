@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AttemptResult } from '../src/application/execution/attempt_runner.js';
 import {
+  AttemptResultProcessor,
   correctiveAffectedArtifacts,
   isAgentExecutionStall,
   renderFindingMessage,
@@ -45,6 +46,79 @@ describe('correctiveAffectedArtifacts', () => {
       'docs/01-requirement-analysis.md',
     ]);
   });
+
+  it('uses the baseline-test-only scope at the production propagation call site', async () => {
+    const propagated: Array<Record<string, unknown>> = [];
+    const requirement = {
+      id: 'requirement-step',
+      name: 'P1-S001',
+      type: 'REQUIREMENT_ANALYSIS',
+      projectId: 'project-id',
+      phaseId: 'phase-id',
+      outputs: ['docs/01-requirements.md', 'tests/functional/baseline.test.ts'],
+      pairedStepId: 'functional-step',
+    } as Step;
+    const design = {
+      id: 'design-step', name: 'P1-S002', type: 'HIGH_LEVEL_DESIGN',
+      projectId: 'project-id', phaseId: 'phase-id', outputs: ['docs/02-design.md'],
+    } as Step;
+    const code = {
+      id: 'code-step', name: 'P1-S004', type: 'CODE',
+      projectId: 'project-id', phaseId: 'phase-id', outputs: ['src/main.ts'],
+    } as Step;
+    const functional = {
+      id: 'functional-step', name: 'P1-S008', type: 'FUNCTIONAL_TEST',
+      projectId: 'project-id', phaseId: 'phase-id', outputs: ['reports/functional.md'],
+    } as Step;
+    const processor = new AttemptResultProcessor({
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
+      controller: {
+        propagateCorrectiveChange: async (input: Record<string, unknown>) => {
+          propagated.push(input);
+          return undefined;
+        },
+      },
+      tickets: {},
+      audit: { event: async () => {} },
+      onTransition: async () => {},
+    } as never);
+
+    await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step: requirement,
+        ticket: {
+          id: 'bug-id',
+          name: 'BUG-P1-001',
+          type: 'bug',
+          description: 'The functional baseline has a bad assertion.',
+          acceptance: ['The paired baseline passes.'],
+          source: { correlationId: 'correlation-id' },
+        },
+      } as never,
+      steps: [requirement, design, code, functional],
+      result: {
+        ok: true,
+        assessment: { id: 'assessment-id', evidence: ['baseline rewritten'] },
+        changedFiles: ['tests/functional/baseline.test.ts'],
+        changes: [],
+        solutionPlan: 'Correct the functional baseline assertion.',
+        wikiEntryIds: [],
+        testOutcomes: [],
+        gateFindings: [],
+      } as never,
+    });
+
+    expect(propagated).toHaveLength(1);
+    expect(propagated[0]?.affectedStepIds).toEqual(['functional-step']);
+  });
 });
 
 describe('renderFindingMessage', () => {
@@ -81,7 +155,14 @@ describe('corrective routing evidence', () => {
       boundAt: new Date(0).toISOString(),
     } as const;
     const processor = new AttemptResultProcessor({
-      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
       controller: {
         routeQualityGap: async (input: Record<string, unknown>) => {
           routed.push(input);
@@ -113,7 +194,6 @@ describe('corrective routing evidence', () => {
         type: 'story',
         source: { correlationId: 'correlation-id' },
       },
-      mode: 'normal',
     };
     await processor.process({
       phase: { id: 'phase-id' } as never,
@@ -127,6 +207,7 @@ describe('corrective routing evidence', () => {
         testOutcomes: [],
         gateFindings: [{
           category: 'test-incomplete',
+          code: 'module_baseline_source_missing',
           summary: 'The module baseline omits the declared source.',
           evidence: ['tests/modules/domain.test.ts exercises 0/1 sources'],
           target: 'current-step',
@@ -141,6 +222,86 @@ describe('corrective routing evidence', () => {
       affectedArtifacts: ['tests/modules/domain.test.ts'],
       workspaceBinding: binding,
     });
+  });
+
+  it('keeps findings with different machine codes as independent routed Tickets', async () => {
+    const routed: Array<Record<string, unknown>> = [];
+    const registered: string[][] = [];
+    const processor = new AttemptResultProcessor({
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
+      controller: {
+        routeFailure: async (input: Record<string, unknown>) => {
+          routed.push(input);
+          return {
+            id: `bug-${routed.length}`,
+            type: 'bug',
+            source: { correlationId: 'correlation-id' },
+          };
+        },
+      },
+      tickets: {
+        ownerActorId: async () => 'actor-id',
+        registerGateBatch: async (ids: string[]) => {
+          registered.push(ids);
+          return [];
+        },
+      },
+      audit: { event: async () => {} },
+      onTransition: async () => {},
+    } as never);
+    const step = {
+      id: 'step-id', name: 'P1-S004', type: 'CODE', projectId: 'project-id', phaseId: 'phase-id',
+    } as Step;
+    const finding = {
+      category: 'product-defect' as const,
+      summary: 'The generated contract is incomplete.',
+      evidence: ['The public result omits one required field.'],
+      target: 'current-step' as const,
+      affectedArtifacts: ['src/result.ts'],
+      dependencyPackages: [],
+    };
+
+    await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step,
+        ticket: {
+          id: 'story-id', name: 'P1-S004-STORY', type: 'story',
+          source: { correlationId: 'correlation-id' },
+        },
+      } as never,
+      steps: [step],
+      result: {
+        ok: false,
+        changedFiles: [],
+        wikiEntryIds: [],
+        testOutcomes: [],
+        gateFindings: [
+          { ...finding, code: 'result_source_missing' },
+          {
+            ...finding,
+            code: 'result_source_missing',
+            summary: 'A second rendering of the same source problem.',
+            evidence: ['The serialized result also omits source.'],
+          },
+          { ...finding, code: 'result_timestamp_missing' },
+        ],
+      },
+    });
+
+    expect(routed.map((input) => (input.failure as { code: string }).code)).toEqual([
+      'result_source_missing',
+      'result_timestamp_missing',
+    ]);
+    expect(routed[0]?.message).toContain('The serialized result also omits source.');
+    expect(registered).toEqual([['bug-1', 'bug-2']]);
   });
 });
 
@@ -192,7 +353,14 @@ describe('agent execution stall disposition', () => {
       '../src/application/project_management/attempt_result_processor.js');
     const retained: string[] = [];
     const processor = new AttemptResultProcessor({
-      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
       controller: {
         retainAgentExecutionFailure: async (_work: unknown, reason: string) => {
           retained.push(reason);
@@ -204,7 +372,7 @@ describe('agent execution stall disposition', () => {
 
     const work = {
       phase: { id: 'p' }, step: { id: 's', name: 'P1-S001', projectId: 'proj' },
-      ticket: { id: 't', name: 'P1-S001-STORY' }, mode: 'normal',
+      ticket: { id: 't', name: 'P1-S001-STORY', type: 'story' },
     };
     const outcome = await (processor as unknown as {
       process(input: unknown): Promise<{ action: string }>;

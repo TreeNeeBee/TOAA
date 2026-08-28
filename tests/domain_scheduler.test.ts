@@ -8,6 +8,7 @@ import { ProjectGraphPersistenceService } from '../src/application/planning/proj
 import { TicketWorkflow } from '../src/application/project_management/ticket_workflow.js';
 import { ProjectStateService } from '../src/application/project_management/project_state_service.js';
 import { ProjectController, type ScheduledWork } from '../src/application/project_management/project_controller.js';
+import { workModeFor } from '../src/application/project_management/work_scheduler.js';
 import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { createObjectEnvelope } from '../src/domain/objects/object_envelope.js';
@@ -15,6 +16,7 @@ import { compileProjectGraph } from '../src/domain/planning/compiler.js';
 import { TicketSchema } from '../src/domain/tickets/ticket.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../src/workspace/workspace.js';
+import { bugContracts } from './helpers/ticket_fixtures.js';
 
 describe('PM WorkScheduler', () => {
   it('keeps a source Step delivered until its paired verification closes it', async () => {
@@ -52,6 +54,7 @@ describe('PM WorkScheduler', () => {
       },
       rawEvidenceRef: '.xcompiler/failures/unit.log',
       correlationId: createObjectId(),
+      bugKind: 'test-failure',
     });
     const code = fixture.graph.steps.find((step) => step.type === 'CODE')!;
     expect((await fixture.repository.read(code.id)).state).toBe('reopened');
@@ -60,7 +63,8 @@ describe('PM WorkScheduler', () => {
     const repository = new DomainObjectRepository(new Workspace(fixture.root));
     await repository.load();
     const resumed = await new ProjectController(repository).resume(fixture.graph.phases[0]!.id);
-    expect(resumed).toMatchObject({ mode: 'debug', step: { id: code.id }, ticket: { id: bug.id } });
+    expect(resumed).toMatchObject({ step: { id: code.id }, ticket: { id: bug.id } });
+    expect(resumed && workModeFor(resumed.ticket)).toBe('debug');
   });
 
   it('resumes an owned Ticket whose Step is pending before dispatching an earlier created CR', async () => {
@@ -98,10 +102,11 @@ describe('PM WorkScheduler', () => {
       solution: undefined,
       resolvedAt: undefined,
       closedAt: undefined,
-      sourceTicketId: unitStory.id,
+      sourceTicketIds: [unitStory.id],
       triggerStepId: unitStep.id,
       sourceStepId: unitStep.id,
       targetStepId: unitStep.id,
+      propagationStepIds: [unitStep.id],
       contractDelta: {
         summary: 'Re-check the earlier unit contract.',
         before: ['previous contract'],
@@ -120,10 +125,10 @@ describe('PM WorkScheduler', () => {
 
     const resumed = await fixture.controller.resume(fixture.graph.phases[0]!.id);
     expect(resumed).toMatchObject({
-      mode: 'normal',
       step: { id: functionalWork.step.id },
       ticket: { id: functionalWork.ticket.id },
     });
+    expect(resumed && workModeFor(resumed.ticket)).toBe('normal');
     const routed = await fixture.registration.routeAndAssign(resumed!.ticket.id, {
       forStepId: resumed!.step.id,
     });
@@ -217,6 +222,9 @@ describe('PM WorkScheduler', () => {
       retryable: true,
       switchProvider: false,
       correlationId: createObjectId(),
+      ...bugContracts(late, repaired, late, {
+        category: 'test', code: 'module_contract_mismatch',
+      }),
     });
     await new TicketRegistrationService(fixture.repository).routeAndAssign(bug.id);
 

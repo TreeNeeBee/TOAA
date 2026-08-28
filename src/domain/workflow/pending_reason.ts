@@ -8,6 +8,8 @@ export const PENDING_REASONS = [
   'manual-review',
   'defect',
   'quality-gap',
+  /** PM identified this Ticket as another report of active authoritative work. */
+  'duplicate',
   /** The run that started this work died before the attempt completed. */
   'interrupted',
 ] as const;

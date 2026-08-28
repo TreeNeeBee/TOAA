@@ -77,6 +77,23 @@ describe('new domain lifecycle', () => {
         targetStepType: 'CODE',
         verificationStepId: failedStep.id,
         verificationStepType: 'UNIT_TEST',
+        identity: {
+          version: 1,
+          category: 'test',
+          code: 'unit_assertion_failed',
+          failedStepId: failedStep.id,
+          targetStepId: targetStep.id,
+          verificationStepId: failedStep.id,
+          testSelectors: [],
+          artifactTargets: [],
+        },
+      },
+      verificationContract: {
+        kind: 'test-gate',
+        verificationStepId: failedStep.id,
+        verificationStepType: 'UNIT_TEST',
+        testSelectors: [],
+        artifactTargets: [],
       },
     });
 

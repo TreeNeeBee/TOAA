@@ -10,8 +10,11 @@ import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.j
 import type { AuditLogger } from '../../audit/audit.js';
 import { changelistEntries, type AttemptResult } from '../execution/attempt_runner.js';
 import type { ProjectController, ScheduledWork } from './project_controller.js';
+import { workModeFor } from './work_scheduler.js';
 import type { TicketRegistrationService } from './ticket_registration_service.js';
 import type { DeliveryGateFinding } from '../../domain/quality/delivery_gate.js';
+import { isExecutableTestPath } from '../../core/test_assets.js';
+import type { Language } from '../../core/plan.js';
 
 export interface AttemptResultProcessorOptions {
   repository: DomainObjectRepositoryPort;
@@ -55,15 +58,23 @@ export class AttemptResultProcessor {
     result: AttemptResult;
   }): Promise<AttemptDisposition> {
     const { phase, work, steps, result } = input;
+    const mode = workModeFor(work.ticket);
     if (!result.ok) return this.processFailure(phase, work, steps, result);
     if (!result.assessment) {
       return { action: 'stop', reason: 'Passing attempt has no Quality Assessment' };
     }
 
-    if (work.mode === 'normal') {
+    if (mode === 'normal') {
       await this.options.controller.deliverNormal(work, result.assessment.id);
     } else if (work.ticket.type === 'bug' || work.ticket.type === 'enhancement') {
-      const affected = downstreamStepIds(steps, work.step);
+      const affectedArtifacts = correctiveAffectedArtifacts(steps, work.step, result);
+      const project = await this.options.repository.read(work.step.projectId);
+      if (project.objectType !== 'project') {
+        return { action: 'stop', reason: `Step ${work.step.name} has no Project` };
+      }
+      const affected = correctivePropagationStepIds(
+        steps, work.step, affectedArtifacts, project.language,
+      );
       if (affected.length === 0) {
         return {
           action: 'stop',
@@ -71,7 +82,6 @@ export class AttemptResultProcessor {
         };
       }
       const solution = correctiveSolution(work, result.solutionPlan, result.changedFiles, result.commit);
-      const affectedArtifacts = correctiveAffectedArtifacts(steps, work.step, result);
       const parentTicket = work.ticket.parentTicketId
         ? await this.options.repository.read(work.ticket.parentTicketId)
         : undefined;
@@ -118,9 +128,12 @@ export class AttemptResultProcessor {
         commit: result.commit,
         verification: result.assessment.evidence,
         application: result.changeRequestDisposition,
+        testOutcomes: result.testOutcomes,
       });
-      if (completion.closed && completion.sourceTicketId && completion.sourceTicketType === 'bug') {
-        await this.options.recordVerifiedBugResolution?.(completion.sourceTicketId);
+      if (completion.closed) {
+        for (const ticketId of completion.verifiedBugTicketIds ?? []) {
+          await this.options.recordVerifiedBugResolution?.(ticketId);
+        }
       }
     } else {
       return {
@@ -129,7 +142,7 @@ export class AttemptResultProcessor {
       };
     }
 
-    await this.options.audit.event('phase.end', `${work.step.name} ${work.mode} gate passed`, {
+    await this.options.audit.event('phase.end', `${work.step.name} ${mode} gate passed`, {
       messageId: 'domain.step_delivered',
       projectId: work.step.projectId,
       phaseId: phase.id,
@@ -149,7 +162,7 @@ export class AttemptResultProcessor {
       ticketType: work.ticket.type,
       correlationId: work.ticket.source.correlationId,
       causationId: work.ticket.source.causationId,
-      message: `${work.mode} quality gate passed`,
+      message: `${mode} quality gate passed`,
     });
     return { action: 'continue' };
   }
@@ -160,6 +173,7 @@ export class AttemptResultProcessor {
     steps: readonly Step[],
     result: AttemptResult,
   ): Promise<AttemptDisposition> {
+    const mode = workModeFor(work.ticket);
     await this.options.audit.event('note', `${work.step.name} attempt rejected`, {
       messageId: 'domain.step_attempt_rejected',
       projectId: work.step.projectId,
@@ -167,7 +181,7 @@ export class AttemptResultProcessor {
       stepId: work.step.id,
       stepName: work.step.name,
       ticketId: work.ticket.id,
-      workMode: work.mode,
+      workMode: mode,
       reason: result.reason,
       failureLog: result.failureLog,
     });
@@ -200,7 +214,7 @@ export class AttemptResultProcessor {
         stepId: work.step.id,
         stepName: work.step.name,
         ticketId: work.ticket.id,
-        workMode: work.mode,
+        workMode: mode,
         reason,
       });
       return {
@@ -220,7 +234,7 @@ export class AttemptResultProcessor {
         stepId: work.step.id,
         stepName: work.step.name,
         ticketId: work.ticket.id,
-        workMode: work.mode,
+        workMode: mode,
         reason,
       });
       // The attempt fails; the run does not. A stall is a degenerate model turn, not a project
@@ -235,7 +249,7 @@ export class AttemptResultProcessor {
       ...(result.gateFindings ?? []),
       ...(result.assessment?.findings ?? []),
     ]);
-    if (gateFindings.length > 0 && (work.mode === 'normal' || work.mode === 'change-request')) {
+    if (gateFindings.length > 0 && (mode === 'normal' || mode === 'change-request')) {
       await this.routeGateFindings(phase, work, steps, result, gateFindings);
       return { action: 'continue' };
     }
@@ -252,16 +266,17 @@ export class AttemptResultProcessor {
     // refused because the file belongs to P1-S001. Such a failure belongs to its discoverer, which
     // the fallback below already routes correctly.
     if (
-      work.mode === 'change-request' &&
+      mode === 'change-request' &&
       work.ticket.type === 'change-request' &&
       result.executor?.validationDefect &&
       result.executor.validationDefectSource !== 'gate-rendered' &&
-      work.ticket.originFailure &&
+      work.ticket.originFailures.length > 0 &&
       !await this.alreadyContradicted(work.ticket)
     ) {
+      const originFailure = work.ticket.originFailures[0]!;
       const routed = await this.options.controller.routeFailure({
         creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
-        failedStepId: work.ticket.originFailure.failedStepId,
+        failedStepId: originFailure.failedStepId,
         message: result.failureLog ?? result.executor.validationDefect,
         summary: result.executor.validationDefect,
         failure: {
@@ -269,25 +284,28 @@ export class AttemptResultProcessor {
           category: 'contract',
           code: VALIDATION_CONTRACT_DEFECT_CODE,
           message: result.executor.validationDefect,
-          retryable: work.ticket.originFailure.retryable,
-          switchProvider: work.ticket.originFailure.switchProvider,
+          retryable: originFailure.retryable,
+          switchProvider: originFailure.switchProvider,
           details: {
-            ...(work.ticket.originFailure.details ?? {}),
+            ...(originFailure.details ?? {}),
             defectKind: 'validation-contract',
-            originFailureCategory: work.ticket.originFailure.category,
-            originFailureCode: work.ticket.originFailure.code,
+            originFailureCategory: originFailure.category,
+            originFailureCode: originFailure.code,
             discoveringStepId: work.step.id,
           },
         },
-        rawEvidenceRef: work.ticket.originFailure.rawEvidenceRef,
-        tool: work.ticket.originFailure.tool,
-        exitCode: work.ticket.originFailure.exitCode,
-        statusCode: work.ticket.originFailure.statusCode,
+        rawEvidenceRef: originFailure.rawEvidenceRef,
+        tool: originFailure.tool,
+        exitCode: originFailure.exitCode,
+        statusCode: originFailure.statusCode,
         discoveringStepId: work.step.id,
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: work.ticket.id,
         workspaceBinding: result.workspaceBinding,
+        bugKind: 'test-failure',
+        testOutcomes: result.testOutcomes,
+        affectedArtifacts: result.changedFiles,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
@@ -297,7 +315,7 @@ export class AttemptResultProcessor {
       !result.testOutcomes.some((outcome) => outcome.status === 'failed' || outcome.status === 'timed_out');
     if (
       (result.failure?.code === 'test_assets_incomplete' || semanticTestGap) &&
-      (work.mode === 'normal' || work.mode === 'change-request')
+      (mode === 'normal' || mode === 'change-request')
     ) {
       const routed = await this.options.controller.routeQualityGap({
         creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
@@ -308,7 +326,7 @@ export class AttemptResultProcessor {
         kind: 'test-incomplete',
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
-        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        parentChangeRequestId: mode === 'change-request' ? work.ticket.id : undefined,
         workspaceBinding: result.workspaceBinding,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
@@ -317,7 +335,7 @@ export class AttemptResultProcessor {
     if (
       result.assessment &&
       !result.assessment.passed &&
-      (work.mode === 'normal' || work.mode === 'change-request')
+      (mode === 'normal' || mode === 'change-request')
     ) {
       const gaps = result.assessment.gaps.length > 0
         ? result.assessment.gaps
@@ -332,7 +350,7 @@ export class AttemptResultProcessor {
           qualityAssessmentId: result.assessment.id,
           correlationId: work.ticket.source.correlationId,
           causationId: work.ticket.id,
-          parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+          parentChangeRequestId: mode === 'change-request' ? work.ticket.id : undefined,
           workspaceBinding: result.workspaceBinding,
         });
         await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
@@ -348,13 +366,13 @@ export class AttemptResultProcessor {
         kind: 'test-incomplete',
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
-        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        parentChangeRequestId: mode === 'change-request' ? work.ticket.id : undefined,
         workspaceBinding: result.workspaceBinding,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
     }
-    if (work.mode === 'change-request') {
+    if (mode === 'change-request') {
       const routed = await this.options.controller.routeFailure({
         creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
         failedStepId: work.step.id,
@@ -365,11 +383,14 @@ export class AttemptResultProcessor {
         causationId: work.ticket.id,
         parentChangeRequestId: work.ticket.id,
         workspaceBinding: result.workspaceBinding,
+        bugKind: bugKindForFailure(result.failure),
+        testOutcomes: result.testOutcomes,
+        affectedArtifacts: result.changedFiles,
       });
       await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
       return { action: 'continue' };
     }
-    if (work.mode !== 'normal') return { action: 'continue' };
+    if (mode !== 'normal') return { action: 'continue' };
     const routed = await this.options.controller.routeFailure({
       creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
       failedStepId: work.step.id,
@@ -379,6 +400,9 @@ export class AttemptResultProcessor {
       correlationId: createObjectId(),
       causationId: work.ticket.id,
       workspaceBinding: result.workspaceBinding,
+      bugKind: bugKindForFailure(result.failure),
+      testOutcomes: result.testOutcomes,
+      affectedArtifacts: result.changedFiles,
     });
     await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
     return { action: 'continue' };
@@ -391,6 +415,7 @@ export class AttemptResultProcessor {
     result: AttemptResult,
     findings: readonly DeliveryGateFinding[],
   ): Promise<void> {
+    const mode = workModeFor(work.ticket);
     const creatorActorId = await this.options.tickets.ownerActorId(work.ticket.id);
     const queued: Array<{ id: ObjectId; order: number }> = [];
     for (const finding of findings) {
@@ -420,8 +445,8 @@ export class AttemptResultProcessor {
             kind: 'execution',
             category: finding.category === 'test-defect' ? 'contract' : 'test',
             code: finding.category === 'test-defect'
-              ? VALIDATION_CONTRACT_DEFECT_CODE
-              : 'delivery_gate_product_defect',
+              ? `${VALIDATION_CONTRACT_DEFECT_CODE}:${finding.code}`
+              : finding.code,
             message: findingMessage,
             retryable: true,
             switchProvider: false,
@@ -429,8 +454,11 @@ export class AttemptResultProcessor {
           },
           correlationId: work.ticket.source.correlationId,
           causationId: work.ticket.id,
-          parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+          parentChangeRequestId: mode === 'change-request' ? work.ticket.id : undefined,
           workspaceBinding: result.workspaceBinding,
+          bugKind: 'quality-gate',
+          testOutcomes: result.testOutcomes,
+          affectedArtifacts: finding.affectedArtifacts ?? result.changedFiles,
         });
         queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
         continue;
@@ -449,7 +477,7 @@ export class AttemptResultProcessor {
         qualityAssessmentId: result.assessment?.id,
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
-        parentChangeRequestId: work.mode === 'change-request' ? work.ticket.id : undefined,
+        parentChangeRequestId: mode === 'change-request' ? work.ticket.id : undefined,
         workspaceBinding: result.workspaceBinding,
       });
       queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
@@ -503,6 +531,7 @@ export class AttemptResultProcessor {
       causationId: work.ticket.id,
       creatorActorId: await this.options.tickets.ownerActorId(work.ticket.id),
       workspaceBinding: input.workspaceBinding,
+      bugKind: 'quality-gate',
     });
     await this.routeTicket(phase, work, routed.id, routed.type, routed.source.correlationId);
     return { action: 'continue' };
@@ -556,6 +585,36 @@ function downstreamStepIds(steps: readonly Step[], source: Step): ObjectId[] {
     .map((step) => step.id);
 }
 
+export function correctivePropagationStepIds(
+  steps: readonly Step[],
+  source: Step,
+  affectedArtifacts: readonly string[],
+  language: Language,
+): ObjectId[] {
+  const downstream = downstreamStepIds(steps, source);
+  const developmentSide = STEP_TYPE_ORDER[source.type] <= STEP_TYPE_ORDER.CODE;
+  // The Project's own language, not both of them: what counts as an executable test path is a
+  // language question, and guessing it means a fixture written in the other language reads as a
+  // test file here.
+  const baselineTestOnly = affectedArtifacts.length > 0 &&
+    affectedArtifacts.every((path) => isExecutableTestPath(path, language));
+  if (developmentSide && baselineTestOnly && source.pairedStepId) {
+    const paired = steps.find((step) => step.id === source.pairedStepId);
+    if (paired && STEP_TYPE_ORDER[paired.type] > STEP_TYPE_ORDER[source.type]) return [paired.id];
+  }
+  return downstream;
+}
+
+function bugKindForFailure(failure: AttemptResult['failure']):
+  'stage-execution' | 'test-failure' | 'quality-gate' | 'infrastructure' | 'exception' {
+  if (!failure) return 'exception';
+  if (failure.category === 'llm-provider') return 'infrastructure';
+  if (failure.category === 'test' || failure.category === 'contract') return 'test-failure';
+  if (failure.category === 'quality') return 'quality-gate';
+  if (failure.category === 'tool') return 'stage-execution';
+  return failure.code === 'unclassified_execution_failure' ? 'exception' : 'stage-execution';
+}
+
 function resolveFindingTarget(
   steps: readonly Step[],
   current: Step,
@@ -582,19 +641,31 @@ function resolveFindingTarget(
 }
 
 function deduplicateGateFindings(findings: readonly DeliveryGateFinding[]): DeliveryGateFinding[] {
-  const seen = new Set<string>();
-  return findings.filter((finding) => {
+  const grouped = new Map<string, DeliveryGateFinding>();
+  for (const finding of findings) {
     const key = JSON.stringify({
       category: finding.category,
-      summary: finding.summary,
+      code: finding.code,
       target: finding.target,
-      affectedArtifacts: [...(finding.affectedArtifacts ?? [])].sort(),
-      dependencyPackages: [...finding.dependencyPackages].sort(),
     });
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, finding);
+      continue;
+    }
+    grouped.set(key, {
+      ...existing,
+      evidence: [...new Set([...existing.evidence, ...finding.evidence])],
+      affectedArtifacts: [
+        ...new Set([...(existing.affectedArtifacts ?? []), ...(finding.affectedArtifacts ?? [])]),
+      ],
+      dependencyPackages: [
+        ...new Set([...existing.dependencyPackages, ...finding.dependencyPackages]),
+      ],
+      scene: existing.scene ?? finding.scene,
+    });
+  }
+  return [...grouped.values()];
 }
 
 /** Keeps Ticket evidence complete without repeating detail already embedded in the summary. */

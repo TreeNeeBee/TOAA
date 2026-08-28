@@ -15,6 +15,7 @@ import { PluginHost } from '../src/plugins/host.js';
 import { Workspace } from '../src/workspace/workspace.js';
 import { reviseActor } from '../src/domain/project_management/index.js';
 import { VALIDATION_CONTRACT_DEFECT_CODE } from '../src/domain/tickets/ticket.js';
+import { passedTestOutcome } from './helpers/ticket_fixtures.js';
 
 describe('ProjectOrchestrator', () => {
   it('returns cancelled attempt capacity to PM without opening a project defect', async () => {
@@ -183,6 +184,7 @@ describe('ProjectOrchestrator', () => {
           findings: [
             {
               category: 'product-defect' as const,
+              code: 'live_entrypoint_invalid_payload',
               summary: 'The live entrypoint returns an invalid payload.',
               evidence: ['expected source:string, received undefined'],
               target: 'code' as const,
@@ -190,6 +192,7 @@ describe('ProjectOrchestrator', () => {
             },
             {
               category: 'test-incomplete' as const,
+              code: 'functional_empty_response_case_missing',
               summary: 'The functional baseline omits the empty-response scenario.',
               evidence: ['requirement R-12 has no executable case'],
               target: 'requirement-analysis' as const,
@@ -197,6 +200,7 @@ describe('ProjectOrchestrator', () => {
             },
             {
               category: 'dependency' as const,
+              code: 'schema_validation_dependency_missing',
               summary: 'Schema validation requires the declared package.',
               evidence: ['Cannot resolve package zod'],
               target: 'high-level-design' as const,
@@ -307,7 +311,7 @@ describe('ProjectOrchestrator', () => {
     expect(bug?.objectType === 'ticket' && bug.state).toBe('closed');
     expect(request?.objectType === 'ticket' && request.state).toBe('closed');
     const rootRequests = tickets.filter((ticket) =>
-      ticket.type === 'change-request' && ticket.sourceTicketId === bug!.id,
+      ticket.type === 'change-request' && ticket.sourceTicketIds.includes(bug!.id),
     );
     expect(rootRequests.length).toBeGreaterThan(1);
     // Every hop descends from the same Bug, but each carries the change it must check rather than a
@@ -415,7 +419,7 @@ describe('ProjectOrchestrator', () => {
     const engine = new ProjectOrchestrator(options(setup.workspace, setup.repository, runner), setup.plan);
     const result = await engine.run(setup.graph.phases[0]!.id);
 
-    expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
+    expect(result.failedStepId, JSON.stringify({ result, calls })).toBeUndefined();
     const tickets = (await setup.repository.list({ objectType: 'ticket', projectId: setup.graph.project.id }))
       .filter((ticket) => ticket.objectType === 'ticket');
     const bugs = tickets.filter((ticket) => ticket.type === 'bug');
@@ -423,7 +427,7 @@ describe('ProjectOrchestrator', () => {
     const stepIds = (...names: string[]) =>
       names.map((name) => setup.graph.steps.find((step) => step.name === name)!.id).sort();
     const targetsOf = (sourceTicketId: string) => requests
-      .filter((ticket) => ticket.type === 'change-request' && ticket.sourceTicketId === sourceTicketId)
+      .filter((ticket) => ticket.type === 'change-request' && ticket.sourceTicketIds.includes(sourceTicketId))
       .map((ticket) => (ticket.type === 'change-request' ? ticket.targetStepId : ''))
       .sort();
 
@@ -522,7 +526,11 @@ describe('ProjectOrchestrator', () => {
     expect(discovered?.type === 'bug' && discovered.failure.code).toBe(VALIDATION_CONTRACT_DEFECT_CODE);
     expect(discovered?.type === 'bug' && discovered.failure.details?.originFailureCode).toBe('unclassified_execution_failure');
     expect(discovered?.parentTicketId).toBeDefined();
-    expect(calls.filter((call) => call === 'P1-S001:debug')).toHaveLength(2);
+    // Three repairs, not two. A Bug now closes only after its own gate has re-run and passed, so the
+    // run keeps going until that happens instead of stopping with the Bug still open. The extra cycle
+    // is a second diagnosis contradiction: `alreadyContradicted` is keyed on one Change Request, and
+    // each repair opens a new one, so the guard does not span repair cycles.
+    expect(calls.filter((call) => call === 'P1-S001:debug')).toHaveLength(3);
   });
 
   // The same shape as the test above, with one field changed: the defect text is rendered by the
@@ -564,6 +572,7 @@ describe('ProjectOrchestrator', () => {
               args: ['tests/unit/cli.test.ts'],
               exitCode: 1,
               timedOut: false,
+              failedTests: ['tests/unit/cli.test.ts'],
               recordedAt: new Date().toISOString(),
             }],
             executor: {
@@ -668,7 +677,7 @@ describe('ProjectOrchestrator', () => {
     // propagate to, and resumes to re-apply that Step carrying the repair — so the Step is never
     // handed the same delta by two chains at once.
     expect(requests.some((ticket) =>
-      ticket.type === 'change-request' && ticket.sourceTicketId === enhancements[0]?.id)).toBe(false);
+      ticket.type === 'change-request' && ticket.sourceTicketIds.includes(enhancements[0]!.id))).toBe(false);
     expect(calls.filter((call) => call === 'P1-S005:change-request')).toHaveLength(2);
   });
 });
@@ -779,8 +788,16 @@ async function passingAttempt(repository: DomainObjectRepository, step: Step): P
     commit: `commit-${step.name}`,
     solutionPlan: `Complete ${step.name} incrementally.`,
     wikiEntryIds: [],
-    testOutcomes: [],
+    // A passing attempt ran this Step's tests and they passed. Reporting no outcomes at all made
+    // every simulated repair unverifiable, so no Bug could ever close.
+    testOutcomes: [passedTestOutcome(step, testSelectorsFor(step))],
   };
+}
+
+/** The selectors a Step's own gate runs: its declared executable test outputs, or its test root. */
+function testSelectorsFor(step: Step): string[] {
+  const declared = step.outputs.filter((output) => output.startsWith('tests/'));
+  return declared.length > 0 ? declared : ['tests/'];
 }
 
 async function failingAssessment(repository: DomainObjectRepository, step: Step) {

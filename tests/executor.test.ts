@@ -279,12 +279,12 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-CONTRADICTED',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
         description: 'Implement the missing CLI.',
         triggerStepId: 'S008',
         sourceStepId: 'S003',
         targetStepId: 'S004',
-        originFailure: {
+        originFailures: [{
           category: 'test',
           code: 'test_command_failed',
           message: 'npm test exit=1 args=tests/functional/cli.test.ts',
@@ -297,7 +297,7 @@ describe('StepExecutor system prompt assembly', () => {
           targetStepType: 'REQUIREMENT_ANALYSIS',
           verificationStepId: 'S008',
           verificationStepType: 'FUNCTIONAL_TEST',
-        },
+        }],
         contractDelta: {
           summary: 'Implement the missing CLI.',
           before: ['npm test exit=1'],
@@ -309,7 +309,9 @@ describe('StepExecutor system prompt assembly', () => {
 
     expect(result.success).toBe(false);
     expect(result.validationDefect).toContain('CR premise is false');
-    expect(llm.lastUser).toContain('original failed gate: FUNCTIONAL_TEST');
+    expect(llm.lastUser).toContain(
+      'original failed gates:\n- FUNCTIONAL_TEST [test_command_failed]: functional test failed',
+    );
     expect(llm.lastUser).toContain('Runtime will make the discovering role create a Bug');
   });
 
@@ -355,12 +357,12 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-CONVERGE',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
         description: 'Implement the missing CLI.',
         triggerStepId: 'S008',
         sourceStepId: 'S003',
         targetStepId: 'S004',
-        originFailure: {
+        originFailures: [{
           category: 'test',
           code: 'test_command_failed',
           message: 'npm test timed out',
@@ -373,7 +375,7 @@ describe('StepExecutor system prompt assembly', () => {
           targetStepType: 'REQUIREMENT_ANALYSIS',
           verificationStepId: 'S008',
           verificationStepType: 'FUNCTIONAL_TEST',
-        },
+        }],
         contractDelta: {
           summary: 'Implement the missing CLI.',
           before: ['npm test timed out'],
@@ -556,6 +558,7 @@ describe('StepExecutor system prompt assembly', () => {
             blockedBy: [],
             findings: [{
               category: 'test-defect',
+              code: 'run_cli_result_contract_conflict',
               summary: 'run_cli returns int while every assertion reads result.returncode',
               evidence: ["AttributeError: 'int' object has no attribute 'returncode'"],
               target: 'paired-source',
@@ -1121,7 +1124,8 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'DEP-P1-RECHECK',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'P1-S004-STORY',
+        sourceTicketIds: ['P1-S004-STORY'],
+        originFailures: [],
         description: 'Confirm the design after the dependency set changed.',
         contractDelta: {
           summary: 'The dependency set changed upstream.',
@@ -1537,7 +1541,8 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-CODE-IMPACT',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
+        originFailures: [],
         description: 'CLI does not execute when invoked directly.',
         contractDelta: {
           summary: 'Implement the executable CLI behavior.',
@@ -1620,12 +1625,12 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-INVALID-OWNERSHIP',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
         description: 'Implement the missing entrypoint.',
         triggerStepId: 'S008',
         sourceStepId: 'S003',
         targetStepId: 'S010',
-        originFailure: {
+        originFailures: [{
           category: 'test',
           code: 'test_command_failed',
           message: 'functional acceptance failed because the entrypoint was reported missing',
@@ -1638,7 +1643,7 @@ describe('StepExecutor system prompt assembly', () => {
           targetStepType: 'REQUIREMENT_ANALYSIS',
           verificationStepId: 'S008',
           verificationStepType: 'FUNCTIONAL_TEST',
-        },
+        }],
         contractDelta: {
           summary: 'Restore executable entrypoint behavior.',
           before: ['The entrypoint is reported missing.'],
@@ -1706,7 +1711,8 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-CODE-REVIEWED-NOOP',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
+        originFailures: [],
         description: 'The project entrypoint does not execute directly.',
         contractDelta: {
           summary: 'Restore executable project behavior.',
@@ -1764,7 +1770,8 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-MISSING-DISPOSITION',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
+        originFailures: [],
         description: 'Repair the executable CLI behavior.',
         contractDelta: {
           summary: 'CLI must write an output file.',
@@ -1856,7 +1863,8 @@ describe('StepExecutor system prompt assembly', () => {
         id: 'CR-PASS-THROUGH',
         revision: 1,
         state: 'in_progress',
-        sourceTicketId: 'BUG-FUNCTIONAL',
+        sourceTicketIds: ['BUG-FUNCTIONAL'],
+        originFailures: [],
         description: 'Repair the executable CLI behavior.',
         contractDelta: {
           summary: 'CLI must produce an output file.',

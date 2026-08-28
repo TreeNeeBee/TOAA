@@ -891,6 +891,44 @@ describe('stall diagnosis', () => {
       await new Promise<void>((r) => server.close(() => r()));
     }
   }, 20_000);
+
+  it('discards a late diagnosis after bytes arrive and diagnoses only once per request', async () => {
+    let response: import('node:http').ServerResponse | undefined;
+    let diagnoses = 0;
+    const server = createServer((_req, res) => {
+      response = res;
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'late-diagnosis',
+        requestTimeoutMs: 2_000, streamFirstTokenTimeoutMs: 350, streamIdleTimeoutMs: 350,
+        stallDiagnosisAfterMs: 60,
+      });
+      let failure: Error | undefined;
+      try {
+        await client.chat([{ role: 'user', content: 'hi' }], {
+          onToken: () => undefined,
+          onStall: async () => {
+            diagnoses += 1;
+            response?.writeHead(200, { 'content-type': 'text/event-stream' });
+            response?.write(': provider is alive\n\n');
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            return 'stale diagnosis that completed after provider bytes';
+          },
+        });
+      } catch (error) {
+        failure = error as Error;
+      }
+      expect(failure).toBeDefined();
+      expect(failure?.message).not.toContain('stale diagnosis');
+      expect(diagnoses).toBe(1);
+    } finally {
+      response?.end();
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 20_000);
 });
 
 /**

@@ -6,6 +6,7 @@ import { createObjectId, type ObjectId } from '../../domain/identity/object_id.j
 import type { Phase } from '../../domain/phases/phase.js';
 import { STEP_TYPE_ORDER, type Step } from '../../domain/steps/step.js';
 import { ProjectController, type ScheduledWork } from './project_controller.js';
+import { workModeFor } from './work_scheduler.js';
 import { TicketRegistrationService } from './ticket_registration_service.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
 import type { RoutingActor } from './role_registry.js';
@@ -430,6 +431,7 @@ export class ProjectOrchestrator {
                 retryable: true,
                 switchProvider: false,
               },
+              bugKind: 'quality-gate',
               correlationId: createObjectId(),
             });
             continue;
@@ -498,6 +500,7 @@ export class ProjectOrchestrator {
       } catch (error) {
         return this.failure(phase.id, steps.length, executed, work.step, (error as Error).message);
       }
+      const mode = workModeFor(work.ticket);
       await this.transition({
         event: 'ticket_started',
         projectId: work.step.projectId,
@@ -508,7 +511,7 @@ export class ProjectOrchestrator {
         ticketType: work.ticket.type,
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.source.causationId,
-        message: `${work.ticket.name} entered ${work.mode} execution`,
+        message: `${work.ticket.name} entered ${mode} execution`,
       });
       await this.transition({
         event: 'step_started',
@@ -520,7 +523,7 @@ export class ProjectOrchestrator {
         ticketType: work.ticket.type,
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.source.causationId,
-        message: `${work.mode} execution started`,
+        message: `${mode} execution started`,
       });
       await this.options.plugins.emit('step.before', { plan: projection.plan, step: executionStep });
       let result: AttemptResult;
@@ -530,7 +533,7 @@ export class ProjectOrchestrator {
           executionStep,
           domainStep: work.step,
           ticket: work.ticket,
-          mode: work.mode,
+          mode,
           assignee,
         });
       } catch (error) {

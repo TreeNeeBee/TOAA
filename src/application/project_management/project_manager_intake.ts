@@ -86,7 +86,7 @@ export class ProjectManagerIntakeService {
           failure: {
             kind: 'execution',
             category: report.category === 'test-defect' ? 'contract' : 'test',
-            code: `phase_delivery_${report.category.replaceAll('-', '_')}`,
+            code: report.code,
             message: reportText,
             retryable: true,
             switchProvider: false,
@@ -101,6 +101,8 @@ export class ProjectManagerIntakeService {
           correlationId: input.correlationId,
           sourceKind: 'pm-intake',
           sourceExternalId: `${input.origin}:${phase.name}`,
+          tool: report.scene?.scenario.operation,
+          affectedArtifacts: report.affectedArtifacts,
         });
       } else {
         ticket = await this.corrective.routeQualityGap({
@@ -167,7 +169,7 @@ function deduplicateReports(reports: readonly DeliveryGateFinding[]): DeliveryGa
   return reports.filter((report) => {
     const key = JSON.stringify({
       category: report.category,
-      summary: report.summary,
+      code: report.code,
       target: report.target,
       affectedArtifacts: [...(report.affectedArtifacts ?? [])].sort(),
       packages: [...report.dependencyPackages].sort(),

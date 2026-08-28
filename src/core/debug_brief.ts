@@ -594,6 +594,13 @@ export function buildFailureSignature(brief: DebugBrief, structuredCode?: string
     category: brief.category,
     primaryError: withoutRunVaryingTokens(stableErrorText(brief.primaryError, brief.toolFailures)),
     failedTests: [...brief.failedTests].sort(),
+    // Failed test selectors already identify a test failure's target. Verbose runners mention files
+    // from passing cases too, so adding every extracted file would make the same failed selector
+    // acquire a different identity under `-v`. Non-test failures still need files to distinguish,
+    // for example, identical write errors against two different targets.
+    files: brief.failedTests.length > 0
+      ? []
+      : dedup(brief.files.map((file) => withoutRunVaryingTokens(normalizePath(file)))).sort(),
     toolFailures: dedup(brief.toolFailures.map(toolFailureIdentity)).sort(),
     structuredCode,
   })).digest('hex');

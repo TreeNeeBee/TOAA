@@ -122,11 +122,11 @@ export function renderExecutionUserPrompt(
         `id: ${input.changeRequest.id}`,
         `revision: ${input.changeRequest.revision}`,
         `state: ${input.changeRequest.state}`,
-        `source ticket: ${input.changeRequest.sourceTicketId}`,
+        `source tickets: ${input.changeRequest.sourceTicketIds.join(', ')}`,
         `objective: ${input.changeRequest.description}`,
         `contract delta: ${input.changeRequest.contractDelta.summary}`,
-        input.changeRequest.originFailure
-          ? `original failed gate: ${input.changeRequest.originFailure.failedStepType} — ${input.changeRequest.originFailure.message}`
+        input.changeRequest.originFailures.length > 0
+          ? `original failed gates:\n${renderOriginFailures(input.changeRequest.originFailures)}`
           : 'original failed gate: not recorded (dependency or quality CR)',
         'failing baseline / before:',
         truncate(input.changeRequest.contractDelta.before.join('\n'), 2600),
@@ -320,6 +320,15 @@ function renderStepSubTasks(tasks: NonNullable<Step['subTasks']>, depth: number)
     if (task.subTasks && task.subTasks.length > 0) lines.push(renderStepSubTasks(task.subTasks, depth + 1));
     return lines;
   }).join('\n');
+}
+
+function renderOriginFailures(
+  failures: NonNullable<ExecutorRunInput['changeRequest']>['originFailures'],
+): string {
+  return truncate(failures.map((failure) => {
+    const evidence = failure.rawEvidenceRef ? ` evidence=${failure.rawEvidenceRef}` : '';
+    return `- ${failure.failedStepType} [${failure.code}]: ${truncate(failure.summary, 700)}${evidence}`;
+  }).join('\n'), 3200);
 }
 
 function truncate(value: string, limit: number): string {

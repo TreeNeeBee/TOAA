@@ -140,6 +140,7 @@ async function checkDocumentationBundle(
       ...(!exists ? {
         finding: {
           category: 'deliverable-defect' as const,
+          code: 'required_delivery_document_missing',
           summary: `Required delivery document is missing: ${doc}`,
           evidence: [`Phase audit could not find ${doc}.`],
           target: 'current-step' as const,
@@ -180,6 +181,7 @@ async function checkTestFiles(ws: Workspace): Promise<ProjectAuditCheck> {
     summary: t().execute.auditTestFilesMissing,
     finding: {
       category: 'test-incomplete',
+      code: 'executable_test_assets_missing',
       summary: 'The delivered project contains no executable test files.',
       evidence: ['Phase audit found no Python or TypeScript tests under tests/.'],
       target: 'paired-source',
@@ -216,6 +218,7 @@ async function runEntrypointAudit(
     detail: tailText(probe.stderrTail || probe.stdoutTail),
     finding: {
       category: 'product-defect',
+      code: 'entrypoint_smoke_failed',
       summary: `Entrypoint smoke check failed: ${probe.command}`,
       evidence: [tailText(probe.stderrTail || probe.stdoutTail) || `exit=${probe.exitCode}`],
       target: 'code',
@@ -276,6 +279,7 @@ async function runScenarioAudit(
       scene,
       finding: {
         category: 'product-defect',
+        code: `scenario_expectation_failed:${scenario.name}`,
         summary: `Scenario ${scenario.name} produced a result that does not meet its expectation: ${verdict.reason}`,
         evidence: [`expected: ${scenario.expected}`, ...verdict.evidence],
         target: 'code',
@@ -294,6 +298,7 @@ async function runScenarioAudit(
     scene,
     finding: {
       category: 'product-defect',
+      code: `scenario_execution_failed:${scenario.name}`,
       summary: `Real entrypoint scenario failed: ${probe.command}`,
       evidence: sceneEvidence,
       target: 'code',
@@ -328,6 +333,7 @@ async function runTypeScriptAudit(ws: Workspace, sandbox: Sandbox): Promise<Proj
       summary: t().execute.auditPackageJsonMissing,
       finding: {
         category: 'deliverable-defect',
+        code: 'typescript_package_manifest_missing',
         summary: 'TypeScript delivery is missing package.json.',
         evidence: ['Phase audit could not load package.json.'],
         target: 'high-level-design',
@@ -392,6 +398,7 @@ function toExecCheck(
       : tailText(result.stderr || result.stdout),
     finding: {
       category: 'product-defect',
+      code: `delivery_check_failed:${name}`,
       summary: `${name} delivery check failed.`,
       evidence: [tailText(result.stderr || result.stdout) || `exit=${result.exitCode}`],
       target: 'code',

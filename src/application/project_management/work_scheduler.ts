@@ -11,7 +11,6 @@ export interface ScheduledWork {
   phase: Phase;
   step: Step;
   ticket: Ticket;
-  mode: WorkMode;
 }
 
 export class WorkScheduler {
@@ -30,7 +29,7 @@ export class WorkScheduler {
     for (const step of steps) {
       const corrective = await this.readyCorrectiveTicket(step, tickets);
       if (corrective) {
-        return { phase, step, ticket: corrective, mode: modeFor(corrective) };
+        return { phase, step, ticket: corrective };
       }
       // Closed Steps suppress their ordinary Story only. A queued corrective Ticket is allowed to
       // reopen one, and was therefore considered above — and unready dependencies suppress it the
@@ -54,7 +53,7 @@ export class WorkScheduler {
         story.blockedByTicketIds.length === 0 &&
         await this.ticketDependenciesReady(story, tickets)
       ) {
-        return { phase, step, ticket: story, mode: 'normal' };
+        return { phase, step, ticket: story };
       }
     }
     return undefined;
@@ -78,7 +77,7 @@ export class WorkScheduler {
       (ticket) => ticket.type === 'story' && ticket.stepId === step.id && ticket.state === 'in_progress',
     );
     if (!active) throw new Error(`In-progress Step ${step.name} has no active Ticket`);
-    return { phase, step, ticket: active, mode: modeFor(active) };
+    return { phase, step, ticket: active };
   }
 
   /**
@@ -118,7 +117,6 @@ export class WorkScheduler {
           phase,
           step: candidate.step,
           ticket: candidate.ticket,
-          mode: modeFor(candidate.ticket),
         };
       }
     }
@@ -168,6 +166,7 @@ export class WorkScheduler {
 function activeCorrectiveTickets(step: Step, tickets: readonly Ticket[]): Ticket[] {
   return tickets
     .filter((ticket) => isActiveTicket(ticket))
+    .filter((ticket) => ticket.duplicateOfTicketId === undefined)
     .filter((ticket) => ticket.blockedByTicketIds.length === 0)
     .filter((ticket) =>
       // Bugs and Enhancements are repaired at the Step `workStepId` designates, which is the same
@@ -199,7 +198,7 @@ function scheduledStepId(ticket: Ticket): ObjectId | undefined {
   return workStepId(ticket);
 }
 
-function modeFor(ticket: Ticket): WorkMode {
+export function workModeFor(ticket: Ticket): WorkMode {
   if (ticket.type === 'bug') return 'debug';
   if (ticket.type === 'enhancement') return 'enhancement';
   if (ticket.type === 'change-request') return 'change-request';

@@ -1,7 +1,13 @@
 import { createObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
-import { TicketSchema, workStepId, type Ticket } from '../../domain/tickets/ticket.js';
+import {
+  TicketSchema,
+  sameFailureIdentity,
+  workStepId,
+  type BugTicket,
+  type Ticket,
+} from '../../domain/tickets/ticket.js';
 import {
   TicketAssignmentSchema,
   reviseActor,
@@ -14,24 +20,31 @@ import { TicketTraceService } from './ticket_trace_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 import type { PersistedDomainObject } from '../../domain/objects/persisted.js';
 import { GovernanceService } from './governance_service.js';
+import { TicketWorkflow } from './ticket_workflow.js';
 
 export class TicketRegistrationService {
   private readonly roles: RoleRegistry;
   private readonly traces: TicketTraceService;
   private readonly governance: GovernanceService;
+  private readonly tickets: TicketWorkflow;
 
   constructor(private readonly repository: DomainObjectRepositoryPort) {
     this.roles = new RoleRegistry(repository);
     this.traces = new TicketTraceService(repository);
     this.governance = new GovernanceService(repository);
+    this.tickets = new TicketWorkflow(repository);
   }
 
   async register(ticketId: ObjectId): Promise<Ticket> {
     const ticket = await this.requireTicket(ticketId);
-    if (ticket.registeredAt) return ticket;
+    if (ticket.registeredAt) {
+      if (ticket.type !== 'bug' || ticket.duplicateOfTicketId) return ticket;
+      return this.checkAndParkDuplicate(ticket, await this.projectManager(ticket.projectId));
+    }
     const creator = await this.roles.require(ticket.creatorActorId);
     this.assertCreationAuthority(ticket, creator);
     const pmIntake = ticket.source.kind === 'pm-intake';
+    const pm = await this.projectManager(ticket.projectId);
     const now = new Date().toISOString();
     const built = await this.traces.build(ticket, [
       {
@@ -60,7 +73,7 @@ export class TicketRegistrationService {
       },
       {
         eventType: 'registered',
-        initiatorActorId: (await this.projectManager(ticket.projectId)).id,
+        initiatorActorId: pm.id,
         initiatorRole: 'project-manager',
         reasonCode: 'ticket.registration_validated',
         reason: 'Project Manager validated routing metadata without rewriting technical context.',
@@ -86,7 +99,63 @@ export class TicketRegistrationService {
         now,
       }),
     ]);
-    return registered;
+    return registered.type === 'bug'
+      ? await this.checkAndParkDuplicate(registered, pm)
+      : registered;
+  }
+
+  /** PM compares registered Bugs before assignment and records the selected routing outcome. */
+  private async checkAndParkDuplicate(incoming: BugTicket, pm: ActorRegistration): Promise<BugTicket> {
+    const earlier = (candidate: BugTicket) =>
+      candidate.submittedAt < incoming.submittedAt ||
+      (candidate.submittedAt === incoming.submittedAt && candidate.id < incoming.id);
+    const original = (await this.tickets.list())
+      .filter((ticket): ticket is BugTicket =>
+        ticket.type === 'bug' &&
+        ticket.id !== incoming.id &&
+        ticket.projectId === incoming.projectId &&
+        ticket.registeredAt !== undefined &&
+        ticket.duplicateOfTicketId === undefined &&
+        ticket.state !== 'closed' &&
+        ticket.state !== 'cancelled' &&
+        ticket.failure.targetStepId === incoming.failure.targetStepId &&
+        sameFailureIdentity(ticket.failure.identity, incoming.failure.identity) &&
+        earlier(ticket))
+      .sort((left, right) =>
+        left.submittedAt.localeCompare(right.submittedAt) || left.id.localeCompare(right.id))[0];
+    if (!original) return incoming;
+    const now = new Date().toISOString();
+    const governance = await this.governance.prepareDecision({
+      projectId: incoming.projectId,
+      decisionType: 'routing',
+      decidedByActorId: pm.id,
+      authority: 'project-manager',
+      options: ['assign', 'park-as-duplicate'],
+      selected: 'park-as-duplicate',
+      rationale: `${incoming.name} has the same structural failure identity and target Step as ${original.name}.`,
+      confidence: 1,
+      evidenceRefs: [incoming.id, original.id],
+      correlationId: incoming.source.correlationId,
+      causationId: incoming.id,
+      now,
+    });
+    return this.tickets.parkDuplicateBug(incoming.id, original.id, pm.id, [
+      governance.decision,
+      governance.managementPlan,
+      createDomainEvent({
+        projectId: incoming.projectId,
+        aggregate: { id: governance.decision.id, objectType: 'decision-record' },
+        eventType: 'governance.decision_recorded',
+        payload: { decisionType: 'routing', selected: 'park-as-duplicate' },
+        phaseId: incoming.phaseId,
+        stepId: incoming.stepId,
+        ticketId: incoming.id,
+        correlationId: incoming.source.correlationId,
+        causationId: incoming.id,
+        objectRevision: governance.decision.revision,
+        now,
+      }),
+    ]);
   }
 
   async registerProjectTickets(projectId: ObjectId): Promise<Ticket[]> {
@@ -109,6 +178,10 @@ export class TicketRegistrationService {
     let predecessor: Ticket | undefined;
     for (const id of ids) {
       let ticket = await this.register(id);
+      if (ticket.duplicateOfTicketId) {
+        registered.push(ticket);
+        continue;
+      }
       if (predecessor && !ticket.dependencyTicketIds.includes(predecessor.id)) {
         if (ticket.projectId !== predecessor.projectId) {
           throw new Error('A delivery-gate Ticket batch cannot cross Project boundaries');
@@ -150,6 +223,11 @@ export class TicketRegistrationService {
     } = {},
   ): Promise<{ ticket: Ticket; assignment: TicketAssignment }> {
     let ticket = await this.register(ticketId);
+    if (ticket.duplicateOfTicketId) {
+      throw new Error(
+        `Duplicate Ticket ${ticket.name} follows ${ticket.duplicateOfTicketId} and must not be assigned`,
+      );
+    }
     const routingStepId = options.forStepId ?? workStepId(ticket);
     const stepObject = routingStepId ? await this.repository.read(routingStepId) : undefined;
     const step = stepObject?.objectType === 'step' ? stepObject : undefined;

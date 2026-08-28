@@ -7,6 +7,7 @@ import { normalizeTypeScriptTestArgs } from '../sandbox/test_args.js';
 import { resolveTypeScriptProgramCommand } from '../sandbox/program_args.js';
 import { resolveWorkspacePath } from './path_guard.js';
 import { isExecutableTestPath } from '../core/test_assets.js';
+import { buildDebugBrief } from '../core/debug_brief.js';
 
 /** 截取多行文本最后 N 行，用于在 ToolResult.summary 里给 LLM 直接看的失败上下文。
  * 仅在失败时调用——成功路径上 stdout 通常很长且无价值，没必要塞回 prompt。 */
@@ -137,7 +138,15 @@ async function unwrittenSelectors(ctx: ToolContext, gateSelectors: readonly stri
 
 export const runTestsTool: Tool<
   { args?: string[]; cwd?: string; timeoutMs?: number },
-  { exitCode: number; stdout: string; stderr: string; timedOut: boolean; passed: boolean }
+  {
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    passed: boolean;
+    effectiveArgs: string[];
+    failedTests: string[];
+  }
 > = {
   name: 'run_tests',
   description:
@@ -194,6 +203,9 @@ export const runTestsTool: Tool<
       runArgs.length > 0 ? `args=${runArgs.join(' ')}` : '',
     ].filter(Boolean).join(' ');
     const successEvidence = ctx.language === 'typescript' ? extractVitestEvidence(r.stdout) : [];
+    const failedTests = failed
+      ? buildDebugBrief({ failureLog: `${r.stderr}\n${r.stdout}` }).failedTests
+      : [];
     return {
       ok: passed,
       data: {
@@ -202,6 +214,8 @@ export const runTestsTool: Tool<
         stderr: r.stderr,
         timedOut: r.timedOut,
         passed,
+        effectiveArgs: runArgs,
+        failedTests,
       },
       summary: passed
         ? [base, ...successEvidence].join('\n')

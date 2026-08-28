@@ -1243,7 +1243,7 @@ function ensurePairedTestAssets(steps: Step[], language: Language): Step[] {
             `新增本阶段拥有的聚焦补充测试，禁止修改配对基线测试和 src/**。` +
             `补充完成后冻结“基线 + 补充”测试集，再使用 ${testCommand} 完整执行。` +
             `涉及外部数据时使用 Record/Replay 保持可复现；真实用户场景由 Phase 交付门禁统一执行。` +
-            `每个独立问题写入 qualityAssessment.findings；基线测试缺陷使用 test-defect + paired-source，` +
+            `每个独立问题写入 qualityAssessment.findings，并提供同一问题重现时稳定复用的机器 code；基线测试缺陷使用 test-defect + paired-source，` +
             `补充测试缺陷使用 test-defect + current-step，` +
             `产品缺陷使用 product-defect，测试不完整使用 test-incomplete，依赖问题使用 dependency。`;
           testStep.acceptance +=

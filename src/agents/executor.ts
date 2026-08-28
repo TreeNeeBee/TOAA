@@ -1229,7 +1229,7 @@ export class StepExecutor {
         ((V_MODEL_TEST_PHASES as readonly string[]).includes(inp.step.phase) &&
           (currentExecutableFailure ||
             (!!reportedValidationDefect && hasSuccessfulCompletionVerification(calls)))) ||
-        inp.changeRequest?.originFailure !== undefined
+        (inp.changeRequest?.originFailures.length ?? 0) > 0
       );
       const unsupportedValidationDefect = validationDefect && !supportedValidationDefect
         ? validationDefect
@@ -1682,7 +1682,7 @@ export class StepExecutor {
           providers: [...providers],
         });
         const targets = actions.flatMap((action) => actionTargetPaths(action.tool, action.args)).join(', ');
-        const changeRequestRecovery = inp.changeRequest?.originFailure
+        const changeRequestRecovery = (inp.changeRequest?.originFailures.length ?? 0) > 0
           ? ' If inspection disproves the original CR diagnosis, stop with actions=[], done=true and ' +
             'changeRequestDisposition reasonCategory="diagnosis-contradicted" so Runtime can route the ' +
             'discovering role\'s Bug through PM.'
@@ -1817,7 +1817,7 @@ export class StepExecutor {
               }
             : undefined,
           changeRequestContradictionRecovery:
-            !!inp.changeRequest?.originFailure && consecutiveReadOnlyRounds >= 2,
+            (inp.changeRequest?.originFailures.length ?? 0) > 0 && consecutiveReadOnlyRounds >= 2,
           missingOutputStallWarning: missingOutputStallRounds >= 1 && !verify.ok
             ? {
                 rounds: missingOutputStallRounds,
@@ -2121,7 +2121,7 @@ function classifyInvalidChangeRequestDisposition(
   }
   if (
     disposition.reasonCategory === 'already-aligned' &&
-    input.changeRequest.originFailure &&
+    input.changeRequest.originFailures.length > 0 &&
     allArtifactsOwned &&
     !hasSuccessfulCompletionVerification(calls)
   ) {
@@ -2333,7 +2333,7 @@ function validationDefectFromChangeRequestDisposition(
   disposition: ChangeRequestDisposition | undefined,
 ): string | undefined {
   if (
-    !input.changeRequest?.originFailure ||
+    !input.changeRequest?.originFailures.length ||
     disposition?.outcome !== 'not-applicable' ||
     disposition.reasonCategory !== 'diagnosis-contradicted'
   ) return undefined;

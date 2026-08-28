@@ -34,6 +34,7 @@ export function mergePairedSourceTestQuality(
       ...(assessment.findings ?? []),
       ...inspection.invalid.map((failure) => ({
         category: 'test-incomplete' as const,
+        code: 'paired_baseline_contract_incomplete',
         summary: `Paired baseline test contract is incomplete: ${failure}`,
         evidence: [failure, remediation],
         target: 'current-step' as const,

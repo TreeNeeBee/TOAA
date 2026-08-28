@@ -453,7 +453,7 @@ export class TicketChangeSetService {
       if (!object || object.objectType !== 'ticket') continue;
       if (object.parentTicketId) queue.push(object.parentTicketId);
       if (object.source.causationId) queue.push(object.source.causationId);
-      if (object.type === 'change-request') queue.push(object.sourceTicketId);
+      if (object.type === 'change-request') queue.push(...object.sourceTicketIds);
     }
     return undefined;
   }

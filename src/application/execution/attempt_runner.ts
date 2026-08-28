@@ -330,6 +330,7 @@ export class DomainAttemptRunner {
             gateFindings: [
               ...inspection.missing.map((file): DeliveryGateFinding => ({
                 category: 'test-incomplete',
+                code: 'required_baseline_asset_missing',
                 summary: `Required baseline test asset is missing: ${file}`,
                 evidence: [inspection.failureLog],
                 target: 'paired-source',
@@ -338,6 +339,7 @@ export class DomainAttemptRunner {
               })),
               ...inspection.invalid.map((detail): DeliveryGateFinding => ({
                 category: 'test-incomplete',
+                code: 'baseline_asset_invalid',
                 summary: detail,
                 evidence: [inspection.failureLog],
                 target: 'paired-source',
@@ -393,6 +395,7 @@ export class DomainAttemptRunner {
             },
             gateFindings: [{
               category: 'test-incomplete',
+              code: 'baseline_test_assets_missing',
               summary: failureLog,
               evidence: [
                 `Declared outputs: ${input.executionStep.outputs.join(', ') || '(none)'}`,

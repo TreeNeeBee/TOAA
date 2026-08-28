@@ -7,6 +7,25 @@ import { DomainRoleSchema, ExecutingRoleSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import { STEP_TYPES } from '../steps/step.js';
 import { WORKSPACE_KINDS } from '../workspace/change_set.js';
+import {
+  BugVerificationContractSchema,
+  BugVerificationRecordSchema,
+  FailureIdentitySchema,
+  sameFailureIdentity,
+} from './failure_identity.js';
+
+export {
+  BugVerificationContractSchema,
+  BugVerificationRecordSchema,
+  FailureIdentitySchema,
+  failureIdentityKey,
+  sameFailureIdentity,
+} from './failure_identity.js';
+export type {
+  BugVerificationContract,
+  BugVerificationRecord,
+  FailureIdentity,
+} from './failure_identity.js';
 
 export const TICKET_TYPES = [
   'epic',
@@ -156,6 +175,10 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   dependencyTicketIds: z.array(ObjectIdSchema).default([]),
   blockedByTicketIds: z.array(ObjectIdSchema).default([]),
   relatedTicketIds: z.array(ObjectIdSchema).default([]),
+  /** Tickets that PM identified as later reports of this same work. */
+  duplicateTicketIds: z.array(ObjectIdSchema).default([]),
+  /** The authoritative Ticket this duplicate follows. */
+  duplicateOfTicketId: ObjectIdSchema.optional(),
   logIds: z.array(ObjectIdSchema).default([]),
   changelistIds: z.array(ObjectIdSchema).default([]),
   assignmentIds: z.array(ObjectIdSchema).default([]),
@@ -215,6 +238,7 @@ export const BugFailureSchema = z.object({
     tool: z.string().min(1).optional(),
     exitCode: z.number().int().optional(),
     statusCode: z.number().int().optional(),
+    identity: FailureIdentitySchema,
   }).strict();
 
 /** A discovering role proved that the failed verification contract, not the reported product gap, is defective. */
@@ -232,6 +256,8 @@ export const BugTicketSchema = TicketBaseSchema.extend({
   ]),
   severity: z.enum(['low', 'medium', 'high', 'critical']),
   failure: BugFailureSchema,
+  verificationContract: BugVerificationContractSchema,
+  verificationRecords: z.array(BugVerificationRecordSchema).default([]),
   enhancementTicketId: ObjectIdSchema.optional(),
   changeRequestTicketIds: z.array(ObjectIdSchema).default([]),
   debugWikiCandidateEntryIds: z.array(z.string().min(1)).default([]),
@@ -273,7 +299,7 @@ export const ChangeRequestApplicationDecisionSchema = z.object({
  *
  * Two Bugs on one Step each open their own chain along the identical route — a live run produced
  * four such pairs (`S004→S005`, `S005→S006`, `S006→S007`, `S007→S008`), created one to two minutes
- * apart, carrying the same delta to the same owner. The existing guard keys on `sourceTicketId`, so
+ * apart, carrying the same delta to the same owner. Source ids alone cannot identify that shared
  * it never sees them: they differ precisely in the field it compares. What actually makes a hop
  * redundant is where it comes from, where it goes, and which failure started it — so that is what
  * the key is built from.
@@ -297,7 +323,7 @@ export function changeRequestHopKey(input: {
 
 export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   type: z.literal('change-request'),
-  sourceTicketId: ObjectIdSchema,
+  sourceTicketIds: z.array(ObjectIdSchema).min(1),
   parentChangeRequestId: ObjectIdSchema.optional(),
   triggerStepId: ObjectIdSchema,
   sourceStepId: ObjectIdSchema,
@@ -309,8 +335,10 @@ export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
    * owners and verification gates are unaffected merely because it did not edit a file.
    */
   targetStepId: ObjectIdSchema,
-  /** Immutable failure evidence that caused a corrective CR chain. */
-  originFailure: BugFailureSchema.optional(),
+  /** Ordered Steps that actually consume this accepted delta. */
+  propagationStepIds: z.array(ObjectIdSchema).min(1),
+  /** Immutable failure evidence for every Bug whose correction this hop carries. */
+  originFailures: z.array(BugFailureSchema).default([]),
   contractDelta: z.object({
     summary: z.string().min(1),
     before: z.array(z.string().min(1)).default([]),
@@ -355,6 +383,39 @@ export function bindTicketWorkspace<T extends Ticket>(
     workspaceBinding: parsed,
     workspaceBindingHistory: [...ticket.workspaceBindingHistory, parsed],
   }) as T;
+}
+
+/** Records a PM duplicate decision without merging either Bug's technical context. */
+export function linkDuplicateBugs(
+  original: BugTicket,
+  duplicateAfterTransition: BugTicket,
+  now = new Date().toISOString(),
+): { original: BugTicket; duplicate: BugTicket } {
+  if (original.id === duplicateAfterTransition.id) throw new Error('A Bug cannot duplicate itself');
+  if (original.projectId !== duplicateAfterTransition.projectId) {
+    throw new Error('Duplicate Bugs must belong to the same Project');
+  }
+  if (original.failure.targetStepId !== duplicateAfterTransition.failure.targetStepId) {
+    throw new Error('Duplicate Bugs must target the same Step');
+  }
+  if (!sameFailureIdentity(original.failure.identity, duplicateAfterTransition.failure.identity)) {
+    throw new Error('Duplicate Bugs must share one structural failure identity');
+  }
+  if (duplicateAfterTransition.duplicateOfTicketId && duplicateAfterTransition.duplicateOfTicketId !== original.id) {
+    throw new Error(`Bug ${duplicateAfterTransition.name} already follows another original`);
+  }
+  return {
+    original: TicketSchema.parse({
+      ...original,
+      ...reviseObjectEnvelope(original, { now }),
+      duplicateTicketIds: [...new Set([...original.duplicateTicketIds, duplicateAfterTransition.id])],
+    }) as BugTicket,
+    // The lifecycle transition already advanced this revision. Add the relation to that same commit.
+    duplicate: TicketSchema.parse({
+      ...duplicateAfterTransition,
+      duplicateOfTicketId: original.id,
+    }) as BugTicket,
+  };
 }
 
 function sameWorkspaceBinding(

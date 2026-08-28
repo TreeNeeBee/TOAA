@@ -262,6 +262,7 @@ describe('quality failure evidence', () => {
       gaps: [],
       findings: [{
         category: 'test-incomplete',
+        code: 'acceptance_product_import_missing',
         summary: 'tests/acceptance.test.ts does not import src/main.ts',
         evidence: [
           'exercises 0/1 required product sources',

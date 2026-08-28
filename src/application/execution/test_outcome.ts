@@ -21,6 +21,7 @@ export interface TestOutcome {
   totalTests?: number;
   summary?: string;
   failure?: string;
+  failedTests: string[];
   recordedAt: string;
 }
 
@@ -32,20 +33,27 @@ export function collectTestOutcomes(
     const data = isRecord(call.data) ? call.data : {};
     const timedOut = data.timedOut === true;
     const exitCode = typeof data.exitCode === 'number' ? data.exitCode : undefined;
+    const failure = call.error;
+    const failedTests = Array.isArray(data.failedTests)
+      ? data.failedTests.filter((value): value is string => typeof value === 'string')
+      : [];
     return {
       status: timedOut ? 'timed_out' : call.ok ? 'passed' : 'failed',
       stepType,
       tool: 'run_tests',
       callId: call.callId,
-      args: Array.isArray(call.args?.args)
-        ? call.args.args.filter((value): value is string => typeof value === 'string')
-        : [],
+      args: Array.isArray(data.effectiveArgs)
+        ? data.effectiveArgs.filter((value): value is string => typeof value === 'string')
+        : Array.isArray(call.args?.args)
+          ? call.args.args.filter((value): value is string => typeof value === 'string')
+          : [],
       exitCode,
       timedOut,
       passedTests: numericMatch(call.summary, /Tests\s+(\d+)\s+passed/iu),
       totalTests: numericMatch(call.summary, /Tests\s+\d+\s+passed\s+\((\d+)\)/iu),
       summary: call.summary,
-      failure: call.error,
+      failure,
+      failedTests,
       recordedAt: new Date().toISOString(),
     };
   });

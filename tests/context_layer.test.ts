@@ -20,6 +20,7 @@ import { PLAN_VERSION, type Plan } from '../src/core/plan.js';
 import { STEP_TYPES } from '../src/domain/steps/step.js';
 import { bindTicketWorkspace, type Ticket } from '../src/domain/tickets/ticket.js';
 import { TicketWorkflow } from '../src/application/project_management/ticket_workflow.js';
+import { bugContracts } from './helpers/ticket_fixtures.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 
 async function fixture() {
@@ -340,5 +341,6 @@ async function openBugTicket(
     switchProvider: false,
     rawEvidenceRef: '.xcompiler/failures/unit.log',
     correlationId: createObjectId(),
+    ...bugContracts(unit, coding, unit, { category: 'test', code: 'assert' }),
   });
 }

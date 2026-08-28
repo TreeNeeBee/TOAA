@@ -1,11 +1,18 @@
 import { createObjectEnvelope, reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { ObjectId } from '../../domain/identity/object_id.js';
-import { stepDependsOn, stepSatisfiesDependency, type Step, type StepType } from '../../domain/steps/step.js';
+import {
+  STEP_TYPE_ORDER,
+  stepDependsOn,
+  stepSatisfiesDependency,
+  type Step,
+  type StepType,
+} from '../../domain/steps/step.js';
 import {
   TICKET_PRIORITY,
   TicketSchema,
   transitionTicket,
   type BugTicket,
+  type BugVerificationContract,
   type ChangeRequestApplicationDecision,
   type ChangeRequestTicket,
   type EnhancementTicket,
@@ -14,7 +21,10 @@ import {
   type TicketSolution,
   type TicketWorkspaceBinding,
   type WorkTicket,
+  type FailureIdentity,
   changeRequestHopKey,
+  failureIdentityKey,
+  linkDuplicateBugs,
 } from '../../domain/tickets/ticket.js';
 import { ChangelistSchema, type Changelist } from '../../domain/evidence/evidence.js';
 import type { DomainObjectRepositoryPort } from '../../domain/ports/repository.js';
@@ -26,6 +36,12 @@ import type { ActorRegistration } from '../../domain/project_management/index.js
 import type { PersistedDomainObject } from '../../domain/objects/persisted.js';
 import { TicketCatalog } from './ticket_catalog.js';
 import { TicketBlockerService } from './ticket_blocker_service.js';
+import type { TestOutcome } from '../execution/test_outcome.js';
+import {
+  bugVerificationProven,
+  bugVerificationSatisfied,
+  passedTestSelectors,
+} from './bug_verification.js';
 
 export class TicketWorkflow {
   private readonly lifecycle: TicketLifecycleService;
@@ -46,6 +62,57 @@ export class TicketWorkflow {
 
   async storyForStep(stepId: ObjectId): Promise<WorkTicket> {
     return this.catalog.storyForStep(stepId);
+  }
+
+  /** Applies PM's recorded duplicate decision without comparing or merging technical context. */
+  async parkDuplicateBug(
+    ticketId: ObjectId,
+    originalTicketId: ObjectId,
+    pmActorId: ObjectId,
+    governanceObjects: readonly PersistedDomainObject[] = [],
+  ): Promise<BugTicket> {
+    const incoming = await this.requireTicket(ticketId);
+    if (incoming.type !== 'bug') throw new Error(`Ticket ${incoming.name} is not a Bug`);
+    if (incoming.duplicateOfTicketId) return incoming;
+    const original = await this.requireTicket(originalTicketId);
+    if (original.type !== 'bug') throw new Error(`Ticket ${original.name} is not a Bug`);
+    if (!original.registeredAt || !incoming.registeredAt) {
+      throw new Error('Duplicate Bugs must be registered before PM can link them');
+    }
+    if (original.state === 'closed' || original.state === 'cancelled' || original.duplicateOfTicketId) {
+      throw new Error(`Bug ${original.name} is not an active authoritative duplicate target`);
+    }
+    const pm = await this.repository.read(pmActorId);
+    if (pm.objectType !== 'actor-registration' || pm.role !== 'project-manager') {
+      throw new Error(`Routing duplicate ${incoming.name} requires a registered Project Manager`);
+    }
+    const prepared = await this.lifecycle.prepareTransition(incoming, 'pending', {
+      initiatorActorId: pm.id,
+      pendingReason: 'duplicate',
+      reasonCode: 'pm.duplicate_bug_parked',
+      reason: `Project Manager linked ${incoming.name} to authoritative Bug ${original.name}.`,
+      evidenceRefs: [original.id, ...governanceObjects.map((object) => object.id)],
+    });
+    const linked = linkDuplicateBugs(original, prepared.ticket as BugTicket);
+    await this.repository.commit([
+      ...governanceObjects,
+      linked.original,
+      ...replaceTicket(prepared.objects, linked.duplicate),
+      createDomainEvent({
+        projectId: incoming.projectId,
+        aggregate: { id: incoming.id, objectType: 'ticket' },
+        eventType: 'ticket.duplicate_linked',
+        payload: { originalTicketId: original.id },
+        phaseId: incoming.phaseId,
+        stepId: incoming.stepId,
+        ticketId: incoming.id,
+        correlationId: incoming.source.correlationId,
+        causationId: original.id,
+        objectRevision: linked.duplicate.revision,
+      }),
+    ]);
+    await this.blockers.release(linked.duplicate);
+    return linked.duplicate;
   }
 
   async openBug(input: {
@@ -73,7 +140,10 @@ export class TicketWorkflow {
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
     workspaceBinding?: TicketWorkspaceBinding;
+    identity: FailureIdentity;
+    verificationContract: BugVerificationContract;
   }): Promise<BugTicket> {
+    assertBugContractInput(input);
     const targetStory = await this.storyForStep(input.targetStep.id);
     const parentChangeRequest = input.parentChangeRequestId
       ? await this.requireTicket(input.parentChangeRequestId)
@@ -84,18 +154,6 @@ export class TicketWorkflow {
     const causationTicket = input.causationId
       ? await this.ticketIfPresent(input.causationId)
       : undefined;
-    const existing = (await this.list()).find((ticket): ticket is BugTicket =>
-      ticket.type === 'bug' &&
-      ticket.state !== 'closed' &&
-      ticket.state !== 'cancelled' &&
-      ticket.projectId === input.targetStep.projectId &&
-      ticket.parentTicketId === (parentChangeRequest?.id ?? targetStory.id) &&
-      ticket.failure.failedStepId === input.failedStep.id &&
-      ticket.failure.targetStepId === input.targetStep.id &&
-      ticket.failure.code === input.code &&
-      ticket.failure.summary === input.summary,
-    );
-    if (existing) return existing;
     const envelope = createObjectEnvelope({
       name: await this.nextName('BUG', input.targetStep.name.split('-')[0] ?? 'P'),
       objectType: 'ticket',
@@ -157,7 +215,9 @@ export class TicketWorkflow {
         tool: input.tool,
         exitCode: input.exitCode,
         statusCode: input.statusCode,
+        identity: input.identity,
       },
+      verificationContract: input.verificationContract,
     }) as BugTicket;
     const blockedStory = await this.blockers.prepareWorkIfLive(targetStory, bug.id, 'defect');
     // A defect found by a verification Step blocks that Step's own Story too: its verdict cannot be
@@ -369,11 +429,12 @@ export class TicketWorkflow {
       ...(workspaceBinding
         ? { workspaceBinding, workspaceBindingHistory: [workspaceBinding] }
         : {}),
-      sourceTicketId: requester.id,
+      sourceTicketIds: [requester.id],
       parentChangeRequestId: input.parentChangeRequestId,
       triggerStepId: input.requestingStepId,
       sourceStepId: input.requestingStepId,
       targetStepId: input.targetStep.id,
+      propagationStepIds: [input.targetStep.id],
       contractDelta: {
         summary,
         before: [],
@@ -427,25 +488,31 @@ export class TicketWorkflow {
 
   async openChangeRequest(input: {
     creatorActorId: ObjectId;
-    sourceTicketId: ObjectId;
+    sourceTicketIds: ObjectId[];
     triggerStepId: ObjectId;
     sourceStepId: ObjectId;
     /** The one Step this CR is applied to; the chain grows a child per Step, not a list. */
     targetStepId: ObjectId;
+    propagationStepIds: ObjectId[];
     contractDelta: ChangeRequestTicket['contractDelta'];
     implementationPlan: string[];
     verificationGate: string[];
     parentChangeRequestId?: ObjectId;
   }): Promise<ChangeRequestTicket> {
-    const targetObject = await this.repository.read(input.targetStepId);
-    if (targetObject.objectType !== 'step') {
-      throw new Error(`Change Request target ${input.targetStepId} is not a Step`);
+    if (input.propagationStepIds.length === 0 || input.propagationStepIds[0] !== input.targetStepId) {
+      throw new Error('Change Request propagation must start with its target Step');
     }
-    const target = targetObject;
-    const source = await this.requireTicket(input.sourceTicketId);
-    if (source.type !== 'bug' && source.type !== 'enhancement') {
-      throw new Error('Change Request source must be a Bug or Enhancement Ticket');
+    const sourceTickets = await Promise.all(input.sourceTicketIds.map((id) => this.requireTicket(id)));
+    if (sourceTickets.length === 0 || sourceTickets.some((ticket) =>
+      ticket.type !== 'bug' && ticket.type !== 'enhancement')) {
+      throw new Error('Change Request sources must be Bug or Enhancement Tickets');
     }
+    const sources = sourceTickets as Array<BugTicket | EnhancementTicket>;
+    const source = sources[0]!;
+    if (sources.some((candidate) => candidate.projectId !== source.projectId || candidate.phaseId !== source.phaseId)) {
+      throw new Error('Change Request sources must belong to the same Project and Phase');
+    }
+    const target = await this.validateChangeRequestScope(input, source);
     const parent = source.parentTicketId
       ? await this.requireTicket(source.parentTicketId)
       : undefined;
@@ -455,14 +522,15 @@ export class TicketWorkflow {
     const hopKey = changeRequestHopKey({
       sourceStepId: input.sourceStepId,
       targetStepId: input.targetStepId,
-      originFailedStepId: source.type === 'bug' ? source.failure.failedStepId : undefined,
+      originFailedStepId: sources.find((candidate): candidate is BugTicket => candidate.type === 'bug')
+        ?.failure.failedStepId,
       parentChangeRequestId: input.parentChangeRequestId,
     });
     const open = (await this.list()).filter((ticket): ticket is ChangeRequestTicket =>
-      ticket.type === 'change-request' && ticket.state !== 'cancelled',
+      ticket.type === 'change-request' && ticket.state !== 'closed' && ticket.state !== 'cancelled',
     );
     const sameSource = open.find((ticket) =>
-      ticket.sourceTicketId === source.id &&
+      sameIds(ticket.sourceTicketIds, sources.map((candidate) => candidate.id)) &&
       ticket.parentChangeRequestId === input.parentChangeRequestId,
     );
     if (sameSource) return sameSource;
@@ -471,11 +539,18 @@ export class TicketWorkflow {
       changeRequestHopKey({
         sourceStepId: ticket.sourceStepId,
         targetStepId: ticket.targetStepId,
-        originFailedStepId: ticket.originFailure?.failedStepId,
+        originFailedStepId: ticket.originFailures[0]?.failedStepId,
         parentChangeRequestId: ticket.parentChangeRequestId,
       }) === hopKey,
     );
-    if (sameHop) return await this.mergeChangeRequestHop(sameHop, source, input.contractDelta);
+    if (sameHop) {
+      return await this.mergeChangeRequestHop(
+        sameHop,
+        sources,
+        input.contractDelta,
+        input.propagationStepIds,
+      );
+    }
     const envelope = createObjectEnvelope({
       name: await this.nextName('CR', parent.name.split('-')[0] ?? 'P'),
       objectType: 'ticket',
@@ -500,7 +575,7 @@ export class TicketWorkflow {
       acceptance: input.verificationGate,
       /** Source linkage is causal, not a scheduling dependency: the source waits for this CR. */
       dependencyTicketIds: [],
-      relatedTicketIds: [source.id],
+      relatedTicketIds: sources.map((candidate) => candidate.id),
       ...(workspaceBinding
         ? { workspaceBinding, workspaceBindingHistory: [workspaceBinding] }
         : {}),
@@ -511,13 +586,16 @@ export class TicketWorkflow {
         correlationId: source.source.correlationId,
         causationId: source.id,
       },
-      sourceTicketId: source.id,
+      sourceTicketIds: sources.map((candidate) => candidate.id),
       maxAttempts: source.maxAttempts,
       parentChangeRequestId: input.parentChangeRequestId,
       triggerStepId: input.triggerStepId,
       sourceStepId: input.sourceStepId,
       targetStepId: input.targetStepId,
-      originFailure: source.type === 'bug' ? source.failure : undefined,
+      propagationStepIds: [...input.propagationStepIds],
+      originFailures: sources
+        .filter((candidate): candidate is BugTicket => candidate.type === 'bug')
+        .map((candidate) => candidate.failure),
       contractDelta: input.contractDelta,
       implementationPlan: input.implementationPlan,
       verificationGate: input.verificationGate,
@@ -536,10 +614,10 @@ export class TicketWorkflow {
       ? await this.requireTicket(input.parentChangeRequestId)
       : undefined;
     const continuesChain = chainParent?.type === 'change-request' &&
-      chainParent.sourceTicketId === source.id;
-    const sourceObjects = continuesChain
-      ? []
-      : await this.prepareSourceChangeRequest(source, request);
+      sameIds(chainParent.sourceTicketIds, sources.map((candidate) => candidate.id));
+    const sourceObjects = continuesChain ? [] : (await Promise.all(
+      sources.map((candidate) => this.prepareSourceChangeRequest(candidate, request)),
+    )).flat();
     await this.repository.commit([request, ...sourceObjects]);
     return request;
   }
@@ -556,15 +634,29 @@ export class TicketWorkflow {
    */
   private async mergeChangeRequestHop(
     existing: ChangeRequestTicket,
-    source: BugTicket | EnhancementTicket,
+    sources: readonly (BugTicket | EnhancementTicket)[],
     incoming: ChangeRequestTicket['contractDelta'],
+    incomingPropagationStepIds: readonly ObjectId[],
   ): Promise<ChangeRequestTicket> {
     const summaries = dedupeStrings([existing.contractDelta.summary, incoming.summary]);
+    const propagationStepIds = await this.orderStepIds([
+      ...existing.propagationStepIds,
+      ...incomingPropagationStepIds,
+    ]);
     const merged = TicketSchema.parse({
       ...existing,
       ...reviseObjectEnvelope(existing),
-      relatedTicketIds: dedupeStrings([...existing.relatedTicketIds, source.id]),
-      changelistIds: dedupeStrings([...existing.changelistIds, ...source.changelistIds]),
+      relatedTicketIds: dedupeStrings([...existing.relatedTicketIds, ...sources.map((source) => source.id)]),
+      sourceTicketIds: dedupeStrings([...existing.sourceTicketIds, ...sources.map((source) => source.id)]),
+      changelistIds: dedupeStrings([
+        ...existing.changelistIds,
+        ...sources.flatMap((source) => source.changelistIds),
+      ]),
+      originFailures: dedupeFailures([
+        ...existing.originFailures,
+        ...sources.filter((source): source is BugTicket => source.type === 'bug').map((source) => source.failure),
+      ]),
+      propagationStepIds,
       contractDelta: {
         ...existing.contractDelta,
         summary: summaries.join('\n'),
@@ -580,9 +672,60 @@ export class TicketWorkflow {
     // it would be behind a hop of its own, and the `changeRequestTicketIds` back-link is what makes
     // that true — without it the Bug stays schedulable forever and the merge trades one redundant
     // CR for one immortal Bug.
-    const sourceObjects = await this.prepareSourceChangeRequest(source, merged);
+    const incomingSources = sources.filter((source) => !existing.sourceTicketIds.includes(source.id));
+    const sourceObjects = (await Promise.all(
+      incomingSources.map((source) => this.prepareSourceChangeRequest(source, merged)),
+    )).flat();
     await this.repository.commit([merged, ...sourceObjects]);
     return merged;
+  }
+
+  private async orderStepIds(ids: readonly ObjectId[]): Promise<ObjectId[]> {
+    const steps = await Promise.all([...new Set(ids)].map((id) => this.repository.read(id)));
+    return steps
+      .map((object) => {
+        if (object.objectType !== 'step') throw new Error(`CR propagation target ${object.id} is not a Step`);
+        return object;
+      })
+      .sort((left, right) => STEP_TYPE_ORDER[left.type] - STEP_TYPE_ORDER[right.type])
+      .map((step) => step.id);
+  }
+
+  private async validateChangeRequestScope(
+    input: {
+      triggerStepId: ObjectId;
+      sourceStepId: ObjectId;
+      targetStepId: ObjectId;
+      propagationStepIds: readonly ObjectId[];
+    },
+    source: BugTicket | EnhancementTicket,
+  ): Promise<Step> {
+    if (new Set(input.propagationStepIds).size !== input.propagationStepIds.length) {
+      throw new Error('Change Request propagation Steps must be unique');
+    }
+    const ids = [...new Set([
+      input.triggerStepId,
+      input.sourceStepId,
+      ...input.propagationStepIds,
+    ])];
+    const objects = await Promise.all(ids.map((id) => this.repository.read(id)));
+    const steps = new Map<ObjectId, Step>();
+    for (const object of objects) {
+      if (object.objectType !== 'step') {
+        throw new Error(`Change Request scope object ${object.id} is not a Step`);
+      }
+      if (object.projectId !== source.projectId || object.phaseId !== source.phaseId) {
+        throw new Error('Change Request Steps must belong to the source Project and Phase');
+      }
+      steps.set(object.id, object);
+    }
+    const propagation = input.propagationStepIds.map((id) => steps.get(id)!);
+    for (let index = 1; index < propagation.length; index += 1) {
+      if (STEP_TYPE_ORDER[propagation[index - 1]!.type] >= STEP_TYPE_ORDER[propagation[index]!.type]) {
+        throw new Error('Change Request propagation Steps must follow V-model order');
+      }
+    }
+    return steps.get(input.targetStepId)!;
   }
 
   async setSolution(ticketId: ObjectId, solution: TicketSolution): Promise<Ticket> {
@@ -798,7 +941,10 @@ export class TicketWorkflow {
     return changelist;
   }
 
-  async closeVerified(ticketId: ObjectId): Promise<Ticket> {
+  async closeVerified(
+    ticketId: ObjectId,
+    options: { verificationStep?: Step; testOutcomes?: readonly TestOutcome[] } = {},
+  ): Promise<Ticket> {
     let ticket = await this.requireTicket(ticketId);
     if (ticket.state === 'cancelled') {
       throw new Error(`Cancelled Ticket ${ticket.name} must be reopened before verified closure`);
@@ -814,7 +960,33 @@ export class TicketWorkflow {
           `Change Request ${request.name} is missing a verified application for ${request.targetStepId}`,
         );
       }
+      // The last hop of a chain carries its sources to closure, so it must not close while any of
+      // them is unproven: a source Bug whose chain has ended has nothing left that would ever run
+      // its gate. Earlier hops are unaffected — they close on their own Step's evidence.
+      //
+      // Stated as a refusal rather than an exception. The chain is unfinished, not corrupt, and the
+      // next hop or the reopened Step can still complete it.
+      const finalPropagationHop = request.propagationStepIds.at(-1) === request.targetStepId;
+      if (finalPropagationHop) {
+        const sources = await Promise.all(
+          request.sourceTicketIds.map((sourceTicketId) => this.requireTicket(sourceTicketId)),
+        );
+        const unproven = sources.some((source) =>
+          source.type === 'bug' &&
+          source.state !== 'closed' &&
+          source.state !== 'cancelled' &&
+          !bugVerificationProven(source, options.verificationStep, options.testOutcomes ?? []));
+        if (unproven) return ticket;
+      }
     }
+    // The invariant this enforces is that a Bug never closes on an unreplayed failure. It is stated
+    // as a refusal to close rather than as an exception: callers reach here from ordinary flow, and
+    // an unfinished Bug is a state the run recovers from, not one it should die on.
+    if (
+      ticket.type === 'bug' &&
+      ticket.state !== 'closed' &&
+      !bugVerificationProven(ticket, options.verificationStep, options.testOutcomes ?? [])
+    ) return ticket;
     if (ticket.solution?.status !== 'verified') {
       throw new Error(`Ticket ${ticket.name} cannot close without a verified solution`);
     }
@@ -833,19 +1005,33 @@ export class TicketWorkflow {
     }
 
     if (ticket.type === 'change-request') {
-      let source = await this.requireTicket(ticket.sourceTicketId);
-      // Only a corrective chain resolves its source on closure. A dependency request is opened by
-      // the Story that needed packages: nothing about that Story is being repaired, and it carries
-      // no implementation solution to mark verified.
-      if (source.type !== 'bug' && source.type !== 'enhancement') return ticket;
-      const openSibling = (await this.list()).some((candidate) =>
-        candidate.type === 'change-request' &&
-        candidate.sourceTicketId === source.id &&
-        candidate.id !== ticket.id &&
-        candidate.state !== 'closed' &&
-        candidate.state !== 'cancelled',
-      );
-      if (!openSibling) {
+      const finalPropagationHop = ticket.propagationStepIds.at(-1) === ticket.targetStepId;
+      if (!finalPropagationHop) {
+        await this.blockers.release(ticket);
+        return ticket;
+      }
+      for (const sourceTicketId of ticket.sourceTicketIds) {
+        let source = await this.requireTicket(sourceTicketId);
+        // Only a corrective chain resolves its sources on closure. A dependency request is opened by
+        // the Story that needed packages: nothing about that Story is being repaired.
+        if (source.type !== 'bug' && source.type !== 'enhancement') continue;
+        const openSibling = (await this.list()).some((candidate) =>
+          candidate.type === 'change-request' &&
+          candidate.sourceTicketIds.includes(source.id) &&
+          candidate.id !== ticket.id &&
+          candidate.state !== 'closed' &&
+          candidate.state !== 'cancelled',
+        );
+        if (openSibling) continue;
+        // An unproven Bug is left open rather than closed or thrown over. Its Story stays blocked,
+        // the work stays visible, and the next chain that reaches its proving Step can still finish
+        // it. Ending the run here would have destroyed a recoverable state over unfinished work.
+        if (
+          source.type === 'bug' &&
+          source.state !== 'closed' &&
+          source.state !== 'cancelled' &&
+          !bugVerificationProven(source, options.verificationStep, options.testOutcomes ?? [])
+        ) continue;
         if (!source.solution) {
           throw new Error(`Source Ticket ${source.name} has no implementation solution`);
         }
@@ -860,11 +1046,154 @@ export class TicketWorkflow {
             updatedAt: new Date().toISOString(),
           });
         }
-        await this.closeVerified(source.id);
+        await this.closeVerified(source.id, options);
       }
     }
     await this.blockers.release(ticket);
     return ticket;
+  }
+
+  /** Parks a repaired corrective Ticket until the original verifier reruns, without blocking it. */
+  async awaitVerification(ticketId: ObjectId): Promise<Ticket> {
+    let ticket = await this.requireTicket(ticketId);
+    if (ticket.type !== 'bug' && ticket.type !== 'enhancement') {
+      throw new Error(`Ticket ${ticket.name} cannot wait for corrective verification`);
+    }
+    if (ticket.state === 'in_progress') {
+      ticket = await this.lifecycle.transition(ticket, 'pending', {
+        pendingReason: ticket.type === 'bug' ? 'defect' : 'quality-gap',
+        reasonCode: 'ticket.awaiting_original_verification',
+        reason: `${ticket.name} is repaired and awaits its original verification gate.`,
+        evidenceRefs: ticket.changelistIds,
+      });
+    }
+    await this.blockers.release(ticket);
+    return ticket;
+  }
+
+  /** Persists exact verification at the Step where it happened while later CR impact work continues. */
+  async recordBugVerification(
+    ticketId: ObjectId,
+    step: Step,
+    testOutcomes: readonly TestOutcome[],
+    qualityAssessmentId: ObjectId,
+  ): Promise<BugTicket> {
+    const ticket = await this.requireTicket(ticketId);
+    if (ticket.type !== 'bug') throw new Error(`Ticket ${ticket.name} is not a Bug`);
+    if (!bugVerificationSatisfied(ticket, step, testOutcomes)) return ticket;
+    const identityKey = failureIdentityKey(ticket.failure.identity);
+    if (ticket.verificationRecords.some((record) =>
+      record.failureIdentityKey === identityKey && record.qualityAssessmentId === qualityAssessmentId)) {
+      return ticket;
+    }
+    const updated = TicketSchema.parse({
+      ...ticket,
+      ...reviseObjectEnvelope(ticket),
+      verificationRecords: [
+        ...ticket.verificationRecords,
+        {
+          failureIdentityKey: identityKey,
+          verificationStepId: step.id,
+          verificationStepType: step.type,
+          qualityAssessmentId,
+          executedTestSelectors: passedTestSelectors(step, testOutcomes),
+          recordedAt: new Date().toISOString(),
+        },
+      ],
+    }) as BugTicket;
+    await this.repository.commit([
+      updated,
+      createDomainEvent({
+        projectId: ticket.projectId,
+        aggregate: { id: ticket.id, objectType: 'ticket' },
+        eventType: 'ticket.bug_verification_recorded',
+        payload: {
+          verificationStepId: step.id,
+          qualityAssessmentId,
+          failureIdentityKey: identityKey,
+        },
+        phaseId: ticket.phaseId,
+        stepId: step.id,
+        ticketId: ticket.id,
+        correlationId: ticket.source.correlationId,
+        causationId: qualityAssessmentId,
+        objectRevision: updated.revision,
+      }),
+    ]);
+    return updated;
+  }
+
+  /** Closes corrections discovered inside a CR only when that CR reruns their original gate. */
+  /** Closes corrections discovered inside a CR only when that CR reruns their original gate. */
+  /**
+   * Closes Bugs parked for a verification that this Step just performed.
+   *
+   * A Bug handed to the Change Request under repair has no chain of its own, so no hop of its own
+   * will ever prove it. Its contract names exactly one Step, and when that Step runs — whoever is
+   * running it — the proof exists. Matching on the contract rather than on parentage is what lets a
+   * Bug parked by one chain be closed by the chain that actually reached its gate.
+   */
+  async closeBugsProvenAt(
+    projectId: ObjectId,
+    step: Step,
+    testOutcomes: readonly TestOutcome[],
+    verification: readonly string[],
+  ): Promise<ObjectId[]> {
+    if (testOutcomes.length === 0) return [];
+    const parked = (await this.list()).filter((ticket): ticket is BugTicket =>
+      ticket.type === 'bug' &&
+      ticket.projectId === projectId &&
+      ticket.state !== 'closed' &&
+      ticket.state !== 'cancelled' &&
+      ticket.duplicateOfTicketId === undefined &&
+      ticket.verificationContract.verificationStepId === step.id &&
+      bugVerificationSatisfied(ticket, step, testOutcomes));
+    const closed: ObjectId[] = [];
+    for (let bug of parked) {
+      const openChain = (await this.list()).some((candidate) =>
+        candidate.type === 'change-request' &&
+        candidate.sourceTicketIds.includes(bug.id) &&
+        candidate.state !== 'closed' &&
+        candidate.state !== 'cancelled');
+      const solution = bug.solution;
+      if (openChain || !solution) continue;
+      bug = await this.recordBugVerification(bug.id, step, testOutcomes, step.qualityAssessmentId ?? bug.id);
+      bug = await this.setSolution(bug.id, {
+        ...solution,
+        status: 'verified',
+        verification: [...new Set([...solution.verification, ...verification])],
+        updatedAt: new Date().toISOString(),
+      }) as BugTicket;
+      await this.closeVerified(bug.id, { verificationStep: step, testOutcomes });
+      closed.push(bug.id);
+    }
+    return closed;
+  }
+
+  async verifyCorrectionsRaisedBy(
+    parentChangeRequestId: ObjectId,
+    step: Step,
+    testOutcomes: readonly TestOutcome[],
+    verification: readonly string[],
+  ): Promise<ObjectId[]> {
+    const candidates = (await this.list()).filter((ticket) =>
+      ticket.parentTicketId === parentChangeRequestId &&
+      ticket.state !== 'closed' &&
+      ticket.state !== 'cancelled' &&
+      (ticket.type === 'bug' || ticket.type === 'enhancement'));
+    const closed: ObjectId[] = [];
+    for (let ticket of candidates) {
+      if (!ticket.solution) continue;
+      ticket = await this.setSolution(ticket.id, {
+        ...ticket.solution,
+        status: 'verified',
+        verification: [...new Set([...ticket.solution.verification, ...verification])],
+        updatedAt: new Date().toISOString(),
+      });
+      await this.closeVerified(ticket.id, { verificationStep: step, testOutcomes });
+      closed.push(ticket.id);
+    }
+    return closed;
   }
 
   /**
@@ -938,13 +1267,13 @@ export class TicketWorkflow {
         // cannot be reached is one edge further out than the blocker itself. Releasing only the
         // direct Story-to-hop edge left the same Phase idle: the Story was still parked behind the
         // Bug, and the Bug was still waiting for the hop that needed the Story.
-        // Hops are found through each Change Request's own `sourceTicketId`, the direction the
+        // Hops are found through each Change Request's own source Ticket ids, the direction the
         // closure cascade already trusts. The back-reference on the source is a denormalized copy
         // and had drifted in the live run: the hop holding the Phase was absent from it.
         const hops = blocker.type === 'change-request'
           ? [blocker]
           : tickets.filter((hop): hop is ChangeRequestTicket =>
-            hop.type === 'change-request' && hop.sourceTicketId === blocker.id);
+            hop.type === 'change-request' && hop.sourceTicketIds.includes(blocker.id));
         const unreachable = hops.some((hop) => {
           if (hop.state === 'closed' || hop.state === 'cancelled') return false;
           const target = steps.get(hop.targetStepId);
@@ -975,11 +1304,44 @@ export class TicketWorkflow {
   }
 
   async reconcileClosedCorrectiveTickets(projectId: ObjectId): Promise<void> {
-    const closed = (await this.list()).filter((ticket) =>
+    const tickets = await this.list();
+    const closed = tickets.filter((ticket) =>
       ticket.projectId === projectId &&
       ticket.state === 'closed' &&
       (ticket.type === 'change-request' || ticket.type === 'bug' || ticket.type === 'enhancement'));
     for (const ticket of closed) await this.closeVerified(ticket.id);
+    for (const original of tickets) {
+      if (
+        original.projectId !== projectId ||
+        (original.state !== 'closed' && original.state !== 'cancelled') ||
+        original.duplicateTicketIds.length === 0
+      ) continue;
+      for (const duplicateId of original.duplicateTicketIds) {
+        await this.cancelDuplicate(duplicateId, original.id);
+      }
+    }
+  }
+
+  private async cancelDuplicate(ticketId: ObjectId, originalId: ObjectId): Promise<void> {
+    const ticket = await this.requireTicket(ticketId);
+    if (ticket.state === 'cancelled' || ticket.state === 'closed') return;
+    // A stale or crossed link is skipped, not thrown over: this runs inside a sweep across every
+    // corrective Ticket in the Project, and one inconsistent pair must not abort the reconciliation
+    // for all the others.
+    if (ticket.duplicateOfTicketId !== originalId) return;
+    const actors = await this.repository.list({ objectType: 'actor-registration', projectId: ticket.projectId });
+    const pm = actors.find((object) => object.objectType === 'actor-registration' &&
+      object.role === 'project-manager' && object.state === 'active');
+    if (!pm || pm.objectType !== 'actor-registration') {
+      throw new Error(`Project ${ticket.projectId} has no active Project Manager for duplicate reconciliation`);
+    }
+    const cancelled = await this.lifecycle.transition(ticket, 'cancelled', {
+      initiatorActorId: pm.id,
+      reasonCode: 'pm.duplicate_followed_original_terminal',
+      reason: `Duplicate ${ticket.name} cancelled after authoritative Ticket ${originalId} became terminal.`,
+      evidenceRefs: [originalId],
+    });
+    await this.blockers.release(cancelled);
   }
 
   async cancelUnresolved(ticketId: ObjectId): Promise<Ticket> {
@@ -1151,4 +1513,51 @@ export function verificationStepTypeForFailure(type: StepType): StepType {
 
 function dedupeStrings<T extends string>(values: readonly T[]): T[] {
   return [...new Set(values.filter((value) => value.trim().length > 0))];
+}
+
+function sameIds(left: readonly ObjectId[], right: readonly ObjectId[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((id, index) => id === sortedRight[index]);
+}
+
+function dedupeFailures(
+  failures: readonly ChangeRequestTicket['originFailures'][number][],
+): ChangeRequestTicket['originFailures'] {
+  const seen = new Set<string>();
+  return failures.filter((failure) => {
+    const key = failureIdentityKey(failure.identity);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function assertBugContractInput(input: {
+  failedStep: Step;
+  targetStep: Step;
+  verificationStep: Step;
+  category: BugTicket['failure']['category'];
+  code: string;
+  identity: FailureIdentity;
+  verificationContract: BugVerificationContract;
+}): void {
+  const identity = input.identity;
+  if (
+    identity.category !== input.category ||
+    identity.code !== input.code ||
+    identity.failedStepId !== input.failedStep.id ||
+    identity.targetStepId !== input.targetStep.id ||
+    identity.verificationStepId !== input.verificationStep.id
+  ) {
+    throw new Error('Bug failure identity does not match its persisted failure and Step routing contract');
+  }
+  const verification = input.verificationContract;
+  if (
+    verification.verificationStepId !== input.verificationStep.id ||
+    verification.verificationStepType !== input.verificationStep.type
+  ) {
+    throw new Error('Bug verification contract does not match its verification Step');
+  }
 }

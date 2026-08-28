@@ -11,6 +11,7 @@ import { MergeGateService } from '../../src/application/workspace/merge_gate_ser
 import { TicketDistillationService } from '../../src/application/context/ticket_distillation_service.js';
 import { ContextService } from '../../src/application/context/context_service.js';
 import { TicketWorkflow } from '../../src/application/project_management/ticket_workflow.js';
+import { bugContracts } from '../helpers/ticket_fixtures.js';
 import { GitRepositoryService } from '../../src/infrastructure/git/git_repository_service.js';
 import { DomainObjectRepository } from '../../src/infrastructure/repository/domain_object_repository.js';
 import { DebugWiki } from '../../src/core/debug_wiki.js';
@@ -306,6 +307,9 @@ async function openBug(world: Awaited<ReturnType<typeof fixture>>): Promise<Tick
     switchProvider: false,
     rawEvidenceRef: '.xcompiler/failures/unit.log',
     correlationId: createObjectId(),
+    ...bugContracts(unit, world.coding, unit, {
+      category: 'test', code: 'parser_drops_source',
+    }),
   });
 }
 

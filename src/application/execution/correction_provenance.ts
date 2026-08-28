@@ -30,11 +30,10 @@ export function directCorrectionOrigin(
     return plan.steps.find((step) => step.id === ticket.stepId);
   }
   if (ticket.type === 'change-request') {
-    if (ticket.originFailure) {
-      return {
-        id: ticket.originFailure.failedStepId,
-        phase: ticket.originFailure.failedStepType,
-      };
+    if (ticket.originFailures.length > 0) {
+      return ticket.originFailures
+        .map((failure) => ({ id: failure.failedStepId, phase: failure.failedStepType }))
+        .sort((left, right) => PHASE_ORDER[right.phase] - PHASE_ORDER[left.phase])[0];
     }
     return plan.steps.find((step) => step.id === ticket.triggerStepId);
   }
@@ -87,7 +86,7 @@ function correctionParentIds(ticket: Ticket): ObjectId[] {
     if (ticket.sourceBugTicketId) ids.push(ticket.sourceBugTicketId);
   }
   if (ticket.type === 'change-request') {
-    ids.push(ticket.sourceTicketId);
+    ids.push(...ticket.sourceTicketIds);
     if (ticket.parentChangeRequestId) ids.push(ticket.parentChangeRequestId);
   }
   return [...new Set(ids)];

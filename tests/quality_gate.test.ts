@@ -17,6 +17,7 @@ describe('LLM quality evidence normalization', () => {
       findings: [
         {
           category: 'test-defect',
+          code: 'supplement_assertion_contract_conflict',
           summary: 'The supplemental assertion contradicts the accepted contract.',
           evidence: ['tests/verification/p1/unit-test/s005/risk.test.ts:18'],
           target: 'current-step',
@@ -24,6 +25,7 @@ describe('LLM quality evidence normalization', () => {
         },
         {
           category: 'product-defect',
+          code: 'implementation_status_incorrect',
           summary: 'The implementation returns the wrong status.',
           evidence: ['expected=ready actual=pending'],
           target: 'code',

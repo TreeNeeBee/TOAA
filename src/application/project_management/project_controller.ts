@@ -32,7 +32,8 @@ import { ProjectStateService } from './project_state_service.js';
 import { GovernanceService } from './governance_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
 import type { AttemptFailure } from '../execution/failure_classification.js';
-import { WorkScheduler, type ScheduledWork } from './work_scheduler.js';
+import type { TestOutcome } from '../execution/test_outcome.js';
+import { WorkScheduler, workModeFor, type ScheduledWork } from './work_scheduler.js';
 import { CorrectiveWorkflowService } from './corrective_workflow_service.js';
 import {
   ProjectManagerIntakeService,
@@ -79,6 +80,7 @@ export class ProjectController {
   }
 
   async start(work: ScheduledWork): Promise<ScheduledWork> {
+    const mode = workModeFor(work.ticket);
     let ticket = await this.requireTicket(work.ticket.id);
     if (ticket.attempts >= ticket.maxAttempts) {
       ticket = await this.extendConvergingTicket(ticket);
@@ -107,8 +109,8 @@ export class ProjectController {
       ticket = await this.saveTicketTransition(ticket, 'in_progress');
     }
     if (ticket.type === 'story') await this.startTasks(ticket);
-    await this.checkpoint(step, `Started ${work.mode} work through ${ticket.name}`);
-    return { phase, step: await this.requireStep(step.id), ticket, mode: work.mode };
+    await this.checkpoint(step, `Started ${mode} work through ${ticket.name}`);
+    return { phase, step: await this.requireStep(step.id), ticket };
   }
 
   private async extendConvergingTicket(ticket: Ticket): Promise<Ticket> {
@@ -250,7 +252,7 @@ export class ProjectController {
   }
 
   async deliverNormal(work: ScheduledWork, qualityAssessmentId: ObjectId): Promise<void> {
-    if (work.mode !== 'normal' || work.ticket.type !== 'story') {
+    if (work.ticket.type !== 'story') {
       throw new Error('deliverNormal requires normal Story work');
     }
     let step = await this.requireStep(work.step.id);
@@ -285,7 +287,7 @@ export class ProjectController {
     message: string;
     summary: string;
     failure: AttemptFailure;
-    bugKind?: BugTicket['bugKind'];
+    bugKind: BugTicket['bugKind'];
     rawEvidenceRef?: string;
     tool?: string;
     exitCode?: number;
@@ -298,6 +300,8 @@ export class ProjectController {
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
     workspaceBinding?: TicketWorkspaceBinding;
+    testOutcomes?: readonly TestOutcome[];
+    affectedArtifacts?: readonly string[];
   }): Promise<BugTicket> {
     return this.corrective.routeFailure(input);
   }
@@ -359,7 +363,8 @@ export class ProjectController {
     commit?: string;
     verification?: string[];
     application?: ChangeRequestApplicationDecision;
-  }): Promise<{ closed: boolean; sourceTicketId?: ObjectId; sourceTicketType?: 'bug' | 'enhancement' }> {
+    testOutcomes?: readonly TestOutcome[];
+  }): ReturnType<CorrectiveWorkflowService['completeChangeRequestStep']> {
     return this.corrective.completeChangeRequestStep(input);
   }
 

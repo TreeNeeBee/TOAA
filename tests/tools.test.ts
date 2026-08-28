@@ -628,6 +628,10 @@ describe('runTestsTool / runPythonTool summary', () => {
     expect(r.summary).toMatch(/pytest exit=1/);
     expect(r.summary).toMatch(/assert 3 == 4/); // 真实失败行必须出现在 LLM 可见的 summary 里
     expect(r.summary).toMatch(/stdout/);
+    expect(r.data).toMatchObject({
+      effectiveArgs: ['-v', 'tests/'],
+      failedTests: ['tests/test_foo.py::test_x'],
+    });
   });
 
   it('keeps summary terse on success (no stdout flood)', async () => {
