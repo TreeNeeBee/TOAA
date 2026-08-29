@@ -230,6 +230,76 @@ describe('TicketWorkflow', () => {
     expect(closedBug.objectType === 'ticket' && closedBug.solution?.status).toBe('verified');
   });
 
+  it('reports only Bugs as verified resolutions, never an Enhancement raised inside the CR', async () => {
+    // Both types close in this sweep, but the caller feeds the returned ids to the verified-Bug
+    // knowledge base, which refuses anything else. A live run raised an Enhancement inside a Change
+    // Request, closed it here, handed its id on, and the throw ended the run after S005 had already
+    // delivered its work.
+    const { graph, repository, workflow, registration } = await setup();
+    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
+    const coding = graph.steps.find((step) => step.type === 'CODE')!;
+    const tester = graph.actors.find((actor) => actor.role === 'tester')!.id;
+    const enhancement = await workflow.openEnhancement({
+      creatorActorId: tester,
+      sourceStep: unit,
+      targetStep: coding,
+      verificationStep: unit,
+      kind: 'test-incomplete',
+      finding: 'Boundary branches are not covered.',
+      correlationId: createObjectId(),
+    });
+    await registration.routeAndAssign(enhancement.id);
+    await workflow.setSolution(enhancement.id, {
+      status: 'applied',
+      approach: 'Add the missing boundary implementation and tests.',
+      rationale: 'Coverage is below the approved KPI.',
+      changes: ['src/service.ts'],
+      verification: [],
+      updatedAt: new Date().toISOString(),
+    });
+    const request = await workflow.openChangeRequest({
+      creatorActorId: tester,
+      sourceTicketIds: [enhancement.id],
+      triggerStepId: unit.id,
+      sourceStepId: unit.id,
+      targetStepId: coding.id,
+      propagationStepIds: [coding.id],
+      contractDelta: {
+        summary: 'Cover the boundary branches.',
+        before: ['uncovered'], after: ['covered'], affectedArtifacts: ['src/service.ts'],
+      },
+      implementationPlan: ['Add the branch tests.'],
+      verificationGate: ['coverage meets the KPI'],
+    });
+    // The Enhancement is raised inside the CR and carries a solution, so the sweep reaches it.
+    const raised = await workflow.openEnhancement({
+      creatorActorId: tester,
+      sourceStep: unit,
+      targetStep: coding,
+      verificationStep: unit,
+      kind: 'test-incomplete',
+      finding: 'The renderer branch is still uncovered.',
+      correlationId: createObjectId(),
+      parentChangeRequestId: request.id,
+    });
+    await registration.routeAndAssign(raised.id);
+    await workflow.setSolution(raised.id, {
+      status: 'applied',
+      approach: 'Cover the renderer branch.',
+      rationale: 'Reported by the unit gate.',
+      changes: ['tests/renderer.test.ts'],
+      verification: [],
+      updatedAt: new Date().toISOString(),
+    });
+
+    const verified = await workflow.verifyCorrectionsRaisedBy(
+      request.id, unit, [passedTestOutcome(unit, ['tests/renderer.test.ts'])], ['coverage restored'],
+    );
+    expect(verified).not.toContain(raised.id);
+    const closed = await repository.read(raised.id);
+    expect(closed.objectType === 'ticket' && closed.state).toBe('closed');
+  });
+
   it('refuses to close a CR until its own Step has verified evidence', async () => {
     const { graph, repository, workflow, registration } = await setup();
     const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;

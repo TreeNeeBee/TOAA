@@ -1181,6 +1181,9 @@ export class TicketWorkflow {
       ticket.state !== 'closed' &&
       ticket.state !== 'cancelled' &&
       (ticket.type === 'bug' || ticket.type === 'enhancement'));
+    // Only the Bugs. Both types close here, but the caller feeds this list to the verified-Bug
+    // knowledge base, which refuses anything else — an Enhancement id reaching it threw and took the
+    // whole run down after S005 had already delivered.
     const closed: ObjectId[] = [];
     for (let ticket of candidates) {
       if (!ticket.solution) continue;
@@ -1191,7 +1194,7 @@ export class TicketWorkflow {
         updatedAt: new Date().toISOString(),
       });
       await this.closeVerified(ticket.id, { verificationStep: step, testOutcomes });
-      closed.push(ticket.id);
+      if (ticket.type === 'bug') closed.push(ticket.id);
     }
     return closed;
   }
