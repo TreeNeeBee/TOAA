@@ -1,3 +1,4 @@
+import { renderExecutionPromptPolicy } from '../src/agents/prompt_policy.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -5276,5 +5277,16 @@ describe('repeat-verification ticket carries the owed outputs', () => {
     // The shape was always reported; the cause is what the ticket used to lose.
     expect(result.error).toMatch(/tests\/test_main\.py/u);
     expect(result.error).toMatch(/docs\/tests\/unit-test-plan\.md/u);
+  });
+});
+
+describe('debug prompt completion contract', () => {
+  it('states the completion evidence rule inside the DEBUG block', () => {
+    // The contract rejects done=true with actions=[] and no qualityAssessment, but the DEBUG block
+    // never said so: a live run lost 36 Debugger turns across two models to that omission, each one
+    // declaring the repair finished and being refused, so the Bug could never propagate.
+    const debugBlock = renderExecutionPromptPolicy({ debug: true, changeRequest: false });
+    expect(debugBlock).toMatch(/DEBUG mode/u);
+    expect(debugBlock).toMatch(/done=true with actions=\[\] is rejected unless[\s\S]*qualityAssessment/u);
   });
 });
