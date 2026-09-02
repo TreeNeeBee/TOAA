@@ -45,7 +45,7 @@ export interface AttemptTransitionEvent {
 }
 
 export type AttemptDisposition =
-  | { action: 'continue' }
+  | { action: 'continue'; integrate?: boolean }
   | { action: 'stop'; reason: string };
 
 export class AttemptResultProcessor {
@@ -130,6 +130,27 @@ export class AttemptResultProcessor {
         application: result.changeRequestDisposition,
         testOutcomes: result.testOutcomes,
       });
+      if (completion.status === 'awaiting-verification') {
+        const reason = await this.options.controller.recordChangeRequestVerificationFailure({
+          work,
+          unprovenBugTicketIds: completion.unprovenBugTicketIds ?? [],
+          testOutcomes: result.testOutcomes,
+        });
+        await this.options.audit.event('note', `${work.step.name} Change Request verification incomplete`, {
+          messageId: 'domain.change_request_verification_incomplete',
+          projectId: work.step.projectId,
+          phaseId: phase.id,
+          stepId: work.step.id,
+          stepName: work.step.name,
+          ticketId: work.ticket.id,
+          reason,
+          unprovenBugTicketIds: completion.unprovenBugTicketIds ?? [],
+        });
+        // The candidate commit remains in its Ticket worktree for the next bounded attempt, but it
+        // is neither merged nor presented as a delivered Step until the immutable Bug contract is
+        // replayed successfully.
+        return { action: 'continue', integrate: false };
+      }
       if (completion.closed) {
         for (const ticketId of completion.verifiedBugTicketIds ?? []) {
           await this.options.recordVerifiedBugResolution?.(ticketId);
@@ -249,8 +270,31 @@ export class AttemptResultProcessor {
       ...(result.gateFindings ?? []),
       ...(result.assessment?.findings ?? []),
     ]);
-    if (gateFindings.length > 0 && (mode === 'normal' || mode === 'change-request')) {
-      await this.routeGateFindings(phase, work, steps, result, gateFindings);
+    // A corrective role can discover that an accepted artifact owned by another Step is deficient.
+    // That is independent work, not another attempt at the current Bug. Route only cross-Step
+    // quality gaps here; same-Step findings remain feedback for the current corrective Ticket, and
+    // nested product/test defects keep their existing Bug recurrence semantics.
+    const routableGateFindings = gateFindings.filter((finding) => {
+      if (mode === 'normal') return true;
+      const targetsAnotherStep = resolveFindingTarget(steps, work.step, finding).id !== work.step.id;
+      if (mode === 'change-request') return !isQualityGapFinding(finding) || targetsAnotherStep;
+      return isQualityGapFinding(finding) && targetsAnotherStep;
+    });
+    if (routableGateFindings.length > 0) {
+      await this.routeGateFindings(phase, work, steps, result, routableGateFindings);
+      return { action: 'continue' };
+    }
+    if (
+      mode !== 'normal' &&
+      gateFindings.length > 0 &&
+      gateFindings.every((finding) =>
+        isQualityGapFinding(finding) &&
+        resolveFindingTarget(steps, work.step, finding).id === work.step.id
+      )
+    ) {
+      // The current corrective Ticket already is the unit of work for this deficiency. Opening an
+      // Enhancement beneath it reproduces the same evidence and blocks the parent behind itself.
+      // Keep the finding as retry feedback and let the current owner finish the accepted repair.
       return { action: 'continue' };
     }
     // A verifier that disproves the active CR diagnosis has identified a concrete test/contract
@@ -420,6 +464,22 @@ export class AttemptResultProcessor {
     const queued: Array<{ id: ObjectId; order: number }> = [];
     for (const finding of findings) {
       const target = resolveFindingTarget(steps, work.step, finding);
+      if (finding.category === 'change-request') {
+        const routed = await this.options.controller.routeContractChange({
+          reportingStepId: work.step.id,
+          targetStepId: target.id,
+          summary: finding.summary,
+          evidence: finding.evidence,
+          expected: finding.scene?.scenario.expected ?? finding.summary,
+          affectedArtifacts: finding.affectedArtifacts ?? [],
+          creatorActorId,
+          correlationId: work.ticket.source.correlationId,
+          sourceKind: work.ticket.source.kind,
+          sourceExternalId: work.ticket.source.externalId,
+        });
+        queued.push({ id: routed.id, order: STEP_TYPE_ORDER[target.type] });
+        continue;
+      }
       if (finding.category === 'dependency') {
         const routed = await this.options.controller.routeDependencyChange({
           requestingStepId: work.step.id,
@@ -475,6 +535,7 @@ export class AttemptResultProcessor {
             ? 'functional-gap'
             : 'quality-shortfall',
         qualityAssessmentId: result.assessment?.id,
+        sourceBugTicketId: work.ticket.type === 'bug' ? work.ticket.id : undefined,
         correlationId: work.ticket.source.correlationId,
         causationId: work.ticket.id,
         parentChangeRequestId: mode === 'change-request' ? work.ticket.id : undefined,
@@ -652,6 +713,12 @@ function resolveFindingTarget(
   const target = steps.find((step) => step.type === type);
   if (!target) throw new Error(`Gate finding target ${type} is not materialized in this Phase`);
   return target;
+}
+
+function isQualityGapFinding(finding: DeliveryGateFinding): boolean {
+  return finding.category === 'test-incomplete' ||
+    finding.category === 'quality-shortfall' ||
+    finding.category === 'deliverable-defect';
 }
 
 function deduplicateGateFindings(findings: readonly DeliveryGateFinding[]): DeliveryGateFinding[] {

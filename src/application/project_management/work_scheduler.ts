@@ -166,6 +166,10 @@ export class WorkScheduler {
 function activeCorrectiveTickets(step: Step, tickets: readonly Ticket[]): Ticket[] {
   return tickets
     .filter((ticket) => isActiveTicket(ticket))
+    // Resolved work is finished and waiting for a verdict, so it is not work to hand out. Offering
+    // the Step again re-runs a repair that already landed and the Ticket comes straight back: a live
+    // run spent three cycles there before anyone noticed it was the same repair each time.
+    .filter((ticket) => ticket.state !== 'resolved')
     .filter((ticket) => ticket.duplicateOfTicketId === undefined)
     .filter((ticket) => ticket.blockedByTicketIds.length === 0)
     .filter((ticket) =>

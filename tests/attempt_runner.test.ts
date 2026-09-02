@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { renderDebugBriefForPrompt } from '../src/core/debug_brief.js';
 import {
   reconcileMeasuredQualityAssessment,
@@ -28,6 +31,7 @@ import type { Plan, Step } from '../src/core/plan.js';
 import type { Ticket } from '../src/domain/tickets/ticket.js';
 import { getLanguageProfile } from '../src/core/language.js';
 import { computeIncrementalAllowedWrites } from '../src/application/execution/execution_context.js';
+import { Workspace } from '../src/workspace/workspace.js';
 
 describe('corrective write scope', () => {
   it('limits a focused Enhancement to its structured affected test artifact', () => {
@@ -70,7 +74,7 @@ describe('corrective write scope', () => {
     const coding = {
       ...plan.steps[0]!,
       phase: 'CODE' as const,
-      outputs: ['src/cli.ts', 'src/scrapers/baidu.ts'],
+      outputs: ['src/cli.ts', 'src/upstream/primary.ts'],
     };
 
     const allowed = computeIncrementalAllowedWrites(
@@ -84,7 +88,7 @@ describe('corrective write scope', () => {
     );
 
     expect(allowed).not.toEqual([]);
-    expect(allowed).toEqual(expect.arrayContaining(['src/cli.ts', 'src/scrapers/baidu.ts']));
+    expect(allowed).toEqual(expect.arrayContaining(['src/cli.ts', 'src/upstream/primary.ts']));
     // The floor is the Step's own outputs, never the artifacts it does not own.
     expect(allowed).not.toContain('docs/05-unit-test.md');
   });
@@ -304,7 +308,7 @@ describe('attempt failure classification', () => {
     )).toBe('infrastructure');
     expect(classifyAttemptFailure('OpenAI stream idle before first token for 60000ms; aborting'))
       .toBe('infrastructure');
-    expect(classifyAttemptFailure('run_tests failed: external news API returned HTTP 429'))
+    expect(classifyAttemptFailure('run_tests failed: external upstream API returned HTTP 429'))
       .toBe('execution');
   });
 
@@ -363,11 +367,11 @@ describe('attempt retry feedback', () => {
         tool: 'run_tests',
         ok: false,
         error: 'npm test exit=1',
-        summary: 'npm test exit=1\nFAIL tests/modules/scrapers.test.ts\nAssertionError: invalid matcher',
+        summary: 'npm test exit=1\nFAIL tests/modules/upstream.test.ts\nAssertionError: invalid matcher',
       }],
     });
 
-    expect(failure).toContain('FAIL tests/modules/scrapers.test.ts');
+    expect(failure).toContain('FAIL tests/modules/upstream.test.ts');
     expect(failure).toContain('AssertionError: invalid matcher');
   });
 
@@ -406,7 +410,7 @@ describe('attempt retry feedback', () => {
   it('places the latest rolled-back failure before the original Bug context', () => {
     const evidence = prioritizeAttemptFailureEvidence(
       'Original failure: runPipeline is not a function',
-      'Latest failure: expected zhihu to be baidu after the interface repair',
+      'Latest failure: expected secondary to be primary after the interface repair',
     );
 
     expect(evidence.indexOf('Latest failure')).toBeLessThan(evidence.indexOf('Original failure'));
@@ -424,13 +428,13 @@ describe('attempt retry feedback', () => {
         },
         failureLog: [
           'run_tests: npm test exit=1 args=tests/integration/pipeline.test.ts',
-          "AssertionError: expected 'zhihu' to be 'baidu'",
+          "AssertionError: expected 'secondary' to be 'primary'",
         ].join('\n'),
       },
     } as unknown as DomainLog, 'DETAILED_DESIGN');
 
     expect(feedback).toContain('category: test_failure');
-    expect(feedback).toContain("expected 'zhihu' to be 'baidu'");
+    expect(feedback).toContain("expected 'secondary' to be 'primary'");
     expect(feedback).not.toContain('This is LLM provider/context infrastructure');
   });
 
@@ -513,6 +517,90 @@ describe('measured test quality evidence', () => {
     expect(result?.metrics.branchCoverage).toBeCloseTo(0.8666);
     expect(result?.metrics.testCasePassRate).toBe(1);
     expect(result?.evidence.at(-1)).toContain('src/cli.ts=0%');
+  });
+
+  it('measures module and contract coverage from validated selectors actually executed by Runtime', () => {
+    const result = reconcileMeasuredQualityAssessment({
+      metrics: { moduleCoverage: 0.2, contractCoverage: 0.1 },
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['model could not collect V8 coverage'],
+      unavailableMetrics: ['moduleCoverage', 'contractCoverage'],
+      gaps: [],
+      blockedBy: ['coverage provider unavailable'],
+    }, [{
+      tool: 'run_tests',
+      ok: true,
+      summary: 'npm test exit=0\nTests 8 passed (8)',
+      data: {
+        effectiveArgs: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+      },
+    }], {
+      phase: 'MODULE_TEST',
+      architectureModules: [
+        {
+          id: 'M001', name: 'A', responsibility: 'Owns the first product module.',
+          sourcePaths: ['src/a.ts'], testPaths: ['tests/modules/a.test.ts'], dependencies: [],
+        },
+        {
+          id: 'M002', name: 'B', responsibility: 'Owns the second product module.',
+          sourcePaths: ['src/b.ts'], testPaths: ['tests/modules/b.test.ts'], dependencies: [],
+        },
+      ],
+      baselineTestPaths: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+      supplementalTestPaths: [],
+      sourceContracts: [{
+        ok: true,
+        testPaths: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+        valid: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+        invalid: [],
+        references: {
+          'tests/modules/a.test.ts': ['src/a.ts'],
+          'tests/modules/b.test.ts': ['src/b.ts'],
+        },
+      }],
+    });
+
+    expect(result?.metrics).toMatchObject({
+      moduleCoverage: 1,
+      contractCoverage: 1,
+      testCasePassRate: 1,
+    });
+    expect(result?.unavailableMetrics).toEqual([]);
+  });
+
+  it('does not credit a declared module contract that was not in the successful frozen run', () => {
+    const result = reconcileMeasuredQualityAssessment({
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['frozen suite'], unavailableMetrics: [], gaps: [], blockedBy: [],
+    }, [{
+      tool: 'run_tests', ok: true, summary: 'Tests 4 passed (4)',
+      data: { effectiveArgs: ['tests/modules/a.test.ts'] },
+    }], {
+      phase: 'MODULE_TEST',
+      architectureModules: [
+        {
+          id: 'M001', name: 'A', responsibility: 'Owns the first product module.',
+          sourcePaths: ['src/a.ts'], testPaths: ['tests/modules/a.test.ts'], dependencies: [],
+        },
+        {
+          id: 'M002', name: 'B', responsibility: 'Owns the second product module.',
+          sourcePaths: ['src/b.ts'], testPaths: ['tests/modules/b.test.ts'], dependencies: [],
+        },
+      ],
+      baselineTestPaths: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+      supplementalTestPaths: [],
+      sourceContracts: [{
+        ok: true,
+        testPaths: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+        valid: ['tests/modules/a.test.ts', 'tests/modules/b.test.ts'],
+        invalid: [],
+        references: {},
+      }],
+    });
+
+    expect(result?.metrics.moduleCoverage).toBe(0.5);
+    expect(result?.metrics.contractCoverage).toBe(0.5);
   });
 });
 
@@ -620,7 +708,194 @@ describe('manifest delivery', () => {
     expect(deliveredManifest(['src/main.ts', 'docs/02.md'], 'package.json')).toBe(false);
     expect(deliveredManifest([], 'package.json')).toBe(false);
   });
+
+  it('rejects an accepted invalid manifest before invoking another Step role', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-attempt-contract-'));
+    const workspace = new Workspace(tmp);
+    await workspace.writeFile('package.json', JSON.stringify({
+      scripts: { test: 'vitest run --exclude tests/functional.test.ts' },
+    }));
+    const runner = contractRunner(workspace);
+    let assembled = false;
+    (runner as unknown as { assembleContext: () => Promise<never> }).assembleContext = async () => {
+      assembled = true;
+      throw new Error('the role must not be invoked');
+    };
+
+    const result = await runner.run(contractAttempt('REQUIREMENT_ANALYSIS'));
+
+    expect(assembled).toBe(false);
+    expect(result.gateFindings).toEqual([
+      expect.objectContaining({
+        code: 'language_test_entrypoint_contract_invalid',
+        target: 'high-level-design',
+      }),
+    ]);
+  });
+
+  it('lets the owning corrective Step enter before enforcing the contract again on delivery', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-attempt-contract-'));
+    const workspace = new Workspace(tmp);
+    await workspace.writeFile('package.json', JSON.stringify({
+      scripts: { test: 'vitest run --exclude tests/functional.test.ts' },
+    }));
+    const runner = contractRunner(workspace);
+    let assembled = false;
+    (runner as unknown as { assembleContext: () => Promise<never> }).assembleContext = async () => {
+      assembled = true;
+      throw new Error('stop after proving the corrective role was entered');
+    };
+    const input = contractAttempt('HIGH_LEVEL_DESIGN');
+    input.mode = 'enhancement';
+    input.ticket = {
+      ...input.ticket,
+      type: 'enhancement',
+      targetStepId: input.domainStep.id,
+    } as Ticket;
+
+    await runner.run(input);
+
+    expect(assembled).toBe(true);
+  });
+
+  it('still rejects a corrective Step that does not own the invalid contract', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-attempt-contract-'));
+    const workspace = new Workspace(tmp);
+    await workspace.writeFile('package.json', JSON.stringify({
+      scripts: { test: 'vitest run --exclude tests/functional.test.ts' },
+    }));
+    const runner = contractRunner(workspace);
+    let assembled = false;
+    (runner as unknown as { assembleContext: () => Promise<never> }).assembleContext = async () => {
+      assembled = true;
+      throw new Error('the unrelated corrective role must not be invoked');
+    };
+    const input = contractAttempt('DETAILED_DESIGN');
+    input.mode = 'enhancement';
+    input.ticket = {
+      ...input.ticket,
+      type: 'enhancement',
+      targetStepId: input.domainStep.id,
+    } as Ticket;
+
+    const result = await runner.run(input);
+
+    expect(assembled).toBe(false);
+    expect(result.gateFindings?.[0]?.target).toBe('high-level-design');
+  });
+
+  it('rejects an invalid manifest written by HIGH_LEVEL_DESIGN before delivery', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-attempt-contract-'));
+    const workspace = new Workspace(tmp);
+    const runner = contractRunner(workspace);
+    (runner as unknown as { assembleContext: () => Promise<unknown> }).assembleContext = async () => ({
+      assembled: { text: '', debugWikiMatches: [] },
+      debugBrief: undefined,
+    });
+    (runner as unknown as { buildEnvironment: () => Promise<unknown> }).buildEnvironment = async () => ({
+      baselineGateExecution: { mode: 'defer', reason: 'initial-pre-code' },
+      verificationScope: { testArgs: ['tests/module.test.ts'], inheritedFromTicket: false },
+      tools: [], context: {}, snippets: [], hints: [],
+      executor: {
+        run: async () => {
+          await workspace.writeFile('package.json', JSON.stringify({
+            scripts: { test: 'vitest run --exclude tests/functional.test.ts' },
+          }));
+          return {
+            success: true,
+            rounds: 1,
+            toolCalls: [],
+            qualityAssessment: {
+              metrics: {}, tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+              evidence: [], gaps: [],
+            },
+            metrics: {
+              rounds: 1, parseFailures: 0, repeatedTurns: 0, toolFailRatio: 0,
+              progressRatio: 1, healthScore: 1, providers: [],
+            },
+          };
+        },
+      },
+    });
+
+    const result = await runner.run(contractAttempt('HIGH_LEVEL_DESIGN'));
+
+    expect(result.gateFindings?.[0]).toMatchObject({
+      code: 'language_test_entrypoint_contract_invalid',
+      target: 'high-level-design',
+      affectedArtifacts: ['package.json'],
+    });
+  });
 });
+
+function contractRunner(workspace: Workspace): DomainAttemptRunner {
+  const runner = new DomainAttemptRunner({
+    workspace,
+    git: {
+      ensureRepo: async () => {},
+      raw: () => ({
+        status: async () => ({ isClean: () => true, files: [] }),
+        revparse: async () => 'a'.repeat(40),
+      }),
+    },
+    sandbox: {}, router: {}, repository: {}, audit: { event: async () => {} },
+    plugins: { size: 0 }, debugWikiPath: '/tmp/xcompiler-attempt-contract-wiki',
+  } as never, 'typescript');
+  (runner as unknown as { recordTicketRevision: () => Promise<void> }).recordTicketRevision = async () => {};
+  (runner as unknown as {
+    failAttempt: (
+      _scope: unknown,
+      _baseline: string,
+      _input: unknown,
+      failure: Record<string, unknown>,
+    ) => Promise<unknown>;
+  }).failAttempt = async (_scope, _baseline, _input, failure) => ({
+    ok: false,
+    changedFiles: [],
+    wikiEntryIds: [],
+    testOutcomes: [],
+    ...failure,
+  });
+  return runner;
+}
+
+function contractAttempt(phase: Step['phase']): AttemptInput {
+  const step = {
+    id: phase === 'HIGH_LEVEL_DESIGN' ? 'design-id' : 'requirement-id',
+    iterationId: 'P1',
+    phase,
+    title: phase,
+    description: 'Validate the project contract.',
+    systemPrompt: 'Validate the project contract.',
+    role: phase === 'HIGH_LEVEL_DESIGN' ? 'Architect' : 'Planner',
+    tools: ['write_file'],
+    inputs: [],
+    outputs: phase === 'HIGH_LEVEL_DESIGN' ? ['package.json'] : ['docs/01.md'],
+    dependsOn: [],
+    acceptance: 'The contract passes.',
+    maxAttempts: 3,
+  } as Step;
+  return {
+    plan: { ...fixturePlan(), steps: [step] },
+    executionStep: step,
+    domainStep: {
+      ...step,
+      name: phase === 'HIGH_LEVEL_DESIGN' ? 'P1-S002' : 'P1-S001',
+      type: phase,
+      projectId: 'project-id',
+      phaseId: 'phase-id',
+      attempts: 1,
+      agent: phase === 'HIGH_LEVEL_DESIGN' ? 'Architect' : 'Planner',
+    },
+    ticket: {
+      id: 'story-id',
+      type: 'story',
+      logIds: [],
+      source: { correlationId: 'correlation-id' },
+    },
+    mode: 'normal',
+  } as unknown as AttemptInput;
+}
 
 describe('quality gaps a Step does not own', () => {
   const assessment = (gaps: string[]) => ({
@@ -687,7 +962,7 @@ describe('every stream watchdog wording is our infrastructure', () => {
  *
  * A Ticket's own `failure` is the one that opened it, and a repair loop moves through several —
  * unwritten tests, then an import error, then a failing assertion. Keying Debug Wiki retrieval on
- * the opening failure answers the first question for the rest of the Ticket's life: a live dbc4 Bug
+ * the opening failure answers the first question for the rest of the Ticket's life: a live Bug
  * received the same entry 51 times while the entry matching its current `ModuleNotFoundError` never
  * appeared once, and the Ticket ran out of attempts on advice for a problem it had already left.
  */

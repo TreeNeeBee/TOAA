@@ -86,6 +86,18 @@ export function renderExecutionUserPrompt(
         '',
       ].join('\n')
     : '';
+  const phaseDeliveryVerification = input.debugContext?.phaseDeliveryVerification
+    ? [
+        '## Phase delivery verification boundary',
+        `phase: ${input.debugContext.phaseDeliveryVerification.phaseId}`,
+        `finding: ${input.debugContext.phaseDeliveryVerification.findingCode}`,
+        'PM routed a finding captured by the Phase delivery gate to this owning Step.',
+        'Repair the current Step-owned root cause and pass this Step\'s deliverable and baseline gates.',
+        'Do not require the complete live Phase scenario to pass inside this repair attempt. Runtime replays that scenario after the correction propagates through the affected V-model Steps.',
+        'If a replay or exploratory command reveals a different external-source, requirement, dependency, or product failure, preserve that evidence as an independent finding; do not absorb it into this Bug or keep retrying the repaired symptom.',
+        '',
+      ].join('\n')
+    : '';
   const validationContractDefect =
     input.ticket?.type === 'bug' && input.ticket.failure.code === VALIDATION_CONTRACT_DEFECT_CODE
       ? [
@@ -141,10 +153,10 @@ export function renderExecutionUserPrompt(
         'Classify the CR result structurally. Use reasonCategory="contract-applied" only with outcome="applied". For outcome="not-applicable", use exactly one of: "already-aligned", "outside-step-scope", "downstream-owned", or "diagnosis-contradicted".',
         'Ownership constrains that classification: if this Step owns every declared affected artifact, "downstream-owned" is invalid; if it owns any affected artifact, "outside-step-scope" is invalid. For a CR with an immutable original failed gate, "already-aligned" cannot close owned work without a successful executable verification of that failure.',
         'Use "diagnosis-contradicted" when current files or executable evidence disprove the CR diagnosis or reveal that the original test/contract is defective. Runtime will make the discovering role create a Bug and PM will route it using the immutable original failed-gate snapshot. Never hide a disproved CR premise in blockedBy.',
-        'Every CR completion must include this exact top-level shape: changeRequestDisposition={outcome:"applied"|"not-applicable",reasonCategory:"contract-applied"|"already-aligned"|"outside-step-scope"|"downstream-owned"|"diagnosis-contradicted",rationale:"...",inspectedArtifacts:["path"],evidence:["fact"]}. All five fields are required; inspectedArtifacts and evidence must be JSON string arrays, never a single string. A normal not-applicable decision must inspect every affected artifact owned by this Step, explain why the failure belongs elsewhere, and name that downstream work in qualityAssessment.blockedBy.',
-        'If this Step owns none of the listed affected artifacts, inspect at least one declared affected artifact, then return an explicit not-applicable disposition with actions=[] and done=true. ' +
-          `Use this concrete path first when available: ${input.changeRequest.contractDelta.affectedArtifacts[0] ?? '(no affected artifact was declared)'}. ` +
-          'Do not substitute this Step\'s report or plan for that inspection. Do not rewrite this Step outputs or call unavailable verification tools merely to manufacture progress; PM will carry the CR to its next owning stage.',
+        'Every CR completion must include this exact top-level shape: changeRequestDisposition={outcome:"applied"|"not-applicable",reasonCategory:"contract-applied"|"already-aligned"|"outside-step-scope"|"downstream-owned"|"diagnosis-contradicted",rationale:"...",inspectedArtifacts:["path"],evidence:["fact"]}. All five fields are required; inspectedArtifacts and evidence must be JSON string arrays, never a single string. A not-applicable decision must inspect every affected artifact owned by this Step. Only outside-step-scope or downstream-owned delegates work and therefore must name that downstream work in qualityAssessment.blockedBy; blockedBy is also a JSON string array such as ["CODE owns src/main.ts"], never an array of objects. already-aligned and diagnosis-contradicted must not invent a blocker.',
+        'The listed affected artifacts are where the change was recorded upstream, not the work assigned to you. Owning none of them settles nothing on its own: read them, then decide whether the change they carry requires a change in the artifacts this Step does own. An upstream decision to use a different external interface, data shape, or contract usually does. ' +
+          `Read this concrete path first when available: ${input.changeRequest.contractDelta.affectedArtifacts[0] ?? '(no affected artifact was declared)'}. ` +
+          'Return not-applicable only when nothing this Step owns has to change, and say in the rationale what you compared it against. Do not substitute this Step\'s report or plan for that inspection. Do not rewrite this Step outputs or call unavailable verification tools merely to manufacture progress; PM carries the CR to the next stage either way.',
         'Never add comments, whitespace, formatting, renames, or unrelated edits merely to manufacture mutation evidence. Such changes do not implement a CR.',
         'Do not regenerate the whole phase, project, design, or test suite.',
         '',
@@ -270,6 +282,7 @@ export function renderExecutionUserPrompt(
     debugRepairPacket,
     verificationScope,
     deferredVerificationScope,
+    phaseDeliveryVerification,
     validationContractDefect,
     bugNoopHandoffContract,
     contextBlock

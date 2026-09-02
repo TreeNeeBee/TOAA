@@ -24,9 +24,15 @@ export function buildBugFailureContracts(input: {
   const failedOutcomes = (input.testOutcomes ?? []).filter((outcome) =>
     outcome.status === 'failed' || outcome.status === 'timed_out');
   const exactFailedTests = failedOutcomes.flatMap((outcome) => outcome.failedTests);
+  // Runner output can mix executable selectors with presentation-only suite labels. Vitest, for
+  // example, emits both `file > suite > case` and `suite > case 3ms`. The latter cannot be replayed
+  // by a test command, so persisting it makes the Bug impossible to verify even when the exact file
+  // passes. Keep selectors that identify a test file; otherwise retain the invocation scope that
+  // can actually be executed again.
+  const replayableFailedTests = exactFailedTests.filter(hasExecutableTestPath);
   const testSelectors = canonicalStrings(
-    exactFailedTests.length > 0
-      ? exactFailedTests
+    replayableFailedTests.length > 0
+      ? replayableFailedTests
       : failedOutcomes.flatMap((outcome) => outcome.args.filter((arg) => !arg.startsWith('-'))),
     normalizeSelector,
   );
@@ -67,12 +73,13 @@ export function bugVerificationSatisfied(
   if (contract.kind === 'quality-gate' && contract.testSelectors.length === 0) return true;
   const passed = outcomes.filter((outcome) => outcome.status === 'passed' && outcome.stepType === step.type);
   if (passed.length === 0) return false;
-  if (contract.testSelectors.length === 0) return true;
+  const requiredSelectors = replayableTestSelectors(contract.testSelectors);
+  if (requiredSelectors.length === 0) return true;
   const executed = canonicalStrings(
     passed.flatMap((outcome) => outcome.args.filter((arg) => !arg.startsWith('-'))),
     normalizeSelector,
   );
-  return contract.testSelectors.every((selector) =>
+  return requiredSelectors.every((selector) =>
     executed.some((candidate) => selectorCoveredBy(candidate, selector)));
 }
 
@@ -104,7 +111,23 @@ function selectorCoveredBy(executed: string, required: string): boolean {
 }
 
 function selectorPath(value: string): string {
-  return normalizePath(value.split('::', 1)[0] ?? value);
+  const normalized = normalizePath(value);
+  // Pytest renders `file::suite::case`; Vitest/Jest render `file > suite > case`.
+  // A successful file-level invocation proves every selected case in that file, so comparison is
+  // performed on the runner-independent file portion rather than on presentation syntax.
+  return normalized.split('::', 1)[0]!.split(/\s+>\s+/u, 1)[0]!;
+}
+
+function hasExecutableTestPath(selector: string): boolean {
+  return /\.(?:py|[cm]?[jt]sx?)$/iu.test(selectorPath(selector));
+}
+
+function replayableTestSelectors(selectors: readonly string[]): string[] {
+  const replayable = selectors.filter(hasExecutableTestPath);
+  // Preserve contracts that contain only a runner-specific non-file selector. We cannot infer a
+  // broader executable scope safely. Mixed contracts are different: their file-qualified entries
+  // carry the same cases in a replayable form, while suite-only labels are duplicate presentation.
+  return replayable.length > 0 ? replayable : [...selectors];
 }
 
 function canonicalStrings(

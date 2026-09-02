@@ -323,6 +323,12 @@ export function changeRequestHopKey(input: {
 
 export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   type: z.literal('change-request'),
+  /** Why this CR exists; source Ticket shape and completion semantics depend on this value. */
+  // Defaulted, not required. The field is new, so every Change Request persisted before it exists
+  // without one — absence means "written by an older build", not corruption. Requiring it made the
+  // repository refuse those objects, and the refusal surfaced as an unhandled error at startup that
+  // no operator could tell apart from a damaged workspace. Corrective is what those Tickets were.
+  changeKind: z.enum(['corrective', 'dependency', 'contract-change']).default('corrective'),
   sourceTicketIds: z.array(ObjectIdSchema).min(1),
   parentChangeRequestId: ObjectIdSchema.optional(),
   triggerStepId: ObjectIdSchema,
@@ -451,12 +457,23 @@ export function transitionTicketPath(
     if (next === 'pending' && !options.pendingReason) {
       throw new Error(`Ticket ${ticket.id} requires pendingReason when entering pending`);
     }
+    // Resolved means the repair landed and passed this Step's own checks; the verdict from the gate
+    // that found the failure is what is still outstanding. Demanding a *verified* solution here left
+    // finished work with nowhere to wait — it was parked as `pending`, which says blocked, so the
+    // scheduler kept offering the Step the repair it had just completed.
+    //
+    // The bar here is only that a repair exists, because closure paths pass through this state on
+    // their way out and legitimately carry no changes of their own. That the Step actually checked
+    // the repair is enforced by the application workflow wherever a Ticket comes to rest: both the
+    // main Change Request handoff and the meeting-point path require a passing assessment of the
+    // Step that did the work. Closure remains the line that cannot be skipped: a verified solution
+    // and the original failure replayed where it was observed.
     if (
       next === 'resolved' &&
       ['bug', 'enhancement', 'change-request'].includes(ticket.type) &&
-      ticket.solution?.status !== 'verified'
+      !ticket.solution
     ) {
-      throw new Error(`Ticket ${ticket.id} requires a verified solution before resolution`);
+      throw new Error(`Ticket ${ticket.id} requires a solution before resolution`);
     }
     if (next === 'in_progress' && !ticket.activeAssignmentId) {
       throw new Error(`Ticket ${ticket.id} requires an accepted active assignment before execution`);

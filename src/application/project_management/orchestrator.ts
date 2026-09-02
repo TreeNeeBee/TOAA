@@ -378,6 +378,11 @@ export class ProjectOrchestrator {
           evidence: gate.evidence ?? [gate.reason ?? 'Phase delivery gate evaluated.'],
           findings: gate.findings ?? [],
         });
+        await this.scheduler.reconcilePhaseDeliveryBugs(
+          phase.id,
+          gate.findings ?? [],
+          phaseAssessment.id,
+        );
         if (!gate.ok) {
           const acceptance = steps.find((step) => step.type === 'FUNCTIONAL_TEST');
           if (!acceptance || !gate.findings?.length) {
@@ -556,7 +561,7 @@ export class ProjectOrchestrator {
         await this.projection.refresh(phase.projectId);
         return this.failure(phase.id, steps.length, executed, work.step, disposition.reason);
       }
-      if (result.ok && this.options.integrateTicket) {
+      if (result.ok && disposition.integrate !== false && this.options.integrateTicket) {
         // The delivering Ticket itself. Its ChangeSet is keyed on the CODE Story that owns the
         // branch, and a Bug or CR repairing that Story is recorded on the same ChangeSet — whereas
         // `rootTicketId` is the Phase Epic, which owns no branch and matches nothing.

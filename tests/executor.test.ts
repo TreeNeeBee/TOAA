@@ -1086,7 +1086,7 @@ describe('StepExecutor system prompt assembly', () => {
             evidence: ['package.json inspected and paired module baseline passed'],
             unavailableMetrics: [],
             gaps: [],
-            blockedBy: ['no HIGH_LEVEL_DESIGN artifact change is required'],
+            blockedBy: [],
             postToolEvidence: 'run_tests passed after the manifest inspection',
           },
           actions: [],
@@ -1142,6 +1142,155 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.toolCalls.map((call) => call.tool)).toEqual(['read_file', 'run_tests']);
   });
 
+  it('does not inject a baseline after inspection while a greenfield Step still owes outputs', async () => {
+    class InspectThenImplementLLM implements LLMClient {
+      readonly name = 'inspect-then-implement';
+      private round = 0;
+
+      async chat(): Promise<string> {
+        this.round++;
+        if (this.round === 1) {
+          return JSON.stringify({
+            thoughts: 'read the accepted design before creating the product output',
+            actions: [{ tool: 'read_file', args: { path: 'docs/03-detailed-design.md' } }],
+            done: false,
+          });
+        }
+        if (this.round === 2) {
+          return JSON.stringify({
+            thoughts: 'implement one required output without running an incomplete baseline',
+            actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 1\n' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'implement the final required output and close against the Runtime baseline',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['src/x.py and src/y.py created'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+            findings: [],
+          },
+          actions: [{ tool: 'write_file', args: { path: 'src/y.py', content: 'y = 1\n' } }],
+          done: true,
+        });
+      }
+    }
+    await ws.writeFile('docs/03-detailed-design.md', '# Design\n');
+    let baselineRuns = 0;
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled unit baseline gate',
+      argsSchema: {},
+      async run() {
+        baselineRuns++;
+        return { ok: true, summary: 'unit baseline passed' };
+      },
+    };
+    const result = await new StepExecutor({ llm: new InspectThenImplementLLM(), maxRounds: 3 }).run({
+      step: {
+        ...baseStep,
+        phase: 'CODE',
+        role: 'Coder',
+        outputs: ['src/x.py', 'src/y.py'],
+        tools: ['read_file', 'write_file', 'run_tests'],
+      },
+      baselineTestExecution: 'execute',
+      tools: [readFileTool, writeFileTool, runTests],
+      ctx: {
+        ...ctx,
+        allowedWrites: ['src/x.py', 'src/y.py'],
+        testGateArgs: ['tests/unit/x.test.py'],
+      },
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(baselineRuns).toBe(1);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual([
+      'read_file',
+      'write_file',
+      'write_file',
+      'run_tests',
+    ]);
+  });
+
+  it('does not rerun a failing corrective baseline after inspection before the repair mutation', async () => {
+    class InspectThenRepairLLM implements LLMClient {
+      readonly name = 'inspect-then-repair';
+      private round = 0;
+
+      async chat(): Promise<string> {
+        this.round++;
+        if (this.round === 1) {
+          return JSON.stringify({
+            thoughts: 'inspect the failing baseline before editing it',
+            actions: [{ tool: 'read_file', args: { path: 'tests/modules/x.test.ts' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'repair the malformed baseline and verify the new mutation generation',
+          bugResolutionPlan: 'Correct the malformed assertion and rerun the paired module baseline.',
+          actions: [{
+            tool: 'write_file',
+            args: { path: 'tests/modules/x.test.ts', content: 'export const baseline = "fixed";\n' },
+          }],
+          done: false,
+        });
+      }
+    }
+    await ws.writeFile('tests/modules/x.test.ts', 'export const baseline = "broken";\n');
+    let baselineRuns = 0;
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'controlled module baseline gate',
+      argsSchema: {},
+      async run() {
+        baselineRuns++;
+        const source = await ws.readFile('tests/modules/x.test.ts');
+        return source.includes('fixed')
+          ? { ok: true, summary: 'module baseline passed' }
+          : { ok: false, error: 'module baseline is still malformed' };
+      },
+    };
+    const result = await new StepExecutor({ llm: new InspectThenRepairLLM(), maxRounds: 2 }).run({
+      step: {
+        ...baseStep,
+        phase: 'HIGH_LEVEL_DESIGN',
+        role: 'Architect',
+        outputs: ['tests/modules/x.test.ts'],
+        tools: ['read_file', 'write_file', 'run_tests'],
+      },
+      executionRole: 'Debugger',
+      baselineTestExecution: 'execute',
+      tools: [readFileTool, writeFileTool, runTests],
+      ctx: {
+        ...ctx,
+        allowedWrites: ['tests/modules/x.test.ts'],
+        testGateArgs: ['tests/modules/x.test.ts'],
+      },
+      debugContext: {
+        bugTicketId: 'BUG-MODULE-BASELINE',
+        reason: 'MODULE_TEST found a malformed baseline test',
+        failureLog: 'tests/modules/x.test.ts failed to parse',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success, result.error).toBe(true);
+    expect(baselineRuns).toBe(1);
+    expect(result.toolCalls.map((call) => call.tool)).toEqual([
+      'read_file',
+      'write_file',
+      'run_tests',
+    ]);
+  });
+
   it('returns the DEBUG Bug Ticket resolution plan when the Bug Ticket is fixed', async () => {
     class PlannedLLM implements LLMClient {
       readonly name = 'planned';
@@ -1180,7 +1329,7 @@ describe('StepExecutor system prompt assembly', () => {
         this.lastUser = messages.at(-1)?.content ?? '';
         return JSON.stringify({
           thoughts: 'update only the current design contract',
-          bugResolutionPlan: 'Specify the injected scraper contract for downstream implementation.',
+          bugResolutionPlan: 'Specify the injected client contract for downstream implementation.',
           actions: [{ tool: 'write_file', args: { path: 'src/x.py', content: 'x = 3\n' } }],
           done: true,
         });
@@ -1880,9 +2029,15 @@ describe('StepExecutor system prompt assembly', () => {
     expect(result.rounds).toBe(3);
     expect(result.changeRequestDisposition?.outcome).toBe('not-applicable');
     expect(llm.userPrompts.some((prompt) =>
-      prompt.includes('Use this concrete path first when available: src/cli.ts'))).toBe(true);
+      prompt.includes('Read this concrete path first when available: src/cli.ts'))).toBe(true);
     expect(llm.userPrompts.some((prompt) =>
       prompt.includes("Do not substitute this Step's report or plan for that inspection"))).toBe(true);
+    // Owning none of the listed artifacts is not itself an answer. Making it one let every
+    // downstream Step close the chain untouched while the product never changed.
+    expect(llm.userPrompts.some((prompt) =>
+      prompt.includes('Owning none of them settles nothing on its own'))).toBe(true);
+    expect(llm.userPrompts.some((prompt) =>
+      prompt.includes('requires a change in the artifacts this Step does own'))).toBe(true);
     expect(result.toolCalls.find((call) => !call.ok)?.error).toContain('permission denied for file_write');
     expect(await ws.readFile('docs/design.md')).toBe('# accepted design\n');
   });
@@ -2228,7 +2383,7 @@ describe('StepExecutor system prompt assembly', () => {
       async chat(): Promise<string> {
         return JSON.stringify({
           thoughts: 'claim repair by adding an existing dependency',
-          actions: [{ tool: 'add_dependency', args: { packages: ['cheerio'] } }],
+          actions: [{ tool: 'add_dependency', args: { packages: ['zod'] } }],
           done: true,
         });
       }
@@ -2241,7 +2396,7 @@ describe('StepExecutor system prompt assembly', () => {
         return {
           ok: true,
           summary: 'add_dependency package.json +0 (none new; sandbox rebuild skipped)',
-          data: { added: [], finalLines: ['cheerio'] },
+          data: { added: [], finalLines: ['zod'] },
         };
       },
     };
@@ -4806,6 +4961,111 @@ describe('StepExecutor system prompt assembly', () => {
     expect(await ws.readFile('src/x.py')).toBe('x = 3\n');
   });
 
+  it('accepts current verification after a dependency mutation is rejected by the owning phase', async () => {
+    class VerifiedExistingDependencyLLM implements LLMClient {
+      readonly name = 'verified-existing-dependency';
+      calls = 0;
+      unresolvedFailurePersisted = false;
+
+      async chat(messages: ChatMessage[]): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'check the dependency diagnosis against the current executable baseline',
+            bugResolutionPlan:
+              'Confirm the dependency ownership boundary, then compile and execute the exact unit baseline.',
+            actions: [{ tool: 'add_dependency', args: { packages: ['@types/js-yaml'], dev: true } }],
+            done: false,
+          });
+        }
+        const feedback = messages.filter((message) => message.role === 'user').at(-1)?.content ?? '';
+        this.unresolvedFailurePersisted = feedback.includes('Unresolved tool failures remain');
+        return JSON.stringify({
+          thoughts: 'the current workspace already satisfies the dependency and executable contracts',
+          bugResolutionPlan:
+            'The historical dependency failure is already repaired; current compilation and all declared unit tests pass.',
+          qualityAssessment: {
+            completion: 1,
+            upstreamAlignment: 1,
+            metrics: {},
+            tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+            evidence: ['npx tsc --noEmit exit=0', 'declared unit baseline passed'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: [],
+            findings: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+    const addDependency: Tool = {
+      name: 'add_dependency',
+      description: 'dependency manifest mutation',
+      argsSchema: {},
+      async run() {
+        return {
+          ok: false,
+          code: 'dependency_not_owned',
+          error: 'add_dependency is owned by HIGH_LEVEL_DESIGN; CODE cannot change the manifest',
+        };
+      },
+    };
+    const runProgram: Tool = {
+      name: 'run_program',
+      description: 'static compile gate',
+      argsSchema: {},
+      async run() {
+        return { ok: true, summary: 'npx tsc --noEmit exit=0' };
+      },
+    };
+    const runTests: Tool = {
+      name: 'run_tests',
+      description: 'unit baseline gate',
+      argsSchema: {},
+      async run() {
+        return { ok: true, summary: 'declared unit baseline passed' };
+      },
+    };
+    await ws.writeFile('src/x.ts', 'export const x = 1;\n');
+    const llm = new VerifiedExistingDependencyLLM();
+    const exec = new StepExecutor({ llm, maxRounds: 2 });
+    const result = await exec.run({
+      step: {
+        ...baseStep,
+        outputs: ['src/x.ts'],
+        tools: ['add_dependency', 'run_program', 'run_tests'],
+        qualityGate: { metrics: {} },
+      },
+      executionRole: 'Debugger',
+      tools: [addDependency, runProgram, runTests],
+      ctx: {
+        ...ctx,
+        language: 'typescript',
+        allowedWrites: ['src/x.ts'],
+        testGateArgs: ['tests/unit/x.test.ts'],
+      },
+      baselineTestExecution: 'execute',
+      debugContext: {
+        bugTicketId: 'BUG-1',
+        reason: 'historical TypeScript declaration failure',
+        failureLog: 'TS7016: missing declaration for js-yaml',
+        repairRequired: true,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.rounds).toBe(2);
+    expect(result.toolCalls.map((call) => [call.tool, call.ok])).toEqual([
+      ['add_dependency', false],
+      ['run_program', true],
+      ['run_tests', true],
+    ]);
+    expect(llm.unresolvedFailurePersisted).toBe(false);
+    expect(await ws.readFile('src/x.ts')).toBe('export const x = 1;\n');
+  });
+
   it('does not let advisory tool failures poison a later successful repair', async () => {
     class AdvisoryFailureThenWriteLLM implements LLMClient {
       readonly name = 'advisory-failure';
@@ -5157,7 +5417,7 @@ describe('design-phase policy', () => {
  * `freshAfterTools` is false when the assessment was produced before the last tool call — a fact
  * about round ordering. It was reported as a missing field, `qualityAssessment.postToolEvidence`,
  * which `StageQualityAssessment` has no room for; supplying it changes no round number, so the same
- * rejection returns and the Step spends its rounds on it. A live dbc2excel S003 opened a Bug against
+ * rejection returns and the Step spends its rounds on it. A live S003 opened a Bug against
  * the generated project for it — an XCompiler wording defect charged to the product.
  */
 describe('stale quality assessment feedback', () => {
@@ -5203,7 +5463,7 @@ describe('stale quality assessment feedback', () => {
  *
  * When no assessment was produced at all, the whole action is producing one — and a produced one is
  * necessarily post-tool. Emitting the re-assessment line beside "there is no assessment" spends a
- * line of the instruction contradicting the one above it, and a live dbc3 S001 got a six-item list
+ * line of the instruction contradicting the one above it, and a live S001 got a six-item list
  * whose first and second entries disagreed.
  */
 describe('absent versus stale quality assessment', () => {
@@ -5235,7 +5495,7 @@ describe('absent versus stale quality assessment', () => {
  * A repeat-command ticket has to carry why the command kept failing.
  *
  * "You reran a command" is the shape; "you have not written the files that command runs" is the
- * cause, and only the cause tells the role receiving the ticket what to do. A live dbc3 Bug reached
+ * cause, and only the cause tells the role receiving the ticket what to do. A live Bug reached
  * a Debugger describing the repetition while the five unwritten outputs sat in a separate feedback
  * line the ticket did not carry.
  */
@@ -5288,5 +5548,80 @@ describe('debug prompt completion contract', () => {
     const debugBlock = renderExecutionPromptPolicy({ debug: true, changeRequest: false });
     expect(debugBlock).toMatch(/DEBUG mode/u);
     expect(debugBlock).toMatch(/done=true with actions=\[\] is rejected unless[\s\S]*qualityAssessment/u);
+  });
+});
+
+describe('an affected artifact that is not there', () => {
+  it('counts a read that returns "no such file" as having inspected it', async () => {
+    // A Change Request whose affected artifact was a dated runtime output from the day before could
+    // not be closed as out of scope: the Step had to read the file to say so, the read returned
+    // ENOENT, and only a successful read counted. Every one of its 37 completed turns was discarded
+    // and the Ticket died on the non-convergence guard with its work already done.
+    class OutOfScopeLLM implements LLMClient {
+      readonly name = 'out-of-scope';
+      calls = 0;
+      async chat(): Promise<string> {
+        this.calls++;
+        if (this.calls === 1) {
+          return JSON.stringify({
+            thoughts: 'check whether the artifact is here at all',
+            actions: [{ tool: 'read_file', args: { path: 'output/briefing-2026-09-01.md' } }],
+            done: false,
+          });
+        }
+        return JSON.stringify({
+          thoughts: 'the artifact does not exist and is not owned by this Step',
+          changeRequestDisposition: {
+            outcome: 'not-applicable',
+            reasonCategory: 'outside-step-scope',
+            rationale: 'output/briefing-2026-09-01.md is a runtime output owned by CODE; it is absent.',
+            inspectedArtifacts: ['output/briefing-2026-09-01.md'],
+            evidence: ['read_file reported ENOENT for output/briefing-2026-09-01.md'],
+          },
+          qualityAssessment: {
+            summary: 'nothing in this Step to change',
+            evidence: ['the affected artifact is absent'],
+            unavailableMetrics: [],
+            gaps: [],
+            blockedBy: ['CODE owns the runtime output'],
+            findings: [],
+          },
+          actions: [],
+          done: true,
+        });
+      }
+    }
+
+    const missingRead = {
+      name: 'read_file',
+      description: 'read',
+      argsSchema: { path: 'string' },
+      run: async () => ({
+        ok: false as const,
+        error: "read_file failed: ENOENT: no such file or directory, realpath 'output/briefing-2026-09-01.md'",
+      }),
+    };
+
+    const llm = new OutOfScopeLLM();
+    const result = await new StepExecutor({ llm, maxRounds: 4 }).run({
+      step: { ...baseStep, outputs: [] },
+      tools: [missingRead as never],
+      ctx: { ...ctx, allowedWrites: [], stepId: baseStep.id },
+      changeRequest: {
+        id: 'CR-ABSENT', revision: 1, state: 'in_progress',
+        sourceTicketIds: ['BUG-X'], description: 'Handle the briefing artifact.',
+        triggerStepId: 'S006', sourceStepId: 'S004', targetStepId: 'S006', originFailures: [],
+        contractDelta: {
+          summary: 'Handle the briefing artifact.',
+          before: [], after: ['handled'],
+          affectedArtifacts: ['output/briefing-2026-09-01.md'],
+        },
+      } as never,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.error).toBeUndefined();
+    // Two rounds: look, then report. Without this it spent every round it had.
+    expect(llm.calls).toBe(2);
   });
 });

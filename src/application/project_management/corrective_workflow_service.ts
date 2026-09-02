@@ -93,6 +93,66 @@ export class CorrectiveWorkflowService {
     return request;
   }
 
+  /** Routes a required accepted-contract change as a CR, without manufacturing a defect Ticket. */
+  async routeContractChange(input: {
+    reportingStepId: ObjectId;
+    targetStepId: ObjectId;
+    summary: string;
+    evidence: readonly string[];
+    expected: string;
+    affectedArtifacts: readonly string[];
+    creatorActorId: ObjectId;
+    correlationId: ObjectId;
+    sourceKind?: TicketSource['kind'];
+    sourceExternalId?: string;
+  }): Promise<ChangeRequestTicket> {
+    const reporting = await this.state.requireStep(input.reportingStepId);
+    const target = await this.state.requireStep(input.targetStepId);
+    if (reporting.phaseId !== target.phaseId || reporting.projectId !== target.projectId) {
+      throw new Error('Contract Change Request must remain inside one Project Phase');
+    }
+    const sourceStory = await this.tickets.storyForStep(reporting.id);
+    const objects = await this.repository.list({ objectType: 'step', projectId: target.projectId });
+    const propagationStepIds = objects
+      .filter((object): object is Step =>
+        object.objectType === 'step' &&
+        object.phaseId === target.phaseId &&
+        STEP_TYPE_ORDER[object.type] >= STEP_TYPE_ORDER[target.type])
+      .sort((left, right) => STEP_TYPE_ORDER[left.type] - STEP_TYPE_ORDER[right.type])
+      .map((step) => step.id);
+    const request = await this.tickets.openChangeRequest({
+      changeKind: 'contract-change',
+      creatorActorId: input.creatorActorId,
+      sourceTicketIds: [sourceStory.id],
+      triggerStepId: reporting.id,
+      sourceStepId: reporting.id,
+      targetStepId: target.id,
+      propagationStepIds,
+      contractDelta: {
+        summary: input.summary,
+        before: [...input.evidence],
+        after: [`The accepted ${target.name} contract is revised so the Phase can satisfy: ${input.expected}`],
+        affectedArtifacts: [...input.affectedArtifacts],
+      },
+      implementationPlan: [
+        `Revise only ${target.name}-owned accepted contracts needed to address this contract change.`,
+        'Choose a viable project-independent replacement or contract adjustment from current evidence.',
+        'Propagate the accepted delta incrementally through every affected downstream V-model Step.',
+      ],
+      verificationGate: [
+        `The revised project satisfies the original observable expectation: ${input.expected}`,
+        'The Phase delivery scenario passes after downstream propagation.',
+      ],
+      sourceKind: input.sourceKind,
+      sourceExternalId: input.sourceExternalId,
+      correlationId: input.correlationId,
+    });
+    await this.registration.register(request.id);
+    await this.activateChangeRequest(request.id);
+    await this.state.checkpoint(target, `Contract change routed through ${request.name}`);
+    return request;
+  }
+
   /** The HIGH_LEVEL_DESIGN Step of the requesting Step's Phase: the one that owns the manifest. */
   private async designStepFor(step: Step): Promise<Step> {
     const objects = await this.repository.list({ objectType: 'step', projectId: step.projectId });
@@ -160,6 +220,27 @@ export class CorrectiveWorkflowService {
       testOutcomes: input.testOutcomes,
       artifactTargets: input.affectedArtifacts,
     });
+    // The gate that was going to confirm this repair has just failed on the same thing instead. That
+    // is a verdict on the Ticket already waiting for it, not a new defect: reopening it keeps one
+    // Ticket for one failure and puts the repair back in front of the role that made it. Opening a
+    // second Ticket would leave the first resolved forever, waiting for a verification that had
+    // already come back negative.
+    const reopened = await this.tickets.reopenResolvedForRecurrence({
+      failedStep: failed,
+      targetStep: target,
+      identity: contracts.identity,
+      reopenedByActorId: input.creatorActorId,
+      parentChangeRequestId: input.parentChangeRequestId,
+      routingObjects: [...routing.objects, ...(discovering?.objects ?? [])],
+    });
+    if (reopened) {
+      await this.state.checkpoint(failed, `Recurrence reopened ${reopened.name}`);
+      await this.state.checkpoint(target, `Reopened by recurrence of ${reopened.name}`);
+      if (discovering) {
+        await this.state.checkpoint(discovering.step, `Discovery parked behind ${reopened.name}`);
+      }
+      return reopened;
+    }
     const bug = await this.tickets.openBug({
       creatorActorId: input.creatorActorId,
       failedStep: failed,
@@ -207,6 +288,8 @@ export class CorrectiveWorkflowService {
     correlationId: ObjectId;
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
+    /** Corrective Bug whose work discovered this independent upstream quality gap. */
+    sourceBugTicketId?: ObjectId;
     creatorActorId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
@@ -236,6 +319,7 @@ export class CorrectiveWorkflowService {
       finding: input.finding,
       affectedArtifacts: input.affectedArtifacts,
       sourceQualityAssessmentId: input.qualityAssessmentId,
+      sourceBugTicketId: input.sourceBugTicketId,
       correlationId: input.correlationId,
       causationId: input.causationId,
       parentChangeRequestId: input.parentChangeRequestId,
@@ -303,7 +387,10 @@ export class CorrectiveWorkflowService {
     // the corrective Ticket closed here, its closure released that CR; parking it releases the
     // blocker but leaves the CR parked, so the repair reached its Step and nothing carried it on.
     if (await this.repairedChangeRequestTargetsStep(input.work.ticket, input.affectedStepIds[0]!)) {
-      await this.tickets.awaitVerification(input.work.ticket.id);
+      await this.tickets.awaitVerification(input.work.ticket.id, {
+        stepId: step.id,
+        qualityAssessmentId: input.qualityAssessmentId,
+      });
       const repaired = input.work.ticket.parentTicketId;
       if (repaired) await this.activateChangeRequest(repaired);
       await this.state.checkpoint(
@@ -313,6 +400,7 @@ export class CorrectiveWorkflowService {
       return undefined;
     }
     const request = await this.tickets.openChangeRequest({
+      changeKind: 'corrective',
       creatorActorId: await this.state.ticketOwnerActorId(input.work.ticket.id),
       sourceTicketIds: [input.work.ticket.id],
       triggerStepId: input.work.ticket.stepId ?? step.id,
@@ -341,10 +429,12 @@ export class CorrectiveWorkflowService {
     application?: ChangeRequestApplicationDecision;
     testOutcomes?: readonly TestOutcome[];
   }): Promise<{
+    status: 'applied' | 'awaiting-verification';
     closed: boolean;
     sourceTicketIds?: ObjectId[];
     sourceTicketTypes?: Array<'bug' | 'enhancement'>;
     verifiedBugTicketIds?: ObjectId[];
+    unprovenBugTicketIds?: ObjectId[];
   }> {
     if (input.work.ticket.type !== 'change-request') {
       throw new Error('completeChangeRequestStep requires a Change Request');
@@ -354,13 +444,17 @@ export class CorrectiveWorkflowService {
     const request = await this.state.requireTicket(input.work.ticket.id);
     if (request.type !== 'change-request') throw new Error('Change Request type changed while applying it');
     const sourceTickets = await Promise.all(request.sourceTicketIds.map((id) => this.state.requireTicket(id)));
-    const dependencyRequest = sourceTickets.length === 1 &&
-      (sourceTickets[0]!.type === 'story' || sourceTickets[0]!.type === 'task');
-    if (!dependencyRequest && sourceTickets.some((source) =>
+    const dependencyRequest = request.changeKind === 'dependency';
+    const contractChange = request.changeKind === 'contract-change';
+    if (request.changeKind === 'corrective' && sourceTickets.some((source) =>
       source.type !== 'bug' && source.type !== 'enhancement')) {
       throw new Error(`Change Request ${request.name} has an invalid source Ticket`);
     }
-    const correctiveSources = dependencyRequest
+    if ((dependencyRequest || contractChange) && sourceTickets.some((source) =>
+      source.type !== 'story' && source.type !== 'task')) {
+      throw new Error(`Change Request ${request.name} has an invalid work source Ticket`);
+    }
+    const correctiveSources = request.changeKind !== 'corrective'
       ? []
       : sourceTickets as Array<BugTicket | EnhancementTicket>;
     let next = dependencyRequest ? undefined : nextPropagationStepId(request, step.id);
@@ -379,7 +473,10 @@ export class CorrectiveWorkflowService {
       // for the verdict instead of blocking the Step that produces it.
       for (const source of correctiveSources) {
         if (!source.parentTicketId) continue;
-        await this.tickets.awaitVerification(source.id);
+        await this.tickets.awaitVerification(source.id, {
+          stepId: step.id,
+          qualityAssessmentId: input.qualityAssessmentId,
+        });
         await this.activateChangeRequest(source.parentTicketId);
       }
     }
@@ -414,10 +511,30 @@ export class CorrectiveWorkflowService {
       source.state !== 'closed' &&
       source.state !== 'cancelled' &&
       !bugVerificationProven(source, step, input.testOutcomes ?? []));
+    const verificationDueHere = unprovenSources.filter((source) =>
+      source.verificationContract.verificationStepId === step.id);
+    // A correction cannot pass through the Step that owns its immutable replay contract. Letting it
+    // continue merely because another downstream Step exists postpones the verdict until the end of
+    // the chain, then manufactures a backward CR to revisit this Step. Besides obscuring the failed
+    // gate, that loop can reserve the same role twice. The current CR remains the unit of work until
+    // this Step has actually replayed the original failure.
+    if (verificationDueHere.length > 0) {
+      return {
+        status: 'awaiting-verification',
+        closed: false,
+        unprovenBugTicketIds: verificationDueHere.map((source) => source.id),
+      };
+    }
     // Not at the meeting point: there the Bug was deliberately handed to the Change Request under
     // repair, which runs the Step that proves it. Retrying here could never produce that proof and
     // would spend the whole attempt budget rediscovering it.
-    if (!next && !metRepairedRequest && unprovenSources.length > 0) return { closed: false };
+    if (!next && !metRepairedRequest && unprovenSources.length > 0) {
+      return {
+        status: 'awaiting-verification',
+        closed: false,
+        unprovenBugTicketIds: unprovenSources.map((source) => source.id),
+      };
+    }
     step = await this.state.attachQuality(step, input.qualityAssessmentId);
     if (step.state === 'in_progress') step = await this.state.transitionStep(step, 'delivered');
     if (isVerificationStep(step)) {
@@ -455,7 +572,7 @@ export class CorrectiveWorkflowService {
     // to carry downstream — the design answered, and the Step that asked can run again.
     if (dependencyRequest) {
       await this.completeDependencyRequest(request, input.verification ?? []);
-      return { closed: true };
+      return { status: 'applied', closed: true };
     }
     // A Bug parked at a meeting point is proven by whichever chain reaches its gate, not only by the
     // one that opened it, so every hop closes what its own Step has just proven.
@@ -513,9 +630,10 @@ export class CorrectiveWorkflowService {
     await this.closeStoriesForClosedSteps(storySteps);
     if (next) {
       // The source Bug or Enhancement waits for the last descendant, not for this hop.
-      return { closed: false };
+      return { status: 'applied', closed: false };
     }
     return {
+      status: 'applied',
       closed: true,
       sourceTicketIds: request.sourceTicketIds,
       sourceTicketTypes: correctiveSources.map((source) => source.type),
@@ -705,6 +823,29 @@ export class CorrectiveWorkflowService {
    * owns this work: its gate, its attempts, and its closure. One Ticket spanning four roles has no
    * single owner to hold to any of that.
    */
+  /**
+   * The Ticket at the head of a contract-change chain, whose delta is the change the chain exists to land.
+   *
+   * Every hop rewrites its own delta with what that hop changed, which is right for scope and wrong
+   * for substance: by the third hop the delta reads "docs/03-detailed-design.md is accepted in its
+   * current form" and carries none of the requirement. Walking to the head recovers it structurally
+   * rather than parsing it back out of the verification gate's prose.
+   */
+  private async rootContractChange(request: ChangeRequestTicket): Promise<ChangeRequestTicket> {
+    let current = request;
+    const seen = new Set<ObjectId>([current.id]);
+    while (current.parentChangeRequestId && !seen.has(current.parentChangeRequestId)) {
+      seen.add(current.parentChangeRequestId);
+      // Reading the chain is context, not the work. An unreadable ancestor must not stop the delta
+      // from travelling — the nearest one we did read still carries a real change, and losing the
+      // whole hop over missing background is a worse answer than slightly poorer background.
+      const parent = await this.state.requireTicket(current.parentChangeRequestId).catch(() => undefined);
+      if (!parent || parent.type !== 'change-request') break;
+      current = parent;
+    }
+    return current;
+  }
+
   private async openChildChangeRequest(
     parent: ChangeRequestTicket,
     targetStepId: ObjectId,
@@ -717,7 +858,10 @@ export class CorrectiveWorkflowService {
     // so it had nothing to do, produced no actions, and the attempt stopped for no progress.
     const changed = [...new Set(applied.entries.map((entry) => entry.path))];
     const artifacts = changed.length > 0 ? changed : parent.contractDelta.affectedArtifacts;
+    // The change itself, unchanged at every hop. Only the scope is local; the requirement is not.
+    const root = await this.rootContractChange(parent);
     const child = await this.tickets.openChangeRequest({
+      changeKind: parent.changeKind === 'contract-change' ? 'contract-change' : 'corrective',
       creatorActorId,
       sourceTicketIds: parent.sourceTicketIds,
       triggerStepId: parent.triggerStepId,
@@ -730,21 +874,35 @@ export class CorrectiveWorkflowService {
         ? parent.propagationStepIds.slice(parent.propagationStepIds.indexOf(targetStepId))
         : [targetStepId],
       contractDelta: {
-        summary: changed.length > 0
-          ? applied.summary
-          : `${parent.contractDelta.summary} (no artifact changed at the previous Step)`,
-        before: parent.contractDelta.after,
-        after: artifacts.map((artifact) => `${artifact} is accepted in its current form`),
+        // What the upstream Step actually changed, stated in full, plus why the chain exists. A hop
+        // decides its own exposure, so it needs both: the change to assess, and the requirement that
+        // makes the assessment meaningful. Carrying only the first left CODE reading
+        // "docs/03-detailed-design.md is accepted in its current form" — a statement about a file it
+        // does not own, with nothing to assess — so it answered "not mine", correctly, and the
+        // product never changed while the design said it had.
+        // A hop that changed nothing passes the upstream change on untouched rather than wrapping it:
+        // wrapping nests on every no-op hop and the text grows without bound down a long chain.
+        // That a hop changed nothing is stated in the plan, where it is instruction rather than content.
+        summary: changed.length > 0 ? applied.summary : parent.contractDelta.summary,
+        before: [`This chain exists to satisfy: ${root.contractDelta.summary}`],
+        after: changed.length > 0
+          ? [`${artifacts.join(', ')} now carry that change; downstream Steps must be consistent with it.`]
+          : [...parent.contractDelta.after],
         affectedArtifacts: artifacts,
       },
-      // A downstream hop checks its own work against the accepted change; it does not re-run the
-      // repair that produced it.
+      // The question a hop answers is impact, not ownership of the upstream file. Naming that file as
+      // the task made every Step that did not own it close the chain untouched; naming it as the
+      // material to read keeps the guard this construction was written for — a hop never inherits
+      // work it cannot do — while asking the judgement that makes the chain worth propagating.
       implementationPlan: [
-        `Check this Step's artifacts and tests against the accepted change to ${artifacts.join(', ')}.`,
-        'Apply only what this Step owns; if nothing here is affected, record that as the outcome.',
+        `Upstream changed: ${changed.length > 0 ? applied.summary : 'nothing at the previous Step'}`,
+        `Read ${artifacts.join(', ')} and decide whether that change affects what this Step owns.`,
+        'Apply what it requires of this Step; if nothing here is affected, record that as the outcome.',
+        'Either way the change continues downstream, so state what you changed for the next Step.',
       ],
       verificationGate: parent.verificationGate,
       parentChangeRequestId: parent.id,
+      correlationId: parent.source.correlationId,
     });
     await this.registration.register(child.id);
     await this.activateChangeRequest(child.id);

@@ -7,7 +7,8 @@ import {
   type DebugBrief,
   type DebugBriefInput,
 } from '../../core/debug_brief.js';
-import type { Plan, Step } from '../../core/plan.js';
+import type { ArchitectureModule, Plan, Step } from '../../core/plan.js';
+import type { PairedSourceTestInspection } from '../../core/paired_test_contract.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
 import { defaultQualityGateForPhase } from '../../core/quality_gate.js';
 import {
@@ -135,6 +136,7 @@ export function resolveAttemptRoundLimit(
 export function reconcileMeasuredQualityAssessment(
   value: StageQualityAssessment | undefined,
   toolCalls: ExecutorRunResult['toolCalls'],
+  verification?: VerificationQualityEvidence,
 ): StageQualityAssessment | undefined {
   if (!value) return value;
   // A Step that could not run its tests because the manifest belongs to another phase reports that
@@ -154,24 +156,138 @@ export function reconcileMeasuredQualityAssessment(
     ),
     tests: summary.match(/Tests\s+(\d+)\s+passed\s+\((\d+)\)/u),
   })).find((item) => item.coverage || item.tests);
-  if (!measured) return value;
+  if (!measured && !verification) return value;
   const metrics = { ...value.metrics };
-  if (measured.coverage) {
+  if (measured?.coverage) {
     metrics.statementCoverage = Number(measured.coverage[1]) / 100;
     metrics.branchCoverage = Number(measured.coverage[2]) / 100;
     metrics.functionCoverage = Number(measured.coverage[3]) / 100;
     metrics.lineCoverage = Number(measured.coverage[4]) / 100;
   }
-  if (measured.tests) {
+  if (measured?.tests) {
     const passed = Number(measured.tests[1]);
     const total = Number(measured.tests[2]);
     metrics.testCasePassRate = total > 0 ? passed / total : 0;
   }
+  const runtimeMetrics = verification
+    ? measuredVerificationMetrics(toolCalls, verification, metrics.testCasePassRate)
+    : {};
+  Object.assign(metrics, runtimeMetrics);
+  const measuredMetricNames = new Set(Object.keys(runtimeMetrics));
   return {
     ...value,
     metrics,
-    evidence: [...new Set([...value.evidence, measured.summary])],
+    unavailableMetrics: (value.unavailableMetrics ?? [])
+      .filter((metric) => !measuredMetricNames.has(metric)),
+    evidence: [...new Set([
+      ...value.evidence,
+      ...(measured ? [measured.summary] : []),
+    ])],
   };
+}
+
+/**
+ * Evidence already validated and frozen by TestPhaseValidator.
+ *
+ * These ratios describe coverage of the declared V-model test contract, not source-line coverage.
+ * Runtime owns the denominator and sees the exact selectors the sandbox executed, so an LLM cannot
+ * accidentally invent the number or report it unavailable after a green run.
+ */
+export interface VerificationQualityEvidence {
+  phase: Step['phase'];
+  architectureModules: readonly ArchitectureModule[];
+  baselineTestPaths: readonly string[];
+  supplementalTestPaths: readonly string[];
+  sourceContracts: readonly PairedSourceTestInspection[];
+}
+
+function measuredVerificationMetrics(
+  toolCalls: ExecutorRunResult['toolCalls'],
+  evidence: VerificationQualityEvidence,
+  testCasePassRate: number | undefined,
+): Record<string, number> {
+  const declaredBaseline = dedupPaths(evidence.baselineTestPaths);
+  const declaredSupplements = dedupPaths(evidence.supplementalTestPaths);
+  const declaredFrozen = dedupPaths([...declaredBaseline, ...declaredSupplements]);
+  const validBaseline = new Set(dedupPaths(
+    evidence.sourceContracts.flatMap((contract) => contract.valid),
+  ));
+  const validFrozen = new Set([...validBaseline, ...declaredSupplements]);
+  const executed = successfulExecutedTestPaths(toolCalls, declaredFrozen);
+  const validAndExecuted = new Set(
+    [...validFrozen].filter((testPath) => executed.has(testPath)),
+  );
+  const frozenCoverage = coverageRatio(declaredFrozen, validAndExecuted);
+
+  switch (evidence.phase) {
+    case 'MODULE_TEST': {
+      const modules = evidence.architectureModules.filter((module) => module.testPaths.length > 0);
+      const coveredModules = modules.filter((module) =>
+        module.testPaths.every((testPath) => validAndExecuted.has(normalizeEvidencePath(testPath)))
+      ).length;
+      const contractPaths = dedupPaths(modules.flatMap((module) => module.testPaths));
+      return {
+        moduleCoverage: modules.length > 0 ? coveredModules / modules.length : 0,
+        contractCoverage: coverageRatio(contractPaths, validAndExecuted),
+      };
+    }
+    case 'INTEGRATION_TEST':
+      // DETAILED_DESIGN baseline validation already requires every valid case to exercise at least
+      // two declared product sources. Here Runtime proves that the accepted interface/scenario set
+      // was actually frozen and executed.
+      return {
+        interfaceCoverage: frozenCoverage,
+        integrationScenarioCoverage: frozenCoverage,
+      };
+    case 'FUNCTIONAL_TEST':
+      // Requirement-baseline validation checks contract identifiers before this point. The final
+      // Step metric measures execution of that accepted requirement/function set; the Phase gate
+      // remains responsible for live user scenarios.
+      return {
+        functionalCoverage: frozenCoverage,
+        requirementCoverage: frozenCoverage,
+        endToEndPassRate: testCasePassRate ?? frozenCoverage,
+      };
+    default:
+      return {};
+  }
+}
+
+function successfulExecutedTestPaths(
+  toolCalls: ExecutorRunResult['toolCalls'],
+  declaredPaths: readonly string[],
+): Set<string> {
+  const declared = new Set(declaredPaths);
+  const executed = new Set<string>();
+  for (const call of toolCalls) {
+    if (!call.ok || call.tool !== 'run_tests' || !isRecord(call.data)) continue;
+    const effectiveArgs = Array.isArray(call.data.effectiveArgs)
+      ? call.data.effectiveArgs.filter((value): value is string => typeof value === 'string')
+      : [];
+    for (const arg of effectiveArgs) {
+      const normalized = normalizeEvidencePath(arg);
+      if (declared.has(normalized)) executed.add(normalized);
+    }
+  }
+  return executed;
+}
+
+function coverageRatio(paths: readonly string[], covered: ReadonlySet<string>): number {
+  const declared = dedupPaths(paths);
+  if (declared.length === 0) return 0;
+  return declared.filter((testPath) => covered.has(testPath)).length / declared.length;
+}
+
+function dedupPaths(paths: readonly string[]): string[] {
+  return [...new Set(paths.map(normalizeEvidencePath))];
+}
+
+function normalizeEvidencePath(value: string): string {
+  return value.replace(/\\/gu, '/').replace(/^\.\//u, '');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export function reconcileDeferredSourceQualityAssessment(

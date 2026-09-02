@@ -411,6 +411,7 @@ async function registerChangeRequest(
       now: new Date().toISOString(),
     }),
     type: 'change-request',
+    changeKind: 'contract-change',
     parentTicketId: parent.id,
     state: 'created',
     assignmentIds: [],

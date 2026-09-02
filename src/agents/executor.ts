@@ -13,6 +13,7 @@ import {
 } from '../core/plan.js';
 import {
   normalizeQualityAssessment,
+  qualityAssessmentShapeIssues,
   type StageQualityAssessment,
 } from '../core/quality_gate.js';
 import type {
@@ -75,7 +76,7 @@ export { verifyOutputs } from './execution/output_verifier.js';
  * Names the outputs still owed, so a repeat-command ticket carries its cause and not just its shape.
  *
  * "You reran a command" is the symptom; "you have not written the files that command runs" is the
- * reason, and only the reason tells the role receiving the ticket what to do. A live dbc3 Bug landed
+ * reason, and only the reason tells the role receiving the ticket what to do. A live Bug landed
  * on a Debugger saying the command had been repeated, while the five unwritten outputs it was
  * repeating over sat in a separate feedback line the ticket did not carry.
  */
@@ -170,6 +171,11 @@ export interface ExecutorRunInput {
     deferredVerificationScope?: {
       stepId: string;
       phase: Step['phase'];
+    };
+    /** The live Phase gate owns replay of a problem reported through PM intake. */
+    phaseDeliveryVerification?: {
+      phaseId: string;
+      findingCode: string;
     };
   };
   /**
@@ -603,12 +609,13 @@ export class StepExecutor {
       bugResolutionDisposition =
         extractBugResolutionDisposition(turn) ?? bugResolutionDisposition;
       changeRequestDisposition = extractChangeRequestDisposition(turn) ?? changeRequestDisposition;
-      const turnQualityAssessment = normalizeQualityAssessment(
-        turn.qualityAssessment ?? turn.quality_assessment,
-      );
-      if (turnQualityAssessment) {
+      const rawTurnQualityAssessment = turn.qualityAssessment ?? turn.quality_assessment;
+      const turnQualityAssessment = normalizeQualityAssessment(rawTurnQualityAssessment);
+      if (rawTurnQualityAssessment !== undefined) {
+        // A malformed current assessment must not inherit a valid assessment from an earlier turn.
+        // Doing so hides the actual protocol error and can make a CR repeat forever.
         qualityAssessment = turnQualityAssessment;
-        qualityAssessmentRound = round;
+        qualityAssessmentRound = turnQualityAssessment ? round : 0;
       }
       const normalizedActions = normalizeActions(turn.actions, toolMap);
       let actions = normalizedActions.actions;
@@ -701,11 +708,25 @@ export class StepExecutor {
           metrics,
         };
       }
+      const actorRequestedNoActions = actions.length === 0;
+      const missingRequiredOutputs = (await verifyOutputs(inp)).missing;
+      const allowVerifiedChangeRequestNoop =
+        turn.done === true &&
+        actorRequestedNoActions &&
+        canAcceptExplicitChangeRequestNoop(
+          inp,
+          ownedChangeRequestArtifacts,
+          calls,
+          qualityAssessment,
+          changeRequestDisposition,
+        );
       const automaticDevelopmentVerifications = await automaticDevelopmentVerificationActions({
         actions,
         phase: inp.step.phase,
         baselineTestExecution: inp.baselineTestExecution ?? 'execute',
         baselineTestVerified: baselineTestVerifiedMutationGeneration === mutationGeneration,
+        missingRequiredOutputs,
+        allowVerifiedChangeRequestNoop,
         language: profile.id,
         toolMap,
         ctx: inp.ctx,
@@ -1357,7 +1378,7 @@ export class StepExecutor {
       );
       const explicitChangeRequestNoop =
         turn.done === true &&
-        actions.length === 0 &&
+        actorRequestedNoActions &&
         verify.ok &&
         qualityAssessmentMissing.length === 0 &&
         !invalidChangeRequestDisposition &&
@@ -2143,12 +2164,24 @@ function canAcceptExplicitChangeRequestNoop(
 ): boolean {
   if (!input.changeRequest) return false;
   if (disposition?.outcome !== 'not-applicable') return false;
-  if (!assessment || assessment.gaps.length > 0 || assessment.blockedBy.length === 0) return false;
+  if (!assessment || assessment.gaps.length > 0) return false;
+  const delegatesWork = disposition.reasonCategory === 'downstream-owned' ||
+    disposition.reasonCategory === 'outside-step-scope';
+  if (delegatesWork && assessment.blockedBy.length === 0) return false;
   const inspected = new Set(disposition.inspectedArtifacts.map(normalizeComparablePath));
   const successfullyRead = new Set([
     ...(input.contextSnippets ?? []).map((snippet) => normalizeComparablePath(snippet.path)),
     ...calls
-      .filter((call) => call.ok && call.tool === 'read_file' && typeof call.args?.path === 'string')
+      .filter((call) =>
+        call.tool === 'read_file' &&
+        typeof call.args?.path === 'string' &&
+        // A read that returns "no such file" inspected the artifact as surely as one that returns
+        // its text — and it is the stronger evidence for not-applicable, because an artifact that
+        // does not exist cannot be this Step's to change. Requiring content deadlocked a live
+        // Change Request whose affected artifact was a dated runtime output from the day before:
+        // the Step had to read it to say it was out of scope, and could not, so every one of its
+        // 37 completed turns was discarded and the Ticket died on the non-convergence guard.
+        (call.ok || isMissingArtifactRead(call)))
       .map((call) => normalizeComparablePath(String(call.args!.path))),
   ]);
   if (ownedArtifacts.length > 0) {
@@ -2164,6 +2197,12 @@ function canAcceptExplicitChangeRequestNoop(
   const affected = input.changeRequest.contractDelta.affectedArtifacts
     .map(normalizeComparablePath);
   return affected.some((artifact) => inspected.has(artifact) && successfullyRead.has(artifact));
+}
+
+/** Whether a failed read is the workspace saying the file is not there, rather than a tool misuse. */
+function isMissingArtifactRead(call: ToolCallRecord): boolean {
+  const detail = `${call.error ?? ''} ${call.summary ?? ''}`;
+  return /ENOENT|no such file or directory|does not exist|not found/i.test(detail);
 }
 
 function normalizeComparablePath(value: string): string {
@@ -2384,9 +2423,15 @@ function validateExecutionTurnContract(
   const actions = normalizeActions(turn.actions, toolMap).actions;
   if (turn.done !== true || actions.length > 0 || !step.qualityGate) return;
 
-  const assessment = normalizeQualityAssessment(
-    turn.qualityAssessment ?? turn.quality_assessment,
-  );
+  const rawAssessment = turn.qualityAssessment ?? turn.quality_assessment;
+  const shapeIssues = qualityAssessmentShapeIssues(rawAssessment);
+  if (shapeIssues.length > 0) {
+    throw new Error(
+      'low-quality Executor response: invalid qualityAssessment shape; ' +
+      `${shapeIssues.join(', ')}; use arrays such as blockedBy:["CODE owns this work"], never objects`,
+    );
+  }
+  const assessment = normalizeQualityAssessment(rawAssessment);
   const missing = missingQualityAssessmentFields(step, assessment, true, {
     baselineExecutionDeferred,
   });
@@ -2501,6 +2546,8 @@ async function automaticDevelopmentVerificationActions(input: {
   phase: Step['phase'];
   baselineTestExecution: 'execute' | 'defer';
   baselineTestVerified: boolean;
+  missingRequiredOutputs: string[];
+  allowVerifiedChangeRequestNoop: boolean;
   language: LanguageProfile['id'];
   toolMap: Map<string, Tool>;
   ctx: ToolContext;
@@ -2509,6 +2556,13 @@ async function automaticDevelopmentVerificationActions(input: {
   const automatic: LLMAction[] = [];
   const requestedTools = new Set(input.actions.map((action) => action.tool));
   const hasOutputMutation = input.actions.some((action) => isOutputMutationTool(action.tool));
+  const currentMutationsCoverMissingOutputs = input.missingRequiredOutputs.every((missing) =>
+    input.actions.some((action) =>
+      isOutputMutationTool(action.tool) &&
+      actionTargetPaths(action.tool, action.args).some(
+        (target) => normalizeRelPath(target) === normalizeRelPath(missing),
+      )),
+  );
   const codeMutationTargeted = input.actions.some((action) =>
     actionTargetPaths(action.tool, action.args).some((target) =>
       normalizeRelPath(target).startsWith('src/')),
@@ -2532,6 +2586,12 @@ async function automaticDevelopmentVerificationActions(input: {
   if (
     input.baselineTestExecution === 'execute' &&
     !input.baselineTestVerified &&
+    // The Runtime owns this safety-net gate, but it must follow a proposed mutation rather than an
+    // inspection. Otherwise every Debugger read reruns the still-failing suite before the repair can
+    // be written. A verified CR no-op is the one mutation-free delivery path and receives one gate
+    // only after its structured disposition and inspection evidence are complete.
+    ((hasOutputMutation && currentMutationsCoverMissingOutputs) ||
+      input.allowVerifiedChangeRequestNoop) &&
     (input.ctx.testGateArgs?.length ?? 0) > 0 &&
     input.toolMap.has('run_tests') &&
     !requestedTools.has('run_tests')

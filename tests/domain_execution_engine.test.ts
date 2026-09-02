@@ -15,7 +15,7 @@ import { PluginHost } from '../src/plugins/host.js';
 import { Workspace } from '../src/workspace/workspace.js';
 import { reviseActor } from '../src/domain/project_management/index.js';
 import { VALIDATION_CONTRACT_DEFECT_CODE } from '../src/domain/tickets/ticket.js';
-import { passedTestOutcome } from './helpers/ticket_fixtures.js';
+import { failedTestOutcome, passedTestOutcome } from './helpers/ticket_fixtures.js';
 
 describe('ProjectOrchestrator', () => {
   it('returns cancelled attempt capacity to PM without opening a project defect', async () => {
@@ -176,10 +176,23 @@ describe('ProjectOrchestrator', () => {
       ...base,
       finalGate: async () => {
         gateRuns += 1;
-        if (gateRuns > 1) return { ok: true, evidence: ['all corrected delivery checks pass'] };
+        if (gateRuns > 1) {
+          const tickets = await setup.repository.list({
+            objectType: 'ticket',
+            projectId: setup.graph.project.id,
+          });
+          const repairedPhaseBug = tickets.find((ticket) =>
+            ticket.objectType === 'ticket' &&
+            ticket.type === 'bug' &&
+            ticket.description.includes('invalid payload'));
+          // Step/CR verification proves the repair, but the external gate has not returned its
+          // verdict yet. It must not be reported closed before this replay runs.
+          expect(repairedPhaseBug?.objectType === 'ticket' && repairedPhaseBug.state).toBe('resolved');
+          return { ok: true, evidence: ['all corrected delivery checks pass'] };
+        }
         return {
           ok: false,
-          reason: 'Phase delivery found three independent problems.',
+          reason: 'Phase delivery found four independent problems.',
           evidence: ['live acceptance and deliverable audit failed'],
           findings: [
             {
@@ -196,6 +209,15 @@ describe('ProjectOrchestrator', () => {
               summary: 'The functional baseline omits the empty-response scenario.',
               evidence: ['requirement R-12 has no executable case'],
               target: 'requirement-analysis' as const,
+              dependencyPackages: [],
+            },
+            {
+              category: 'change-request' as const,
+              code: 'accepted_external_capability_unavailable',
+              summary: 'The accepted external capability is no longer viable.',
+              evidence: ['The current provider contract cannot satisfy the declared user flow.'],
+              target: 'high-level-design' as const,
+              affectedArtifacts: ['docs/02-high-level-design.md'],
               dependencyPackages: [],
             },
             {
@@ -220,11 +242,22 @@ describe('ProjectOrchestrator', () => {
     })).filter((ticket) => ticket.objectType === 'ticket');
     expect(tickets.filter((ticket) => ticket.type === 'bug' &&
       ticket.description.includes('invalid payload'))).toHaveLength(1);
+    expect(tickets.find((ticket) => ticket.type === 'bug' &&
+      ticket.description.includes('invalid payload'))?.state).toBe('closed');
     expect(tickets.filter((ticket) => ticket.type === 'enhancement' &&
       ticket.description.includes('empty-response scenario'))).toHaveLength(1);
     expect(tickets.filter((ticket) => ticket.type === 'change-request' &&
       ticket.name.startsWith('DEP-') &&
       ticket.description.includes('Schema validation'))).toHaveLength(1);
+    // One finding opens one chain. Counted at the head, because every hop now carries the same
+    // change: a child that described only what the previous Step did reached CODE saying a document
+    // it does not own was accepted, and CODE closed it without touching the product.
+    expect(tickets.filter((ticket) => ticket.type === 'change-request' &&
+      ticket.changeKind === 'contract-change' &&
+      ticket.parentChangeRequestId === undefined &&
+      ticket.description.includes('external capability'))).toHaveLength(1);
+    expect(tickets.some((ticket) => ticket.type === 'bug' &&
+      ticket.description.includes('external capability'))).toBe(false);
     const actors = (await setup.repository.list({
       objectType: 'actor-registration',
       projectId: setup.graph.project.id,
@@ -232,14 +265,14 @@ describe('ProjectOrchestrator', () => {
     const pm = actors.find((actor) => actor.role === 'project-manager');
     expect(pm).toBeDefined();
     const intakeTickets = tickets.filter((ticket) => ticket.source.kind === 'pm-intake');
-    expect(intakeTickets.length).toBeGreaterThanOrEqual(3);
+    expect(intakeTickets.length).toBeGreaterThanOrEqual(4);
     expect(intakeTickets.every((ticket) => ticket.creatorActorId === pm?.id)).toBe(true);
     const phaseAssessments = (await setup.repository.list({
       objectType: 'quality-assessment',
       projectId: setup.graph.project.id,
     })).filter((object) => object.objectType === 'quality-assessment' &&
       object.subject.objectType === 'phase');
-    expect(phaseAssessments.some((assessment) => !assessment.passed && assessment.findings.length === 3))
+    expect(phaseAssessments.some((assessment) => !assessment.passed && assessment.findings.length === 4))
       .toBe(true);
     expect(phaseAssessments.some((assessment) => assessment.passed)).toBe(true);
   });
@@ -260,7 +293,7 @@ describe('ProjectOrchestrator', () => {
             projectId: setup.graph.project.id,
           });
           const sourceBug = tickets.find((ticket) => ticket.objectType === 'ticket' && ticket.type === 'bug');
-          expect(sourceBug?.objectType === 'ticket' && sourceBug.state).toBe('pending');
+          expect(sourceBug?.objectType === 'ticket' && sourceBug.state).toBe('resolved');
           const activeRequest = tickets.find((ticket) =>
             ticket.objectType === 'ticket' &&
             ticket.type === 'change-request' &&
@@ -325,8 +358,20 @@ describe('ProjectOrchestrator', () => {
     const downstream = hops.filter((hop) => hop.parentChangeRequestId);
     expect(downstream.length).toBeGreaterThan(0);
     for (const hop of downstream) {
-      expect(hop.type === 'change-request' && hop.implementationPlan.join(' '))
-        .toContain('against the accepted change');
+      const plan = hop.type === 'change-request' ? hop.implementationPlan.join(' ') : '';
+      // Each hop is handed what changed upstream and asked whether it is affected — not handed the
+      // upstream file as its task. Framing it as ownership let every Step that did not own that file
+      // close the chain untouched while the product never changed.
+      expect(plan).toContain('Upstream changed:');
+      expect(plan).toContain('decide whether that change affects what this Step owns');
+      // The guard the original construction existed for: a hop never inherits work it cannot do.
+      expect(plan).toContain('Apply what it requires of this Step');
+      // And the chain keeps moving whatever this hop decides.
+      expect(plan).toContain('continues downstream');
+      // Why the chain exists travels with it, so "does this affect me" is answerable.
+      const root = hops.find((candidate) => !candidate.parentChangeRequestId);
+      expect(hop.type === 'change-request' && hop.contractDelta.before.join(' '))
+        .toContain(root?.type === 'change-request' ? root.contractDelta.summary : '');
     }
     expect(bug?.objectType === 'ticket' && bug.type === 'bug' && bug.changelistIds).toHaveLength(1);
     const bugChange = bug?.objectType === 'ticket' && bug.type === 'bug'
@@ -337,6 +382,60 @@ describe('ProjectOrchestrator', () => {
     expect(calls.findIndex((call) => call.startsWith('wiki:'))).toBeGreaterThan(
       calls.lastIndexOf('P1-S008:change-request'),
     );
+  });
+
+  it('does not call the merge boundary for a CR attempt that missed the original Bug replay', async () => {
+    const setup = await fixture();
+    const integratedTicketIds: string[] = [];
+    let failedFunctional = false;
+    let functionalCrAttempts = 0;
+    let functionalCrTicketId: string | undefined;
+    const runner = {
+      initialize: async () => undefined,
+      run: async (input: AttemptInput): Promise<AttemptResult> => {
+        if (input.domainStep.type === 'FUNCTIONAL_TEST' && input.mode === 'normal' && !failedFunctional) {
+          failedFunctional = true;
+          return {
+            ok: false,
+            reason: 'the original functional contract failed',
+            failureLog: 'tests/functional/original.test.ts > original contract > returns source failed',
+            changedFiles: [],
+            wikiEntryIds: [],
+            testOutcomes: [failedTestOutcome(input.domainStep, [
+              'tests/functional/original.test.ts > original contract > returns source',
+            ])],
+          };
+        }
+        const result = await passingAttempt(setup.repository, input.domainStep);
+        if (input.domainStep.type === 'FUNCTIONAL_TEST' && input.mode === 'change-request') {
+          functionalCrAttempts += 1;
+          functionalCrTicketId = input.ticket.id;
+          return {
+            ...result,
+            testOutcomes: [passedTestOutcome(input.domainStep, [
+              functionalCrAttempts === 1
+                ? 'tests/functional/unrelated.test.ts'
+                : 'tests/functional/original.test.ts',
+            ])],
+          };
+        }
+        return result;
+      },
+    };
+    const engine = new ProjectOrchestrator({
+      ...options(setup.workspace, setup.repository, runner),
+      integrateTicket: async (ticketId) => {
+        integratedTicketIds.push(ticketId);
+        return { status: 'merged' };
+      },
+    }, setup.plan);
+
+    const result = await engine.run(setup.graph.phases[0]!.id);
+
+    expect(result.failedStepId, JSON.stringify(result)).toBeUndefined();
+    expect(functionalCrAttempts).toBe(2);
+    expect(functionalCrTicketId).toBeDefined();
+    expect(integratedTicketIds.filter((ticketId) => ticketId === functionalCrTicketId)).toHaveLength(1);
   });
 
   // A live run produced six validation-contract Bugs against one Change Request that never closed.
@@ -526,11 +625,10 @@ describe('ProjectOrchestrator', () => {
     expect(discovered?.type === 'bug' && discovered.failure.code).toBe(VALIDATION_CONTRACT_DEFECT_CODE);
     expect(discovered?.type === 'bug' && discovered.failure.details?.originFailureCode).toBe('unclassified_execution_failure');
     expect(discovered?.parentTicketId).toBeDefined();
-    // Three repairs, not two. A Bug now closes only after its own gate has re-run and passed, so the
-    // run keeps going until that happens instead of stopping with the Bug still open. The extra cycle
-    // is a second diagnosis contradiction: `alreadyContradicted` is keyed on one Change Request, and
-    // each repair opens a new one, so the guard does not span repair cycles.
-    expect(calls.filter((call) => call === 'P1-S001:debug')).toHaveLength(3);
+    // The original failure and the diagnosis contradiction each require one repair. A repeated
+    // verdict now reopens its canonical resolved Bug instead of creating another corrective chain,
+    // so no third debug pass is manufactured solely by Ticket identity churn.
+    expect(calls.filter((call) => call === 'P1-S001:debug')).toHaveLength(2);
   });
 
   // The same shape as the test above, with one field changed: the defect text is rendered by the

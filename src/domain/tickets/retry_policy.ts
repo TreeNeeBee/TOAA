@@ -3,6 +3,15 @@ export interface AttemptFailureEvidence {
   category?: string;
   /** The XCompiler build that produced this failure, when the run recorded one. */
   toolchainBuildId?: string;
+  /**
+   * What the Step was told to do when this failure was recorded.
+   *
+   * The build id answers "did XCompiler change". This answers "did this Step's instructions change",
+   * which is the other way a recurrence stops being evidence: a declared output that no longer
+   * exists, or a prompt naming an artifact that was removed, produces the same failure every time
+   * until someone repairs the declaration — and that repair was invisible here.
+   */
+  stepContextFingerprint?: string;
 }
 
 export interface AttemptExtensionDecision {
@@ -15,6 +24,7 @@ const REPEATED_FAILURE_LIMIT = 3;
 export function evaluateAttemptExtension(
   evidence: readonly AttemptFailureEvidence[],
   currentBuildId?: string,
+  currentStepContext?: string,
 ): AttemptExtensionDecision {
   // Recurrence means "the corrective work is not converging" only while the toolchain holds still.
   // Failures recorded by a build that no longer exists say nothing about whether the repair that
@@ -28,13 +38,18 @@ export function evaluateAttemptExtension(
   // wrong one: every failure logged before builds were identified is unlabelled, which is exactly
   // the case where the toolchain has demonstrably changed — a live Ticket stayed stopped through
   // the repair that fixed it for precisely this reason.
-  const relevant = currentBuildId === undefined
-    ? evidence
-    : evidence.filter((item) => item.toolchainBuildId === currentBuildId);
+  const relevant = evidence.filter((item) =>
+    (currentBuildId === undefined || item.toolchainBuildId === currentBuildId) &&
+    // A failure recorded against instructions this Step no longer has says nothing about whether it
+    // still recurs. Unlabelled records keep their old meaning: only a fingerprint that is present
+    // and different proves the instructions moved.
+    (currentStepContext === undefined ||
+      item.stepContextFingerprint === undefined ||
+      item.stepContextFingerprint === currentStepContext));
   if (evidence.length > 0 && relevant.length === 0) {
     return {
       extend: true,
-      reason: 'every recorded failure predates the running XCompiler build',
+      reason: 'every recorded failure predates the running build or this Step\'s current instructions',
     };
   }
   const latest = relevant.at(-1);

@@ -62,6 +62,25 @@ export class ProjectManagerIntakeService {
       const target = reportTarget(steps, acceptance, report);
       const reportText = renderProblemReport(input.origin, report);
       let ticket: Ticket;
+      if (report.category === 'change-request') {
+        ticket = await this.corrective.routeContractChange({
+          reportingStepId: acceptance.id,
+          targetStepId: target.id,
+          summary: report.summary,
+          evidence: report.evidence,
+          expected: report.scene?.scenario.expected ?? report.summary,
+          affectedArtifacts: report.affectedArtifacts ?? [],
+          creatorActorId,
+          correlationId: input.correlationId,
+          sourceKind: 'pm-intake',
+          // The finding's stable code, so the Change Request can be traced back to what raised it
+          // and a recurrence recognised as the same problem rather than a second one. Without it
+          // every Change Request in a Phase carried the same external id.
+          sourceExternalId: `${input.origin}:${phase.name}:${report.code}`,
+        });
+        queued.push({ ticket, order: STEP_TYPE_ORDER[target.type] });
+        continue;
+      }
       if (report.category === 'dependency') {
         ticket = await this.corrective.routeDependencyChange({
           requestingStepId: acceptance.id,

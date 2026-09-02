@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
  * Selectors come from the plan — `pairedTestAssetPaths` derives them from the paired source Step's
  * declared outputs — and nothing reconciles them against the filesystem. The runner then reports a
  * usage error, `file or directory not found`, which reads as a broken environment while the real
- * cause is unfinished work. A live dbc3 CODE Step spent all ten of its rounds re-issuing that same
+ * cause is unfinished work. A live CODE Step spent all ten of its rounds re-issuing that same
  * invocation, was told 69 times which five outputs it still owed, and the run stopped at 11/8.
  */
 describe('run_tests refuses selectors nobody has written', () => {
