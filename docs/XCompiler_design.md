@@ -166,13 +166,15 @@ Ticket 类型固定为：
 - `task`：Story 下的计划工作，最多再嵌套一层 Task。
 - `bug`：错误行为、命令失败、测试失败或异常，进入 Debug 流程。
 - `enhancement`：功能缺口、测试不完备或质量指标不足。
-- `change-request`：承接已接受上游变更，向受影响下游 Step 传导增量。
+- `change-request`：承接已接受上游变更，或承接真实场景证明必须调整的已接受契约，向受影响下游 Step 传导增量。
 
 Ticket 通用字段包含角色、Agent、0-255 优先级、父/根 Ticket、依赖、阻塞项、关联项、检查点、日志、changelist、solution 和 source。source 保存 correlation ID、causation ID 及外部来源。调度工作不再持久化第二份 `mode`；Runtime 仅在执行边界由 Ticket 类型派生 `normal`、`debug`、`enhancement` 或 `change-request` 模式，避免生命周期事实与执行副本漂移。
 
 Bug 额外持久化结构化 `failure.identity`、`verificationContract` 和只追加的 `verificationRecords`。身份由失败类别、机器码、失败/目标/验证 Step、操作、失败测试选择器、目标产物及状态码组成，不包含摘要、完整日志、临时目录、计数器或模型措辞。原始验证 Step 通过后立即记录身份哈希、QualityAssessment 和实际测试选择器；CR 若仍需继续下游影响分析，最终跳复用这份证明而不是要求另一个 Step 冒充原验证门禁。每次发现都先创建独立 Bug；PM 注册后、分配前才比较同一目标 Step 上更早的活动 Bug。命中时保留两张票，以 `duplicateOfTicketId` / `duplicateTicketIds` 双向关联，把后到票停放为 `pending:duplicate`，并记录治理决策；原票终态后再取消重复票。PM 不合并两者的技术上下文。
 
-Change Request 使用 `sourceTicketIds[]` 保存全部来源、`originFailures[]` 保存全部起因失败，并以 `propagationStepIds[]` 明确本链的受影响 Step。传播范围必须从当前目标 Step 开始，只包含同一 Project/Phase 内唯一且按 V 模型顺序递增的 Step；非法范围在创建任何 Ticket、关系或生命周期变更前拒绝。相同传播跳可以折叠多个来源，但不能丢弃任一来源、契约差异、changelist 或验证要求。最终跳关闭前必须一次性重放所有仍活动源 Bug 的原始验证契约；少一个失败用例都整体拒绝关闭，不能先关闭 CR 再留下半数源票。
+Change Request 使用 `changeKind` 区分纠正传播、依赖变更和已接受契约变更，使用 `sourceTicketIds[]` 保存全部来源、`originFailures[]` 保存全部起因失败，并以 `propagationStepIds[]` 明确本链的受影响 Step。传播范围必须从当前目标 Step 开始，只包含同一 Project/Phase 内唯一且按 V 模型顺序递增的 Step；非法范围在创建任何 Ticket、关系或生命周期变更前拒绝。相同纠正传播跳可以折叠多个来源，但不能丢弃任一来源、契约差异、changelist 或验证要求。最终跳关闭前必须一次性重放所有仍活动源 Bug 的原始验证契约；少一个失败用例都整体拒绝关闭，不能先关闭 CR 再留下半数源票。
+
+Phase 真实场景的进程状态、40X/50X、重定向、超时、异常和空结果只作为现场证据。ProjectManager LLM 根据已接受需求、场景预期与完整证据判断：契约仍有效而实现错误时创建 Bug；满足预期必须调整需求、能力、接口、依赖、数据源或设计前提时直接创建 `contract-change` CR 并从归属 Step 向下游传播。LLM 判定缺少合法 Ticket 类型或归属 Step 时门禁失败，不允许静默通过或默认归类。
 
 Ticket 状态机：
 
@@ -185,7 +187,22 @@ reopened -> in_progress | cancelled
 cancelled -> reopened | closed
 ```
 
-Bug、Enhancement、CR 没有 `verified` solution 时不能进入 `resolved`。
+纠正类 Ticket（Bug / Enhancement / CR）的每个状态各有确切含义,三者不可互相顶替:
+
+- **`in_progress`** —— 正在修复。
+- **`resolved`** —— 修复已落地,**且本 Step 自己的检查已通过**;等待的是发现该失败的那道门禁的裁决。
+  停驻到这个状态要出示**属于本 Step 且通过**的 QualityAssessment,不是模型声称完成即可。
+  领域状态机只要求存在 solution,因为关闭路径会途经此状态;应用层的统一评估校验同时约束
+  Change Request 主交接和特殊汇合路径,不能从旁路把未通过门禁的修复写成 `resolved`。
+- **`reopened`** —— 那道门禁把同一个失败又报了一次,即裁决为否。**重开原票而不是新开一张**:
+  按失败身份与目标 Step 匹配。新开会让原票永远停在 `resolved` 等一个已经回来的答复。
+- **`closed`** —— 裁决为是。要求已验证的 solution **且**原始失败在观察到它的 Step 上重放通过。
+- **`pending`** —— 只表示被别的事物阻塞,不表示「已完成待验」。混用这两种含义会让调度器把活
+  重新派给刚刚完成它的 Step:一次实跑因此让同一张 Bug 在 `pending → in_progress` 之间循环三轮,
+  反复重做已经落地的修复。
+
+调度器不把工作交给 `resolved` 的 Ticket —— 它的工作已经做完,欠的只是裁决。
+
 
 ## 7. Step、Phase 与 Project 状态
 
@@ -454,6 +471,7 @@ Phase 未完成时因当前 Phase 通过而误报项目已交付。
 - 写权限按文件归属判定；被拒绝的写入必须同时得到可执行的替代动作。
 - Provider 失败与被生成工程的失败必须分类区分，依据是结构化的流进度而非消息文本。
 - Bug 只有在开票的那个失败于其验证 Step 重跑并通过后才关闭；未通过时拒绝关闭，不终止运行。
+- 纠正 Ticket 停驻为 `resolved` 必须出示本 Step 的通过评估；门禁重报同一失败时重开原票，不新开。
 - 纠正流程中「无法推进」一律表现为停在原地并说明，异常只用于真正的不变量破坏。
 - 重复缺陷保留为独立 Ticket，由 PM 在路由前判定，生命周期跟随原始票。
 - 执行模式由 Ticket 类型派生，不单独持久化。

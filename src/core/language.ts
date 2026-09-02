@@ -41,6 +41,12 @@ export interface LanguageProfile {
   /** 默认 Docker 镜像。 */
   readonly defaultDockerImage: string;
 
+  /** Machine-checked contracts for a manifest authored by the V-model. */
+  readonly manifestContract?: {
+    /** Exact package-manager test entrypoint accepted by the generated-project contract. */
+    testScript?: string;
+  };
+
   /** 把依赖列表渲染为 manifest 文件内容（仅当 seedManifestFromDeps=true 时使用）。 */
   renderManifest(deps: string[]): string;
 
@@ -92,6 +98,8 @@ const pythonProfile: LanguageProfile = {
   },
 };
 
+const TYPESCRIPT_TEST_SCRIPT = 'vitest run';
+
 const typescriptProfile: LanguageProfile = {
   id: 'typescript',
   displayName: 'TypeScript',
@@ -102,13 +110,14 @@ const typescriptProfile: LanguageProfile = {
   // starts, and the manifest that populates it arrives when the design that chose it does.
   seedManifestFromDeps: false,
   defaultDockerImage: 'node:24-slim',
+  manifestContract: { testScript: TYPESCRIPT_TEST_SCRIPT },
   renderManifest(deps) {
     const pkg = {
       name: 'app',
       version: '0.0.0',
       private: true,
       type: 'module',
-      scripts: { test: 'vitest run', start: 'tsx src/main.ts' },
+      scripts: { test: TYPESCRIPT_TEST_SCRIPT, start: 'tsx src/main.ts' },
       dependencies: Object.fromEntries(
         [...new Set(deps.map((d) => d.trim()).filter(Boolean))].sort().map((d) => [d, '*']),
       ),
@@ -134,8 +143,8 @@ const typescriptProfile: LanguageProfile = {
   // "No test files found" and no role can repair it, because the name came from the Step's declared
   // outputs rather than from anything the executor chose.
   plannerPromptOverride: '\n\nTypeScript test files must be named `<name>.test.ts` or `<name>.spec.ts` ' +
-    '(for example `tests/modules/scrapers.test.ts`). `vitest run` collects no other name, so a Step ' +
-    'declaring `tests/test_scrapers.ts` produces a suite that can never run.',
+    '(for example `tests/modules/service.test.ts`). `vitest run` collects no other name, so a Step ' +
+    'declaring `tests/test_service.ts` produces a suite that can never run.',
   executorPromptOverride: '',
   async autoFixImports(ws, audit) {
     return autoFixTypeScriptTypeOnlyImports(ws, audit);
@@ -196,25 +205,6 @@ async function probeTsEntrypoint(
     };
   }
   const ok = r.exitCode === 0 && !r.timedOut && helpOutputLooksMeaningful(r.stdout, r.stderr);
-  if (ok) {
-    try {
-      const smoke = await runTsEntrySmoke(entry, sandbox);
-      const smokeNetworkFailure = detectNetworkApiFailureInExec(smoke);
-      if (smokeNetworkFailure) {
-        return {
-          ok: false,
-          command: tsSmokeCommand(entry),
-          exitCode: smoke.exitCode,
-          timedOut: smoke.timedOut ?? false,
-          stdoutTail: tail(smoke.stdout),
-          stderrTail: `${smokeNetworkFailure.message}\nEvidence: ${smokeNetworkFailure.evidence}`,
-        };
-      }
-    } catch {
-      // Smoke run is only a network/API failure detector; ordinary no-arg failures
-      // still fall back to the --help entrypoint verdict.
-    }
-  }
   return {
     ok,
     command: entry.command,
@@ -284,36 +274,6 @@ async function runTsEntryProbe(
     return sandbox.exec(probe.cmd, probe.argv, { timeoutMs: 60_000 });
   }
   return sandbox.runProgram([probe.entry, '--help'], { timeoutMs: 60_000 });
-}
-
-async function runTsEntrySmoke(
-  probe:
-    | { type: 'start-script'; command: string }
-    | { type: 'run-program'; entry: string; command: string }
-    | { type: 'exec'; cmd: string; argv: string[]; command: string },
-  sandbox: Sandbox,
-): Promise<Awaited<ReturnType<Sandbox['runProgram']>>> {
-  if (probe.type === 'start-script') {
-    return sandbox.exec('npm', ['run', '--silent', 'start'], { timeoutMs: 60_000 });
-  }
-  if (probe.type === 'exec') {
-    return sandbox.exec(probe.cmd, probe.argv.filter((arg) => arg !== '--help'), { timeoutMs: 60_000 });
-  }
-  return sandbox.runProgram([probe.entry], { timeoutMs: 60_000 });
-}
-
-function tsSmokeCommand(
-  probe:
-    | { type: 'start-script'; command: string }
-    | { type: 'run-program'; entry: string; command: string }
-    | { type: 'exec'; cmd: string; argv: string[]; command: string },
-): string {
-  if (probe.type === 'start-script') return 'npm run --silent start';
-  if (probe.type === 'exec') {
-    const argv = probe.argv.filter((arg) => arg !== '--help');
-    return [probe.cmd, ...argv].join(' ');
-  }
-  return `npx tsx ${probe.entry}`;
 }
 
 function toTsBinProbe(

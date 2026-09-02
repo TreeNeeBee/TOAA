@@ -728,7 +728,7 @@ describe('OpenAI-compatible streaming', () => {
  * Counting only `content` made every reasoning chunk invisible: `streamedContentChars` stayed 0
  * while hundreds of chunks arrived, the first-token watchdog fired on a fully active stream, and
  * the error told the operator to raise a timeout that could never be reached. Two live runs of the
- * dbc2excel project died this way — 300s per streaming attempt, 900s per non-stream retry.
+ * live project died this way — 300s per streaming attempt, 900s per non-stream retry.
  */
 describe('reasoning-model streams', () => {
   const reasoningServer = (opts: { reasoningChunks: number; then?: string }) => createServer((_req, res) => {
@@ -795,7 +795,7 @@ describe('reasoning-model streams', () => {
 
 /**
  * Two faults produce one message: a dead network and a model still thinking both surface as a
- * timeout, and they need opposite responses. Two live dbc2excel runs died 15 minutes apart with
+ * timeout, and they need opposite responses. Two live runs died 15 minutes apart with
  * `request timed out after 900000ms`, and nothing in the failure said which one it was.
  *
  * The diagnosis never ends the request — the timeouts own that. It exists so the failure can name

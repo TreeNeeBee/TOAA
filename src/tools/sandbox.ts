@@ -19,6 +19,40 @@ function tailLines(text: string, n: number): string {
 
 /** Build a compact failure summary for run_program / run_tests.
  * 把硬截断写成单字节计数避免极端 case 把 prompt 撑爆（默认 4KB）。 */
+/**
+ * Relative imports a runner could not resolve because they leave the workspace.
+ *
+ * The runner's own words are "Does the file exist?", which sends the author looking for a missing
+ * file instead of a miscounted path. A live run lost a Ticket to that: the test imported
+ * `../../src/models/record.ts` from `tests/unit/renderer/`, which lands in `tests/src/`, and three
+ * attempts re-ran the same suite without seeing why. The prefix is the answer, so it is given —
+ * the same lesson the paired-test gate already applies before the suite ever runs.
+ */
+export function unresolvedProductImportHint(output: string): string | undefined {
+  const misses = [...output.matchAll(
+    /Failed to load url ((?:\.\.\/)+[^\s()]*src\/[^\s()]+?)[.,;]?\s[\s\S]{0,200}?in\s+\S*?(tests\/[^\s:]+?\.[cm]?[jt]sx?)/gu,
+  )];
+  if (misses.length === 0) return undefined;
+  const lines = new Set<string>();
+  for (const match of misses) {
+    const specifier = match[1] ?? '';
+    const testPath = match[2] ?? '';
+    const depth = testPath.split('/').length - 1;
+    if (depth <= 0) continue;
+    // Only when the count is actually wrong. A runner reports an unresolved import for other
+    // reasons too — the file may simply not be written yet — and telling an author to use the
+    // prefix they already used sends them looking for a difference that is not there.
+    const written = /^(\.\.\/)+/u.exec(specifier)?.[0] ?? '';
+    if (written === '../'.repeat(depth)) continue;
+    lines.add(
+      `${specifier} from ${testPath} resolves outside the workspace — ` +
+      `from ${testPath.slice(0, testPath.lastIndexOf('/'))}/ the product is reached with exactly ` +
+      `${'../'.repeat(depth)}src/…`,
+    );
+  }
+  return lines.size > 0 ? [...lines].join('\n') : undefined;
+}
+
 function buildRunSummary(
   base: string,
   r: { stdout: string; stderr: string },
@@ -109,7 +143,16 @@ export const runProgramTool: Tool<
       data: { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, timedOut: r.timedOut },
       summary: ok
         ? base
-        : buildRunSummary(networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base, r),
+        // The unresolved-import hint keys on what the output says, not on which tool ran: a Step that
+        // drives the runner through run_program hits the same wrong-depth import, and reading the
+        // hint only out of run_tests leaves that door unwatched.
+        : buildRunSummary(
+          [
+            networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base,
+            unresolvedProductImportHint(`${r.stderr}\n${r.stdout}`),
+          ].filter(Boolean).join('\n'),
+          r,
+        ),
       ...(ok ? {} : await diagnoseSandboxFailure(ctx, base, r, 'program')),
     };
   },
@@ -166,7 +209,7 @@ export const runTestsTool: Tool<
     const gateArgs = await appendVerificationSupplements(ctx, ctx.testGateArgs ?? []);
     // A selector naming a file the Step has not written yet describes a run that cannot pass, and
     // the runner reports it as a usage error — `file or directory not found`, which reads as a
-    // broken environment rather than as unfinished work. A live dbc3 CODE Step spent all ten of its
+    // broken environment rather than as unfinished work. A live CODE Step spent all ten of its
     // rounds re-issuing that same invocation while Runtime told it, correctly and repeatedly, which
     // five outputs it still owed; the run stopped on the non-convergence guard. Refusing here turns
     // those rounds into one refusal that names the files to write.
@@ -219,7 +262,13 @@ export const runTestsTool: Tool<
       },
       summary: passed
         ? [base, ...successEvidence].join('\n')
-        : buildRunSummary(networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base, r),
+        : buildRunSummary(
+          [
+            networkFailure ? `${base}\n${networkFailure.message}\nEvidence: ${networkFailure.evidence}` : base,
+            unresolvedProductImportHint(`${r.stderr}\n${r.stdout}`),
+          ].filter(Boolean).join('\n'),
+          r,
+        ),
       ...(passed ? await Promise.resolve({}) : await diagnoseSandboxFailure(ctx, base, r, 'tests')),
     };
   },

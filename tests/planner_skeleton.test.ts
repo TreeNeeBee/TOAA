@@ -299,7 +299,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
   it('拒绝只有 REQUIREMENT_ANALYSIS + HIGH_LEVEL_DESIGN 两步的残缺 plan（用户回放）', async () => {
     const draft = {
-      requirementDigest: '批量 DBC → Excel',
+      requirementDigest: '批量配置文件 → 表格',
       globalPrompt: '',
       ...planMetadata,
       dependencies: ['pytest'],
@@ -345,23 +345,23 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       dependencies: index === 0 ? [] : [`M00${index}`],
     }));
     const phasePlan = {
-      requirementDigest: 'DBC CLI parses files, filters signals, and writes Excel output.',
-      globalPrompt: 'Build a DBC to Excel CLI.',
+      requirementDigest: 'Config CLI parses files, filters entries, and writes spreadsheet output.',
+      globalPrompt: 'Build a config to spreadsheet CLI.',
       projectType: 'application',
       complexityAssessment: {
         level: 'moderate',
-        rationale: 'CLI plus parser, filter, and Excel IO modules.',
+        rationale: 'CLI plus parser, filter, and spreadsheet IO modules.',
         splitRecommended: true,
         userForcedPhaseSplit: false,
       },
       implementationPhases: [
         {
           id: 'P1',
-          title: 'Core DBC export',
+          title: 'Core config export',
           objective: 'Deliver the core CLI conversion path.',
           status: 'current',
-          scope: ['parse DBC', 'filter ECU signals', 'write Excel'],
-          deliverables: ['CLI', 'Excel output'],
+          scope: ['parse config', 'filter entries', 'write spreadsheet'],
+          deliverables: ['CLI', 'spreadsheet output'],
           dependsOn: [],
           verificationGate: {
             summary: 'Run generated tests and CLI smoke checks.',
@@ -403,7 +403,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
     ]));
 
     const draft = await p.decompose({
-      rawRequirement: '写一个 python CLI，解析 dbc 文件，按 ECU 过滤信号并写入 Excel。',
+      rawRequirement: '写一个 python CLI，解析配置文件，按分组过滤条目并写入表格。',
       clarifications: [],
     });
 
@@ -1038,29 +1038,29 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
   });
 
   it('当前 phase 的架构规模门禁不被后续 planned phase 的 surface 误伤', async () => {
-    const rawRequirement = '写一个 TypeScript CLI，每日抓取网上热点新闻并生成 Markdown 简报，后续支持定时调度。';
+    const rawRequirement = '写一个 TypeScript CLI，每日读取配置的数据源并生成 Markdown 报表，后续支持定时调度。';
     const phasePlan = {
-      requirementDigest: 'TypeScript news briefing CLI with scheduled daily execution planned in a later phase.',
+      requirementDigest: 'TypeScript reporting CLI with scheduled daily execution planned in a later phase.',
       globalPrompt: '',
       projectType: 'application',
       complexityAssessment: {
         level: 'moderate',
-        rationale: 'core CLI and scraping now, scheduler later',
+        rationale: 'core CLI and reporting now, scheduler later',
         splitRecommended: true,
         userForcedPhaseSplit: false,
       },
       implementationPhases: [
         {
           id: 'P1',
-          title: 'Core news briefing',
-          objective: 'Deliver a TypeScript CLI that fetches public news pages, filters categories, and writes a Markdown briefing.',
+          title: 'Core report pipeline',
+          objective: 'Deliver a TypeScript CLI that reads configured sources, filters records, and writes a Markdown report.',
           status: 'current',
-          scope: ['CLI entrypoint', 'public web scraping', 'category filtering', 'Markdown generation'],
-          deliverables: ['Runnable TypeScript CLI', 'Markdown briefing output'],
+          scope: ['CLI entrypoint', 'source reading', 'record filtering', 'Markdown generation'],
+          deliverables: ['Runnable TypeScript CLI', 'Markdown report output'],
           dependsOn: [],
           verificationGate: {
-            summary: 'P1 core CLI can fetch, filter, and render a briefing.',
-            checks: ['CLI starts', 'news items are fetched', 'Markdown contains titles and links'],
+            summary: 'P1 core CLI can read, filter, and render a report.',
+            checks: ['CLI starts', 'records are read', 'Markdown contains titles and links'],
             failurePolicy: 'Feed failures to Debugger, roll back to the paired V-model phase, and rerun subsequent phases.',
           },
         },
@@ -1080,15 +1080,15 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
         },
       ],
     };
-    const sourcePaths = ['src/cli.ts', 'src/fetcher.ts', 'src/filter.ts', 'src/brief.ts'];
-    const testPaths = ['tests/cli.test.ts', 'tests/fetcher.test.ts', 'tests/filter.test.ts', 'tests/brief.test.ts'];
+    const sourcePaths = ['src/cli.ts', 'src/reader.ts', 'src/filter.ts', 'src/report.ts'];
+    const testPaths = ['tests/cli.test.ts', 'tests/reader.test.ts', 'tests/filter.test.ts', 'tests/report.test.ts'];
     const modules = sourcePaths.map((sourcePath, index) => ({
       id: `M${String(index + 1).padStart(3, '0')}`,
-      name: ['CliEntrypoint', 'NewsFetcher', 'CategoryFilter', 'BriefRenderer'][index]!,
-      responsibility: 'Own one P1 core news briefing boundary.',
+      name: ['CliEntrypoint', 'SourceReader', 'RecordFilter', 'ReportRenderer'][index]!,
+      responsibility: 'Own one P1 core report pipeline boundary.',
       sourcePaths: [sourcePath],
       testPaths: [testPaths[index]!],
-      dependencies: index === 0 ? ['M002', 'M003', 'M004'] : index === 1 ? ['cheerio'] : [],
+      dependencies: index === 0 ? ['M002', 'M003', 'M004'] : index === 1 ? ['zod'] : [],
     }));
     const steps = vModelSteps('P1', 1, sourcePaths[0], testPaths[0]);
     steps[3] = {
@@ -1112,7 +1112,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
       })),
     };
     const stepPlan = {
-      requirementDigest: 'TypeScript CLI news briefing core with scheduled daily execution planned later.',
+      requirementDigest: 'TypeScript reporting CLI core with scheduled daily execution planned later.',
       globalPrompt: '',
       dependencies: ['typescript', 'tsx', 'vitest'],
       architectureModules: modules,
@@ -1124,7 +1124,7 @@ describe('Planner.decompose — V 模型骨架完整性校验', () => {
 
     expect(plan.architectureModules).toHaveLength(4);
     expect(plan.architectureModules?.[1]?.dependencies).toEqual([]);
-    expect(plan.dependencies).toContain('cheerio');
+    expect(plan.dependencies).toContain('zod');
     expect(plan.steps.every((step) => step.iterationId === 'P1')).toBe(true);
   });
 
@@ -1213,6 +1213,46 @@ describe('forced phase split reads user sources only', () => {
   it('still fires on the user\'s own request', async () => {
     const { hasForcedPhaseSplit } = await import('../src/agents/planning/phase_strategy.js');
     expect(hasForcedPhaseSplit('请分两期交付，第一阶段先做解析')).toBe(true);
-    expect(hasForcedPhaseSplit('写一个解析 DBC 并导出 Excel 的脚本')).toBe(false);
+    expect(hasForcedPhaseSplit('写一个解析配置文件并导出表格的脚本')).toBe(false);
+  });
+});
+
+describe('Planner architectureModules schema errors', () => {
+  it('names the module, not just its array index', async () => {
+    // Naming the field was already learned once here: a rule without a location repeats. The index
+    // left the same gap one step further in — a live run repaired a different module three times
+    // over, because `architectureModules.4` still has to be counted out by hand.
+    const { parseDraftPlanJson } = await import('../src/agents/planner.js');
+    const draft = JSON.stringify({
+      requirementDigest: 'record report',
+      architectureModules: [
+        {
+          id: 'M001', name: 'Readers', responsibility: 'Read the source records',
+          sourcePaths: ['src/readers/primary.ts'], testPaths: ['tests/modules/readers.test.ts'],
+          dependencies: [],
+        },
+        {
+          id: 'M002', name: 'Renderer', responsibility: 'Render the report',
+          sourcePaths: ['src/renderer.ts'], testPaths: [], dependencies: [],
+        },
+      ],
+      // The skeleton check runs first, so the draft has to be complete enough to reach the module
+      // validation this test is about.
+      steps: [
+        'REQUIREMENT_ANALYSIS', 'HIGH_LEVEL_DESIGN', 'DETAILED_DESIGN', 'CODE',
+        'UNIT_TEST', 'INTEGRATION_TEST', 'MODULE_TEST', 'FUNCTIONAL_TEST',
+      ].map((phase, index) => ({
+        id: `S00${index + 1}`,
+        iterationId: 'P1',
+        phase,
+        title: phase,
+        description: phase,
+        inputs: [],
+        outputs: [`docs/0${index + 1}-${phase.toLowerCase()}.md`],
+        subTasks: [],
+      })),
+    });
+
+    expect(() => parseDraftPlanJson(draft)).toThrow(/architectureModules\.1 \(M002\)\.testPaths/u);
   });
 });

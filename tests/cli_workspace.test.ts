@@ -17,9 +17,9 @@ describe('CLI workspace resolution', () => {
     // the name is nowhere in the path, so anything that recovers a project name by parsing the
     // workspace silently loses it. The name has to travel as data.
     const explicit = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-cli-explicit-'));
-    const ws = await resolveCompileWorkspace({ workspace: explicit, name: 'news-ts' });
+    const ws = await resolveCompileWorkspace({ workspace: explicit, name: 'report-ts' });
     expect(ws).toBe(path.resolve(explicit));
-    expect(ws).not.toContain('news-ts');
+    expect(ws).not.toContain('report-ts');
   });
 
   it('defaults evolve mode to the current working directory instead of a temp workspace', async () => {

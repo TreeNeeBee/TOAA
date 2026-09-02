@@ -879,3 +879,62 @@ describe('non-stream retry after a stalled stream', () => {
     }
   }, 30_000);
 });
+
+describe('rate-limited providers back off instead of burning the chain', () => {
+  /** A client that fails with the bare 429 OpenRouter returns — no retry-after to lean on. */
+  function limitedThen(successAt: number): { client: LLMClient; calls: () => number } {
+    let calls = 0;
+    return {
+      client: {
+        name: 'stub:limited',
+        chat: async () => {
+          calls += 1;
+          if (calls >= successAt) return 'ok';
+          throw new Error('OpenAI HTTP 429: Rate exceeded.');
+        },
+      } as unknown as LLMClient,
+      calls: () => calls,
+    };
+  }
+
+  function routerWith(client: LLMClient, retry?: Partial<{ max_retries: number; max_delay: number; jitter: 'random' | 'none' }>) {
+    const cfg = mkCfg({
+      providers: {
+        only: {
+          type: 'openai', api_key: 'k', base_url: 'http://y', model: 'm',
+          ...(retry ? { retry: { max_retries: 3, max_delay: 32_000, jitter: 'none', ...retry } } : {}),
+        },
+      },
+      roles: { Coder: ['only'] },
+    } as never);
+    const router = new LLMRouter(cfg);
+    (router as unknown as { clients: Map<string, LLMClient> }).clients.set('only', client);
+    return router;
+  }
+
+  it('retries the same provider until the limit lifts', async () => {
+    const stub = limitedThen(3);
+    // max_delay 0 keeps the test instant; the decision under test is whether it retries at all.
+    const client = routerWith(stub.client, { max_delay: 0 }).for('Coder');
+    await expect(client.chat([{ role: 'user', content: 'x' }])).resolves.toBe('ok');
+    expect(stub.calls()).toBe(3);
+  });
+
+  it('gives up after max_retries', async () => {
+    const stub = limitedThen(99);
+    const client = routerWith(stub.client, { max_retries: 2, max_delay: 0 }).for('Coder');
+    await expect(client.chat([{ role: 'user', content: 'x' }])).rejects.toThrow();
+    expect(stub.calls()).toBe(3);
+  });
+
+  it('does not retry a spent budget, which no wait can lift', async () => {
+    let calls = 0;
+    const spent = {
+      name: 'stub:spent',
+      chat: async () => { calls += 1; throw new Error('OpenAI HTTP 429: insufficient credits'); },
+    } as unknown as LLMClient;
+    const client = routerWith(spent, { max_delay: 0 }).for('Coder');
+    await expect(client.chat([{ role: 'user', content: 'x' }])).rejects.toThrow();
+    expect(calls).toBe(1);
+  });
+});

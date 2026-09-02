@@ -77,10 +77,10 @@ describe('autoFixSrcImports', () => {
 
   it('rewrites src/<pkg>/__main__.py with from src. imports', async () => {
     const { ws, audit } = await tmpWs();
-    await ws.ensure('src/dbc2excel');
-    await ws.writeFile('src/dbc2excel/__main__.py', 'from src.dbc2excel.parser import p\np()\n');
+    await ws.ensure('src/toolpkg');
+    await ws.writeFile('src/toolpkg/__main__.py', 'from src.toolpkg.parser import p\np()\n');
     const fixed = await autoFixSrcImports(ws, audit);
-    expect(fixed).toEqual(['src/dbc2excel/__main__.py']);
+    expect(fixed).toEqual(['src/toolpkg/__main__.py']);
   });
 
   it('leaves files alone when no from src. import is present', async () => {
@@ -165,10 +165,10 @@ describe('probeEntrypoint', () => {
     const probe = await probeEntrypoint(ws, sb);
     expect(probe.ok).toBe(true);
     expect(probe.command).toBe('python src/cli.py --help');
-    expect(calls).toEqual([['src/cli.py', '--help'], ['src/cli.py']]);
+    expect(calls).toEqual([['src/cli.py', '--help']]);
   });
 
-  it('fails when no-arg smoke detects a network API failure even if --help works', async () => {
+  it('leaves semantic no-arg execution to the LLM-judged Phase scenario', async () => {
     const { ws } = await tmpWs();
     await ws.ensure('src');
     await ws.writeFile(
@@ -178,22 +178,12 @@ describe('probeEntrypoint', () => {
     const calls: string[][] = [];
     const sb = new FakeSandbox((argv) => {
       calls.push(argv);
-      if (argv.includes('--help')) {
-        return { exitCode: 0, stdout: 'usage: main.py [-h]\n', stderr: '', timedOut: false, durationMs: 1 };
-      }
-      return {
-        exitCode: 0,
-        stdout: 'An unexpected error occurred.\n',
-        stderr: 'ERROR Weather API request failed: 404 Client Error: Not Found\n',
-        timedOut: false,
-        durationMs: 1,
-      };
+      return { exitCode: 0, stdout: 'usage: main.py [-h]\n', stderr: '', timedOut: false, durationMs: 1 };
     });
     const probe = await probeEntrypoint(ws, sb);
-    expect(probe.ok).toBe(false);
-    expect(probe.command).toBe('python src/main.py');
-    expect(probe.stderrTail).toContain('Network API failure detected');
-    expect(calls).toEqual([['src/main.py', '--help'], ['src/main.py']]);
+    expect(probe.ok).toBe(true);
+    expect(probe.command).toBe('python src/main.py --help');
+    expect(calls).toEqual([['src/main.py', '--help']]);
   });
 
   it('falls back to python -m src.<pkg> --help', async () => {

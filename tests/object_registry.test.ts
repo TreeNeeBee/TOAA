@@ -38,7 +38,7 @@ describe('ObjectRegistry', () => {
   it('maps global ids to type, name and object content without treating name as identity', async () => {
     const { workspace, registry } = await setup();
     const project = createObjectEnvelope({
-      name: 'news',
+      name: 'report',
       objectType: 'project',
       now: '2026-08-01T00:00:00.000Z',
     });

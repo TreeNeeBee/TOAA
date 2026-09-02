@@ -855,6 +855,7 @@ describe('runTestsTool / runPythonTool summary', () => {
 });
 
 describe('a passing suite is passing', () => {
+  // Samples below keep the shape of a live run's output with the project's own names replaced.
   // A live run failed a UNIT_TEST Step five times on `npm test exit=0`. The project's tests cover
   // "the source is unreachable", so the suite prints network-failure text on its way to passing, and
   // the network detector overrode the green result. The guard meant to prevent that skips lines
@@ -869,7 +870,7 @@ describe('a passing suite is passing', () => {
       sandbox: {
         runTests: async () => ({
           exitCode: 0,
-          stdout: '{"testResults":[{"message":"[warn] source baidu failed: Network error: unreachable"}]}',
+          stdout: '{"testResults":[{"message":"[warn] source upstream failed: Network error: unreachable"}]}',
           stderr: '',
           timedOut: false,
         }),
@@ -885,14 +886,14 @@ describe('a passing suite is passing', () => {
   it('is not failed by network text when run_program invoked the test runner', async () => {
     const { runProgramTool } = await import('../src/tools/sandbox.js');
     const result = await runProgramTool.run(
-      { args: ['npx', 'vitest', 'run', 'tests/unit/scrapers.unit.test.ts', '--reporter=json'] },
+      { args: ['npx', 'vitest', 'run', 'tests/unit/client.unit.test.ts', '--reporter=json'] },
       {
         ...ctx,
         language: 'typescript' as const,
         sandbox: {
           runProgram: async () => ({
             exitCode: 0,
-            stdout: '{"message":"[warn] source baidu failed: Network error: unreachable"}',
+            stdout: '{"message":"[warn] source upstream failed: Network error: unreachable"}',
             stderr: '',
             timedOut: false,
           }),
@@ -1027,6 +1028,39 @@ describe('design phases and a product that does not exist yet', () => {
       design('HIGH_LEVEL_DESIGN', "tests/modules/a.test.ts(3,1): error TS2304: Cannot find name 'foo'."),
     );
     expect(r.code).not.toBe('product_not_implemented');
+  });
+});
+
+describe('unresolved product import hint reaches both runner doors', () => {
+  // Taken verbatim from a live run: the runner was driven through run_program, so a hint read only
+  // out of run_tests never reached the author who wrote the wrong number of levels.
+  const output =
+    'Error: Failed to load url ../src/config/loader.ts (resolved id: ../src/config/loader.ts) ' +
+    'in /tmp/wt/tests/modules/config.test.ts';
+
+  const runner = (stderr: string) => ({
+    ...ctx,
+    language: 'typescript' as const,
+    phase: 'MODULE_TEST',
+    sandbox: {
+      runProgram: async () => ({ exitCode: 1, stdout: '', stderr, timedOut: false }),
+      runTests: async () => ({ exitCode: 1, stdout: '', stderr, timedOut: false }),
+    },
+  } as unknown as typeof ctx);
+
+  it('names the correct prefix when the runner is driven through run_program', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    const r = await runProgramTool.run({ args: ['npx', 'vitest', 'run'] }, runner(output));
+    expect(r.ok).toBe(false);
+    expect(r.summary).toContain('../../src/');
+    expect(r.summary).toContain('tests/modules/config.test.ts');
+  });
+
+  it('stays silent when the written depth is already right', async () => {
+    const { runProgramTool } = await import('../src/tools/sandbox.js');
+    const right = output.replace('../src/config', '../../src/config').replace('id: ../src/', 'id: ../../src/');
+    const r = await runProgramTool.run({ args: ['npx', 'vitest', 'run'] }, runner(right));
+    expect(r.summary).not.toContain('resolves outside the workspace');
   });
 });
 
@@ -1236,5 +1270,39 @@ describe('python run_program argument normalisation', () => {
       const runProgram = source.slice(source.indexOf('async runProgram'));
       expect(runProgram.slice(0, 400)).toContain('stripPythonInterpreterPrefix');
     }
+  });
+});
+
+describe('unresolvedProductImportHint', () => {
+  it('names the prefix a runner could not resolve', async () => {
+    // The runner says "Does the file exist?", which sends the author hunting for a missing file
+    // rather than a miscounted path. A live run lost a Ticket to exactly this: three attempts
+    // re-ran the same suite because nothing said the import was one directory short.
+    const { unresolvedProductImportHint } = await import('../src/tools/sandbox.js');
+    const output = [
+      'FAIL  tests/unit/renderer/markdown.test.ts',
+      'Error: Failed to load url ../../src/models/record.ts (resolved id: ../../src/models/record.ts)' +
+      ' in /tmp/wt/tests/unit/renderer/markdown.test.ts. Does the file exist?',
+    ].join('\n');
+
+    const hint = unresolvedProductImportHint(output);
+
+    expect(hint).toContain('resolves outside the workspace');
+    expect(hint).toContain('../../../src/');
+  });
+
+  it('stays silent when every import resolved', async () => {
+    const { unresolvedProductImportHint } = await import('../src/tools/sandbox.js');
+    expect(unresolvedProductImportHint('FAIL tests/unit/a.test.ts\nAssertionError: expected 1 to be 2'))
+      .toBeUndefined();
+  });
+
+  it('stays silent when the prefix was already right', async () => {
+    // A runner reports an unresolved import for other reasons too, and the file may simply not be
+    // written yet. Repeating the prefix the author already used sends them hunting for a difference
+    // that is not there.
+    const { unresolvedProductImportHint } = await import('../src/tools/sandbox.js');
+    const output = 'Error: Failed to load url ../src/a.ts in /w/tests/a.test.ts. Does the file exist?';
+    expect(unresolvedProductImportHint(output)).toBeUndefined();
   });
 });

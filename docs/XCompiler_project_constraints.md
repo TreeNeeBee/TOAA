@@ -68,8 +68,11 @@ only authority that changes Ticket state.
 - Every Bug preserves the original stage, operation, target, structured failure identity, raw
   evidence reference, and an executable verification contract. Exact replay proof is append-only and
   remains attached to the Bug while its CR continues through later impact Steps.
-- A Bug is resolved only after its original failure contract is replayed successfully. A downstream
-  gate passing for unrelated work is not proof that the Bug was fixed.
+- A Bug becomes `resolved` only after its repair is applied and the repairing Step's own delivery
+  gate passes. `resolved` means implementation is complete while the original failure verdict is
+  still outstanding; it is not executable or blocked work. The Bug closes only after its original
+  failure contract is replayed successfully at the designated verification Step. The same failure
+  recurring reopens that Bug. A downstream gate passing for unrelated work is not closure proof.
 - Scheduled work derives its execution mode from canonical Ticket type at the execution boundary.
   A persisted or independently supplied `work.mode` is forbidden because it duplicates lifecycle
   state and can disagree with the Ticket.
@@ -104,6 +107,14 @@ only authority that changes Ticket state.
 - Phase delivery gates validate complete deliverables and real user scenarios, including real network
   behavior when the scenario requires it. External gate findings go to PM problem intake, which may
   create multiple independent Tickets and restart corrective V-model work.
+- A real-scenario failure is classified from accepted project context and captured evidence by an
+  LLM. An implementation that realizes a still-valid contract incorrectly becomes a Bug; a required
+  change to an accepted requirement, capability, interface, dependency, data source, or design
+  premise becomes a Change Request. Protocol status codes, timeouts, exceptions, and empty results
+  are evidence only and never select the Ticket type or target Step.
+- A failed scenario verdict must include a typed Ticket classification and owning Step. Missing or
+  malformed judgement stops the gate as a runtime judgement failure; it is never treated as a pass
+  or silently defaulted to a product Bug.
 
 ## Workspace and persistence
 

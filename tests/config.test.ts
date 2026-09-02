@@ -188,6 +188,23 @@ agent:
     }
   });
 
+  it('does not report placeholders that exist only in YAML comments', async () => {
+    const name = 'XC_TEST_COMMENTED_MISSING_KEY';
+    const previous = process.env[name];
+    delete process.env[name];
+    try {
+      const config = YAML.stringify(baseConfig());
+      const loaded = await loadConfigWithPath(await writeRawConfig([
+        config,
+        `# api_key: \${${name}}`,
+      ].join('\n')));
+      expect(loaded.missingEnv).not.toContain(name);
+    } finally {
+      if (previous === undefined) delete process.env[name];
+      else process.env[name] = previous;
+    }
+  });
+
   it('parses OpenAI-compatible json_schema response format capability', async () => {
     const cfg = baseConfig({
       llm: {

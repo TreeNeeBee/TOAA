@@ -686,7 +686,7 @@ function parsePhaseStepPlanJson(
   return parsed;
 }
 
-function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPlan {
+export function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPlan {
   const data = parsePlannerJson(text);
   if (!data || typeof data !== 'object') {
     throw new Error('Planner did not return a JSON object.');
@@ -758,9 +758,29 @@ function parseDraftPlanJson(text: string, context?: DraftParseContext): DraftPla
     // Name the field, not just the rule. "Too small: expected array to have >=1 items" told the
     // model nothing about which of seven module fields was empty, so both providers retried and
     // failed identically — a schema error that cannot be acted on is a schema error that repeats.
+    //
+    // And name the module, not just its index. `architectureModules.4.testPaths` still leaves the
+    // author counting array positions to find which module it means, and the count is what keeps
+    // being got wrong: one live run repaired a different module three times over and failed
+    // identically each time.
+    const rawModules = Array.isArray(obj.architectureModules) ? obj.architectureModules : [];
+    const moduleLabel = (index: unknown): string => {
+      const entry = typeof index === 'number' ? rawModules[index] : undefined;
+      const named = entry && typeof entry === 'object'
+        ? (entry as { id?: unknown; name?: unknown })
+        : undefined;
+      const label = typeof named?.id === 'string'
+        ? named.id
+        : typeof named?.name === 'string' ? named.name : undefined;
+      return label ? `architectureModules.${String(index)} (${label})` : `architectureModules.${String(index)}`;
+    };
     throw new Error(
       `Planner architectureModules invalid: ${architectureResult.error.issues
-        .map((issue) => `architectureModules.${issue.path.join('.')}: ${issue.message}`)
+        .map((issue) => {
+          const [index, ...rest] = issue.path;
+          const field = rest.length > 0 ? `.${rest.join('.')}` : '';
+          return `${moduleLabel(index)}${field}: ${issue.message}`;
+        })
         .join('; ')}`,
     );
   }

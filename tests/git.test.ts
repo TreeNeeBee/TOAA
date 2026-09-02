@@ -107,3 +107,44 @@ describe('GitService', () => {
     await expect(ws.exists('.sandbox/run.log')).resolves.toBe(true);
   });
 });
+
+describe('runtime artifacts stay out of the repository', () => {
+  it('gives the generated project a .gitignore covering what it produces by running', async () => {
+    // The repository exclude file is local and invisible, so the delivered project shipped without
+    // the one file every project has, and anyone cloning it saw runtime output as source.
+    await git.ensureRepo();
+    const ignore = await fs.readFile(path.join(tmp, '.gitignore'), 'utf8');
+    for (const pattern of ['output/', 'node_modules/', '*.log', '*.pyc', '.venv/', '*.tsbuildinfo']) {
+      expect(ignore, pattern).toContain(pattern);
+    }
+  });
+
+  it('keeps ignore rules the project already wrote', async () => {
+    await fs.writeFile(path.join(tmp, '.gitignore'), 'secrets.env\noutput/\n', 'utf8');
+    await git.ensureRepo();
+    const ignore = await fs.readFile(path.join(tmp, '.gitignore'), 'utf8');
+    expect(ignore).toContain('secrets.env');
+    // Present entries are not repeated.
+    expect(ignore.split('\n').filter((line) => line === 'output/')).toHaveLength(1);
+  });
+
+  it('untracks output a previous build had already committed', async () => {
+    // A product that rewrites its own output on every delivery gate makes its next merge impossible
+    // once that file is tracked, and the artifact then reaches the corrective flow as a Change
+    // Request against a file no Step owns. A workspace that predates the rule repairs itself.
+    await git.ensureRepo();
+    await fs.mkdir(path.join(tmp, 'output'), { recursive: true });
+    await fs.writeFile(path.join(tmp, 'output', 'daily-briefing.md'), '# first\n', 'utf8');
+    await fs.writeFile(path.join(tmp, 'src.ts'), 'export const a = 1;\n', 'utf8');
+    const { simpleGit } = await import('simple-git');
+    const raw = simpleGit({ baseDir: tmp });
+    await raw.raw(['add', '-f', '--', 'output/daily-briefing.md', 'src.ts']);
+    await raw.commit('tracked by an older build');
+    expect(await raw.raw(['ls-files', '--', 'output/'])).toContain('daily-briefing.md');
+
+    await git.snapshot('S006', 1);
+
+    expect(await raw.raw(['ls-files', '--', 'output/'])).toBe('');
+    expect(await raw.raw(['ls-files', '--', 'src.ts'])).toContain('src.ts');
+  });
+});

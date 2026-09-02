@@ -1,3 +1,4 @@
+import { computeRetryDelayMs, DEFAULT_PROVIDER_RETRY, type ProviderRetryPolicy } from './retry.js';
 import type { XCompilerConfig } from '../config/config.js';
 import type { Role } from '../core/plan.js';
 import type { AuditLogger } from '../audit/audit.js';
@@ -155,8 +156,9 @@ export class LLMRouter {
         name,
         client: this.clients.get(name),
         contextWindowTokens: normalizeContextWindowTokens(this.cfg.llm.providers[name]?.context_window),
+        retry: this.cfg.llm.providers[name]?.retry ?? DEFAULT_PROVIDER_RETRY,
       }))
-      .filter((x): x is { name: string; client: LLMClient; contextWindowTokens: number } => !!x.client);
+      .filter((x): x is ChainEntry => !!x.client);
     if (clients.length === 0) {
       throw new LLMRequestError(`No usable LLM provider in chain for role ${role}: [${ranked.join(', ')}]`, {
         code: 'provider_unavailable', mode: 'router', retryable: true, switchProvider: true,
@@ -256,6 +258,13 @@ export class LLMRouter {
  * Provider/transport 故障可以切换候选；调用方契约校验失败先把精确错误
  * 反馈给当前 provider 纠错一次，仍失败才按质量故障切换候选。
  */
+interface ChainEntry {
+  name: string;
+  client: LLMClient;
+  contextWindowTokens: number;
+  retry: ProviderRetryPolicy;
+}
+
 class FallbackClient implements LLMClient {
   readonly name: string;
   private static readonly MAX_TRANSIENT_PROVIDER_ATTEMPTS = 2;
@@ -265,7 +274,7 @@ class FallbackClient implements LLMClient {
   private static readonly RETRY_GATE_PROBE_MAX_AGE_MS = 5_000;
 
   constructor(
-    private readonly chain: { name: string; client: LLMClient; contextWindowTokens: number }[],
+    private readonly chain: ChainEntry[],
     private readonly audit: AuditLogger | undefined,
     private readonly role: string,
     private readonly scores?: ScoreStore,
@@ -323,7 +332,13 @@ class FallbackClient implements LLMClient {
       }
       let attemptOptions = options;
       let providerMessages = messages;
-      for (let providerAttempt = 1; providerAttempt <= FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS; providerAttempt++) {
+      // A rate-limited provider gets its own, configurable budget: the wait is the whole remedy, and
+      // the transient-failure cap of two was written for errors that a second try either fixes or not.
+      const maxProviderAttempts = Math.max(
+        FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS,
+        1 + c.retry.max_retries,
+      );
+      for (let providerAttempt = 1; providerAttempt <= maxProviderAttempts; providerAttempt++) {
         let out: string;
         try {
           options?.onProviderStart?.(c.name, c.client.name, {
@@ -370,10 +385,16 @@ class FallbackClient implements LLMClient {
           // fallback, trigger a retry, or alter the provider's score.
           if (isCancellationError(err, options?.signal)) throw err;
           lastErr = err;
-          const retryDelayMs = retryDelayForLLMError(err);
+          const rateLimited = isRateLimitedLLMError(err);
+          const attemptCap = rateLimited
+            ? 1 + c.retry.max_retries
+            : FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS;
+          const retryDelayMs = rateLimited
+            ? computeRetryDelayMs(providerAttempt, c.retry, providerRetryAfterMs(err))
+            : retryDelayForLLMError(err);
           if (
-            providerAttempt < FallbackClient.MAX_TRANSIENT_PROVIDER_ATTEMPTS &&
-            isRetryableLLMError(err)
+            providerAttempt < attemptCap &&
+            (rateLimited || isRetryableLLMError(err))
           ) {
             const retryWithoutStreaming = shouldRetryWithoutStreaming(err, attemptOptions);
             if (retryWithoutStreaming) {
@@ -381,11 +402,17 @@ class FallbackClient implements LLMClient {
             }
             await this.audit?.event(
               'note',
-              retryWithoutStreaming
-                ? `${this.role} retrying ${c.client.name} without streaming after transient LLM stream failure`
-                : `${this.role} retrying ${c.client.name} after transient LLM stream failure`,
+              rateLimited
+                // The wait is the whole story here, so it is stated: a reader watching a silent run
+                // needs to tell backing off from hanging.
+                ? `${this.role} rate limited by ${c.client.name}; retry ${providerAttempt}/${c.retry.max_retries} in ${retryDelayMs}ms`
+                : retryWithoutStreaming
+                  ? `${this.role} retrying ${c.client.name} without streaming after transient LLM stream failure`
+                  : `${this.role} retrying ${c.client.name} after transient LLM stream failure`,
               {
-                messageId: retryWithoutStreaming ? 'llm.provider_retry_non_stream' : 'llm.provider_retry',
+                messageId: rateLimited
+                  ? 'llm.provider_retry_rate_limited'
+                  : retryWithoutStreaming ? 'llm.provider_retry_non_stream' : 'llm.provider_retry',
                 provider: c.name,
                 attempt: i + 1,
                 providerAttempt,
@@ -627,17 +654,34 @@ function isTransientConnectivityLLMError(err: unknown): boolean {
   );
 }
 
-function retryDelayForLLMError(err: unknown): number {
+/**
+ * A rate limit that will lift, as opposed to a budget that is spent.
+ *
+ * The distinction decides whether waiting can help at all: an exhausted daily allowance or an empty
+ * balance returns the same 429 and would burn every retry to arrive at the same answer.
+ */
+function isRateLimitedLLMError(err: unknown): boolean {
   const msg = errorMessage(err);
-  if (!/\b(?:http\s*)?429\b/i.test(msg)) return 0;
-  if (/free-models-per-day|insufficient credits|quota exceeded/i.test(msg)) return 0;
+  if (!/\b(?:http\s*)?429\b/i.test(msg)) return false;
+  return !/free-models-per-day|insufficient credits|quota exceeded/i.test(msg);
+}
+
+/** The wait the provider asked for, when it named one. It knows when its own window reopens. */
+function providerRetryAfterMs(err: unknown): number | undefined {
+  const msg = errorMessage(err);
   const seconds =
     msg.match(/try again in\s+([0-9]+(?:\.[0-9]+)?)s/i)?.[1] ??
     msg.match(/retry_after_seconds["']?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)/i)?.[1] ??
     msg.match(/retry-after["']?\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)/i)?.[1];
-  if (!seconds) return 0;
+  if (!seconds) return undefined;
   const ms = Math.ceil(Number(seconds) * 1000) + 250;
-  return Number.isFinite(ms) && ms > 0 && ms <= 60_000 ? ms : 0;
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+function retryDelayForLLMError(err: unknown): number {
+  if (!isRateLimitedLLMError(err)) return 0;
+  const ms = providerRetryAfterMs(err);
+  return ms !== undefined && ms <= 60_000 ? ms : 0;
 }
 
 function delay(ms: number): Promise<void> {

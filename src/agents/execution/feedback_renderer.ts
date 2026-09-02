@@ -203,7 +203,10 @@ export function renderExecutionFeedback(
       'Change Request completion is incomplete. Return a top-level changeRequestDisposition with outcome, reasonCategory, rationale, inspectedArtifacts, and evidence. ' +
       'Use outcome="applied" only with real mutation or successful executable verification evidence. ' +
       'Use outcome="not-applicable" only after inspecting the declared affected artifact(s), with ' +
-      'actions=[], done=true, concrete evidence, and the true downstream owner in qualityAssessment.blockedBy. ' +
+      'actions=[], done=true, and concrete evidence. When reasonCategory is downstream-owned or ' +
+      'outside-step-scope, also name the true downstream owner in qualityAssessment.blockedBy; ' +
+      'blockedBy must be a JSON string array such as ["CODE owns src/main.ts"], never objects; ' +
+      'already-aligned and diagnosis-contradicted must not invent one. ' +
       'Do not rewrite unrelated phase outputs to manufacture an application.',
     );
   }
@@ -263,7 +266,7 @@ export function renderExecutionFeedback(
     if (turn.unresolvedFailures.some((failure) => /invalid add_dependency args/i.test(failure))) {
       lines.push(
         'Tool contract violation: add_dependency requires args.packages as a non-empty string array, ' +
-        'for example {"packages":["cheerio@1.0.0"]}; set dev=true for test/build tooling.',
+        'for example {"packages":["zod@3.23.8"]}; set dev=true for test/build tooling.',
       );
     }
     if (turn.unresolvedFailures.some((failure) =>

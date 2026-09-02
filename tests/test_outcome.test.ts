@@ -45,7 +45,7 @@ describe('collectTestOutcomes by what was executed', () => {
     // names that Step impossible to prove.
     const outcomes = collectTestOutcomes([{
       tool: 'run_program',
-      args: { args: ['npx', 'vitest', 'run', 'tests/modules/baidu-hot-search.test.ts'] },
+      args: { args: ['npx', 'vitest', 'run', 'tests/modules/upstream-listing.test.ts'] },
       ok: true,
       summary: 'npx vitest run exit=0',
       data: { exitCode: 0, timedOut: false },
@@ -53,7 +53,7 @@ describe('collectTestOutcomes by what was executed', () => {
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0]!.status).toBe('passed');
     expect(outcomes[0]!.tool).toBe('run_program');
-    expect(outcomes[0]!.args).toContain('tests/modules/baidu-hot-search.test.ts');
+    expect(outcomes[0]!.args).toContain('tests/modules/upstream-listing.test.ts');
   });
 
   it('ignores a run_program call that ran something other than a test suite', () => {

@@ -12,12 +12,12 @@ describe('what a failing verification level hands back', () => {
         tool: 'run_tests',
         ok: false,
         summary: 'npm test exit=1',
-        error: 'FAIL tests/modules/scrapers.test.ts > parses the captured page\nexpected 0 to be > 0',
+        error: 'FAIL tests/modules/upstream.test.ts > parses the captured page\nexpected 0 to be > 0',
       },
-      ['tests/modules/scrapers.test.ts', 'tests/modules/renderer.test.ts'],
+      ['tests/modules/upstream.test.ts', 'tests/modules/renderer.test.ts'],
     );
 
-    expect(defect).toContain('Cases under test: tests/modules/scrapers.test.ts, tests/modules/renderer.test.ts');
+    expect(defect).toContain('Cases under test: tests/modules/upstream.test.ts, tests/modules/renderer.test.ts');
     expect(defect).toContain('expected 0 to be > 0');
     expect(defect).toContain('MODULE_TEST executable test gate failed');
   });

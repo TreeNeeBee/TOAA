@@ -5,6 +5,7 @@ import {
   type ArchitectureModule,
   type Plan,
   type Step,
+  type Language,
 } from './plan.js';
 import type { StageQualityAssessment } from './quality_gate.js';
 import { isExecutableTestPath } from './test_assets.js';
@@ -125,9 +126,19 @@ export async function inspectPairedSourceTests(
       ? owners.map((owner) => owner.id).join(', ')
       : sourceStep.id;
     if (matched.length < requiredReferences) {
+      // The expected sources are workspace-relative and the import is file-relative, so a test that
+      // miscounted the hops back to the root reads this list, finds the module it thinks it imported,
+      // and has no way to see what is wrong. The prefix is the whole answer, and the same lesson is
+      // already spelled out for supplements: give it rather than let the directories be counted again.
+      const misreach = misreachedProductSpecifiers(content, testPath, plan.language);
       invalid.push(
         `${testPath}: exercises ${matched.length}/${requiredReferences} required declared product sources for ${ownerLabel}` +
-        ` (expected one of: ${expectedSources.join(', ')})`,
+        ` (expected one of: ${expectedSources.join(', ')})` +
+        (misreach.length > 0
+          ? `; ${misreach.join(', ')} resolve outside the workspace — from ${
+            path.posix.dirname(testPath)}/ the product is reached with exactly ${
+            productUpwardPrefix(testPath)}src/…`
+          : ''),
       );
     }
     invalid.push(...behaviorRisks.map((risk) => `${testPath}: ${risk}`));
@@ -239,7 +250,9 @@ function hasDeterministicExternalDataControl(content: string, language: Plan['la
 
 function importedNoArgumentAwaitCalls(content: string): string[] {
   const imports = [...content.matchAll(
-    /^\s*import\s+(?!type\b)([^'"\n]*?)\s+from\s+["'](?:\.\.\/)+src\/[^"']+["']\s*;?/gmu,
+    // Same multi-line binding list as above. Missing it here under-reports instead of over-reporting:
+    // a test that awaits a product call while claiming controlled data goes unflagged.
+    /^[ \t]*import\s+(?!type\b)([^'"]*?)\s+from\s+["'](?:\.\.\/)+src\/[^"']+["']\s*;?/gmu,
   )];
   const bindings = dedup(imports.flatMap((match) => typescriptImportBindings(match[1] ?? '')));
   const body = stripCommentsAndStrings(content);
@@ -354,8 +367,13 @@ function typescriptProductReferences(
   content: string,
   expectedSources: string[],
 ): string[] {
+  // The binding list may span lines. Excluding newlines from it made every multi-line named import
+  // invisible here, so a test that imported exactly the module it verifies was reported as
+  // exercising none of them — which is how a live run's own module test failed the
+  // paired contract three times over an import it had written correctly. Quotes still bound the
+  // match, so it cannot run past the specifier of the statement it started on.
   const imports = [...content.matchAll(
-    /^\s*import\s+(?!type\b)([^'"\n]*?)\s+from\s+["']([^"']+)["']\s*;?/gmu,
+    /^[ \t]*import\s+(?!type\b)([^'"]*?)\s+from\s+["']([^"']+)["']\s*;?/gmu,
   )].map((match) => ({
     declaration: match[0],
     bindings: typescriptImportBindings(match[1] ?? ''),
@@ -526,6 +544,34 @@ function stripCommentsAndStrings(content: string): string {
     }
   }
   return result;
+}
+
+/** The exact `../` run that reaches the workspace root from the directory holding `testPath`. */
+function productUpwardPrefix(testPath: string): string {
+  const depth = normalizePath(testPath).split('/').length - 1;
+  return '../'.repeat(depth);
+}
+
+/**
+ * Relative imports that name a product path but land outside the workspace.
+ *
+ * Written by a test that counted the hops back to the root wrong — the specifier still reads as
+ * `src/…`, so the author sees the module it meant and no reason the check disagrees.
+ */
+function misreachedProductSpecifiers(
+  content: string,
+  testPath: string,
+  language: Language,
+): string[] {
+  if (language !== 'typescript') return [];
+  const specifiers = [...content.matchAll(
+    /^[ \t]*import\s+(?!type\b)[^'"]*?\s+from\s+["'](\.[^"']+)["']/gmu,
+  )].map((match) => match[1] ?? '');
+  return dedup(specifiers.filter((specifier) => {
+    if (!/(?:^|\/)src\//u.test(specifier)) return false;
+    const resolved = resolveTypeScriptSpecifier(testPath, specifier);
+    return !resolved || !resolved.startsWith('src/');
+  }));
 }
 
 function resolveTypeScriptSpecifier(testPath: string, specifier: string): string | undefined {

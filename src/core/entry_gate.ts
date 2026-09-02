@@ -3,7 +3,7 @@ import type { Workspace } from '../workspace/workspace.js';
 import type { Sandbox, ExecResult } from '../sandbox/types.js';
 import type { AuditLogger } from '../audit/audit.js';
 import { t } from '../i18n/index.js';
-import { detectNetworkApiFailure, detectNetworkApiFailureInExec } from './network_api_gate.js';
+import { detectNetworkApiFailureInExec } from './network_api_gate.js';
 
 const BOOTSTRAP_MARKER = '# >>> xcompiler: sys.path bootstrap (auto) >>>';
 const BOOTSTRAP_BLOCK = [
@@ -204,34 +204,6 @@ export async function probeEntrypoint(
     };
   }
   const ok = r.exitCode === 0 && !r.timedOut && helpOutputLooksMeaningful(r.stdout, r.stderr);
-  if (ok) {
-    try {
-      const smoke = await sandbox.runProgram(entry.smokeArgv, { timeoutMs: 30_000 });
-      const smokeNetworkFailure = detectNetworkApiFailureInExec(smoke);
-      if (smokeNetworkFailure) {
-        return {
-          ok: false,
-          command: entry.smokeCommand,
-          exitCode: smoke.exitCode,
-          timedOut: smoke.timedOut ?? false,
-          stdoutTail: tail(smoke.stdout),
-          stderrTail: `${smokeNetworkFailure.message}\nEvidence: ${smokeNetworkFailure.evidence}`,
-        };
-      }
-    } catch (err) {
-      const smokeNetworkFailure = detectNetworkApiFailure((err as Error).message);
-      if (smokeNetworkFailure) {
-        return {
-          ok: false,
-          command: entry.smokeCommand,
-          exitCode: -1,
-          timedOut: false,
-          stdoutTail: '',
-          stderrTail: `${smokeNetworkFailure.message}\nEvidence: ${smokeNetworkFailure.evidence}`,
-        };
-      }
-    }
-  }
   return {
     ok,
     command: entry.command,
@@ -246,8 +218,6 @@ type PythonEntryCandidate = {
   path: string;
   command: string;
   argv: string[];
-  smokeCommand: string;
-  smokeArgv: string[];
 };
 
 async function detectPythonEntrypoint(ws: Workspace): Promise<PythonEntryCandidate | null> {
@@ -255,8 +225,6 @@ async function detectPythonEntrypoint(ws: Workspace): Promise<PythonEntryCandida
     path: rel,
     command: `python ${rel} --help`,
     argv: [rel, '--help'],
-    smokeCommand: `python ${rel}`,
-    smokeArgv: [rel],
   });
 
   if (await ws.exists('src/main.py')) return fileCandidate('src/main.py');
@@ -273,8 +241,6 @@ async function detectPythonEntrypoint(ws: Workspace): Promise<PythonEntryCandida
           path: rel,
           command: `python -m src.${e.name} --help`,
           argv: ['-m', `src.${e.name}`, '--help'],
-          smokeCommand: `python -m src.${e.name}`,
-          smokeArgv: ['-m', `src.${e.name}`],
         };
       }
     }

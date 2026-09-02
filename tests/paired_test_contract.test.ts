@@ -30,7 +30,7 @@ describe('paired source test product-reference contract', () => {
         'import { describe, expect, it } from "vitest";',
         'function render(value: string): string { return `# ${value}`; }',
         'describe("renderer", () => {',
-        '  it("renders", () => expect(render("news")).toBe("# news"));',
+        '  it("renders", () => expect(render("record")).toBe("# record"));',
         '});',
       ].join('\n'),
     );
@@ -45,6 +45,59 @@ describe('paired source test product-reference contract', () => {
     expect(result.invalid[0]).toContain('exercises 0/1 required');
   });
 
+  it('names the prefix when a relative import misses the workspace root', async () => {
+    // The expected list is workspace-relative and the import is file-relative, so a test that
+    // miscounted the hops finds `src/renderer/render.ts` in the message and sees nothing wrong.
+    // A live run wrote ../src/… from tests/functional/, which resolves to tests/src/…, and read the
+    // rejection as a disagreement rather than an arithmetic error.
+    const plan = contractPlan('typescript', 'tests/functional/acceptance.test.ts');
+    await workspace.writeFile(
+      'tests/functional/acceptance.test.ts',
+      [
+        'import { describe, expect, it } from "vitest";',
+        'import { render } from "../src/renderer/render.ts";',
+        'describe("acceptance", () => {',
+        '  it("renders", () => expect(render("record")).toContain("record"));',
+        '});',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+
+    expect(result.ok).toBe(false);
+    expect(result.invalid[0]).toContain('resolve outside the workspace');
+    expect(result.invalid[0]).toContain('../../src/');
+  });
+
+  it('accepts a multi-line named import of the planned product module', async () => {
+    // The binding list spans lines, which is ordinary TypeScript. Excluding newlines from the
+    // matcher made the whole statement invisible, so a test importing exactly the module it
+    // verifies was reported as exercising none: a live run failed its paired contract three times
+    // over an import it had written correctly, and the Ticket was stopped for not converging.
+    const plan = contractPlan('typescript', 'tests/modules/renderer.test.ts');
+    await workspace.writeFile(
+      'tests/modules/renderer.test.ts',
+      [
+        'import { describe, expect, it } from "vitest";',
+        'import {',
+        '  render,',
+        '  renderAll,',
+        '} from "../../src/renderer/render.ts";',
+        'describe("renderer", () => {',
+        '  it("renders", () => expect(render("record")).toContain("record"));',
+        '  it("renders all", () => expect(renderAll([])).toEqual([]));',
+        '});',
+      ].join('\n'),
+    );
+
+    const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
+
+    expect(result.ok).toBe(true);
+    expect(result.references['tests/modules/renderer.test.ts']).toEqual([
+      'src/renderer/render.ts',
+    ]);
+  });
+
   it('accepts a TypeScript value import from the planned product module', async () => {
     const plan = contractPlan('typescript', 'tests/modules/renderer.test.ts');
     await workspace.writeFile(
@@ -53,7 +106,7 @@ describe('paired source test product-reference contract', () => {
         'import { describe, expect, it } from "vitest";',
         'import { render } from "../../src/renderer/render.ts";',
         'describe("renderer", () => {',
-        '  it("renders", () => expect(render("news")).toContain("news"));',
+        '  it("renders", () => expect(render("record")).toContain("record"));',
         '});',
       ].join('\n'),
     );
@@ -78,7 +131,7 @@ describe('paired source test product-reference contract', () => {
         'import { describe, expect, it } from "vitest";',
         'import type { RenderInput } from "../../src/renderer/render.ts";',
         'describe("renderer", () => {',
-        '  it("declares a shape", () => expect({ title: "news" } satisfies RenderInput).toBeDefined());',
+        '  it("declares a shape", () => expect({ title: "record" } satisfies RenderInput).toBeDefined());',
         '});',
       ].join('\n'),
     );
@@ -102,7 +155,7 @@ describe('paired source test product-reference contract', () => {
         '// render is the planned public API, but this test still uses a local stand-in.',
         'const localRender = (value: string) => value;',
         'describe("renderer", () => {',
-        '  it("renders", () => expect(localRender("news")).toBe("news"));',
+        '  it("renders", () => expect(localRender("record")).toBe("record"));',
         '});',
       ].join('\n'),
     );
@@ -158,7 +211,7 @@ describe('paired source test product-reference contract', () => {
     await workspace.writeFile('tests/functional/acceptance.test.ts', [
       'import { render } from "../../src/renderer/render.ts";',
       'interface NewsItem { title: string; summary: string; heatScore: number; tags: string[] }',
-      'it("renders", () => expect(render({ title: "news", summary: "brief", heatScore: 1, tags: [] })).toBeTruthy());',
+      'it("renders", () => expect(render({ title: "record", summary: "brief", heatScore: 1, tags: [] })).toBeTruthy());',
     ].join('\n'));
 
     const result = await inspectPairedSourceTests(workspace, plan, plan.steps[0]!);
@@ -207,7 +260,7 @@ describe('paired source test product-reference contract', () => {
     plan.architectureModules!.push({
       id: 'M002',
       name: 'Pipeline',
-      responsibility: 'Pass normalized news records into the configured output renderer.',
+      responsibility: 'Pass normalized records into the configured output renderer.',
       sourcePaths: ['src/pipeline/run.ts'],
       testPaths: ['tests/modules/pipeline.test.ts'],
       dependencies: ['M001'],
@@ -217,7 +270,7 @@ describe('paired source test product-reference contract', () => {
       [
         'import { render } from "../../src/renderer/render.ts";',
         'const localPipeline = (value: string) => render(value);',
-        'test("pipeline", () => expect(localPipeline("news")).toContain("news"));',
+        'test("pipeline", () => expect(localPipeline("record")).toContain("record"));',
       ].join('\n'),
     );
     const oneSided = await inspectPairedSourceTests(
@@ -233,7 +286,7 @@ describe('paired source test product-reference contract', () => {
       [
         'import { render } from "../../src/renderer/render.ts";',
         'import { run } from "../../src/pipeline/run.ts";',
-        'test("pipeline", () => expect(run(render, "news")).toContain("news"));',
+        'test("pipeline", () => expect(run(render, "record")).toContain("record"));',
       ].join('\n'),
     );
     const integrated = await inspectPairedSourceTests(
@@ -265,7 +318,7 @@ describe('paired source test product-reference contract', () => {
         'import { run } from "../../src/pipeline/run.ts";',
         'test("pipeline", async () => {',
         '  const values: string[] = [];',
-        '  for (const input of ["news"]) {',
+        '  for (const input of ["record"]) {',
         '    try { values.push(await run(render, input)); } catch { /* copied fallback */ }',
         '  }',
         '  expect(values).toHaveLength(1);',
@@ -284,7 +337,7 @@ describe('paired source test product-reference contract', () => {
     const plan = contractPlan('python', 'tests/test_renderer.py');
     await workspace.writeFile(
       'tests/test_renderer.py',
-      'from renderer.render import render\n\n\ndef test_render():\n    assert render("news")\n',
+      'from renderer.render import render\n\n\ndef test_render():\n    assert render("record")\n',
     );
     const imported = await inspectPairedSourceTests(
       workspace,
@@ -295,7 +348,7 @@ describe('paired source test product-reference contract', () => {
 
     await workspace.writeFile(
       'tests/test_renderer.py',
-      'def render(value):\n    return value\n\n\ndef test_render():\n    assert render("news")\n',
+      'def render(value):\n    return value\n\n\ndef test_render():\n    assert render("record")\n',
     );
     const localOnly = await inspectPairedSourceTests(
       workspace,
@@ -381,7 +434,7 @@ describe('integration tests that assert on real failures', () => {
         '',
         'def test_export_writes_rows(tmp_path):',
         '    out = tmp_path / "out.xlsx"',
-        '    export_to_excel(render("news"), out)',
+        '    export_to_excel(render("record"), out)',
         '    assert _read_rows(out) == [2, 3, 4]',
         '',
         'def test_readonly_target_fails(tmp_path):',
@@ -389,7 +442,7 @@ describe('integration tests that assert on real failures', () => {
         '    target.mkdir()',
         '    target.chmod(0o444)',
         '    try:',
-        '        code = export_to_excel(render("news"), target / "out.xlsx")',
+        '        code = export_to_excel(render("record"), target / "out.xlsx")',
         '        assert code != 0',
         '    finally:',
         '        target.chmod(0o755)',
@@ -420,7 +473,7 @@ describe('integration tests that assert on real failures', () => {
         '',
         'def test_export(tmp_path):',
         '    try:',
-        '        export_to_excel(render("news"), tmp_path / "out.xlsx")',
+        '        export_to_excel(render("record"), tmp_path / "out.xlsx")',
         '    except Exception:',
         '        pass',
       ].join('\n'),
@@ -468,7 +521,7 @@ function contractPlan(
     architectureModules: [{
       id: 'M001',
       name: 'Renderer',
-      responsibility: 'Render normalized news records into the requested output format.',
+      responsibility: 'Render normalized records into the requested output format.',
       sourcePaths: [sourcePath],
       testPaths: [testPath],
       dependencies: [],

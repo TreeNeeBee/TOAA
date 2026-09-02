@@ -72,17 +72,60 @@ describe('squash merge onto the mainline', () => {
     })).rejects.toThrow(/moved from .* to /);
   });
 
-  it('refuses to merge into a dirty mainline', async () => {
+  it('refuses to merge when tracked work would be lost', async () => {
     const { root, service } = await repository();
     const branch = 'xcompiler/ticket/T3';
     await ticketBranch(root, service, branch);
-    await fs.writeFile(path.join(root, 'scratch.txt'), 'uncommitted\n');
+    await fs.writeFile(path.join(root, 'README.md'), '# edited but never committed\n');
 
     await expect(service.squashMerge({
       targetBranch: 'master',
       sourceBranch: branch,
       expectedTargetRevision: await service.revision('master'),
       message: '[xcompiler] T3',
-    })).rejects.toThrow(/uncommitted changes/);
+    })).rejects.toThrow(/uncommitted changes: README\.md/u);
+  });
+
+  it('merges past a runtime artifact an older build had committed', async () => {
+    // Once tracked, a file the product rewrites on every delivery gate blocks every merge after it.
+    // A Phase with seven delivered Steps could not land an eighth over a generated report.
+    const { root, service } = await repository();
+    const branch = 'xcompiler/ticket/T5';
+    await ticketBranch(root, service, branch);
+    await fs.mkdir(path.join(root, 'output'), { recursive: true });
+    await fs.writeFile(path.join(root, 'output', 'daily-briefing.md'), '# first\n');
+    const git = simpleGit({ baseDir: root });
+    await git.raw(['add', '-f', '--', 'output/daily-briefing.md']);
+    await git.commit('tracked by an older build');
+    await fs.writeFile(path.join(root, 'output', 'daily-briefing.md'), '# rewritten by this run\n');
+
+    await expect(service.squashMerge({
+      targetBranch: 'master',
+      sourceBranch: branch,
+      expectedTargetRevision: await service.revision('master'),
+      message: '[xcompiler] T5',
+    })).resolves.toBeTruthy();
+  });
+
+  it('merges past an untracked artifact the incoming change never touches', async () => {
+    // The phase delivery gate runs the product to judge what it produces, so its output sits in the
+    // canonical copy by design. Git carries an untracked file straight through a squash merge, and
+    // refuses on its own when an incoming change would overwrite one — so counting them here added
+    // no protection and stopped a live run at 5 of 8 Steps over a generated report.
+    const { root, service } = await repository();
+    const branch = 'xcompiler/ticket/T4';
+    await ticketBranch(root, service, branch);
+    await fs.mkdir(path.join(root, 'output'), { recursive: true });
+    await fs.writeFile(path.join(root, 'output', 'report.md'), '# generated\n');
+
+    await expect(service.squashMerge({
+      targetBranch: 'master',
+      sourceBranch: branch,
+      expectedTargetRevision: await service.revision('master'),
+      message: '[xcompiler] T4',
+    })).resolves.toBeTruthy();
+
+    expect(await fs.readFile(path.join(root, 'one.txt'), 'utf8')).toContain('one');
+    expect(await fs.readFile(path.join(root, 'output', 'report.md'), 'utf8')).toContain('generated');
   });
 });

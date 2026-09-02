@@ -1,3 +1,4 @@
+import { DEFAULT_PROVIDER_RETRY } from './retry.js';
 import type { XCompilerConfig } from '../config/config.js';
 import { DEFAULT_CONTEXT_WINDOW_TOKENS } from './window.js';
 import type { AuditLogger } from '../audit/audit.js';
@@ -133,6 +134,7 @@ export async function preflightProviders(
         model,
         context_window: DEFAULT_CONTEXT_WINDOW_TOKENS,
         tags: undefined,
+        retry: DEFAULT_PROVIDER_RETRY,
       };
       result.autoAdded[synthName] = model;
       // 默认评分 1

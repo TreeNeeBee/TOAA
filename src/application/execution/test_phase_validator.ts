@@ -7,7 +7,10 @@ import {
   type Plan,
   type Step,
 } from '../../core/plan.js';
-import { inspectPairedSourceTests } from '../../core/paired_test_contract.js';
+import {
+  inspectPairedSourceTests,
+  type PairedSourceTestInspection,
+} from '../../core/paired_test_contract.js';
 import {
   pairedTestAssetPaths,
   verificationSupplementRoot,
@@ -26,6 +29,8 @@ export interface PairedTestAssetInspection {
   testPlanPath?: string;
   missing: string[];
   invalid: string[];
+  /** Structured baseline evidence retained for deterministic Runtime KPI measurement. */
+  sourceContracts: PairedSourceTestInspection[];
   failureLog: string;
 }
 
@@ -58,6 +63,7 @@ export class TestPhaseValidator {
     const expected = dedup([...(testPlanPath ? [testPlanPath] : []), ...testArgs]);
     const missing: string[] = [];
     const invalid: string[] = [];
+    const sourceContracts: PairedSourceTestInspection[] = [];
     const supplementalRoot = this.supplementalRoot(step);
     const illegallyOwnedTests = step.outputs
       .map((output) => normalizeGitPath(output))
@@ -95,6 +101,7 @@ export class TestPhaseValidator {
       (candidate.iterationId ?? 'P1') === iterationId && candidate.phase === sourcePhase
     )) {
       const sourceContract = await inspectPairedSourceTests(this.workspace, plan, sourceStep);
+      sourceContracts.push(sourceContract);
       invalid.push(...sourceContract.invalid);
     }
 
@@ -106,6 +113,7 @@ export class TestPhaseValidator {
       testPlanPath,
       missing,
       invalid,
+      sourceContracts,
       failureLog: ok ? '' : [
         `${step.id} ${step.phase} delivery-gate entry inspection failed.`,
         `Paired source phase: ${sourcePhase}.`,

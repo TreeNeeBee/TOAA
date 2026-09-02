@@ -30,7 +30,7 @@ describe('calibrateArchitectureStepMappings', () => {
       {
         id: 'M001',
         name: 'Brief template',
-        responsibility: 'Provide the runtime template used to render a briefing.',
+        responsibility: 'Provide the runtime template used to render a report.',
         sourcePaths: ['src/templates/brief.md.hbs'],
         testPaths: ['tests/brief-template.test.ts'],
         dependencies: [],

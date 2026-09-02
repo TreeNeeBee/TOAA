@@ -28,9 +28,9 @@ describe('domain plan compiler', () => {
   it('compiles readable Planner names into a globally identified Project graph', () => {
     const graph = compileProjectGraph({
       draft: samplePlan(),
-      topic: 'Build a TypeScript news application.',
+      topic: 'Build a TypeScript reporting application.',
       topicSourceRef: 'examples/news/news_ts.md',
-      projectName: 'news',
+      projectName: 'report',
     });
 
     const allObjects = [
@@ -46,7 +46,7 @@ describe('domain plan compiler', () => {
     expect(allObjects.every((object) => isObjectId(object.id))).toBe(true);
     expect(new Set(allObjects.map((object) => object.id))).toHaveLength(allObjects.length);
     expect(allObjects.every((object) => object.id !== object.name)).toBe(true);
-    expect(graph.project.name).toBe('news');
+    expect(graph.project.name).toBe('report');
     expect(graph.steps.map((step) => step.name)).toEqual(
       STEP_TYPES.map((_, index) => `P1-S${String(index + 1).padStart(3, '0')}`),
     );
@@ -94,8 +94,8 @@ describe('domain plan compiler', () => {
   it('creates Epic, Story and two Task levels while leaving future Phases skeletal', () => {
     const graph = compileProjectGraph({
       draft: samplePlan(),
-      topic: 'Build a TypeScript news application.',
-      projectName: 'news',
+      topic: 'Build a TypeScript reporting application.',
+      projectName: 'report',
     });
     const p1 = graph.phases.find((phase) => phase.name === 'P1')!;
     const p2 = graph.phases.find((phase) => phase.name === 'P2')!;
@@ -152,8 +152,8 @@ describe('domain plan compiler', () => {
     ];
     const graph = compileProjectGraph({
       draft,
-      topic: 'Build a TypeScript news application.',
-      projectName: 'news',
+      topic: 'Build a TypeScript reporting application.',
+      projectName: 'report',
     });
 
     const names = graph.tickets.map((ticket) => ticket.name);
@@ -167,8 +167,8 @@ describe('domain plan compiler', () => {
   it('pairs each development Step and Story with its verification side', () => {
     const graph = compileProjectGraph({
       draft: samplePlan(),
-      topic: 'Build a TypeScript news application.',
-      projectName: 'news',
+      topic: 'Build a TypeScript reporting application.',
+      projectName: 'report',
     });
     const coding = graph.steps.find((step) => step.type === 'CODE')!;
     const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
@@ -186,8 +186,8 @@ describe('domain plan compiler', () => {
     const workspace = new Workspace(root);
     const graph = compileProjectGraph({
       draft: samplePlan(),
-      topic: 'Build a TypeScript news application.',
-      projectName: 'news',
+      topic: 'Build a TypeScript reporting application.',
+      projectName: 'report',
     });
     const repository = new DomainObjectRepository(workspace);
     await repository.load();
@@ -247,7 +247,7 @@ describe('domain plan compiler', () => {
 
   it('does not declare final delivery while a later Phase is incomplete', async () => {
     const draft = samplePlan();
-    const graph = compileProjectGraph({ draft, topic: 'Build news.', projectName: 'news' });
+    const graph = compileProjectGraph({ draft, topic: 'Build reports.', projectName: 'report' });
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-project-report-'));
     const workspace = new Workspace(root);
     const repository = new DomainObjectRepository(workspace);
@@ -310,8 +310,8 @@ describe('domain plan compiler', () => {
     originalDraft.implementationPhases = [originalDraft.implementationPhases[0]!];
     const original = compileProjectGraph({
       draft: originalDraft,
-      topic: 'Build a TypeScript news application.',
-      projectName: 'news',
+      topic: 'Build a TypeScript reporting application.',
+      projectName: 'report',
     });
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-domain-extension-'));
     const repository = new DomainObjectRepository(new Workspace(root));
@@ -391,7 +391,7 @@ function samplePlan(): DraftPlan {
     intent: 'greenfield',
     phaseId: 'P1',
     projectType: 'application',
-    requirementDigest: 'Build a news application.',
+    requirementDigest: 'Build a reporting application.',
     complexityAssessment: {
       level: 'complex',
       rationale: 'The application has external integration and multiple modules.',
@@ -402,7 +402,7 @@ function samplePlan(): DraftPlan {
       {
         id: 'P1',
         title: 'Core delivery',
-        objective: 'Deliver the core news workflow.',
+        objective: 'Deliver the core reporting workflow.',
         status: 'current',
         scope: ['core'],
         deliverables: ['src/main.ts'],
@@ -447,7 +447,7 @@ function samplePlan(): DraftPlan {
       subTasks: index === 3 ? [{
         id: 'M001',
         title: 'Implement service',
-        description: 'Implement the news service.',
+        description: 'Implement the report service.',
         acceptance: 'The service contract is implemented.',
         outputs: ['src/service.ts'],
         subTasks: [{

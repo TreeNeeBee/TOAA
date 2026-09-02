@@ -5,6 +5,7 @@ import os from 'node:os';
 import { Workspace } from '../src/workspace/workspace.js';
 import { AuditLogger } from '../src/audit/audit.js';
 import { getLanguageProfile } from '../src/core/language.js';
+import { inspectLanguageProjectContract } from '../src/core/language_project_contract.js';
 
 describe('TypeScript language profile', () => {
   it('splits known third-party type-only imports before entry probes', async () => {
@@ -58,9 +59,37 @@ describe('test file naming reaches the planner', () => {
     expect(profile.plannerPromptOverride).toContain('.test.ts');
     expect(profile.plannerPromptOverride).toContain('.spec.ts');
     // The counter-example is the mistake actually observed in a live run.
-    expect(profile.plannerPromptOverride).toContain('tests/test_scrapers.ts');
+    expect(profile.plannerPromptOverride).toContain('tests/test_service.ts');
     // Python is unaffected: pytest collects `test_*.py`, so its profile needs no override.
     expect(getLanguageProfile('python').testFileFor('src/x.py', 'S004')).toMatch(/^tests\/test_.*\.py$/u);
     expect(getLanguageProfile('python').plannerPromptOverride).toBe('');
+  });
+});
+
+describe('language project contract', () => {
+  it('routes a TypeScript test entrypoint that hides baseline tests back to its manifest owner', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-language-contract-'));
+    const ws = new Workspace(tmp);
+    await ws.writeFile('package.json', JSON.stringify({
+      scripts: { test: 'vitest run --exclude tests/functional.test.ts' },
+    }));
+
+    await expect(inspectLanguageProjectContract(ws, 'typescript')).resolves.toEqual([
+      expect.objectContaining({
+        category: 'deliverable-defect',
+        code: 'language_test_entrypoint_contract_invalid',
+        target: 'high-level-design',
+        affectedArtifacts: ['package.json'],
+      }),
+    ]);
+  });
+
+  it('accepts the profile-owned test entrypoint and leaves Python manifests unaffected', async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-language-contract-'));
+    const ws = new Workspace(tmp);
+    await ws.writeFile('package.json', JSON.stringify({ scripts: { test: 'vitest run' } }));
+
+    await expect(inspectLanguageProjectContract(ws, 'typescript')).resolves.toEqual([]);
+    await expect(inspectLanguageProjectContract(ws, 'python')).resolves.toEqual([]);
   });
 });

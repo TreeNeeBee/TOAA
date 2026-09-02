@@ -152,7 +152,9 @@ export type ToolFailureCode =
  * the third one gets forgotten, which is exactly what happened when `manifest_missing` was added.
  */
 export function isUnownedStepFailure(code: ToolFailureCode | undefined): boolean {
-  return code === 'manifest_missing' || code === 'product_not_implemented';
+  return code === 'manifest_missing' ||
+    code === 'dependency_not_owned' ||
+    code === 'product_not_implemented';
 }
 
 /** 单次工具调用的结果统一结构。 */

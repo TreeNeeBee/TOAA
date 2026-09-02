@@ -32,10 +32,10 @@ describe('project container layout', () => {
     // The working copy is always named after the canonical branch, so anything deriving a project
     // name from it would call every 0.3 project "master". `--name` and `--base-dir` resolve to the
     // container path, which is where the identity actually lives.
-    const container = new ProjectContainer('/tmp/news-ts');
-    expect(path.basename(container.root)).toBe('news-ts');
+    const container = new ProjectContainer('/tmp/report-ts');
+    expect(path.basename(container.root)).toBe('report-ts');
     expect(path.basename(container.canonical().workspace.root)).toBe('master');
-    expect(path.basename(new ProjectContainer('/tmp/news-ts', 'trunk').canonical().workspace.root))
+    expect(path.basename(new ProjectContainer('/tmp/report-ts', 'trunk').canonical().workspace.root))
       .toBe('trunk');
   });
 

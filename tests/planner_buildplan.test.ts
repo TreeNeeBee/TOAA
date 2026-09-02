@@ -92,8 +92,8 @@ describe('buildPlan — Step id 规整', () => {
 
   it('校准 TypeScript greenfield 的 package.json 与测试文件产物归属', () => {
     const draft = {
-      requirementDigest: 'TypeScript CLI news briefing tool',
-      globalPrompt: 'Fetch public news pages, generate markdown briefing, and expose a CLI.',
+      requirementDigest: 'TypeScript CLI report tool',
+      globalPrompt: 'Read configured sources, generate a markdown report, and expose a CLI.',
       projectType: 'application' as const,
       complexityAssessment: {
         level: 'simple' as const,
@@ -105,7 +105,7 @@ describe('buildPlan — Step id 规整', () => {
         {
           id: 'P1',
           title: 'Core functionality',
-          objective: 'Deliver the runnable CLI news briefing slice.',
+          objective: 'Deliver the runnable CLI report slice.',
           status: 'current' as const,
           scope: ['CLI', 'fetcher', 'brief generation'],
           deliverables: ['Runnable TypeScript CLI'],
@@ -121,10 +121,10 @@ describe('buildPlan — Step id 规整', () => {
       architectureModules: [
         {
           id: 'M001',
-          name: 'news-fetcher',
-          responsibility: 'Fetch and normalize public news items.',
-          sourcePaths: ['src/news-fetcher.ts'],
-          testPaths: ['tests/news-fetcher.test.ts'],
+          name: 'record-reader',
+          responsibility: 'Read and normalize source records.',
+          sourcePaths: ['src/record-reader.ts'],
+          testPaths: ['tests/record-reader.test.ts'],
           dependencies: [],
         },
       ],
@@ -136,12 +136,12 @@ describe('buildPlan — Step id 规整', () => {
           id: 'S004',
           phase: 'CODE',
           role: 'Coder',
-          outputs: ['src/news-fetcher.ts', 'tests/news-fetcher.test.ts', 'docs/tests/unit-test-plan.md', 'package.json', 'tsconfig.json'],
+          outputs: ['src/record-reader.ts', 'tests/record-reader.test.ts', 'docs/tests/unit-test-plan.md', 'package.json', 'tsconfig.json'],
           dependsOn: ['S003'],
         }),
         baseStep({ id: 'S005', phase: 'UNIT_TEST', role: 'Tester', outputs: ['docs/05-unit-test.md'], dependsOn: ['S004'] }),
-        baseStep({ id: 'S006', phase: 'INTEGRATION_TEST', role: 'Tester', outputs: ['docs/06-integration-test.md', 'tests/integration/news-cli.test.ts'], dependsOn: ['S005'] }),
-        baseStep({ id: 'S007', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md', 'tests/news-fetcher.test.ts'], dependsOn: ['S006'] }),
+        baseStep({ id: 'S006', phase: 'INTEGRATION_TEST', role: 'Tester', outputs: ['docs/06-integration-test.md', 'tests/integration/report-cli.test.ts'], dependsOn: ['S005'] }),
+        baseStep({ id: 'S007', phase: 'MODULE_TEST', role: 'Tester', outputs: ['docs/07-module-test.md', 'tests/record-reader.test.ts'], dependsOn: ['S006'] }),
         baseStep({ id: 'S008', phase: 'FUNCTIONAL_TEST', role: 'Tester', outputs: ['README.md', 'docs/quickstart.md', 'docs/08-functional-test.md'], dependsOn: ['S007'] }),
       ],
     };
@@ -159,16 +159,16 @@ describe('buildPlan — Step id 规整', () => {
     expect(hld?.systemPrompt).toContain('禁止新增或要求 `jest`');
     expect(code?.outputs).not.toContain('package.json');
     expect(code?.outputs).not.toContain('tsconfig.json');
-    expect(code?.outputs).not.toContain('tests/news-fetcher.test.ts');
-    expect(hld?.outputs).toContain('tests/news-fetcher.test.ts');
-    expect(moduleTest?.outputs).not.toContain('tests/news-fetcher.test.ts');
-    expect(moduleTest?.inputs).toContain('tests/news-fetcher.test.ts');
+    expect(code?.outputs).not.toContain('tests/record-reader.test.ts');
+    expect(hld?.outputs).toContain('tests/record-reader.test.ts');
+    expect(moduleTest?.outputs).not.toContain('tests/record-reader.test.ts');
+    expect(moduleTest?.inputs).toContain('tests/record-reader.test.ts');
     expect(lintPlan(plan).filter((issue) => issue.level === 'error')).toEqual([]);
   });
 
   it('补齐同一 iteration 内 V 模型宏 Step 的相邻依赖链', () => {
     const draft = {
-      requirementDigest: 'DBC CLI to Excel',
+      requirementDigest: 'Config CLI to spreadsheet',
       globalPrompt: 'g',
       dependencies: ['pytest'],
       steps: [
@@ -275,7 +275,7 @@ describe('buildPlan — Step id 规整', () => {
           responsibility: 'Fetch and parse public content for the CLI.',
           sourcePaths: ['src/fetcher.ts'],
           testPaths: ['tests/fetcher.test.ts'],
-          dependencies: ['cheerio', 'M002'],
+          dependencies: ['zod', 'M002'],
         },
         {
           id: 'M002',
@@ -295,7 +295,7 @@ describe('buildPlan — Step id 规整', () => {
 
     const plan = buildPlan(draft, { language: 'typescript' });
 
-    expect(plan.dependencies).toEqual(expect.arrayContaining(['typescript', 'cheerio', 'commander']));
+    expect(plan.dependencies).toEqual(expect.arrayContaining(['typescript', 'zod', 'commander']));
     expect(plan.architectureModules?.[0]?.dependencies).toEqual(['M002']);
     expect(plan.architectureModules?.[1]?.dependencies).toEqual([]);
   });
@@ -375,7 +375,7 @@ describe('planner schema errors', () => {
     // module fields was empty. Both providers retried and failed identically, and the build aborted
     // — a schema error that cannot be acted on is one that repeats.
     const result = ArchitectureModuleSchema.array().safeParse([
-      { id: 'M001', name: 'fetcher', responsibility: 'fetches the news', sourcePaths: ['src/a.ts'], testPaths: [] },
+      { id: 'M001', name: 'fetcher', responsibility: 'reads the records', sourcePaths: ['src/a.ts'], testPaths: [] },
     ]);
     expect(result.success).toBe(false);
     const described = result.success ? [] : result.error.issues

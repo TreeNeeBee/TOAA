@@ -270,38 +270,38 @@ describe('V-model architecture contract', () => {
     expect(demand.minModules).toBeGreaterThanOrEqual(demand.surfaces.length + 2);
   });
 
-  it('does not overcount API credentials or email suitability as app surfaces for news scraping topics', () => {
+  it('does not overcount API credentials or email suitability as app surfaces for data collection topics', () => {
     const topic = [
       '# Project Topic',
       '',
       '## 原始需求',
       '',
-      '帮我写一个ts程序，每日抓取网上最新的热点新闻信息并生成简报',
+      '帮我写一个ts程序，每日采集配置数据源的最新条目并生成摘要',
       '',
       '## 澄清记录',
       '',
-      '- **Q1 · data** 抓取目标的数据源类型与访问凭证情况如何？',
+      '- **Q1 · data** 采集目标的数据源类型与访问凭证情况如何？',
       '  - **Options**',
-      '    - A. 使用公开免鉴权的新闻聚合API或RSS Feed，本期默认优先采用',
-      '    - B. 用户已提供特定新闻网站的API Key/Token，需集成私有鉴权',
+      '    - A. 使用公开免鉴权的聚合API或RSS Feed，本期默认优先采用',
+      '    - B. 用户已提供特定站点的API Key/Token，需集成私有鉴权',
       '    - C. 直接爬取公开网页HTML，需处理反爬策略（如验证码/频率限制）',
       '  - **A** C. 直接爬取公开网页HTML，需处理反爬策略（如验证码/频率限制）',
-      '- **Q3 · functionality** 生成的简报采用何种格式与内容结构？',
+      '- **Q3 · functionality** 生成的摘要采用何种格式与内容结构？',
       '  - **Options**',
       '    - A. 纯文本Markdown格式，包含标题、摘要、原文链接，适合直接粘贴或邮件发送',
       '    - B. 结构化JSON格式，包含元数据、文章列表及分类标签，供下游系统调用',
       '  - **A** A. 纯文本Markdown格式，包含标题、摘要、原文链接，适合直接粘贴或邮件发送',
-      '- **Q4 · acceptance** 每日抓取任务的触发时机与执行方式如何定义？',
+      '- **Q4 · acceptance** 每日采集任务的触发时机与执行方式如何定义？',
       '  - **A** C. 支持手动触发与定时调度双模式，通过配置文件切换',
       '- **Q6 · boundary** 本项目的交付形态与运行边界是什么？',
-      '  - **A** A. 独立可运行的CLI命令行工具，通过参数触发抓取并输出结果',
+      '  - **A** A. 独立可运行的CLI命令行工具，通过参数触发采集并输出结果',
       '- **Q7 · boundary** 本期明确不纳入开发范围的功能有哪些？',
       '  - **Options**',
-      '    - A. 本期仅聚焦单次抓取与简报生成，不包含用户权限管理、历史简报归档与订阅功能',
-      '  - **A** A. 本期仅聚焦单次抓取与简报生成，不包含用户权限管理、历史简报归档与订阅功能',
+      '    - A. 本期仅聚焦单次采集与摘要生成，不包含用户权限管理、历史摘要归档与订阅功能',
+      '  - **A** A. 本期仅聚焦单次采集与摘要生成，不包含用户权限管理、历史摘要归档与订阅功能',
       '- **Q9 · extensibility** 未来最可能新增的业务能力或扩展维度是什么？',
       '  - **Options**',
-      '    - A. 未来可能增加多语言简报生成与用户偏好订阅，需预留配置化数据源与模板接口',
+      '    - A. 未来可能增加多语言摘要生成与用户偏好订阅，需预留配置化数据源与模板接口',
       '    - C. 暂无明确扩展规划，本期以稳定交付核心功能为主，架构保持紧凑',
       '  - **A** C. 暂无明确扩展规划，本期以稳定交付核心功能为主，架构保持紧凑',
     ].join('\n');
@@ -309,7 +309,7 @@ describe('V-model architecture contract', () => {
     const demand = analyzeArchitectureDemand(
       {
         requirementDigest:
-          'TypeScript CLI tool to scrape public HTML news sources without API keys, support manual/scheduled execution, and generate Markdown briefings suitable for email copy-paste.',
+          'TypeScript CLI tool to collect public HTML listing sources without API keys, support manual/scheduled execution, and generate Markdown summaries suitable for email copy-paste.',
         rawRequirement: topic,
       },
       'typescript',

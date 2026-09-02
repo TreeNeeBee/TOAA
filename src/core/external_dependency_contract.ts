@@ -78,7 +78,7 @@ export function replaysRecordedResponses(content: string): boolean {
  * The same path the Step is instructed to use, stated once so the instruction and the permission
  * cannot disagree. They did: the prompts tell a Step to write `tests/fixtures/<name>` while only the
  * recorded-response subdirectory was writable, so a Step that followed the instruction was refused —
- * and the refusal names a path it was told to use, which leaves it nothing to try. A DBC parser's
+ * and the refusal names a path it was told to use, which leaves it nothing to try. A parser's
  * module tests spent an entire Ticket budget rewriting the same four fixtures into a denial.
  */
 export const TEST_FIXTURE_DIR = 'tests/fixtures';
