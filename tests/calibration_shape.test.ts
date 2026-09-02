@@ -351,7 +351,7 @@ describe('calibrateProducedInputGlobs', () => {
       {
         id: 'S004',
         inputs: [],
-        outputs: ['src/main.ts', 'src/services/news.ts', 'src/schema.json'],
+        outputs: ['src/main.ts', 'src/services/report.ts', 'src/schema.json'],
       },
       {
         id: 'S005',
@@ -362,7 +362,7 @@ describe('calibrateProducedInputGlobs', () => {
 
     expect(calibrateProducedInputGlobs(steps)[1]!.inputs).toEqual([
       'src/main.ts',
-      'src/services/news.ts',
+      'src/services/report.ts',
       'tests/missing/**/*.ts',
     ]);
   });

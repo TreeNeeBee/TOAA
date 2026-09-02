@@ -105,14 +105,18 @@ export class TicketBlockerService {
   }
 
   /** Drops one blocker from one Ticket, for a blocker that is still open but must not hold it. */
-  async releaseFrom(blocked: Ticket, blockerId: ObjectId): Promise<void> {
+  async releaseFrom(
+    blocked: Ticket,
+    blockerId: ObjectId,
+    options: { resume?: boolean } = {},
+  ): Promise<void> {
     if (!blocked.blockedByTicketIds.includes(blockerId)) return;
-    await this.unblock(blocked, blockerId);
+    await this.unblock(blocked, blockerId, options.resume ?? true);
   }
 
-  private async unblock(blocked: Ticket, blockerId: ObjectId): Promise<void> {
+  private async unblock(blocked: Ticket, blockerId: ObjectId, resume = true): Promise<void> {
     const blockers = blocked.blockedByTicketIds.filter((id) => id !== blockerId);
-    if (blockers.length === 0 && blocked.state === 'pending') {
+    if (resume && blockers.length === 0 && blocked.state === 'pending') {
       const prepared = await this.lifecycle.prepareTransition(blocked, 'in_progress', {
         reasonCode: 'ticket.blocker_cleared',
         reason: `Corrective Ticket ${blockerId} closed; ${blocked.name} can resume.`,

@@ -18,9 +18,9 @@ describe('external boundary contract per V-model level', () => {
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-external-boundary-'));
     workspace = new Workspace(root);
-    await workspace.writeFile('src/scrapers/baidu.ts', [
-      'export async function scrape() {',
-      '  const response = await fetch("https://top.baidu.com/board?tab=realtime");',
+    await workspace.writeFile('src/upstream/primary.ts', [
+      'export async function fetchPage() {',
+      '  const response = await fetch("https://primary.example.com/board?tab=realtime");',
       '  return parseHTML(await response.text());',
       '}',
       'export function parseHTML(html: string) { return []; }',
@@ -34,10 +34,10 @@ describe('external boundary contract per V-model level', () => {
   });
 
   it('accepts a mocked UNIT_TEST authored by CODE', async () => {
-    await workspace.writeFile('tests/unit/scrapers.test.ts', [
+    await workspace.writeFile('tests/unit/upstream.test.ts', [
       'import { describe, expect, it } from "vitest";',
-      'import { parseHTML } from "../../src/scrapers/baidu.ts";',
-      'describe("baidu", () => {',
+      'import { parseHTML } from "../../src/upstream/primary.ts";',
+      'describe("primary", () => {',
       '  it("parses", () => {',
       '    const html = \'<a class="title" href="/i">title</a>\';',
       '    expect(parseHTML(html).length).toBe(1);',
@@ -46,42 +46,42 @@ describe('external boundary contract per V-model level', () => {
     ].join('\n'));
 
     const result = await new TestPhaseValidator(workspace)
-      .inspect(networkPlan('UNIT_TEST', 'tests/unit/scrapers.test.ts'), stepFor('UNIT_TEST'));
+      .inspect(networkPlan('UNIT_TEST', 'tests/unit/upstream.test.ts'), stepFor('UNIT_TEST'));
 
     expect(result.ok).toBe(true);
   });
 
   it('accepts a UNIT_TEST that replays a captured response', async () => {
-    await workspace.writeFile('tests/fixtures/network/baidu.html', '<html>real page</html>\n');
-    await workspace.writeFile('tests/unit/scrapers.test.ts', [
+    await workspace.writeFile('tests/fixtures/network/primary.html', '<html>real page</html>\n');
+    await workspace.writeFile('tests/unit/upstream.test.ts', [
       'import { readFileSync } from "node:fs";',
       'import { describe, expect, it } from "vitest";',
-      'import { parseHTML } from "../../src/scrapers/baidu.ts";',
-      'const html = readFileSync("tests/fixtures/network/baidu.html", "utf8");',
-      'describe("baidu", () => {',
+      'import { parseHTML } from "../../src/upstream/primary.ts";',
+      'const html = readFileSync("tests/fixtures/network/primary.html", "utf8");',
+      'describe("primary", () => {',
       '  it("parses the captured page", () => expect(parseHTML(html).length).toBeGreaterThan(0));',
       '});',
     ].join('\n'));
 
     const result = await new TestPhaseValidator(workspace)
-      .inspect(networkPlan('UNIT_TEST', 'tests/unit/scrapers.test.ts'), stepFor('UNIT_TEST'));
+      .inspect(networkPlan('UNIT_TEST', 'tests/unit/upstream.test.ts'), stepFor('UNIT_TEST'));
 
     expect(result.invalid.join(' ')).not.toContain('captured from the');
   });
 
   it('accepts a captured response loaded by import, not only by reading the file', async () => {
-    await workspace.writeFile('tests/fixtures/network/baidu.html', '<html>real page</html>\n');
-    await workspace.writeFile('tests/unit/scrapers.test.ts', [
-      'import html from "../fixtures/network/baidu.html?raw";',
+    await workspace.writeFile('tests/fixtures/network/primary.html', '<html>real page</html>\n');
+    await workspace.writeFile('tests/unit/upstream.test.ts', [
+      'import html from "../fixtures/network/primary.html?raw";',
       'import { describe, expect, it } from "vitest";',
-      'import { parseHTML } from "../../src/scrapers/baidu.ts";',
-      'describe("baidu", () => {',
+      'import { parseHTML } from "../../src/upstream/primary.ts";',
+      'describe("primary", () => {',
       '  it("parses the captured page", () => expect(parseHTML(html).length).toBeGreaterThan(0));',
       '});',
     ].join('\n'));
 
     const result = await new TestPhaseValidator(workspace)
-      .inspect(networkPlan('UNIT_TEST', 'tests/unit/scrapers.test.ts'), stepFor('UNIT_TEST'));
+      .inspect(networkPlan('UNIT_TEST', 'tests/unit/upstream.test.ts'), stepFor('UNIT_TEST'));
 
     expect(result.invalid.join(' ')).not.toContain('captured from the');
   });
@@ -89,9 +89,9 @@ describe('external boundary contract per V-model level', () => {
   it('consumes the REQUIREMENT_ANALYSIS baseline suite in S008', async () => {
     await workspace.writeFile('tests/functional/cli.test.ts', [
       'import { describe, expect, it, vi } from "vitest";',
-      'import { scrape } from "../../src/scrapers/baidu.ts";',
+      'import { fetchPage } from "../../src/upstream/primary.ts";',
       'vi.stubGlobal("fetch", vi.fn());',
-      'describe("cli", () => { it("runs", () => expect(scrape).toBeTypeOf("function")); });',
+      'describe("cli", () => { it("runs", () => expect(fetchPage).toBeTypeOf("function")); });',
     ].join('\n'));
 
     const result = await new TestPhaseValidator(workspace)
@@ -104,29 +104,29 @@ describe('external boundary contract per V-model level', () => {
   it('lets the source phase capture fixtures while keeping verification read-only', async () => {
     const { computeStepAllowedWrites } = await import('../src/application/execution/execution_context.js');
     const { pairedTestAssetPaths } = await import('../src/core/test_assets.js');
-    const plan = networkPlan('UNIT_TEST', 'tests/unit/scrapers.test.ts');
+    const plan = networkPlan('UNIT_TEST', 'tests/unit/upstream.test.ts');
     const unit = plan.steps.find((candidate) => candidate.phase === 'UNIT_TEST')!;
 
     // The exact paired suite a UNIT_TEST runs is owned by CODE.
-    expect(pairedTestAssetPaths(plan.steps, unit, plan.language)).toContain('tests/unit/scrapers.test.ts');
+    expect(pairedTestAssetPaths(plan.steps, unit, plan.language)).toContain('tests/unit/upstream.test.ts');
     // And whoever owns paired tests may store the inputs those tests read. Asserted as reaching the
     // recorded-response path rather than as one literal directory: the grant is the fixture root, and
     // pinning the subdirectory is what let the permission drift away from the instruction before.
     const code = plan.steps.find((candidate) => candidate.phase === 'CODE')!;
     const { isAllowedWrite } = await import('../src/tools/types.js');
-    expect(isAllowedWrite('tests/fixtures/network/baidu.html', computeStepAllowedWrites(code))).toBe(true);
+    expect(isAllowedWrite('tests/fixtures/network/primary.html', computeStepAllowedWrites(code))).toBe(true);
   });
 
   it('still refuses a verification level that claims a test the paired phase does not own', async () => {
-    await workspace.writeFile('tests/unit/scrapers.test.ts', [
+    await workspace.writeFile('tests/unit/upstream.test.ts', [
       'import { readFileSync } from "node:fs";',
       'import { describe, expect, it } from "vitest";',
-      'import { parseHTML } from "../../src/scrapers/baidu.ts";',
-      'const html = readFileSync("tests/fixtures/network/baidu.html", "utf8");',
-      'describe("baidu", () => { it("parses", () => expect(parseHTML(html)).toBeDefined()); });',
+      'import { parseHTML } from "../../src/upstream/primary.ts";',
+      'const html = readFileSync("tests/fixtures/network/primary.html", "utf8");',
+      'describe("primary", () => { it("parses", () => expect(parseHTML(html)).toBeDefined()); });',
     ].join('\n'));
-    await workspace.writeFile('tests/fixtures/network/baidu.html', '<html>real</html>\n');
-    const plan = networkPlan('UNIT_TEST', 'tests/unit/scrapers.test.ts');
+    await workspace.writeFile('tests/fixtures/network/primary.html', '<html>real</html>\n');
+    const plan = networkPlan('UNIT_TEST', 'tests/unit/upstream.test.ts');
     const unit = { ...plan.steps.find((c) => c.phase === 'UNIT_TEST')!, outputs: ['tests/unit/invented.test.ts'] };
 
     const result = await new TestPhaseValidator(workspace).inspect(plan, unit);
@@ -135,23 +135,23 @@ describe('external boundary contract per V-model level', () => {
   });
 
   it('leaves a project that reaches nothing external alone', async () => {
-    await workspace.writeFile('src/scrapers/baidu.ts', 'export function parseHTML() { return []; }\n');
-    await workspace.writeFile('tests/unit/scrapers.test.ts', [
+    await workspace.writeFile('src/upstream/primary.ts', 'export function parseHTML() { return []; }\n');
+    await workspace.writeFile('tests/unit/upstream.test.ts', [
       'import { describe, expect, it } from "vitest";',
-      'import { parseHTML } from "../../src/scrapers/baidu.ts";',
-      'describe("baidu", () => { it("parses", () => expect(parseHTML()).toEqual([])); });',
+      'import { parseHTML } from "../../src/upstream/primary.ts";',
+      'describe("primary", () => { it("parses", () => expect(parseHTML()).toEqual([])); });',
     ].join('\n'));
 
     const result = await new TestPhaseValidator(workspace)
-      .inspect(networkPlan('UNIT_TEST', 'tests/unit/scrapers.test.ts'), stepFor('UNIT_TEST'));
+      .inspect(networkPlan('UNIT_TEST', 'tests/unit/upstream.test.ts'), stepFor('UNIT_TEST'));
 
     expect(result.invalid.join(' ')).not.toContain('captured from the');
   });
 
   it('runs paired baselines plus isolated supplements and ignores undeclared siblings', async () => {
     const { runTestsTool } = await import('../src/tools/sandbox.js');
-    await workspace.writeFile('tests/modules/scrapers.test.ts', 'declared\n');
-    await workspace.writeFile('tests/modules/scrapers-live.test.ts', 'supplement\n');
+    await workspace.writeFile('tests/modules/upstream.test.ts', 'declared\n');
+    await workspace.writeFile('tests/modules/upstream-live.test.ts', 'supplement\n');
     await workspace.writeFile(
       'tests/verification/p1/module-test/s007/network-risk.test.ts',
       'isolated supplement\n',
@@ -161,7 +161,7 @@ describe('external boundary contract per V-model level', () => {
     await runTestsTool.run({}, {
       ws: workspace,
       language: 'typescript',
-      testGateArgs: ['tests/modules/scrapers.test.ts', '--coverage'],
+      testGateArgs: ['tests/modules/upstream.test.ts', '--coverage'],
       supplementalTestRoot: 'tests/verification/p1/module-test/s007/',
       sandbox: {
         runTests: async (a: string[]) => {
@@ -171,9 +171,9 @@ describe('external boundary contract per V-model level', () => {
       },
     } as never);
 
-    expect(ran).toContain('tests/modules/scrapers.test.ts');
+    expect(ran).toContain('tests/modules/upstream.test.ts');
     expect(ran).toContain('tests/verification/p1/module-test/s007/network-risk.test.ts');
-    expect(ran).not.toContain('tests/modules/scrapers-live.test.ts');
+    expect(ran).not.toContain('tests/modules/upstream-live.test.ts');
     // Flags are passed through, not treated as paths.
     expect(ran).toContain('--coverage');
   });
@@ -220,15 +220,15 @@ function networkPlan(phase: Step['phase'], testPath: string): Plan {
     id: 'S004',
     iterationId: 'P1',
     phase: 'CODE',
-    title: 'Implement the scrapers',
-    description: 'Implement the scrapers.',
+    title: 'Implement the upstream clients',
+    description: 'Implement the upstream clients.',
     systemPrompt: 'Implement the declared modules.',
     role: 'Coder',
     tools: ['write_file'],
     inputs: [],
-    outputs: ['src/scrapers/baidu.ts', ...(phase === 'UNIT_TEST' ? [testPath] : [])],
+    outputs: ['src/upstream/primary.ts', ...(phase === 'UNIT_TEST' ? [testPath] : [])],
     dependsOn: [],
-    acceptance: 'The scrapers are implemented.',
+    acceptance: 'The upstream clients are implemented.',
     maxAttempts: 3,
   };
   return {
@@ -237,16 +237,16 @@ function networkPlan(phase: Step['phase'], testPath: string): Plan {
     intent: 'greenfield',
     projectType: 'application',
     createdAt: new Date().toISOString(),
-    requirementDigest: 'news',
+    requirementDigest: 'upstream records',
     globalPrompt: '',
     baselineSummary: '',
     userAddenda: '',
     dependencies: [],
     architectureModules: [{
       id: 'M001',
-      name: 'Scrapers',
-      responsibility: 'Fetch and parse the upstream hot-search pages.',
-      sourcePaths: ['src/scrapers/baidu.ts'],
+      name: 'UpstreamClients',
+      responsibility: 'Fetch and parse the upstream listing pages.',
+      sourcePaths: ['src/upstream/primary.ts'],
       testPaths: [testPath],
       dependencies: [],
     }],
@@ -277,8 +277,8 @@ describe('executable test gate failure', () => {
 
     const defect = validationDefectFromTestFailure(
       'UNIT_TEST',
-      { ok: false, error: 'Failed to load url ../../../src/scrapers/baidu.ts', tool: 'run_tests' },
-      ['tests/unit/scrapers.test.ts', supplement],
+      { ok: false, error: 'Failed to load url ../../../src/upstream/primary.ts', tool: 'run_tests' },
+      ['tests/unit/upstream.test.ts', supplement],
     );
 
     expect(defect).toContain('../../../../../src/');
@@ -286,7 +286,7 @@ describe('executable test gate failure', () => {
     expect(validationDefectFromTestFailure(
       'UNIT_TEST',
       { ok: false, error: 'assertion failed', tool: 'run_tests' },
-      ['tests/unit/scrapers.test.ts'],
+      ['tests/unit/upstream.test.ts'],
     )).not.toContain('reach the product with');
   });
 });
@@ -295,7 +295,7 @@ describe('executable test gate failure', () => {
  * The instruction and the permission must name the same path.
  *
  * The prompts tell a Step to put a fixture in `tests/fixtures/<name>`; only `tests/fixtures/network/`
- * was writable. A live dbc2excel Ticket died on the gap: its module tests needed DBC samples, the
+ * was writable. A live Ticket died on the gap: its module tests needed parser samples, the
  * Debugger wrote four of them, each was denied by name, and after six attempts the non-convergence
  * guard stopped the whole run. A denial that names the path the Step was told to use leaves it
  * nothing to try next.
@@ -318,7 +318,7 @@ describe('test fixture write access', () => {
     const { computeStepAllowedWrites } = await import('../src/application/execution/execution_context.js');
     const scope = computeStepAllowedWrites(stepWithTest());
     // The exact paths the live run was refused.
-    for (const fixture of ['basic_signals.dbc', 'multiplex_signals.dbc', 'ecu_filter_test.dbc', 'error_cases.dbc']) {
+    for (const fixture of ['basic_input.sample', 'nested_input.sample', 'filtered_input.sample', 'error_cases.sample']) {
       expect(await canWrite(`tests/fixtures/${fixture}`, scope)).toBe(true);
     }
   });
@@ -327,7 +327,7 @@ describe('test fixture write access', () => {
   it('grants nothing extra to a Step that owns no test', async () => {
     const { computeStepAllowedWrites } = await import('../src/application/execution/execution_context.js');
     const scope = computeStepAllowedWrites(stepWithTest({ outputs: ['docs/03-detailed-design.md'] }));
-    expect(await canWrite('tests/fixtures/anything.dbc', scope)).toBe(false);
+    expect(await canWrite('tests/fixtures/anything.sample', scope)).toBe(false);
   });
 
   /**
@@ -343,10 +343,10 @@ describe('test fixture write access', () => {
     const bug = { type: 'bug', affectedArtifacts: [], contractDelta: { affectedArtifacts: [] } } as never;
 
     const corrective = computeIncrementalAllowedWrites(plan, step, profile, bug);
-    expect(await canWrite('tests/fixtures/basic_signals.dbc', corrective)).toBe(true);
+    expect(await canWrite('tests/fixtures/basic_input.sample', corrective)).toBe(true);
     // Stated as a relationship, because the two scopes drifting apart is the defect itself.
     const owned = computeStepAllowedWrites(step);
-    expect(await canWrite('tests/fixtures/basic_signals.dbc', owned)).toBe(true);
+    expect(await canWrite('tests/fixtures/basic_input.sample', owned)).toBe(true);
   });
 
   it('gives a Change Request narrowed to a test the same access', async () => {
@@ -360,6 +360,6 @@ describe('test fixture write access', () => {
     } as never;
 
     const scope = computeIncrementalAllowedWrites(plan, step, profile, cr);
-    expect(await canWrite('tests/fixtures/basic_signals.dbc', scope)).toBe(true);
+    expect(await canWrite('tests/fixtures/basic_input.sample', scope)).toBe(true);
   });
 });

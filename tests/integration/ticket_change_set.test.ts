@@ -372,6 +372,23 @@ async function registerBug(
       targetStepType: 'CODE',
       verificationStepId: story.stepId!,
       verificationStepType: 'UNIT_TEST',
+      identity: {
+        version: 1,
+        category: 'test',
+        code: 'test_failed',
+        failedStepId: story.stepId!,
+        targetStepId: story.stepId!,
+        verificationStepId: story.stepId!,
+        testSelectors: [],
+        artifactTargets: [],
+      },
+    },
+    verificationContract: {
+      kind: 'test-gate',
+      verificationStepId: story.stepId!,
+      verificationStepType: 'UNIT_TEST',
+      testSelectors: [],
+      artifactTargets: [],
     },
   });
   await repository.insert(bug, bug.state);
@@ -394,6 +411,7 @@ async function registerChangeRequest(
       now: new Date().toISOString(),
     }),
     type: 'change-request',
+    changeKind: 'contract-change',
     parentTicketId: parent.id,
     state: 'created',
     assignmentIds: [],
@@ -406,10 +424,11 @@ async function registerChangeRequest(
     },
     implementationPlan: ['apply the delta'],
     verificationGate: ['downstream gates pass'],
-    sourceTicketId: parent.id,
+    sourceTicketIds: [parent.id],
     triggerStepId: parent.stepId,
     sourceStepId: parent.stepId,
     targetStepId: parent.stepId,
+    propagationStepIds: [parent.stepId],
   });
   await repository.insert(request, request.state);
   return request;

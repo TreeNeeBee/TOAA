@@ -27,7 +27,7 @@ import { acquireLock, LockError } from '../core/lock.js';
 import { calibratePythonRequirements } from '../agents/calibration.js';
 import { getLanguageProfile } from '../core/language.js';
 import { runProjectAudit } from '../core/project_audit.js';
-import { judgeScenarioOutcome } from '../application/execution/scenario_outcome_judge.js';
+import { judgeScenarioOutcome, isScenarioOutcomeJudgementError } from '../application/execution/scenario_outcome_judge.js';
 import {
   generateProjectDevelopmentReport,
 } from '../core/project_report.js';
@@ -698,38 +698,60 @@ export async function runExecute(opts: ExecuteOptions): Promise<ExecuteResult> {
           }
         }
       }
-      // What the workspace held before the scenario ran, so whatever it touches can be told apart
-      // from everything already there. Difference is what makes this work for any project: nothing
-      // here knows what kind of artifact the scenario is supposed to produce.
-      const beforeScenario = (await canonicalFileTree.entries())
-        .filter((entry) => entry.type === 'file')
-        .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
-      finalProjectAudit = await runProjectAudit({
+      // What the workspace holds right now, so whatever a scenario touches can be told apart from
+      // everything already there. Difference is what makes this work for any project: nothing here
+      // knows what kind of artifact a scenario is supposed to produce. The audit calls it again
+      // before each scenario, because the checks it runs first and the scenarios themselves both
+      // change files that would otherwise be credited to whichever scenario is judged.
+      const snapshotArtifacts = async () => {
+        await canonicalFileTree.rescan();
+        return (await canonicalFileTree.entries())
+          .filter((entry) => entry.type === 'file')
+          .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
+      };
+      // A judgement the model returned unusable is a provider failure, not a verdict about the
+      // project. Letting it escape ended the whole run on an uncaught error — the same death a
+      // schema mismatch produced — with no retry and nothing said about which scenario it was.
+      // The Phase stays open instead, so the next run judges it again.
+      let auditResult;
+      try {
+        auditResult = await runProjectAudit({
         ws,
         sandbox,
         plan,
         profile,
         scenarios: phaseGate.scenarios,
         runLiveScenario: (operation) => recordReplay.runWithMode('off', operation),
-        judgeScenarioOutcome: ({ scenario, scene }) => judgeScenarioOutcome({
+        snapshotArtifacts,
+        judgeScenarioOutcome: ({ scenario, scene, before }) => judgeScenarioOutcome({
           router,
-          before: beforeScenario,
+          before,
           scenario,
           scene,
+          requirementDigest: plan.requirementDigest,
           artifacts: {
-            snapshot: async () => {
-              await canonicalFileTree.rescan();
-              return (await canonicalFileTree.entries())
-                .filter((entry) => entry.type === 'file')
-                .map((entry) => ({ path: entry.path, mtimeMs: entry.mtimeMs }));
-            },
+            snapshot: snapshotArtifacts,
             read: async (relative, maxBytes) => {
               const text = await ws.readFile(relative).catch(() => undefined);
               return text === undefined ? undefined : text.slice(0, maxBytes);
             },
           },
         }),
-      });
+        });
+      } catch (error) {
+        if (!isScenarioOutcomeJudgementError(error)) throw error;
+        await audit.event('phase.delivery_gate', `${domainPhase.name} delivery gate could not be judged`, {
+          messageId: 'domain.phase_delivery_gate_unjudged',
+          projectId: domainProject.id,
+          phaseId: domainPhase.id,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        return {
+          ok: false,
+          reason: `phase delivery gate could not be judged: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      finalProjectAudit = auditResult;
       await audit.event('phase.delivery_gate', `${domainPhase.name} delivery gate evaluated`, {
         messageId: 'domain.phase_delivery_gate_evaluated',
         projectId: domainProject.id,

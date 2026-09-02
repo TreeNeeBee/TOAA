@@ -9,7 +9,7 @@ import {
  * A network that disappears mid-request leaves nothing to detect.
  *
  * No RST, no FIN — the socket black-holes and the request expires on our own clock, reported as a
- * timeout. Two live dbc2excel runs died that way, and `timed out after 900000ms` cannot tell an
+ * timeout. Two live runs died that way, and `timed out after 900000ms` cannot tell an
  * operator whether the network was gone or the model was merely slow. Kernel probes can: a peer's
  * kernel answers them while its model is still thinking, so an unanswered probe means the path is
  * gone rather than that the answer is slow.

@@ -62,6 +62,25 @@ export class ProjectManagerIntakeService {
       const target = reportTarget(steps, acceptance, report);
       const reportText = renderProblemReport(input.origin, report);
       let ticket: Ticket;
+      if (report.category === 'change-request') {
+        ticket = await this.corrective.routeContractChange({
+          reportingStepId: acceptance.id,
+          targetStepId: target.id,
+          summary: report.summary,
+          evidence: report.evidence,
+          expected: report.scene?.scenario.expected ?? report.summary,
+          affectedArtifacts: report.affectedArtifacts ?? [],
+          creatorActorId,
+          correlationId: input.correlationId,
+          sourceKind: 'pm-intake',
+          // The finding's stable code, so the Change Request can be traced back to what raised it
+          // and a recurrence recognised as the same problem rather than a second one. Without it
+          // every Change Request in a Phase carried the same external id.
+          sourceExternalId: `${input.origin}:${phase.name}:${report.code}`,
+        });
+        queued.push({ ticket, order: STEP_TYPE_ORDER[target.type] });
+        continue;
+      }
       if (report.category === 'dependency') {
         ticket = await this.corrective.routeDependencyChange({
           requestingStepId: acceptance.id,
@@ -86,7 +105,7 @@ export class ProjectManagerIntakeService {
           failure: {
             kind: 'execution',
             category: report.category === 'test-defect' ? 'contract' : 'test',
-            code: `phase_delivery_${report.category.replaceAll('-', '_')}`,
+            code: report.code,
             message: reportText,
             retryable: true,
             switchProvider: false,
@@ -101,6 +120,8 @@ export class ProjectManagerIntakeService {
           correlationId: input.correlationId,
           sourceKind: 'pm-intake',
           sourceExternalId: `${input.origin}:${phase.name}`,
+          tool: report.scene?.scenario.operation,
+          affectedArtifacts: report.affectedArtifacts,
         });
       } else {
         ticket = await this.corrective.routeQualityGap({
@@ -167,7 +188,7 @@ function deduplicateReports(reports: readonly DeliveryGateFinding[]): DeliveryGa
   return reports.filter((report) => {
     const key = JSON.stringify({
       category: report.category,
-      summary: report.summary,
+      code: report.code,
       target: report.target,
       affectedArtifacts: [...(report.affectedArtifacts ?? [])].sort(),
       packages: [...report.dependencyPackages].sort(),

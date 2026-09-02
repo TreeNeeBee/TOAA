@@ -90,24 +90,42 @@ function armStallDiagnosis(cfg: OpenAIConfig, options?: ChatOptions) {
   const afterMs = cfg.stallDiagnosisAfterMs ?? 0;
   let diagnosis: string | undefined;
   let timer: NodeJS.Timeout | null = null;
+  let generation = 0;
+  let diagnosisStarted = false;
+  let disposed = false;
   const active = afterMs > 0 && !!options?.onStall;
   const arm = () => {
-    if (!active) return;
+    if (!active || diagnosisStarted || disposed) return;
     if (timer) clearTimeout(timer);
+    const armedGeneration = ++generation;
     timer = setTimeout(() => {
       timer = null;
+      diagnosisStarted = true;
       // Fire and forget: a diagnosis must never become another thing the request waits on.
       void options!.onStall!({ silentForMs: afterMs, provider: cfg.providerName, model: cfg.model })
-        .then((text) => { if (text) diagnosis = text; })
+        .then((text) => {
+          if (text && !disposed && generation === armedGeneration) diagnosis = text;
+        })
         .catch(() => undefined);
     }, afterMs);
   };
   arm();
   return {
     /** Any byte from the provider. Restarts the clock and discards a diagnosis it outlived. */
-    seen: () => { diagnosis = undefined; arm(); },
+    seen: () => {
+      diagnosis = undefined;
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      arm();
+    },
     diagnosis: () => diagnosis,
-    cleanup: () => { if (timer) clearTimeout(timer); timer = null; },
+    cleanup: () => {
+      disposed = true;
+      generation += 1;
+      if (timer) clearTimeout(timer);
+      timer = null;
+    },
   };
 }
 

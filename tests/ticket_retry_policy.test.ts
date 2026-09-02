@@ -92,3 +92,27 @@ describe('adaptive Ticket attempt policy', () => {
     expect(decision.reason).toContain('recurred');
   });
 });
+
+describe('a repair on the project side releases the guard', () => {
+  const recurring = [
+    { signature: 'same', toolchainBuildId: 'b1', stepContextFingerprint: 'before' },
+    { signature: 'same', toolchainBuildId: 'b1', stepContextFingerprint: 'before' },
+    { signature: 'same', toolchainBuildId: 'b1', stepContextFingerprint: 'before' },
+  ];
+
+  it('stops counting failures recorded against instructions the Step no longer has', () => {
+    // The build id answers "did XCompiler change" and nothing answered "did this Step's
+    // instructions change". An operator who removed a declared output that no longer existed had
+    // made exactly the repair the policy exists to recognise, and the only way to release the guard
+    // was rebuilding XCompiler for no reason — the wrong signal, and trivially forged.
+    expect(evaluateAttemptExtension(recurring, 'b1', 'before').extend).toBe(false);
+    expect(evaluateAttemptExtension(recurring, 'b1', 'after').extend).toBe(true);
+  });
+
+  it('keeps holding unlabelled evidence against the Ticket', () => {
+    // Absence is not proof that the instructions moved; only a fingerprint that is present and
+    // different is. Treating unlabelled records as stale would release every guard on every run.
+    const unlabelled = recurring.map(({ stepContextFingerprint: _dropped, ...rest }) => rest);
+    expect(evaluateAttemptExtension(unlabelled, 'b1', 'after').extend).toBe(false);
+  });
+});

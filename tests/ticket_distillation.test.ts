@@ -13,6 +13,7 @@ import { TicketWorkflow } from '../src/application/project_management/ticket_wor
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { PLAN_VERSION, type Plan } from '../src/core/plan.js';
 import { STEP_TYPES } from '../src/domain/steps/step.js';
+import { bugContracts } from './helpers/ticket_fixtures.js';
 
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xc-distil-'));
@@ -79,11 +80,12 @@ describe('ticket distillation', () => {
     const { distillation, context, repository, graph, coding, story } = await fixture();
     // A Bug's history belongs to the wiki: putting defect transcripts in Step Context would load
     // them for every role that later touches this Step.
+    const unit = graph.steps.find((step) => step.type === 'UNIT_TEST')!;
     const bug = await new TicketWorkflow(repository).openBug({
       creatorActorId: graph.actors.find((actor) => actor.role === 'tester')!.id,
-      failedStep: graph.steps.find((step) => step.type === 'UNIT_TEST')!,
+      failedStep: unit,
       targetStep: coding,
-      verificationStep: graph.steps.find((step) => step.type === 'UNIT_TEST')!,
+      verificationStep: unit,
       kind: 'test-failure',
       severity: 'high',
       message: 'boom',
@@ -94,6 +96,7 @@ describe('ticket distillation', () => {
       switchProvider: false,
       rawEvidenceRef: '.xcompiler/failures/unit.log',
       correlationId: createObjectId(),
+      ...bugContracts(unit, coding, unit, { category: 'test', code: 'assert' }),
     });
     expect(await distillation.distil(TicketSchema.parse({ ...bug, state: 'closed' }))).toBe(false);
     // Failed and cancelled work records that an approach did not hold, which is a trace fact rather

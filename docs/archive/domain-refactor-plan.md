@@ -16,7 +16,7 @@ Replace the current plan-driven execution projection with one domain model in wh
 
 The refactor intentionally does not preserve the previous persisted domain schema.
 
-The durable implementation and validation record is [XC-AUDIT-2026-08-01-DOMAIN-001](audit/2026-08-01-runtime-domain-refactor.md).
+The durable implementation and validation record is [XC-AUDIT-2026-08-01-DOMAIN-001](../audit/2026-08-01-runtime-domain-refactor.md).
 
 ## Implementation Status
 

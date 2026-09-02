@@ -21,7 +21,7 @@ describe('phase plan persistence', () => {
       language: 'typescript',
       intent: 'greenfield',
       projectType: 'application',
-      requirementDigest: 'Build a news briefing CLI.',
+      requirementDigest: 'Build a report CLI.',
       complexityAssessment: {
         level: 'moderate',
         rationale: 'Core delivery followed by one enhancement phase.',
@@ -32,7 +32,7 @@ describe('phase plan persistence', () => {
         {
           id: 'P1',
           title: 'Core',
-          objective: 'Deliver the briefing CLI.',
+          objective: 'Deliver the report CLI.',
           status: 'current',
           scope: ['CLI'],
           deliverables: ['Runnable application'],

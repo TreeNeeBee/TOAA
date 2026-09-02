@@ -4,17 +4,47 @@ import { simpleGit, type SimpleGit } from 'simple-git';
 import { GitRepositoryService } from '../infrastructure/git/git_repository_service.js';
 import type { Workspace } from './workspace.js';
 
+/**
+ * What a generated project produces by running rather than by being written.
+ *
+ * Two rules follow from that, and both were learned from runs that stopped on them. A merge refuses
+ * a working copy with tracked changes, so a product that rewrites its own output on every delivery
+ * gate makes its next merge impossible — and the artifact then reaches the corrective flow as a
+ * Change Request against a file nobody owns. Whatever appears here is excluded, and anything already
+ * tracked is untracked on the next snapshot, which repairs a workspace that predates the entry.
+ *
+ * Entries are matched two ways and both must agree: written into the project's `.gitignore` and the
+ * repository's own exclude file, and matched by `isRuntimeArtifactPath` when untracking. Keep the
+ * shapes simple — a leading directory, a suffix, or a path segment — so one predicate can serve both.
+ */
 const RUNTIME_EXCLUDE_PATTERNS = [
+  // XCompiler's own working state inside the project.
   '.xcw/',
   '.sandbox/',
+  // What the product writes when it runs. `output/` is the conventional directory a generated CLI
+  // is told to write to, and a log is never a deliverable.
+  'output/',
+  'dist/',
+  'build/',
+  '*.log',
+  // TypeScript.
+  'node_modules/',
+  'coverage/',
+  '*.tsbuildinfo',
+  '.tsbuildinfo',
+  // Python.
   '.pytest_cache/',
   '**/__pycache__/',
   '*.pyc',
-  'node_modules/',
-  'coverage/',
   '.coverage',
-  '*.tsbuildinfo',
+  '.mypy_cache/',
+  '.ruff_cache/',
+  '*.egg-info/',
+  '.venv/',
 ];
+
+/** The project-visible ignore file, so the deliverable carries the same rules the runtime enforces. */
+const PROJECT_GITIGNORE = '.gitignore';
 
 /**
  * GitService 基于 simple-git 提供 XCompiler 运行时所需的最小集：init / snapshot / revert / log。
@@ -37,6 +67,7 @@ export class GitService {
     const has = (k: string) => !!local?.all?.[k];
     if (!has('user.email')) await this.git.addConfig('user.email', 'xcompiler@local');
     if (!has('user.name')) await this.git.addConfig('user.name', 'XCompiler');
+    await this.ensureProjectGitignore();
     await this.ensureRuntimeExcludes();
     // The condition is an unborn HEAD, not a missing repository: the run path initializes the
     // repository through GitRepositoryService before this ever executes, so guarding on "is a
@@ -64,6 +95,28 @@ export class GitService {
     await this.untrackRuntimeArtifacts();
     await this.git.raw(['add', '-A', '--', '.']);
     await this.untrackRuntimeArtifacts();
+  }
+
+  /**
+   * Writes the same rules into the project's own `.gitignore`.
+   *
+   * The repository exclude file is local and invisible: it keeps XCompiler's merges working while
+   * leaving the delivered project without the one file every project has. Anyone who clones the
+   * result, or any Step that inspects it, sees runtime output as source. Entries already present are
+   * left alone, so a project that wrote its own ignore rules keeps them.
+   */
+  private async ensureProjectGitignore(): Promise<void> {
+    const file = path.join(this.ws.root, PROJECT_GITIGNORE);
+    const current = await fs.readFile(file, 'utf8').catch(() => '');
+    const lines = current.split(/\r?\n/u);
+    const missing = RUNTIME_EXCLUDE_PATTERNS.filter((pattern) => !lines.includes(pattern));
+    if (missing.length === 0) return;
+    const prefix = current === '' ? '' : current.endsWith('\n') ? '\n' : '\n\n';
+    await fs.appendFile(
+      file,
+      `${prefix}# Build output and runtime artifacts\n${missing.join('\n')}\n`,
+      'utf8',
+    );
   }
 
   private async ensureRuntimeExcludes(): Promise<void> {
@@ -127,18 +180,21 @@ export class GitService {
   }
 }
 
-function isRuntimeArtifactPath(file: string): boolean {
+/**
+ * Whether a tracked path is a runtime artifact, derived from the same list the ignore rules use.
+ *
+ * Deriving it rather than restating it is the point: the two drifted before, so a directory could be
+ * ignored for new files while an already-tracked copy stayed in the index and kept blocking merges.
+ */
+export function isRuntimeArtifactPath(file: string): boolean {
   const normalized = file.replace(/\\/g, '/');
   if (!normalized) return false;
-  return (
-    normalized.startsWith('.xcw/') ||
-    normalized === '.coverage' ||
-    normalized.startsWith('.sandbox/') ||
-    normalized.startsWith('.pytest_cache/') ||
-    normalized.startsWith('node_modules/') ||
-    normalized.startsWith('coverage/') ||
-    normalized.endsWith('.tsbuildinfo') ||
-    normalized.endsWith('.pyc') ||
-    normalized.split('/').includes('__pycache__')
-  );
+  return RUNTIME_EXCLUDE_PATTERNS.some((pattern) => {
+    if (pattern.endsWith('/')) {
+      const segment = pattern.replace(/^\*\*\//u, '').slice(0, -1);
+      return normalized.startsWith(`${segment}/`) || normalized.split('/').includes(segment);
+    }
+    if (pattern.startsWith('*')) return normalized.endsWith(pattern.slice(1));
+    return normalized === pattern;
+  });
 }

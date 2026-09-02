@@ -17,6 +17,7 @@ describe('LLM quality evidence normalization', () => {
       findings: [
         {
           category: 'test-defect',
+          code: 'supplement_assertion_contract_conflict',
           summary: 'The supplemental assertion contradicts the accepted contract.',
           evidence: ['tests/verification/p1/unit-test/s005/risk.test.ts:18'],
           target: 'current-step',
@@ -24,16 +25,32 @@ describe('LLM quality evidence normalization', () => {
         },
         {
           category: 'product-defect',
+          code: 'implementation_status_incorrect',
           summary: 'The implementation returns the wrong status.',
           evidence: ['expected=ready actual=pending'],
           target: 'code',
           dependencyPackages: [],
         },
+        {
+          category: 'change-request',
+          code: 'accepted_capability_unavailable',
+          summary: 'The accepted external capability must be replaced.',
+          evidence: ['The accepted interface no longer provides the required operation.'],
+          target: 'high-level-design',
+          dependencyPackages: [],
+        },
       ],
     });
 
-    expect(parsed?.findings).toHaveLength(2);
-    expect(evaluateQualityGate(testStep('UNIT_TEST'), parsed).bugFailures).toHaveLength(2);
+    expect(parsed?.findings).toHaveLength(3);
+    const result = evaluateQualityGate(testStep('UNIT_TEST'), parsed);
+    expect(result.bugFailures).toHaveLength(2);
+    expect(result.changeRequestFailures).toEqual([
+      'change-request: The accepted external capability must be replaced.',
+    ]);
+    expect(result.enhancementFailures).not.toContain(
+      'change-request: The accepted external capability must be replaced.',
+    );
   });
 
   it('rejects a malformed finding instead of silently dropping it', () => {
@@ -43,6 +60,20 @@ describe('LLM quality evidence normalization', () => {
       evidence: ['verification report'],
       gaps: [],
       findings: [{ category: 'dependency', summary: 'needs a package', evidence: ['import failed'] }],
+    })).toBeUndefined();
+  });
+
+  it('rejects structured blocker objects instead of silently dropping the CR owner', () => {
+    expect(normalizeQualityAssessment({
+      completion: 1,
+      upstreamAlignment: 1,
+      metrics: {},
+      tolerance: { failedTests: 0, skippedTests: 0, warnings: 0 },
+      evidence: ['affected artifact inspected'],
+      unavailableMetrics: [],
+      gaps: [],
+      blockedBy: [{ stepId: 'S004', reason: 'CODE owns the product change' }],
+      findings: [],
     })).toBeUndefined();
   });
 

@@ -74,8 +74,8 @@ async function fixture(): Promise<{
   const workspace = new Workspace(root);
   const graph = compileProjectGraph({
     draft: samplePlan(),
-    topic: 'Build a TypeScript news application.',
-    projectName: 'news',
+    topic: 'Build a TypeScript reporting application.',
+    projectName: 'report',
   });
   const repository = new DomainObjectRepository(workspace);
   await repository.load();
@@ -90,7 +90,7 @@ function samplePlan(): Plan {
     intent: 'greenfield',
     phaseId: 'P1',
     projectType: 'application',
-    requirementDigest: 'news reader',
+    requirementDigest: 'record reader',
     complexityAssessment: {
       level: 'simple', rationale: 'fixture', splitRecommended: false, userForcedPhaseSplit: false,
     },

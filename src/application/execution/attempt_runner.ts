@@ -1,8 +1,13 @@
 import type { AuditLogger } from '../../audit/audit.js';
 import type { WorkspaceKind } from '../../domain/workspace/change_set.js';
-import { xcompilerBuildId } from '../../core/build_identity.js';
+import { stepContextFingerprint, xcompilerBuildId } from '../../core/build_identity.js';
 import { resolveFileTreeService } from '../workspace/file_tree_resolver.js';
-import { StepExecutor, type ExecutorRunResult, type ToolCallRecord } from '../../agents/executor.js';
+import {
+  StepExecutor,
+  type AdvisoryFailureRule,
+  type ExecutorRunResult,
+  type ToolCallRecord,
+} from '../../agents/executor.js';
 import { ensureEssentialToolRefs } from '../../agents/calibration.js';
 import { buildDebugBrief, buildFailureSignature, type DebugBrief } from '../../core/debug_brief.js';
 import type { DomainLog } from '../../domain/observability/records.js';
@@ -17,7 +22,10 @@ import {
   computeStepAllowedWrites,
   stepContextChars,
 } from './execution_context.js';
-import { TestPhaseValidator } from './test_phase_validator.js';
+import {
+  TestPhaseValidator,
+  type PairedTestAssetInspection,
+} from './test_phase_validator.js';
 import {
   inspectPairedSourceTests,
   mergePairedSourceTestQuality,
@@ -25,9 +33,10 @@ import {
 import { normalizeGitPath } from './v_model_policy.js';
 import { TEST_FIXTURE_DIR } from '../../core/external_dependency_contract.js';
 import { getLanguageProfile, type LanguageProfile } from '../../core/language.js';
+import { inspectLanguageProjectContract } from '../../core/language_project_contract.js';
 import type { Plan, Step as ExecutionStep } from '../../core/plan.js';
 import type { StageQualityAssessment } from '../../core/quality_gate.js';
-import type { Step } from '../../domain/steps/step.js';
+import { STEP_TYPE_ORDER, type Step, type StepType } from '../../domain/steps/step.js';
 import {
   TicketSchema,
   appendTicketCommit,
@@ -301,6 +310,7 @@ export class DomainAttemptRunner {
         );
     await this.recordTicketRevision(input, baseline, 'baseline', 'attempt baseline');
     let wikiMatches: DebugWikiMatch[] = [];
+    let verificationInspection: PairedTestAssetInspection | undefined;
     try {
       if (scope.preparationError) {
         const preparationFailure = sandboxPreparationFailure(
@@ -313,8 +323,17 @@ export class DomainAttemptRunner {
           failure: preparationFailure,
         });
       }
+      const existingContractFailure = await this.rejectInvalidProjectContract(
+        scope,
+        baseline,
+        input,
+        undefined,
+        true,
+      );
+      if (existingContractFailure) return existingContractFailure;
       if (isVerification(input.domainStep)) {
         const inspection = await this.testValidator(scope).inspect(input.plan, input.executionStep);
+        verificationInspection = inspection;
         if (!inspection.ok) {
           return await this.failAttempt(scope, baseline, input, {
             reason: `${input.domainStep.type} test assets are incomplete`,
@@ -330,6 +349,7 @@ export class DomainAttemptRunner {
             gateFindings: [
               ...inspection.missing.map((file): DeliveryGateFinding => ({
                 category: 'test-incomplete',
+                code: 'required_baseline_asset_missing',
                 summary: `Required baseline test asset is missing: ${file}`,
                 evidence: [inspection.failureLog],
                 target: 'paired-source',
@@ -338,6 +358,7 @@ export class DomainAttemptRunner {
               })),
               ...inspection.invalid.map((detail): DeliveryGateFinding => ({
                 category: 'test-incomplete',
+                code: 'baseline_asset_invalid',
                 summary: detail,
                 evidence: [inspection.failureLog],
                 target: 'paired-source',
@@ -393,6 +414,7 @@ export class DomainAttemptRunner {
             },
             gateFindings: [{
               category: 'test-incomplete',
+              code: 'baseline_test_assets_missing',
               summary: failureLog,
               evidence: [
                 `Declared outputs: ${input.executionStep.outputs.join(', ') || '(none)'}`,
@@ -469,6 +491,12 @@ export class DomainAttemptRunner {
                 phase: environment.verificationScope.verificationPhase,
               }
             : undefined,
+          phaseDeliveryVerification: isPhaseDeliveryGateBug(input.ticket)
+            ? {
+                phaseId: input.ticket.phaseId,
+                findingCode: input.ticket.failure.code,
+              }
+            : undefined,
         } : undefined,
         layeredContext: assembled.text,
         globalPrompt: input.plan.globalPrompt,
@@ -518,6 +546,14 @@ export class DomainAttemptRunner {
         });
       }
 
+      const deliveredContractFailure = await this.rejectInvalidProjectContract(
+        scope,
+        baseline,
+        input,
+        result,
+      );
+      if (deliveredContractFailure) return deliveredContractFailure;
+
       const pairedTestInspection = await inspectPairedSourceTests(
         scope.workspace,
         input.plan,
@@ -532,6 +568,13 @@ export class DomainAttemptRunner {
       const measuredAssessment = reconcileMeasuredQualityAssessment(
         result.qualityAssessment,
         result.toolCalls,
+        verificationInspection ? {
+          phase: input.executionStep.phase,
+          architectureModules: input.plan.architectureModules ?? [],
+          baselineTestPaths: verificationInspection.testArgs,
+          supplementalTestPaths: verificationInspection.supplementalTestArgs,
+          sourceContracts: verificationInspection.sourceContracts,
+        } : undefined,
       );
       const scopedAssessment = reconcileDeferredSourceQualityAssessment(measuredAssessment, {
         currentPhase: input.executionStep.phase,
@@ -779,6 +822,7 @@ export class DomainAttemptRunner {
         signal: this.options.abortSignal,
         streamOutput: this.options.terminalOutput === true,
         maxRounds: rounds,
+        advisoryFailureRules: advisoryFailuresForStage(input.domainStep.type),
       }),
       tools,
       context,
@@ -933,6 +977,59 @@ export class DomainAttemptRunner {
           : []),
       ],
       findings: value?.findings ?? [],
+    });
+  }
+
+  /**
+   * Rejects a structurally invalid language artifact at the Step that authored it, or reports an
+   * already accepted invalid artifact to its owning Step before another role spends model rounds on
+   * a command that artifact made impossible.
+   */
+  private async rejectInvalidProjectContract(
+    scope: ExecutionScope,
+    baseline: string,
+    input: AttemptInput,
+    executor?: ExecutorRunResult,
+    allowOwnedCorrection = false,
+  ): Promise<AttemptResult | undefined> {
+    const findings = await inspectLanguageProjectContract(scope.workspace, input.plan.language);
+    if (findings.length === 0) return undefined;
+    if (
+      allowOwnedCorrection &&
+      input.mode !== 'normal' &&
+      findings.every((finding) => findingBelongsToStep(finding, input.domainStep))
+    ) {
+      await this.options.audit.event(
+        'note',
+        `${input.domainStep.name} owns the existing project contract correction`,
+        {
+          messageId: 'domain.project_contract_correction_entered',
+          projectId: input.domainStep.projectId,
+          phaseId: input.domainStep.phaseId,
+          stepId: input.domainStep.id,
+          ticketId: input.ticket.id,
+          findingCodes: findings.map((finding) => finding.code),
+        },
+      );
+      return undefined;
+    }
+    const failureLog = findings.flatMap((finding) => [
+      finding.summary,
+      ...finding.evidence,
+    ]).join('\n');
+    return this.failAttempt(scope, baseline, input, {
+      reason: findings[0]!.summary,
+      failureLog,
+      failure: {
+        kind: 'execution',
+        category: 'quality',
+        code: 'language_project_contract_invalid',
+        message: failureLog,
+        retryable: true,
+        switchProvider: false,
+      },
+      executor,
+      gateFindings: findings,
     });
   }
 
@@ -1141,6 +1238,8 @@ export class DomainAttemptRunner {
         // Which build produced this failure. The retry policy uses it to tell "the same failure
         // keeps coming back" from "the same failure was recorded by a toolchain since repaired".
         toolchainBuildId: xcompilerBuildId(),
+        // And what this Step was told to do, so a repair to its declarations counts as change too.
+        stepContextFingerprint: stepContextFingerprint(input.domainStep),
         workspaceDisposition: preserveCandidate && (!isCanonical || workspaceBinding)
           ? 'candidate-preserved'
           : 'rolled-back',
@@ -1179,6 +1278,12 @@ export class DomainAttemptRunner {
       gateFindings: failure.gateFindings ?? failure.assessment?.findings ?? [],
     };
   }
+}
+
+function isPhaseDeliveryGateBug(ticket: Ticket): ticket is BugTicket {
+  return ticket.type === 'bug' &&
+    ticket.source.kind === 'pm-intake' &&
+    ticket.failure.details?.reportOrigin === 'phase-delivery-gate';
 }
 
 export function renderQualityAssessmentFailure(
@@ -1236,6 +1341,19 @@ export function changelistEntries(files: readonly string[]) {
  */
 export function deliveredManifest(changedFiles: readonly string[], manifestFile: string): boolean {
   return changedFiles.some((file) => file === manifestFile || file.endsWith(`/${manifestFile}`));
+}
+
+function findingBelongsToStep(finding: DeliveryGateFinding, step: Step): boolean {
+  if (finding.target === 'current-step') return true;
+  if (finding.target === 'paired-source') return false;
+  const targetType: StepType = finding.target === 'requirement-analysis'
+    ? 'REQUIREMENT_ANALYSIS'
+    : finding.target === 'high-level-design'
+      ? 'HIGH_LEVEL_DESIGN'
+      : finding.target === 'detailed-design'
+        ? 'DETAILED_DESIGN'
+        : 'CODE';
+  return step.type === targetType;
 }
 
 function dependencyRequestFrom(
@@ -1306,6 +1424,25 @@ function debugBriefFor(ticket: BugTicket, step: ExecutionStep) {
     targetPhase: step.phase,
     typedFailure: ticket.failure,
   });
+}
+
+/**
+ * Failures a Step is held to that only a later Step could clear.
+ *
+ * Before CODE runs there is no product source tree — that is the V-model's ordering, not a defect of
+ * the Step that notices. A whole-project compile check therefore fails for the absence of inputs, and
+ * the Step is left holding a blocking failure it has no way to resolve. A live run lost every round
+ * of P1-S002 this way: `npx tsc --noEmit` reported TS18003 against a tsconfig whose `src/**` inputs
+ * were not due until S004, and the Architect spent the attempt re-reading files trying to repair a
+ * configuration that was already correct.
+ *
+ * The same reasoning already exempts another Step's missing declared outputs; this states it for the
+ * compile check.
+ */
+export function advisoryFailuresForStage(type: StepType): AdvisoryFailureRule[] {
+  if (STEP_TYPE_ORDER[type] >= STEP_TYPE_ORDER.CODE) return [];
+  // TypeScript names this case explicitly. Python has no equivalent: an empty package checks clean.
+  return [{ tool: 'run_program', errorIncludes: 'TS18003' }];
 }
 
 function debugContextFrom(ticket: BugTicket, brief: DebugBrief, matches: DebugWikiMatch[]) {

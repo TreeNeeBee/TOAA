@@ -1,0 +1,65 @@
+name: CI
+
+# 每次推送和 PR 都跑一遍发版门禁。此前仓库只有 release.yml，它只在 tag 推送时触发，
+# 于是 tsc、lint、测试和打包全部要等到发版才第一次运行——v0.3.0 的 tag 就是这样成为
+# 「第一次有人在 Linux 上跑这套测试」的时刻，一个只在 Linux 复现的缺陷因此活到了发版。
+#
+# 运行环境、Node 版本和门禁顺序与 release.yml 保持一致，包括打包：打包是发版路径上
+# 唯一不被其他门禁覆盖的一段，而 tag 推送是发现它出问题最贵的时机。CI 通过而发版失败
+# 应当只剩下打 tag 本身相关的步骤（版本匹配、release notes、上传）。
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一分支的新推送取消尚未完成的旧运行。release.yml 没有设 concurrency，不受这里影响。
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Verify version metadata
+        run: npm run version:check
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test (vitest)
+        run: npx vitest run
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+
+      - name: Build npm package
+        run: npm run build
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run
+
+      - name: Package all targets (linux-x64 / linux-arm64 / macos-arm64 / win-x64)
+        run: npm run package:all
+
+      - name: Verify SHA256SUMS
+        working-directory: dist/pkg
+        run: sha256sum --check SHA256SUMS

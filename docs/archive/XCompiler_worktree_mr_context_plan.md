@@ -37,63 +37,63 @@ Everything in this section was verified against the source tree, not inferred fr
 ### 2.1 Premises that are correct
 
 **State root is hard-coupled to the workspace root.** `Workspace` holds a single `root`
-([workspace.ts:5](../src/workspace/workspace.ts:5)) and every state path is a `.xcompiler/...` string
+([workspace.ts:5](../../src/workspace/workspace.ts:5)) and every state path is a `.xcompiler/...` string
 resolved against it — registry, objects, audit, lock, PM cache, record/replay fixtures. There is no
 seam between "where the code is" and "where the project state is". The draft's `ProjectContext` /
 `WorkspaceHandle` split is the right correction.
 
 **GitService cannot run inside a linked worktree.** It reads
-`ws.abs('.git/info/exclude')` ([git.ts:68](../src/workspace/git.ts:68)), which assumes `.git` is a
+`ws.abs('.git/info/exclude')` ([git.ts:68](../../src/workspace/git.ts:68)), which assumes `.git` is a
 directory. In a linked worktree `.git` is a *file* pointing at `<common-dir>/worktrees/<name>`, so
 runtime excludes are silently skipped and `.xcompiler` artifacts can be staged. Git internals must be
 resolved through `git rev-parse --git-dir | --git-common-dir | --git-path`.
 
 **The rollback model commits to the mainline.** Attempt baselines are real commits on the current
-branch ([attempt_runner.ts:212](../src/application/execution/attempt_runner.ts:212)) and failure
-rollback is `git reset --hard` ([git.ts:96](../src/workspace/git.ts:96), called from
-[attempt_runner.ts:568](../src/application/execution/attempt_runner.ts:568)). On a protected mainline
+branch ([attempt_runner.ts:212](../../src/application/execution/attempt_runner.ts:212)) and failure
+rollback is `git reset --hard` ([git.ts:96](../../src/workspace/git.ts:96), called from
+[attempt_runner.ts:568](../../src/application/execution/attempt_runner.ts:568)). On a protected mainline
 this is exactly what must be replaced by branch-scoped history.
 
 **Shared state would be mounted into the sandbox.** The Docker sandbox binds
-`${ws.root}:/workspace` ([docker.ts:159](../src/sandbox/docker.ts:159)), and `.xcompiler` currently
+`${ws.root}:/workspace` ([docker.ts:159](../../src/sandbox/docker.ts:159)), and `.xcompiler` currently
 lives inside `ws.root`. Moving the state root out of the worktree fixes this structurally rather than
 by adding mount exclusions.
 
 ### 2.2 Work the draft schedules that is already implemented
 
 **Debug Wiki retrieval and feedback (draft Phase 8) is substantially done.**
-[debug_wiki.ts](../src/core/debug_wiki.ts) already provides `search()` with Top-K and language
+[debug_wiki.ts](../../src/core/debug_wiki.ts) already provides `search()` with Top-K and language
 filtering, `recordUse()` and `recordFailure()` for applied/rejected outcomes, `recordResolution()` for
 distilling an entry, and `renderDebugWikiMatchesForPrompt()`. The AttemptRunner already runs the whole
 loop: build a debug brief, search, inject matches, then record use or failure
-([attempt_runner.ts:542-575](../src/application/execution/attempt_runner.ts:542)), and a relevance
-floor already exists (`score >= 4`, [debug_wiki.ts:157](../src/core/debug_wiki.ts:157)). Phase 8
+([attempt_runner.ts:542-575](../../src/application/execution/attempt_runner.ts:542)), and a relevance
+floor already exists (`score >= 4`, [debug_wiki.ts:157](../../src/core/debug_wiki.ts:157)). Phase 8
 shrinks to adding the project tier (§6.2) and wiring retrieval into the Context Assembler.
 
 **Workspace path safety (draft §22) is largely done, at a different layer.**
-[path_guard.ts](../src/tools/path_guard.ts) resolves through `fs.realpath` and enforces containment
+[path_guard.ts](../../src/tools/path_guard.ts) resolves through `fs.realpath` and enforces containment
 with `isInside()`, and `write_file` runs it *before* the allowlist check
-([fs.ts:144-156](../src/tools/fs.ts:144)). Symlink escape is therefore already covered for
+([fs.ts:144-156](../../src/tools/fs.ts:144)). Symlink escape is therefore already covered for
 agent-driven writes. The residual gaps are narrower than the draft implies: `Workspace.abs()` itself
 is unguarded for internal callers, and there is no `.git` write protection or mainline-worktree write
 protection.
 
-**`.xcompiler` is already gitignored** ([.gitignore:12](../.gitignore:12)).
+**`.xcompiler` is already gitignored** ([.gitignore:12](../../.gitignore:12)).
 
 ### 2.3 Statements in the draft that are wrong
 
 **The Debug Wiki is installation-scoped, and it already has layers — but no project tier.**
 The draft treats the wiki as one per-project store. The implementation is the opposite and is already
 layered: `LAYERS = ['system', 'agent', 'external']`
-([debug_wiki.ts:102](../src/core/debug_wiki.ts:102)), the root resolves to `XC_PATH` or the XCompiler
-installation directory rather than the project ([debug_wiki.ts:105-114](../src/core/debug_wiki.ts:105)),
+([debug_wiki.ts:102](../../src/core/debug_wiki.ts:102)), the root resolves to `XC_PATH` or the XCompiler
+installation directory rather than the project ([debug_wiki.ts:105-114](../../src/core/debug_wiki.ts:105)),
 and `system`/`agent` are shipped read-only platform knowledge copied in from the bundle
-([debug_wiki.ts:289-297](../src/core/debug_wiki.ts:289)); only `external` is writable
-([debug_wiki.ts:392](../src/core/debug_wiki.ts:392)).
+([debug_wiki.ts:289-297](../../src/core/debug_wiki.ts:289)); only `external` is writable
+([debug_wiki.ts:392](../../src/core/debug_wiki.ts:392)).
 
 The real defect is neither "per-project" nor "cross-project" — it is that **every project writes its
 findings into the same shared `external` layer.** `recordResolution()` always creates entries as
-`external` ([debug_wiki.ts:234](../src/core/debug_wiki.ts:234)) in the installation-level root, so
+`external` ([debug_wiki.ts:234](../../src/core/debug_wiki.ts:234)) in the installation-level root, so
 one project's build quirk becomes a retrieval candidate for every unrelated project, and nothing is
 scoped to the project that would need it during refactor and later iterations.
 
@@ -103,7 +103,7 @@ project container and holds findings specific to that codebase. Retrieval reads 
 them together; writes are routed by classification, defaulting to `project`.
 
 **`.xcompiler` does enter Git today, deliberately.** `ensureRepo()` writes and commits
-`.xcompiler/.gitkeep` ([git.ts:44-45](../src/workspace/git.ts:44)) so the initial commit is non-empty,
+`.xcompiler/.gitkeep` ([git.ts:44-45](../../src/workspace/git.ts:44)) so the initial commit is non-empty,
 and `isRuntimeArtifactPath()` explicitly exempts it. The invariant ".xcompiler never enters Git"
 cannot be asserted without removing that behaviour; once the state root moves out of the worktree the
 `.gitkeep` has no purpose and should be deleted.
@@ -117,11 +117,11 @@ The draft — and the first revision of this document — treated worktrees and 
 as entirely new. They are not. `src/runtime/bootstrap.ts` already implements both for the
 self-bootstrap flow, and this work should generalize it rather than build beside it.
 
-`prepareBootstrapWorkspace` ([bootstrap.ts:214](../src/runtime/bootstrap.ts:214)) requires an existing
+`prepareBootstrapWorkspace` ([bootstrap.ts:214](../../src/runtime/bootstrap.ts:214)) requires an existing
 clean repository, resolves the top level through `git rev-parse --show-toplevel`, creates a branch
 `xcompiler/bootstrap/<runId>`, and adds a worktree for it.
 
-`promoteBootstrapCandidate` ([bootstrap.ts:371](../src/runtime/bootstrap.ts:371)) is a working merge
+`promoteBootstrapCandidate` ([bootstrap.ts:371](../../src/runtime/bootstrap.ts:371)) is a working merge
 gate with exactly the revision locking §7.1 specifies:
 
 | §7.1 requirement | Already implemented |
@@ -148,7 +148,7 @@ Bootstrap also merges with `--ff-only` while §2.2 specifies squash. See §4 dec
 
 **Sandbox environments would be rebuilt per worktree.** The subprocess sandbox roots itself at
 `ws.abs('.sandbox')` and names the venv after the worktree directory
-([subprocess.ts:66-71](../src/sandbox/subprocess.ts:66)). With `worktrees/master`,
+([subprocess.ts:66-71](../../src/sandbox/subprocess.ts:66)). With `worktrees/master`,
 `worktrees/tickets/<id>`, and `worktrees/gates/<mr>/<run>` each being a distinct `ws.root`, every
 Ticket and *every Gate run* would build its own Python venv or `node_modules` from scratch and then
 throw it away. This is the single largest practical cost of the worktree model and the draft does not
@@ -206,7 +206,7 @@ dual-read, fail fast with a clear version error and rebuild guidance.
 **Resolution:** no compatibility layer. A workspace laid out for 0.3 fails with a typed error naming
 the expected container layout and telling the user to re-initialize. The config loader already sets
 the precedent for how that diagnostic should read
-([config.ts](../src/config/config.ts) `describeConfigFailure`).
+([config.ts](../../src/config/config.ts) `describeConfigFailure`).
 
 ### 3.2 Ticket creation authority
 
@@ -238,11 +238,11 @@ hold no project, phase, step, ticket, workspace, sandbox, or conversation state;
 per execution. Later, an LLM is bound per role, and several roles run in parallel.
 
 Today those concerns are fused. `ActorRegistration`
-([actor.ts](../src/domain/project_management/actor.ts)) mixes identity (`role`, `capabilities`,
+([actor.ts](../../src/domain/project_management/actor.ts)) mixes identity (`role`, `capabilities`,
 `supportedStepTypes`, `supportedTicketTypes`) with runtime instance state (`state`, `capacity`,
 `activeAssignmentIds`, `qualityScore`). Prompt material lives in the agents layer, and LLM selection
 is global config keyed by `ExecutionAgent` — `llm.roles` maps `Planner|Architect|Coder|Tester|Debugger`
-to a provider pool ([config.ts:175](../src/config/config.ts:175)) — not per registered actor. So a
+to a provider pool ([config.ts:175](../../src/config/config.ts:175)) — not per registered actor. So a
 model cannot be bound to a role instance, and two actors of the same role cannot use different models.
 
 **Resolution — a type/instance split, which is not the duplication 0.3 removed.**
@@ -264,7 +264,7 @@ tool capability. The Role contributes no state to that sum.
 ### 3.4 ChangeSet versus the existing Changelist
 
 0.3 already has a `changelist` domain object recording the file entries, commit, and verification of
-one application ([evidence.ts:24](../src/domain/evidence/evidence.ts:24)). The draft's `ChangeSet` is
+one application ([evidence.ts:24](../../src/domain/evidence/evidence.ts:24)). The draft's `ChangeSet` is
 a different, coarser concept.
 
 **Resolution:** keep both but name them so they cannot be confused. `Changelist` stays per-application
@@ -322,7 +322,7 @@ The draft's `infrastructure-failed` gate status is the same distinction 0.3 alre
 open a Bug.
 
 **Resolution:** gate checks classify through `classifyFailure()`
-([failure_classification.ts](../src/application/execution/failure_classification.ts)). No second
+([failure_classification.ts](../../src/application/execution/failure_classification.ts)). No second
 classifier.
 
 ### 3.9 Ticket history
@@ -389,14 +389,14 @@ Three rules follow.
    it.
 2. **`.xcw/` is not `.xcompiler/`.** A distinct name prevents a worktree-local directory from ever
    being mistaken for the state root. It needs its own ignore entry: `.gitignore` currently lists
-   `.xcompiler/` only ([.gitignore:12](../.gitignore:12)), and the runtime exclude list in
+   `.xcompiler/` only ([.gitignore:12](../../.gitignore:12)), and the runtime exclude list in
    `GitService` is a separate mechanism that must be updated with it.
 3. **The shared tier keeps one writer per aggregate, not one writer overall.** This is the concurrency
    boundary that has to be right before parallelism, and it is stricter today than it needs to be:
 
    - Domain object writes already use optimistic revisions, so distinct aggregates are safe in
      parallel; the registry commit is the serialization point and needs a container-level lock rather
-     than the current per-workspace one ([lock.ts:31](../src/core/lock.ts:31)).
+     than the current per-workspace one ([lock.ts:31](../../src/core/lock.ts:31)).
    - The 0.3 repository read cache is keyed by revision-immutable object paths, which is sound for
      concurrent *readers* but assumes no other process advanced the registry. Before parallel
      execution it must consult the registry cursor on read.
@@ -568,7 +568,7 @@ outbox. Nothing invents its own storage or its own id scheme.
 
 **Role definitions are materialized per project, exactly like actors.** The envelope requires a
 `projectId`, and the compiler already creates one `ActorRegistration` per role per project
-([compiler.ts:702](../src/domain/planning/compiler.ts:702)). Role definitions follow that path:
+([compiler.ts:702](../../src/domain/planning/compiler.ts:702)). Role definitions follow that path:
 installation-level files under `.xcompiler/roles/` are *seed templates*, and the registered
 `RoleDefinition` objects are created from them when the project graph is compiled. A project can then
 revise a prohibition or a prompt without touching any other project, and every such change is a
@@ -576,7 +576,7 @@ tracked revision rather than an untracked config edit.
 
 This also removes a duplication rather than adding one. `createActorRegistration` currently copies
 `capabilitiesForRole(role)`, `supportedTicketTypesForRole(role)`, and the derived step types onto
-every actor ([compiler.ts:708](../src/domain/planning/compiler.ts:708)). Once a `RoleDefinition`
+every actor ([compiler.ts:708](../../src/domain/planning/compiler.ts:708)). Once a `RoleDefinition`
 object exists, `ActorRegistration` holds `roleDefinitionId` as a real foreign key and stops carrying
 its own copy; `role_profile.ts` becomes the seed data for one object instead of a parallel table
 consulted at three call sites.
@@ -603,12 +603,12 @@ Two mechanics change:
 
 **Read.** `DebugWiki` gains a second source and ranks all four layers together instead of one root.
 `copyBundledLayers()` — which physically copies the shipped `system` and `agent` directories into the
-active root ([debug_wiki.ts:289-297](../src/core/debug_wiki.ts:289)) — is replaced by a multi-source
+active root ([debug_wiki.ts:289-297](../../src/core/debug_wiki.ts:289)) — is replaced by a multi-source
 read. Copy-merge cannot express two tiers: it would either duplicate the platform wiki into every
 project or let project entries leak upward.
 
 **Write.** `recordResolution()` currently hardcodes `external`
-([debug_wiki.ts:234](../src/core/debug_wiki.ts:234)). It becomes classified, defaulting to `project`:
+([debug_wiki.ts:234](../../src/core/debug_wiki.ts:234)). It becomes classified, defaulting to `project`:
 
 ```text
 Root cause is in the generated codebase        -> project

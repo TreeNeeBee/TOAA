@@ -20,6 +20,12 @@ coverage/
 docs/audit/*
 docs/dev_audit_log.md
 
+# Debug Wiki 生成物：知识页面在 debug-wiki/wiki/ 下受版本控制，这三个是 load() 每次重建的产物。
+# index.json 还带有本机绝对路径，入库会把一台机器的布局带给所有人。
+debug-wiki/index.json
+debug-wiki/index.md
+debug-wiki/log.md
+
 # release/ 目录由 .github/workflows/release.yml 在 tag 推送时通过 GitHub Releases 发布，
 # 不再纳入版本库（历史中曾短暂入库，已通过 git rm 移除，commit 历史保留）。
 release/

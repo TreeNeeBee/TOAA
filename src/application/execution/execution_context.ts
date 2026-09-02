@@ -105,7 +105,7 @@ export function computeIncrementalAllowedWrites(
  * One function because a Step and the Debugger repairing that same Step must be able to write the
  * same files. They could not: the Step's own scope granted the fixture directory and the corrective
  * scope did not, so a test the Step was allowed to create could not be repaired — and a Bug routed
- * there spent six attempts rewriting four DBC samples into the identical denial before the
+ * there spent six attempts rewriting four fixture samples into the identical denial before the
  * non-convergence guard stopped the run.
  *
  * The whole directory, not only the recorded-response corner of it: what a test must read is decided

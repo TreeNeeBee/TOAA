@@ -53,9 +53,16 @@ V 模型行为：
 - `DETAILED_DESIGN` 定义模块内部结构和具体实现方案。
 - Ticket 类型固定为 `epic`、`story`、`task`、`bug`、`enhancement`、`change-request`。展示名如 `P1-S004` 只用于阅读，所有关系都使用全局 ID。
 - 测试或执行失败创建 Bug，并路由到配对的上游 Step；完成度、对齐度或覆盖指标不足创建 Enhancement。
+- 失败归属发现它的 Step，目标由 V 模型配对关系决定，不继承当时恰好活跃的 CR 链起点。
+- 验证 Step 的门禁同时跑配对基线和该 Step 自己撰写的补充测试。缺陷只落在补充里就留在写它的 Step——交给配对源等于给它一个无权写入的文件；只要有一个失败用例属于基线，整条 finding 仍回到配对源。
+- 两条 CR 传导同一跳（相同源 Step、相同目标 Step、相同起因失败）时并入已承载该跳的那条，不各自开链。
+- 同一失败反复出现时 Ticket 会停止，而不是耗尽预算。是否「同一个失败」由结构化签名判定：签名只含失败本身（失败用例、失败类型、原因的稳定部分），不含工具命令行、运行器分配的临时目录、地址或计数器——这些在两次完全相同的失败之间也会变。
 - 上游修复先形成 CR，携带契约差异、影响 Step/产物、实施方案、changelist、commit 和验证门禁；下游只实施增量变化。
 - CR 下游失败会创建关联 Bug 并阻塞父 CR；配对源 Step 修复和子 CR 验证通过后，只恢复父 CR 尚未完成的应用步骤。
+- Bug 只有在开票的那个失败于观察到它的 Step 重跑并通过后才关闭。每张 Bug 携带验证契约（该 Step 与要重放的选择器），满足时追加不可变的验证记录。未满足则**拒绝关闭而非抛错**：未完成的纠正链让 Bug 保持打开、Story 保持阻塞，下一条到达该门禁的链仍能把它做完。
 - Bug 只有在所有受影响 CR 门禁通过、方案被验证并写入 Debug Wiki 后才关闭。失败的历史方案会标记为待复核。
+- 每一次失败报告都保留为独立 Ticket。PM 在分派前比对已注册的 Bug，把结构性重复（目标 Step 相同、失败身份相同）挂到提交最早的那张上并记录路由决策。被挂起的重复票不参与调度，并随原始票进入其终态。
+- CR 携带开链时确定的传导范围，因此仅修改配对基线测试的修复可直达其验证 Step，不必逐跳走完中间各阶段。
 - 已完成阶段的 Debug 必须提供真实 patch/rewrite 或成功验证证据。
 - 网络/API 调用失败是正式门禁：项目 API 失败时必须修复或切换可用 API，不能跳过或掩盖。
 
@@ -172,7 +179,7 @@ xcompiler bootstrap -r path/to/XCompiler -i self_req.md --yes
 - **语言**：支持 Python 与 TypeScript 的工程生成、测试、运行和入口检查。
 - **Sandbox**：默认 `subprocess` 且隔离宿主环境变量（`inherit_env: false`）；可切换 `docker` 获得可执行的网络/资源隔离。subprocess 无法兑现 `network: off`，因此该组合会明确报错。
 - **Audit**：每次运行写入人类可读日志，并持久化带 correlation/causation ID 的领域 AuditEvent 和 Log 对象。
-- **Debug wiki**：Debugger 处理 Bug Ticket 时会基于压缩后的 `DebugBrief` 检索 LLM-wiki 风格的历史修复经验。wiki 是分层 Markdown 知识库：随包发布的 `wiki/system` 策略页、随包发布的 `wiki/agent` calibration 页、本地 `wiki/external` 真实 Bug 解决方案页。Runtime 会重新生成 `index.md` 供人工审阅、`index.json` 供检索使用，并追加 `log.md` 记录操作流水。默认复制到 XCompiler 路径（设置 `XC_PATH` 时为 `$XC_PATH/.xcompiler/debug-wiki`，否则为包/仓库根目录），也可用 `--debug-wiki-path <dir>` 指定共享根目录。Bug 的全部 CR 验证通过后才把 `bugResolutionPlan` 写入 `external`；复用方案失败会通过 feedback overlay 标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
+- **Debug wiki**：Debugger 处理 Bug Ticket 时会基于压缩后的 `DebugBrief` 检索 LLM-wiki 风格的历史修复经验。wiki 是分层 Markdown 知识库：随包发布的 `wiki/system` 策略页、随包发布的 `wiki/agent` calibration 页、本地 `wiki/external` 真实 Bug 解决方案页。Runtime 会重新生成 `index.md` 供人工审阅、`index.json` 供检索使用；`log.md` 则保留为本地追加式操作流水，不由索引或摘要重建。默认复制到 XCompiler 路径（设置 `XC_PATH` 时为 `$XC_PATH/.xcompiler/debug-wiki`，否则为包/仓库根目录），也可用 `--debug-wiki-path <dir>` 指定共享根目录。Bug 的全部 CR 验证通过后才把 `bugResolutionPlan` 写入 `external`；复用方案失败会通过 feedback overlay 标为 `needs_review`，后续成功修复会创建或纠正 external 条目。
 - **Record/Replay**：针对 HTTP、LLM 和 Tool 的外部数据提供记录与重放；当前工程的代码、构建和测试始终真实执行，Replay 只提供外部 fixture，不复用旧进程退出码。Phase 交付门禁中的真实用户场景会关闭 Replay。
 - **Agent Skills**：内置文件、Web、测试、Debug、Record/Replay、Debug Wiki、依赖、评审、安全、性能、CR 和交付工作流。Planner 只读取 `name + description`，Run 只激活所选 Skill 的正文与按需资源；Plugin API 3 可引入标准 Skill 目录，但不能绕过 Runtime 权限、路径、Ticket 或门禁。
 - **安全门禁**：项目文件访问受控，写工具限制在 Step 声明 outputs 内，每个敏感操作都必须经过 Adapter 的明确权限策略；缺少授权处理器时默认拒绝。
@@ -185,7 +192,7 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 
 | 字段 | 默认 | 作用 |
 |---|---|---|
-| `roles.<Role>` | 按角色不同 | Planner、Architect、Coder、Tester、Debugger 的 provider 候选链 |
+| `roles.<Role>` | 按角色不同 | `Planner`、`Architect`、`Coder`、`Tester`、`Debugger`、`ProjectManager` 的 provider 候选链。所有角色都在此配置；`ProjectManager` 代表项目判定交付结果，不执行 Step |
 | `providers.<name>.context_window` | `128K` | Provider 的上下文容量；为空时使用默认值，模型切换后会重新计算工具窗口 |
 | `llm_scores_user.yaml` | 不存在 | 本地用户评分覆盖；`0` 禁用 provider，`0.1..1` 固定有效优先级 |
 | `cluster_score_min/max` | `0.2..0.5` | `cluster` provider 的动态评分范围；用户覆盖仍可使用 `0.1..1` |
@@ -200,6 +207,9 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 | `permissions.mode` / `--permission-mode` | `request` | 当前 Runtime task 的外部资源授权策略：`request`、`auto` 或 `deny`；工程内部操作不弹权限确认 |
 | `permissions.timeout_ms` | `0` | 权限等待超时；`0` 表示等待用户回答或取消 task |
 | `agent.sandboxes.<language>.<local\|docker>.limits.network` | `download-only` | Docker 可执行 `off`；subprocess 会拒绝 `off`，避免声称无法兑现的隔离 |
+| `providers.<name>.tcp_keepalive_ms` | `30000` | 连接静默多久后内核开始发探活包。断网留下的 socket 收不到 RST/FIN，探活是唯一能把它变成真正连接错误的机制；`0` 关闭 |
+| `providers.<name>.stream_headers_timeout_ms` | `30000` | 仅对流式生效的响应头期限。流式服务端先写响应头再开始思考，所以「头没来」是连接问题、「头来了但 token 慢」是模型问题；`0` 不限制 |
+| `stall_diagnosis_after_ms` | `600000` | 对端持续这么久未送来任何字节时跑一次环境诊断，并把结论随失败一起交出 |
 
 审计不会为了控制体积裁剪原始数据：`.xcompiler/audit/audit.jsonl` 和 `process_log.md` 完整追加保存；`summary.md` 是独立的可重建摘要，保留原始行号和不可变对象 revision 链接，供按需访问详细记录。
 
@@ -213,10 +223,14 @@ LLM 路由配置位于 `config.yaml -> llm.*`。
 | [docs/acp.md](docs/acp.md) | ACP Code Agent Adapter 协议说明 |
 | [docs/agent_skills.md](docs/agent_skills.md) | Agent Skills 标准、内置目录、安全边界与 Plugin API 3 |
 | [docs/XCompiler_design.md](docs/XCompiler_design.md) | 核心设计与 V 模型概念 |
+| [docs/XCompiler_project_constraints.md](docs/XCompiler_project_constraints.md) | 架构、归属、生命周期与目录布局等必须保持的工程约束 |
+| [docs/XCompiler_project_constraints.md](docs/XCompiler_project_constraints.md) | 当前架构、PM/Ticket 生命周期、工作区与发布约束 |
 | [docs/plugin_api.md](docs/plugin_api.md) | Plugin API、生命周期 hooks、tools、skills |
 | [docs/versioning.md](docs/versioning.md) | 版本源、release 脚本、tag 策略 |
 | [docs/self_bootstrap.md](docs/self_bootstrap.md) | 自举开发与 qualification gates |
 | [docs/deploy.md](docs/deploy.md) | 本地、Docker、native package 部署 |
+| [docs/XCompiler_user_fixture_plan.md](docs/XCompiler_user_fixture_plan.md) | 未实施的设计：向一次运行提供真实用户样例（`--fixture`），方案已定 |
+| [docs/archive/](docs/archive/) | 已交付的设计与重构计划，保留代码本身不再解释的决策依据；不是当前文档 |
 
 ---
 

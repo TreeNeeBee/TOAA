@@ -38,3 +38,25 @@ export function xcompilerBuildId(): string {
 export function resetBuildIdentity(): void {
   cached = undefined;
 }
+
+/**
+ * A fingerprint of what a Step was told to do, so a repair on the project side is visible.
+ *
+ * The build id answers "did XCompiler change"; nothing answered "did this Step's instructions
+ * change". An operator who diagnoses a stalled Ticket and fixes its cause — a declared output that
+ * no longer exists, a prompt that named the wrong artifact — has made exactly the repair the retry
+ * policy exists to recognise, and it was invisible: releasing the guard meant rebuilding XCompiler
+ * for no reason, which is both the wrong signal and trivially forged.
+ */
+export function stepContextFingerprint(step: {
+  inputs?: readonly string[];
+  outputs?: readonly string[];
+  systemPrompt?: string;
+}): string {
+  const material = JSON.stringify({
+    inputs: [...(step.inputs ?? [])].sort(),
+    outputs: [...(step.outputs ?? [])].sort(),
+    systemPrompt: step.systemPrompt ?? '',
+  });
+  return createHash('sha256').update(material).digest('hex').slice(0, 16);
+}

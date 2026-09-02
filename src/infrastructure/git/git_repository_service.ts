@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { isRuntimeArtifactPath } from '../../workspace/git.js';
 import { simpleGit, type SimpleGit } from 'simple-git';
 import { MergeConflictError } from '../../application/workspace/git_port.js';
 import type { GitCommitRecord } from '../../application/workspace/git_port.js';
@@ -266,13 +267,25 @@ export class GitRepositoryService {
     // Names the files, because "uncommitted changes" is not something an operator can act on. The
     // one that actually stopped a run was XCompiler's own PM projection, and the message gave no
     // hint of that.
+    //
+    // Tracked changes only. An untracked file cannot be lost to a squash merge — git carries it
+    // straight through — and the one case that would destroy it, an incoming change of the same
+    // path, git refuses on its own with a message naming the file. Counting untracked files here
+    // was therefore strictly worse than git: it added no protection and blocked merges git would
+    // have made. A phase delivery gate runs the product to judge what it produces, so that evidence
+    // is sitting untracked in the canonical copy by design, and the next merge refused because of it.
     const status = await this.git.status();
-    if (!status.isClean()) {
-      const dirty = [...status.not_added, ...status.modified, ...status.created, ...status.deleted]
-        .slice(0, 20);
+    // A runtime artifact is not work to lose. A product that rewrites its own output on every
+    // delivery gate leaves that file modified in the canonical copy by design, and once an older
+    // build had committed it the guard refused every merge that followed — a Phase with seven
+    // delivered Steps could not land an eighth over a generated report.
+    const tracked = [...status.modified, ...status.created, ...status.deleted, ...status.conflicted]
+      .filter((file) => !isRuntimeArtifactPath(file));
+    if (tracked.length > 0) {
+      const dirty = tracked.slice(0, 20);
       throw new Error(
         `Cannot merge into ${input.targetBranch}: the working copy has uncommitted changes: ` +
-        `${dirty.join(', ')}${status.files.length > dirty.length ? ', …' : ''}`,
+        `${dirty.join(', ')}${tracked.length > dirty.length ? ', …' : ''}`,
       );
     }
     try {

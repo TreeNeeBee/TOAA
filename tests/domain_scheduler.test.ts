@@ -8,6 +8,7 @@ import { ProjectGraphPersistenceService } from '../src/application/planning/proj
 import { TicketWorkflow } from '../src/application/project_management/ticket_workflow.js';
 import { ProjectStateService } from '../src/application/project_management/project_state_service.js';
 import { ProjectController, type ScheduledWork } from '../src/application/project_management/project_controller.js';
+import { workModeFor } from '../src/application/project_management/work_scheduler.js';
 import { TicketRegistrationService } from '../src/application/project_management/ticket_registration_service.js';
 import { createObjectId } from '../src/domain/identity/object_id.js';
 import { createObjectEnvelope } from '../src/domain/objects/object_envelope.js';
@@ -15,6 +16,8 @@ import { compileProjectGraph } from '../src/domain/planning/compiler.js';
 import { TicketSchema } from '../src/domain/tickets/ticket.js';
 import { DomainObjectRepository } from '../src/infrastructure/repository/domain_object_repository.js';
 import { Workspace } from '../src/workspace/workspace.js';
+import { bugContracts } from './helpers/ticket_fixtures.js';
+import { DomainAuditTrail } from '../src/application/observability/domain_audit_trail.js';
 
 describe('PM WorkScheduler', () => {
   it('keeps a source Step delivered until its paired verification closes it', async () => {
@@ -52,6 +55,7 @@ describe('PM WorkScheduler', () => {
       },
       rawEvidenceRef: '.xcompiler/failures/unit.log',
       correlationId: createObjectId(),
+      bugKind: 'test-failure',
     });
     const code = fixture.graph.steps.find((step) => step.type === 'CODE')!;
     expect((await fixture.repository.read(code.id)).state).toBe('reopened');
@@ -60,7 +64,63 @@ describe('PM WorkScheduler', () => {
     const repository = new DomainObjectRepository(new Workspace(fixture.root));
     await repository.load();
     const resumed = await new ProjectController(repository).resume(fixture.graph.phases[0]!.id);
-    expect(resumed).toMatchObject({ mode: 'debug', step: { id: code.id }, ticket: { id: bug.id } });
+    expect(resumed).toMatchObject({ step: { id: code.id }, ticket: { id: bug.id } });
+    expect(resumed && workModeFor(resumed.ticket)).toBe('debug');
+  });
+
+  it('stops offering a Step the repair it has already finished', async () => {
+    // A Bug parked for its verification is done, not blocked. Leaving it schedulable handed the same
+    // Step the same repair again the moment it finished: a live run cycled one Bug through
+    // pending → in_progress three times, and the Ticket never propagated because each cycle
+    // restarted it before the chain could open.
+    const fixture = await setup();
+    for (let index = 0; index < 4; index += 1) await deliverPassing(fixture, await startNext(fixture));
+    const unitWork = await startNext(fixture);
+    const creatorActorId = await fixture.registration.discovererActorIdForStep(unitWork.step.id);
+    const bug = await fixture.controller.routeFailure({
+      creatorActorId,
+      failedStepId: unitWork.step.id,
+      message: 'expected source, received undefined',
+      summary: 'Unit result contract failed.',
+      failure: {
+        kind: 'execution',
+        category: 'test',
+        code: 'unit_contract_failed',
+        message: 'expected source, received undefined',
+        retryable: true,
+        switchProvider: false,
+      },
+      correlationId: createObjectId(),
+      bugKind: 'test-failure',
+    });
+    await fixture.registration.routeAndAssign(bug.id);
+    const workflow = new TicketWorkflow(fixture.repository);
+    await workflow.setSolution(bug.id, {
+      status: 'proposed',
+      approach: 'Restore the unit contract.',
+      rationale: 'Reproduced at the unit gate.',
+      changes: ['src/service.ts'],
+      verification: [],
+      updatedAt: new Date().toISOString(),
+    });
+    const code = fixture.graph.steps.find((step) => step.type === 'CODE')!;
+    const codeStep = await fixture.repository.read(code.id);
+    if (codeStep.objectType !== 'step') throw new Error('CODE Step missing');
+    const kpis = await Promise.all(codeStep.kpiIds.map((id) => fixture.repository.read(id)));
+    const assessment = await new QualityAssessmentService(fixture.repository).assessStep({
+      step: codeStep,
+      metrics: kpis.flatMap((object) => object.objectType === 'kpi'
+        ? [{ metric: object.metric, value: 1 }]
+        : []),
+    });
+    await workflow.awaitVerification(bug.id, {
+      stepId: code.id,
+      qualityAssessmentId: assessment.id,
+    });
+
+    const next = await fixture.controller.next(fixture.graph.phases[0]!.id);
+
+    expect(next?.ticket.id).not.toBe(bug.id);
   });
 
   it('resumes an owned Ticket whose Step is pending before dispatching an earlier created CR', async () => {
@@ -90,6 +150,7 @@ describe('PM WorkScheduler', () => {
         projectId: unitStory.projectId,
       }),
       type: 'change-request',
+      changeKind: 'contract-change',
       creatorActorId: tester.id,
       state: 'created',
       assignmentIds: [],
@@ -98,10 +159,11 @@ describe('PM WorkScheduler', () => {
       solution: undefined,
       resolvedAt: undefined,
       closedAt: undefined,
-      sourceTicketId: unitStory.id,
+      sourceTicketIds: [unitStory.id],
       triggerStepId: unitStep.id,
       sourceStepId: unitStep.id,
       targetStepId: unitStep.id,
+      propagationStepIds: [unitStep.id],
       contractDelta: {
         summary: 'Re-check the earlier unit contract.',
         before: ['previous contract'],
@@ -120,14 +182,90 @@ describe('PM WorkScheduler', () => {
 
     const resumed = await fixture.controller.resume(fixture.graph.phases[0]!.id);
     expect(resumed).toMatchObject({
-      mode: 'normal',
       step: { id: functionalWork.step.id },
       ticket: { id: functionalWork.ticket.id },
     });
+    expect(resumed && workModeFor(resumed.ticket)).toBe('normal');
     const routed = await fixture.registration.routeAndAssign(resumed!.ticket.id, {
       forStepId: resumed!.step.id,
     });
     expect(routed.assignment.id).toBe(activeAssignmentId);
+  });
+
+  it('materializes a missing CR outcome before considering one recovery attempt', async () => {
+    const fixture = await setup();
+    const step = fixture.graph.steps.find((candidate) => candidate.type === 'REQUIREMENT_ANALYSIS')!;
+    const story = fixture.graph.tickets.find((ticket) =>
+      ticket.type === 'story' && ticket.stepId === step.id)!;
+    const creator = fixture.graph.actors.find((actor) => actor.role === 'requirements-engineer')!;
+    const {
+      workKind: _workKind,
+      verificationTicketId: _verificationTicketId,
+      pairedSourceTicketId: _pairedSourceTicketId,
+      ...ticketBase
+    } = story;
+    const correlationId = createObjectId();
+    const request = TicketSchema.parse({
+      ...ticketBase,
+      ...createObjectEnvelope({
+        name: 'CR-P1-S001-MISSING-OUTCOME',
+        objectType: 'ticket',
+        projectId: story.projectId,
+      }),
+      type: 'change-request',
+      changeKind: 'contract-change',
+      creatorActorId: creator.id,
+      state: 'created',
+      assignmentIds: [],
+      activeAssignmentId: undefined,
+      attempts: 1,
+      maxAttempts: 1,
+      solution: undefined,
+      resolvedAt: undefined,
+      closedAt: undefined,
+      source: { kind: 'runtime', correlationId },
+      sourceTicketIds: [story.id],
+      triggerStepId: step.id,
+      sourceStepId: step.id,
+      targetStepId: step.id,
+      propagationStepIds: [step.id],
+      originFailures: [],
+      contractDelta: {
+        summary: 'Re-check the accepted requirement contract.',
+        before: ['previous contract'],
+        after: ['corrected contract'],
+        affectedArtifacts: ['docs/01-requirement-analysis.md'],
+      },
+      implementationPlan: ['Verify the accepted requirement contract.'],
+      verificationGate: ['Requirement gate passes.'],
+      applications: [],
+    });
+    await fixture.repository.insert(request, request.state);
+    await fixture.registration.register(request.id);
+    await new DomainAuditTrail(fixture.repository).recordLog({
+      projectId: request.projectId,
+      subject: { id: request.id, objectType: 'ticket' },
+      level: 'info',
+      message: `context assembled for ${step.name}`,
+      data: { stepId: step.id, mode: 'change-request', attempt: 1, snapshot: {} },
+      correlationId,
+    });
+    const routed = await fixture.registration.routeAndAssign(request.id, { forStepId: step.id });
+
+    const started = await fixture.controller.start({
+      phase: fixture.graph.phases[0]!,
+      step,
+      ticket: routed.ticket,
+    });
+
+    expect(started.ticket.attempts).toBe(2);
+    expect(started.ticket.maxAttempts).toBe(2);
+    const errorLogs = await Promise.all(started.ticket.logIds.map((id) => fixture.repository.read(id)));
+    expect(errorLogs.some((object) =>
+      object.objectType === 'log' &&
+      object.level === 'error' &&
+      (object.data.structuredFailure as { code?: string } | undefined)?.code === 'attempt_outcome_missing'
+    )).toBe(true);
   });
 
   it('closes a Phase only after all Step and delivery Tickets close', async () => {
@@ -217,6 +355,9 @@ describe('PM WorkScheduler', () => {
       retryable: true,
       switchProvider: false,
       correlationId: createObjectId(),
+      ...bugContracts(late, repaired, late, {
+        category: 'test', code: 'module_contract_mismatch',
+      }),
     });
     await new TicketRegistrationService(fixture.repository).routeAndAssign(bug.id);
 

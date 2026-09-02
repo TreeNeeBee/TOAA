@@ -210,7 +210,7 @@ function classify(
   // reports `No test files found` — and both used to fall through to the `pytest exit=[1-9]` catch
   // below, which answers with "fix the root implementation defect… do not rewrite fixtures". That
   // sends the one repair that cannot apply: the implementation was fine and the files did not exist.
-  // A live dbc3 CODE Step burned ten rounds on it while owing five declared outputs.
+  // A live CODE Step burned ten rounds on it while owing five declared outputs.
   // pytest exit=4 is the usage error itself, and the explanatory line is often trimmed out of a
   // truncated log, so the exit code has to count on its own — 39 real failures across three runs
   // carried the code without the sentence and were classified as ordinary test failures.
@@ -281,7 +281,11 @@ function hasConcreteNetworkFailure(lower: string): boolean {
     if (/^network api failure detected(?:\.|$)/u.test(line.trim())) return false;
     return /http_fetch[^\n]*(?:失败|failed|error|http\s*(?:401|403|404|408|409|410|422|429|5\d\d)|timed out|timeout)/u.test(line) ||
       /(?:fetch|axios|http request|network request)[^\n]*(?:econnrefused|econnreset|enotfound|etimedout|socket hang up|失败|failed|timed out|timeout)/u.test(line) ||
-      /\bhttp\s*(?:status\s*)?(?:401|403|404|408|409|410|422|429|5\d\d)\b/u.test(line);
+      /\bhttp\s*(?:status\s*)?(?:401|403|404|408|409|410|422|429|5\d\d)\b/u.test(line) ||
+      // A client reports the code in its own words: axios says `Request failed with status code 403`
+      // and names no protocol. `extractStatusCodes` already reads that line, so the two disagreed.
+      // Preserve it as network evidence here; status alone still says nothing about Bug versus CR.
+      /\bstatus\s*(?:code)?\s*(?:401|403|404|408|409|410|422|429|5\d\d)\b/u.test(line);
   });
 }
 
@@ -395,18 +399,18 @@ function buildDebugDemand(category: DebugFailureCategory, phase?: Phase, statusC
 
 function networkDemand(statusCodes: string[]): string {
   if (statusCodes.some((code) => code === '401' || code === '403')) {
-    return 'The API is unauthorized/forbidden. If no user key/token is available, switch to a public no-key API and verify the real integration.';
+    return 'The request was unauthorized/forbidden. Compare the accepted authentication/capability contract with the actual request: fix the implementation when that contract remains viable, or report a change-request finding when the accepted contract must change.';
   }
   if (statusCodes.some((code) => code === '404' || code === '410')) {
-    return 'The API URL/resource is unavailable. Stop retrying the same URL; switch to a maintained endpoint and verify response shape.';
+    return 'The URL/resource was unavailable. Verify request construction and the accepted endpoint contract; fix an implementation error, or report a change-request finding if the accepted endpoint/capability must change. Do not retry blindly.';
   }
   if (statusCodes.includes('429')) {
-    return 'The API is rate-limited. Switch to a suitable fallback API or implement explicit retry/cache behaviour and tests.';
+    return 'The API was rate-limited. Distinguish a transient environment limit from an implementation policy defect or an accepted quota/capability change before selecting Bug, retry, or change-request handling.';
   }
   if (statusCodes.some((code) => /^5/u.test(code))) {
-    return 'The API server failed. Use a stable fallback endpoint or fail closed with a clear user-visible error path.';
+    return 'The API server failed. Preserve the response evidence and determine whether the accepted service remains viable before changing product code or proposing a contract change.';
   }
-  return 'Locate the failing URL/status/body, patch the real API integration, and verify with run_program plus tests. Do not hide the API failure.';
+  return 'Locate the failing operation, response, and accepted contract. Fix the implementation only when the contract remains valid; otherwise report a change-request finding. Do not hide the failure.';
 }
 
 function isProcessNoise(category: DebugFailureCategory): boolean {
@@ -594,6 +598,13 @@ export function buildFailureSignature(brief: DebugBrief, structuredCode?: string
     category: brief.category,
     primaryError: withoutRunVaryingTokens(stableErrorText(brief.primaryError, brief.toolFailures)),
     failedTests: [...brief.failedTests].sort(),
+    // Failed test selectors already identify a test failure's target. Verbose runners mention files
+    // from passing cases too, so adding every extracted file would make the same failed selector
+    // acquire a different identity under `-v`. Non-test failures still need files to distinguish,
+    // for example, identical write errors against two different targets.
+    files: brief.failedTests.length > 0
+      ? []
+      : dedup(brief.files.map((file) => withoutRunVaryingTokens(normalizePath(file)))).sort(),
     toolFailures: dedup(brief.toolFailures.map(toolFailureIdentity)).sort(),
     structuredCode,
   })).digest('hex');

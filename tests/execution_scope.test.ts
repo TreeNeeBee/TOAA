@@ -88,7 +88,7 @@ function input(): AttemptInput {
  *
  * Lookup follows the top of the failure stack; the history stays in the prompt. A Ticket's own
  * `failure` is the one that opened it, and a repair loop moves through several — unwritten tests,
- * then an import error, then a failing assertion. A live dbc4 Bug received the same entry 51 times
+ * then an import error, then a failing assertion. A live Bug received the same entry 51 times
  * while the entry matching its current `ModuleNotFoundError` never appeared, and it ran out of
  * attempts on advice for a problem it had already left behind.
  *

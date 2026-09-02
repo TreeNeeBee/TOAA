@@ -1,11 +1,44 @@
 import { describe, expect, it } from 'vitest';
 import type { AttemptResult } from '../src/application/execution/attempt_runner.js';
 import {
+  AttemptResultProcessor,
   correctiveAffectedArtifacts,
+  correctivePropagationStepIds,
   isAgentExecutionStall,
   renderFindingMessage,
 } from '../src/application/project_management/attempt_result_processor.js';
 import type { Step } from '../src/domain/steps/step.js';
+
+describe('correctivePropagationStepIds shortcut reachability', () => {
+  const step = (id: string, type: string, state: string, pairedStepId?: string) =>
+    ({ id, name: id, type, state, pairedStepId, projectId: 'p', phaseId: 'ph', outputs: [] } as unknown as Step);
+
+  // Every Step between the source and its paired verification, since MODULE_TEST sits above all of
+  // them: the delta may only skip a Step that has already delivered.
+  const steps = (between: string) => [
+    step('s2', 'HIGH_LEVEL_DESIGN', 'in_progress', 's7'),
+    step('s3', 'DETAILED_DESIGN', between),
+    step('s4', 'CODE', between),
+    step('s5', 'UNIT_TEST', between),
+    step('s6', 'INTEGRATION_TEST', between),
+    step('s7', 'MODULE_TEST', 'created'),
+  ];
+
+  it('walks the ordinary path while the Steps before the paired one are unfinished', () => {
+    // MODULE_TEST cannot verify a module that CODE has not written. A live run sent the delta there
+    // anyway, the gate failed for the absence of src/, and the Bug it raised convinced the baseline
+    // policy that product code existed.
+    const all = steps('created');
+    expect(correctivePropagationStepIds(all, all[0]!, ['tests/modules/a.test.ts'], 'typescript'))
+      .toEqual(['s3', 's4', 's5', 's6', 's7']);
+  });
+
+  it('reaches the paired Step directly once the path to it is clear', () => {
+    const all = steps('delivered');
+    expect(correctivePropagationStepIds(all, all[0]!, ['tests/modules/a.test.ts'], 'typescript'))
+      .toEqual(['s7']);
+  });
+});
 
 describe('correctiveAffectedArtifacts', () => {
   it('carries exact downstream outputs named by the Bug resolution into the CR', () => {
@@ -45,6 +78,141 @@ describe('correctiveAffectedArtifacts', () => {
       'docs/01-requirement-analysis.md',
     ]);
   });
+
+  it('uses the baseline-test-only scope at the production propagation call site', async () => {
+    const propagated: Array<Record<string, unknown>> = [];
+    const requirement = {
+      id: 'requirement-step',
+      name: 'P1-S001',
+      type: 'REQUIREMENT_ANALYSIS',
+      projectId: 'project-id',
+      phaseId: 'phase-id',
+      outputs: ['docs/01-requirements.md', 'tests/functional/baseline.test.ts'],
+      pairedStepId: 'functional-step',
+    } as Step;
+    // Delivered, because the shortcut only skips a Step that has already done its work: sending the
+    // delta past one that has not schedules a gate with nothing to verify.
+    const design = {
+      id: 'design-step', name: 'P1-S002', type: 'HIGH_LEVEL_DESIGN', state: 'delivered',
+      projectId: 'project-id', phaseId: 'phase-id', outputs: ['docs/02-design.md'],
+    } as Step;
+    const code = {
+      id: 'code-step', name: 'P1-S004', type: 'CODE', state: 'delivered',
+      projectId: 'project-id', phaseId: 'phase-id', outputs: ['src/main.ts'],
+    } as Step;
+    const functional = {
+      id: 'functional-step', name: 'P1-S008', type: 'FUNCTIONAL_TEST',
+      projectId: 'project-id', phaseId: 'phase-id', outputs: ['reports/functional.md'],
+    } as Step;
+    const processor = new AttemptResultProcessor({
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
+      controller: {
+        propagateCorrectiveChange: async (input: Record<string, unknown>) => {
+          propagated.push(input);
+          return undefined;
+        },
+      },
+      tickets: {},
+      audit: { event: async () => {} },
+      onTransition: async () => {},
+    } as never);
+
+    await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step: requirement,
+        ticket: {
+          id: 'bug-id',
+          name: 'BUG-P1-001',
+          type: 'bug',
+          description: 'The functional baseline has a bad assertion.',
+          acceptance: ['The paired baseline passes.'],
+          source: { correlationId: 'correlation-id' },
+        },
+      } as never,
+      steps: [requirement, design, code, functional],
+      result: {
+        ok: true,
+        assessment: { id: 'assessment-id', evidence: ['baseline rewritten'] },
+        changedFiles: ['tests/functional/baseline.test.ts'],
+        changes: [],
+        solutionPlan: 'Correct the functional baseline assertion.',
+        wikiEntryIds: [],
+        testOutcomes: [],
+        gateFindings: [],
+      } as never,
+    });
+
+    expect(propagated).toHaveLength(1);
+    expect(propagated[0]?.affectedStepIds).toEqual(['functional-step']);
+  });
+});
+
+describe('Change Request verification completion', () => {
+  it('does not deliver or merge a passing-quality attempt that did not replay its source Bug', async () => {
+    const auditEvents: Array<Record<string, unknown>> = [];
+    const transitions: Array<Record<string, unknown>> = [];
+    const recordedFailures: Array<Record<string, unknown>> = [];
+    const processor = new AttemptResultProcessor({
+      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      controller: {
+        completeChangeRequestStep: async () => ({
+          status: 'awaiting-verification',
+          closed: false,
+          unprovenBugTicketIds: ['bug-id'],
+        }),
+        recordChangeRequestVerificationFailure: async (input: Record<string, unknown>) => {
+          recordedFailures.push(input);
+          return 'CR-P1-001 did not replay BUG-P1-001';
+        },
+      },
+      tickets: {},
+      audit: {
+        event: async (_kind: string, _message: string, data: Record<string, unknown>) => {
+          auditEvents.push(data);
+        },
+      },
+      onTransition: async (event) => { transitions.push(event as unknown as Record<string, unknown>); },
+    } as never);
+    const step = {
+      id: 'integration-step', name: 'P1-S006', type: 'INTEGRATION_TEST',
+      projectId: 'project-id', phaseId: 'phase-id',
+    } as Step;
+    const disposition = await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step,
+        ticket: {
+          id: 'cr-id', name: 'CR-P1-001', type: 'change-request',
+          source: { correlationId: 'correlation-id' },
+        },
+      } as never,
+      steps: [step],
+      result: {
+        ok: true,
+        assessment: { id: 'assessment-id', evidence: ['11 tests passed'] },
+        changedFiles: [],
+        changes: [],
+        wikiEntryIds: [],
+        testOutcomes: [],
+        gateFindings: [],
+      } as never,
+    });
+
+    expect(disposition).toEqual({ action: 'continue', integrate: false });
+    expect(recordedFailures).toHaveLength(1);
+    expect(auditEvents.map((event) => event.messageId)).toEqual([
+      'domain.change_request_verification_incomplete',
+    ]);
+    expect(transitions).toEqual([]);
+  });
 });
 
 describe('renderFindingMessage', () => {
@@ -81,7 +249,14 @@ describe('corrective routing evidence', () => {
       boundAt: new Date(0).toISOString(),
     } as const;
     const processor = new AttemptResultProcessor({
-      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
       controller: {
         routeQualityGap: async (input: Record<string, unknown>) => {
           routed.push(input);
@@ -113,7 +288,6 @@ describe('corrective routing evidence', () => {
         type: 'story',
         source: { correlationId: 'correlation-id' },
       },
-      mode: 'normal',
     };
     await processor.process({
       phase: { id: 'phase-id' } as never,
@@ -127,6 +301,7 @@ describe('corrective routing evidence', () => {
         testOutcomes: [],
         gateFindings: [{
           category: 'test-incomplete',
+          code: 'module_baseline_source_missing',
           summary: 'The module baseline omits the declared source.',
           evidence: ['tests/modules/domain.test.ts exercises 0/1 sources'],
           target: 'current-step',
@@ -141,6 +316,218 @@ describe('corrective routing evidence', () => {
       affectedArtifacts: ['tests/modules/domain.test.ts'],
       workspaceBinding: binding,
     });
+  });
+
+  it('keeps findings with different machine codes as independent routed Tickets', async () => {
+    const routed: Array<Record<string, unknown>> = [];
+    const registered: string[][] = [];
+    const processor = new AttemptResultProcessor({
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
+      controller: {
+        routeFailure: async (input: Record<string, unknown>) => {
+          routed.push(input);
+          return {
+            id: `bug-${routed.length}`,
+            type: 'bug',
+            source: { correlationId: 'correlation-id' },
+          };
+        },
+      },
+      tickets: {
+        ownerActorId: async () => 'actor-id',
+        registerGateBatch: async (ids: string[]) => {
+          registered.push(ids);
+          return [];
+        },
+      },
+      audit: { event: async () => {} },
+      onTransition: async () => {},
+    } as never);
+    const step = {
+      id: 'step-id', name: 'P1-S004', type: 'CODE', projectId: 'project-id', phaseId: 'phase-id',
+    } as Step;
+    const finding = {
+      category: 'product-defect' as const,
+      summary: 'The generated contract is incomplete.',
+      evidence: ['The public result omits one required field.'],
+      target: 'current-step' as const,
+      affectedArtifacts: ['src/result.ts'],
+      dependencyPackages: [],
+    };
+
+    await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step,
+        ticket: {
+          id: 'story-id', name: 'P1-S004-STORY', type: 'story',
+          source: { correlationId: 'correlation-id' },
+        },
+      } as never,
+      steps: [step],
+      result: {
+        ok: false,
+        changedFiles: [],
+        wikiEntryIds: [],
+        testOutcomes: [],
+        gateFindings: [
+          { ...finding, code: 'result_source_missing' },
+          {
+            ...finding,
+            code: 'result_source_missing',
+            summary: 'A second rendering of the same source problem.',
+            evidence: ['The serialized result also omits source.'],
+          },
+          { ...finding, code: 'result_timestamp_missing' },
+        ],
+      },
+    });
+
+    expect(routed.map((input) => (input.failure as { code: string }).code)).toEqual([
+      'result_source_missing',
+      'result_timestamp_missing',
+    ]);
+    expect(routed[0]?.message).toContain('The serialized result also omits source.');
+    expect(registered).toEqual([['bug-1', 'bug-2']]);
+  });
+
+  it('routes an upstream manifest gap found during Bug repair and links it back to that Bug', async () => {
+    const { AttemptResultProcessor } = await import(
+      '../src/application/project_management/attempt_result_processor.js');
+    const routed: Array<Record<string, unknown>> = [];
+    const registered: string[][] = [];
+    const processor = new AttemptResultProcessor({
+      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      controller: {
+        routeQualityGap: async (input: Record<string, unknown>) => {
+          routed.push(input);
+          return {
+            id: 'enhancement-id',
+            type: 'enhancement',
+            source: { correlationId: 'correlation-id' },
+          };
+        },
+      },
+      tickets: {
+        ownerActorId: async () => 'actor-id',
+        registerGateBatch: async (ids: string[]) => {
+          registered.push(ids);
+          return [];
+        },
+      },
+      audit: { event: async () => {} },
+      onTransition: async () => {},
+    } as never);
+    const requirement = {
+      id: 'requirement-id', name: 'P1-S001', type: 'REQUIREMENT_ANALYSIS', projectId: 'project-id',
+    } as Step;
+    const design = {
+      id: 'design-id', name: 'P1-S002', type: 'HIGH_LEVEL_DESIGN', projectId: 'project-id',
+    } as Step;
+
+    await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step: requirement,
+        ticket: {
+          id: 'bug-id', name: 'BUG-P1-001', type: 'bug',
+          source: { correlationId: 'correlation-id' },
+        },
+      } as never,
+      steps: [requirement, design],
+      result: {
+        ok: false,
+        changedFiles: [],
+        wikiEntryIds: [],
+        testOutcomes: [],
+        gateFindings: [{
+          category: 'deliverable-defect',
+          code: 'language_test_entrypoint_contract_invalid',
+          summary: 'package.json does not expose the required test entrypoint.',
+          evidence: ['Expected scripts.test="vitest run".'],
+          target: 'high-level-design',
+          affectedArtifacts: ['package.json'],
+          dependencyPackages: [],
+        }],
+      },
+    });
+
+    expect(routed).toHaveLength(1);
+    expect(routed[0]).toMatchObject({
+      sourceStepId: requirement.id,
+      targetStepId: design.id,
+      sourceBugTicketId: 'bug-id',
+      affectedArtifacts: ['package.json'],
+    });
+    expect(registered).toEqual([['enhancement-id']]);
+  });
+
+  it('keeps a current-Step quality finding on its existing Change Request', async () => {
+    const routed: Array<Record<string, unknown>> = [];
+    const registered: string[][] = [];
+    const processor = new AttemptResultProcessor({
+      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      controller: {
+        routeQualityGap: async (input: Record<string, unknown>) => {
+          routed.push(input);
+          return {
+            id: 'duplicate-enhancement-id', type: 'enhancement',
+            source: { correlationId: 'correlation-id' },
+          };
+        },
+      },
+      tickets: {
+        ownerActorId: async () => 'actor-id',
+        registerGateBatch: async (ids: string[]) => {
+          registered.push(ids);
+          return [];
+        },
+      },
+      audit: { event: async () => {} },
+      onTransition: async () => {},
+    } as never);
+    const step = {
+      id: 'design-id', name: 'P1-S002', type: 'HIGH_LEVEL_DESIGN',
+      projectId: 'project-id', phaseId: 'phase-id',
+    } as Step;
+
+    const disposition = await processor.process({
+      phase: { id: 'phase-id' } as never,
+      work: {
+        step,
+        ticket: {
+          id: 'cr-id', name: 'CR-P1-001', type: 'change-request',
+          source: { correlationId: 'correlation-id' },
+          originFailures: [],
+        },
+      } as never,
+      steps: [step],
+      result: {
+        ok: false,
+        changedFiles: [], workspaceBinding: undefined,
+        wikiEntryIds: [], testOutcomes: [],
+        gateFindings: [{
+          category: 'deliverable-defect',
+          code: 'language_test_entrypoint_contract_invalid',
+          summary: 'The manifest correction is still incomplete.',
+          evidence: ['Expected scripts.test="vitest run".'],
+          target: 'current-step',
+          affectedArtifacts: ['package.json'],
+          dependencyPackages: [],
+        }],
+      } as never,
+    });
+
+    expect(disposition).toEqual({ action: 'continue' });
+    expect(routed).toEqual([]);
+    expect(registered).toEqual([]);
   });
 });
 
@@ -192,7 +579,14 @@ describe('agent execution stall disposition', () => {
       '../src/application/project_management/attempt_result_processor.js');
     const retained: string[] = [];
     const processor = new AttemptResultProcessor({
-      repository: { read: async () => undefined, list: async () => [], commit: async () => {} },
+      repository: {
+        // The propagation scope is language-dependent, so the call site reads the Project.
+        read: async (id: string) => id === 'project-id'
+          ? { objectType: 'project', id, language: 'typescript' }
+          : undefined,
+        list: async () => [],
+        commit: async () => {},
+      },
       controller: {
         retainAgentExecutionFailure: async (_work: unknown, reason: string) => {
           retained.push(reason);
@@ -204,7 +598,7 @@ describe('agent execution stall disposition', () => {
 
     const work = {
       phase: { id: 'p' }, step: { id: 's', name: 'P1-S001', projectId: 'proj' },
-      ticket: { id: 't', name: 'P1-S001-STORY' }, mode: 'normal',
+      ticket: { id: 't', name: 'P1-S001-STORY', type: 'story' },
     };
     const outcome = await (processor as unknown as {
       process(input: unknown): Promise<{ action: string }>;

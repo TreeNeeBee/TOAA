@@ -7,6 +7,25 @@ import { DomainRoleSchema, ExecutingRoleSchema } from '../workflow/role.js';
 import { PendingReasonSchema } from '../workflow/pending_reason.js';
 import { STEP_TYPES } from '../steps/step.js';
 import { WORKSPACE_KINDS } from '../workspace/change_set.js';
+import {
+  BugVerificationContractSchema,
+  BugVerificationRecordSchema,
+  FailureIdentitySchema,
+  sameFailureIdentity,
+} from './failure_identity.js';
+
+export {
+  BugVerificationContractSchema,
+  BugVerificationRecordSchema,
+  FailureIdentitySchema,
+  failureIdentityKey,
+  sameFailureIdentity,
+} from './failure_identity.js';
+export type {
+  BugVerificationContract,
+  BugVerificationRecord,
+  FailureIdentity,
+} from './failure_identity.js';
 
 export const TICKET_TYPES = [
   'epic',
@@ -156,6 +175,10 @@ const TicketBaseSchema = ObjectEnvelopeSchema.extend({
   dependencyTicketIds: z.array(ObjectIdSchema).default([]),
   blockedByTicketIds: z.array(ObjectIdSchema).default([]),
   relatedTicketIds: z.array(ObjectIdSchema).default([]),
+  /** Tickets that PM identified as later reports of this same work. */
+  duplicateTicketIds: z.array(ObjectIdSchema).default([]),
+  /** The authoritative Ticket this duplicate follows. */
+  duplicateOfTicketId: ObjectIdSchema.optional(),
   logIds: z.array(ObjectIdSchema).default([]),
   changelistIds: z.array(ObjectIdSchema).default([]),
   assignmentIds: z.array(ObjectIdSchema).default([]),
@@ -215,6 +238,7 @@ export const BugFailureSchema = z.object({
     tool: z.string().min(1).optional(),
     exitCode: z.number().int().optional(),
     statusCode: z.number().int().optional(),
+    identity: FailureIdentitySchema,
   }).strict();
 
 /** A discovering role proved that the failed verification contract, not the reported product gap, is defective. */
@@ -232,6 +256,8 @@ export const BugTicketSchema = TicketBaseSchema.extend({
   ]),
   severity: z.enum(['low', 'medium', 'high', 'critical']),
   failure: BugFailureSchema,
+  verificationContract: BugVerificationContractSchema,
+  verificationRecords: z.array(BugVerificationRecordSchema).default([]),
   enhancementTicketId: ObjectIdSchema.optional(),
   changeRequestTicketIds: z.array(ObjectIdSchema).default([]),
   debugWikiCandidateEntryIds: z.array(z.string().min(1)).default([]),
@@ -273,7 +299,7 @@ export const ChangeRequestApplicationDecisionSchema = z.object({
  *
  * Two Bugs on one Step each open their own chain along the identical route — a live run produced
  * four such pairs (`S004→S005`, `S005→S006`, `S006→S007`, `S007→S008`), created one to two minutes
- * apart, carrying the same delta to the same owner. The existing guard keys on `sourceTicketId`, so
+ * apart, carrying the same delta to the same owner. Source ids alone cannot identify that shared
  * it never sees them: they differ precisely in the field it compares. What actually makes a hop
  * redundant is where it comes from, where it goes, and which failure started it — so that is what
  * the key is built from.
@@ -297,7 +323,13 @@ export function changeRequestHopKey(input: {
 
 export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
   type: z.literal('change-request'),
-  sourceTicketId: ObjectIdSchema,
+  /** Why this CR exists; source Ticket shape and completion semantics depend on this value. */
+  // Defaulted, not required. The field is new, so every Change Request persisted before it exists
+  // without one — absence means "written by an older build", not corruption. Requiring it made the
+  // repository refuse those objects, and the refusal surfaced as an unhandled error at startup that
+  // no operator could tell apart from a damaged workspace. Corrective is what those Tickets were.
+  changeKind: z.enum(['corrective', 'dependency', 'contract-change']).default('corrective'),
+  sourceTicketIds: z.array(ObjectIdSchema).min(1),
   parentChangeRequestId: ObjectIdSchema.optional(),
   triggerStepId: ObjectIdSchema,
   sourceStepId: ObjectIdSchema,
@@ -309,8 +341,10 @@ export const ChangeRequestTicketSchema = TicketBaseSchema.extend({
    * owners and verification gates are unaffected merely because it did not edit a file.
    */
   targetStepId: ObjectIdSchema,
-  /** Immutable failure evidence that caused a corrective CR chain. */
-  originFailure: BugFailureSchema.optional(),
+  /** Ordered Steps that actually consume this accepted delta. */
+  propagationStepIds: z.array(ObjectIdSchema).min(1),
+  /** Immutable failure evidence for every Bug whose correction this hop carries. */
+  originFailures: z.array(BugFailureSchema).default([]),
   contractDelta: z.object({
     summary: z.string().min(1),
     before: z.array(z.string().min(1)).default([]),
@@ -357,6 +391,39 @@ export function bindTicketWorkspace<T extends Ticket>(
   }) as T;
 }
 
+/** Records a PM duplicate decision without merging either Bug's technical context. */
+export function linkDuplicateBugs(
+  original: BugTicket,
+  duplicateAfterTransition: BugTicket,
+  now = new Date().toISOString(),
+): { original: BugTicket; duplicate: BugTicket } {
+  if (original.id === duplicateAfterTransition.id) throw new Error('A Bug cannot duplicate itself');
+  if (original.projectId !== duplicateAfterTransition.projectId) {
+    throw new Error('Duplicate Bugs must belong to the same Project');
+  }
+  if (original.failure.targetStepId !== duplicateAfterTransition.failure.targetStepId) {
+    throw new Error('Duplicate Bugs must target the same Step');
+  }
+  if (!sameFailureIdentity(original.failure.identity, duplicateAfterTransition.failure.identity)) {
+    throw new Error('Duplicate Bugs must share one structural failure identity');
+  }
+  if (duplicateAfterTransition.duplicateOfTicketId && duplicateAfterTransition.duplicateOfTicketId !== original.id) {
+    throw new Error(`Bug ${duplicateAfterTransition.name} already follows another original`);
+  }
+  return {
+    original: TicketSchema.parse({
+      ...original,
+      ...reviseObjectEnvelope(original, { now }),
+      duplicateTicketIds: [...new Set([...original.duplicateTicketIds, duplicateAfterTransition.id])],
+    }) as BugTicket,
+    // The lifecycle transition already advanced this revision. Add the relation to that same commit.
+    duplicate: TicketSchema.parse({
+      ...duplicateAfterTransition,
+      duplicateOfTicketId: original.id,
+    }) as BugTicket,
+  };
+}
+
 function sameWorkspaceBinding(
   left: TicketWorkspaceBinding,
   right: TicketWorkspaceBinding,
@@ -390,12 +457,23 @@ export function transitionTicketPath(
     if (next === 'pending' && !options.pendingReason) {
       throw new Error(`Ticket ${ticket.id} requires pendingReason when entering pending`);
     }
+    // Resolved means the repair landed and passed this Step's own checks; the verdict from the gate
+    // that found the failure is what is still outstanding. Demanding a *verified* solution here left
+    // finished work with nowhere to wait — it was parked as `pending`, which says blocked, so the
+    // scheduler kept offering the Step the repair it had just completed.
+    //
+    // The bar here is only that a repair exists, because closure paths pass through this state on
+    // their way out and legitimately carry no changes of their own. That the Step actually checked
+    // the repair is enforced by the application workflow wherever a Ticket comes to rest: both the
+    // main Change Request handoff and the meeting-point path require a passing assessment of the
+    // Step that did the work. Closure remains the line that cannot be skipped: a verified solution
+    // and the original failure replayed where it was observed.
     if (
       next === 'resolved' &&
       ['bug', 'enhancement', 'change-request'].includes(ticket.type) &&
-      ticket.solution?.status !== 'verified'
+      !ticket.solution
     ) {
-      throw new Error(`Ticket ${ticket.id} requires a verified solution before resolution`);
+      throw new Error(`Ticket ${ticket.id} requires a solution before resolution`);
     }
     if (next === 'in_progress' && !ticket.activeAssignmentId) {
       throw new Error(`Ticket ${ticket.id} requires an accepted active assignment before execution`);

@@ -39,6 +39,12 @@ Agents | Skills | Tools | Plugins | LLM Router | Debug Wiki
 
 Adapter 只负责参数或协议、配置、交互、输出和退出码。它不得直接调用 Planner、Agent、Tool、Plugin、Memory、文件系统或命令执行实现。
 
+模型角色只有一份清单：`Planner`、`Architect`、`Coder`、`Tester`、`Debugger`、`ProjectManager`。
+每个角色在 `llm.roles` 下独立配置 provider 链，Router 如何在链内调度是它自己的事，其余部分不依赖。
+`ProjectManager` 代表项目判定交付结果，它不执行 Step；把它做成独立角色而不是借用 Planner 的注册，
+是为了让它以自己的身份配置和发声。
+
+
 ## 3. 统一对象模型
 
 每个持久化对象都包含统一 envelope：
@@ -160,9 +166,15 @@ Ticket 类型固定为：
 - `task`：Story 下的计划工作，最多再嵌套一层 Task。
 - `bug`：错误行为、命令失败、测试失败或异常，进入 Debug 流程。
 - `enhancement`：功能缺口、测试不完备或质量指标不足。
-- `change-request`：承接已接受上游变更，向受影响下游 Step 传导增量。
+- `change-request`：承接已接受上游变更，或承接真实场景证明必须调整的已接受契约，向受影响下游 Step 传导增量。
 
-Ticket 通用字段包含角色、Agent、0-255 优先级、父/根 Ticket、依赖、阻塞项、关联项、检查点、日志、changelist、solution 和 source。source 保存 correlation ID、causation ID 及外部来源。
+Ticket 通用字段包含角色、Agent、0-255 优先级、父/根 Ticket、依赖、阻塞项、关联项、检查点、日志、changelist、solution 和 source。source 保存 correlation ID、causation ID 及外部来源。调度工作不再持久化第二份 `mode`；Runtime 仅在执行边界由 Ticket 类型派生 `normal`、`debug`、`enhancement` 或 `change-request` 模式，避免生命周期事实与执行副本漂移。
+
+Bug 额外持久化结构化 `failure.identity`、`verificationContract` 和只追加的 `verificationRecords`。身份由失败类别、机器码、失败/目标/验证 Step、操作、失败测试选择器、目标产物及状态码组成，不包含摘要、完整日志、临时目录、计数器或模型措辞。原始验证 Step 通过后立即记录身份哈希、QualityAssessment 和实际测试选择器；CR 若仍需继续下游影响分析，最终跳复用这份证明而不是要求另一个 Step 冒充原验证门禁。每次发现都先创建独立 Bug；PM 注册后、分配前才比较同一目标 Step 上更早的活动 Bug。命中时保留两张票，以 `duplicateOfTicketId` / `duplicateTicketIds` 双向关联，把后到票停放为 `pending:duplicate`，并记录治理决策；原票终态后再取消重复票。PM 不合并两者的技术上下文。
+
+Change Request 使用 `changeKind` 区分纠正传播、依赖变更和已接受契约变更，使用 `sourceTicketIds[]` 保存全部来源、`originFailures[]` 保存全部起因失败，并以 `propagationStepIds[]` 明确本链的受影响 Step。传播范围必须从当前目标 Step 开始，只包含同一 Project/Phase 内唯一且按 V 模型顺序递增的 Step；非法范围在创建任何 Ticket、关系或生命周期变更前拒绝。相同纠正传播跳可以折叠多个来源，但不能丢弃任一来源、契约差异、changelist 或验证要求。最终跳关闭前必须一次性重放所有仍活动源 Bug 的原始验证契约；少一个失败用例都整体拒绝关闭，不能先关闭 CR 再留下半数源票。
+
+Phase 真实场景的进程状态、40X/50X、重定向、超时、异常和空结果只作为现场证据。ProjectManager LLM 根据已接受需求、场景预期与完整证据判断：契约仍有效而实现错误时创建 Bug；满足预期必须调整需求、能力、接口、依赖、数据源或设计前提时直接创建 `contract-change` CR 并从归属 Step 向下游传播。LLM 判定缺少合法 Ticket 类型或归属 Step 时门禁失败，不允许静默通过或默认归类。
 
 Ticket 状态机：
 
@@ -175,7 +187,22 @@ reopened -> in_progress | cancelled
 cancelled -> reopened | closed
 ```
 
-Bug、Enhancement、CR 没有 `verified` solution 时不能进入 `resolved`。
+纠正类 Ticket（Bug / Enhancement / CR）的每个状态各有确切含义,三者不可互相顶替:
+
+- **`in_progress`** —— 正在修复。
+- **`resolved`** —— 修复已落地,**且本 Step 自己的检查已通过**;等待的是发现该失败的那道门禁的裁决。
+  停驻到这个状态要出示**属于本 Step 且通过**的 QualityAssessment,不是模型声称完成即可。
+  领域状态机只要求存在 solution,因为关闭路径会途经此状态;应用层的统一评估校验同时约束
+  Change Request 主交接和特殊汇合路径,不能从旁路把未通过门禁的修复写成 `resolved`。
+- **`reopened`** —— 那道门禁把同一个失败又报了一次,即裁决为否。**重开原票而不是新开一张**:
+  按失败身份与目标 Step 匹配。新开会让原票永远停在 `resolved` 等一个已经回来的答复。
+- **`closed`** —— 裁决为是。要求已验证的 solution **且**原始失败在观察到它的 Step 上重放通过。
+- **`pending`** —— 只表示被别的事物阻塞,不表示「已完成待验」。混用这两种含义会让调度器把活
+  重新派给刚刚完成它的 Step:一次实跑因此让同一张 Bug 在 `pending → in_progress` 之间循环三轮,
+  反复重做已经落地的修复。
+
+调度器不把工作交给 `resolved` 的 Ticket —— 它的工作已经做完,欠的只是裁决。
+
 
 ## 7. Step、Phase 与 Project 状态
 
@@ -250,6 +277,61 @@ parent CR failure -> linked Bug (parent CR pending/blocked)
 
 失败尝试在 Git 快照事务中执行；未通过门禁时回滚工作区。通过的尝试记录 QualityAssessment、Changelist、commit 和证据。失败日志抽取核心原因并挂到 Ticket 的领域 Log，完整过程仍保留在人类审计文件中。
 
+### 9.1 失败身份与不收敛守卫
+
+同一个失败反复出现却修不好时，尝试预算必须能停下来。判定「是否同一个失败」靠结构化签名，
+而不是错误文本：
+
+- 签名只由**失败是什么**构成——失败的用例、失败类型、失败原因的稳定部分以及目标文件。
+- 签名不含**这次尝试怎么跑的**——工具调用的命令行、运行器分配的临时目录、对象地址、计数器。
+  这些在两次完全相同的失败之间也会变，混进去会让每次失败都成为「新」失败，守卫永远够不到阈值。
+- 采集失败用例必须要求肯定式的失败标记。冗长模式下运行器会先打印用例 id、再打印该用例自己的
+  输出，靠排除 PASSED 行反而会把通过的用例算进去；行尾的 `FAILED` 也不得与下一行开头的 id 绑定。
+
+同一签名连续复现达到阈值即判定不收敛，Ticket 停止并给出原因，而不是耗尽剩余预算。
+
+### 9.2 同跳合并
+
+两条 Change Request 传导同一跳（相同源 Step、目标 Step、起因失败 Step 和父 CR）时，后一条并入已经
+承载该跳的那条，而不是各自开链。折叠后的 CR 显式保存全部 `sourceTicketIds`、`originFailures`、契约差异和传播范围；被并入的来源同时移交，避免它仍然可被调度。最终验证必须覆盖每个源 Bug 的精确失败选择器，完成后再统一关闭来源。
+
+### 9.3 Bug 关闭的验证契约
+
+Bug 关闭的依据不是「某个 Step 的门禁过了」，而是**开票的那个失败重跑一遍并通过**。
+
+每张 Bug 携带一份验证契约：失败被观察到的 Step，以及要重放的测试选择器。契约只可能在那一个
+Step 上被满足——别处跑什么都不构成对它的证明。满足时追加一条不可变的验证记录，链上后续跳凭
+记录即可放行。
+
+未满足时**拒绝关闭，而不是抛出异常**。一条尚未完成的纠正链与一条损坏的纠正链不同：Bug 留在
+打开状态，它的 Story 保持阻塞，工作仍然可见，下一条到达该 Step 的链还能把它做完。以异常终止
+整轮运行，会把一个可恢复的状态毁掉，只因为有活没干完。
+
+这条原则贯穿纠正流程的每一处判定：**能推进就推进，不能推进就停在原地并说明，不要终止运行。**
+
+会合点是唯一的例外形状：那里 Bug 被交给它所修复的 CR，由那张 CR 去跑证明它的 Step。交接必须
+同时释放 Bug 对该 CR 的阻塞——否则 Bug 等着一道门禁，而那道门禁被 Bug 自己挡着。
+
+### 9.4 重复缺陷
+
+同一个失败被报告多次时，每一次都保留为独立 Ticket，由 PM 在**路由前**判定重复：目标 Step 相同
+且结构化失败身份相同，即认定为重复，取提交最早的一张为原始票。
+
+重复票被标记、链接到原始票、置为 `pending`，并记录一条路由决策。它不参与调度。原始票到达终态
+时，重复票随之取消——**生命周期跟随原始票**，包括原始票被取消或废弃的情形。
+
+判据与创建侧使用同一份失败身份，两处对「什么算同一个失败」的回答因此不会分叉。
+
+### 9.5 传导范围
+
+CR 的传导范围在开链时确定，逐跳按列表推进，而不是每跳重新计算下一个下游 Step。
+
+这与 0.3 早期「范围应当被发现而非预测」的决定相反，是有意的取舍：仅修改基线测试的修复要直达
+配对验证 Step、跳过中间各跳，而逐跳取下一个邻居表达不了「跳过」。范围既然要能跳，就必须先被
+决定。
+
+代价是范围不再随执行期间的 Step 变化调整。一个 Phase 的八个 Step 固定，因此当前无实际影响。
+
 ## 10. 质量门禁
 
 - S1-S4：`completion`、`upstreamAlignment`。
@@ -261,12 +343,20 @@ parent CR failure -> linked Bug (parent CR pending/blocked)
 
 指标不足创建 Enhancement；实际测试或执行失败创建 Bug。QualityAssessment 是不可替换的领域证据，不使用单独的旧质量状态文件。
 
-门禁结果保留多个独立 `findings`，不得拼成一段错误后只建一张票：
+门禁结果保留多个独立 `findings`，不得拼成一段错误后只建一张票。每条 finding 必须携带稳定机器码 `code`：同一类别、目标和机器码表示同一问题并合并证据；不同机器码即使摘要相同也必须保持独立：
 
 - `test-defect`：验证阶段自己补充的测试有误，Bug 回到当前验证 Step；基线测试契约有误则指向配对源 Step。
 - `product-defect`：Bug 指向产品/契约所有 Step，并按 V 模型通过 CR 向下游传播。
 - `test-incomplete`、`quality-shortfall`、`deliverable-defect`：分别形成 Enhancement，追加缺失工作。
 - `dependency`：不混入 Bug/Enhancement，保持独立 Dependency CR 路由。
+
+失败归属发现它的 Step，由 V 模型配对关系决定目标，而不是继承当时恰好活跃的 CR 链起点。一个在
+FUNCTIONAL_TEST 被发现的失败若记到 HIGH_LEVEL_DESIGN，那个 Step 既不拥有失败的测试，也没有写它
+的权限，修复无从下手。
+
+验证 Step 的门禁同时跑两个归属域：配对基线，和该 Step 自己撰写的补充测试。两者不能一起退回配对
+源——把补充测试的缺陷交给源 Step，等于给它一个它无权写入的文件。判据是全部失败用例是否都落在
+补充命名空间内；只要有一个属于基线，就仍然回到配对源。
 
 一次 Step 或 Phase 门禁可产生多条 finding。发现角色逐条创建 Ticket 并提交 PM；PM 只负责注册、路由、阻塞关系和重启受影响的 V 模型路径。为避免多条纠正链同时关闭同一后续 Step，PM 按最上游受影响 Step 到最下游建立批次调度依赖，依赖类 Ticket 保持独立 CR 路由并排在该批次末尾。任一修复完成后通过 CR 增量传导，并重新执行后续 Step 与 Phase 门禁。
 
@@ -332,6 +422,27 @@ RuntimeIO 明确声明 `request`、`allow` 或 `deny` 权限策略。CLI 和 ACP
 
 ACP 取消把同一 AbortSignal 传入 Build、Run、Planner、Executor 和 OpenAI-compatible 网络请求。权限等待立即取消；无法中断的本地操作以 best-effort 完成后停止，不会静默报告成功。
 
+### 14.1 写作用域
+
+写权限按「谁拥有这个文件」判定，而不是按「谁正在执行」：
+
+- Runtime 拥有的文件集中声明一处，并同时给出替代动作。被拒绝的写入必须知道该做什么，
+  否则同一次拒绝会反复发生。
+- 测试夹具目录授予任何拥有该测试的作用域，于是一个 Step 与针对该 Step 的修复能写同一批文件。
+- 尚未撰写的测试选择器不允许执行，拒绝时点名应当先写哪些文件。
+
+### 14.2 Provider 传输
+
+Provider 侧的失败必须与被生成工程的失败区分开，否则前者会被当作后者去「修复」：
+
+- 推理输出计入活性。只产出 reasoning 而没有 content 的流不是空闲流，是 provider 自身的故障。
+- 流式请求有响应头期限。流式服务端先写响应头再开始思考，所以「响应头没来」是连接问题（秒级），
+  「响应头到了但 token 慢」是模型问题（分钟级）；非流式响应头要等整个答案生成完才发，这道闸不加在它上面。
+- 开启 TCP 探活。断网留下的 socket 收不到 RST/FIN，应用层无从察觉；探活是唯一能把它变成
+  真正连接错误的机制，且不需要 provider 配合。
+- 分类依据是结构化的流进度，不是消息文本。
+- 对端持续静默达到阈值时跑一次环境诊断，并把结论随失败一起交出，让原因和证据同时到达。
+
 ## 15. 项目交付报告
 
 迭代报告只评估当前 Phase；最终项目报告必须扫描 Project 下的全部 Phase、八阶段 Step、
@@ -354,3 +465,13 @@ Phase 未完成时因当前 Phase 通过而误报项目已交付。
 - Bug 的 Debug Wiki 方案必须晚于完整 CR 验证。
 - 失败不能直接跳到后续 Step，也不能通过修改 Planner 文件伪造完成。
 - 外部 API 失败是正式错误，必须修复、替换接口或明确失败。
+- 门禁失败归属发现它的 Step，目标由 V 模型配对关系决定，不继承活跃 CR 链的起点。
+- 验证 Step 自己撰写的补充测试的缺陷留在该 Step；只要有一个失败用例属于基线，就回到配对源。
+- 失败签名只由失败本身构成，不含命令行、临时目录、地址或计数器等运行期细节。
+- 写权限按文件归属判定；被拒绝的写入必须同时得到可执行的替代动作。
+- Provider 失败与被生成工程的失败必须分类区分，依据是结构化的流进度而非消息文本。
+- Bug 只有在开票的那个失败于其验证 Step 重跑并通过后才关闭；未通过时拒绝关闭，不终止运行。
+- 纠正 Ticket 停驻为 `resolved` 必须出示本 Step 的通过评估；门禁重报同一失败时重开原票，不新开。
+- 纠正流程中「无法推进」一律表现为停在原地并说明，异常只用于真正的不变量破坏。
+- 重复缺陷保留为独立 Ticket，由 PM 在路由前判定，生命周期跟随原始票。
+- 执行模式由 Ticket 类型派生，不单独持久化。

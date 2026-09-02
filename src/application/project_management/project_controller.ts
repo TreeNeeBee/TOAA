@@ -1,5 +1,5 @@
 import type { ObjectId } from '../../domain/identity/object_id.js';
-import { xcompilerBuildId } from '../../core/build_identity.js';
+import { stepContextFingerprint, xcompilerBuildId } from '../../core/build_identity.js';
 import { reviseObjectEnvelope } from '../../domain/objects/object_envelope.js';
 import type { Checkpoint } from '../../domain/evidence/evidence.js';
 import type { Phase } from '../../domain/phases/phase.js';
@@ -31,8 +31,12 @@ import { TicketRegistrationService } from './ticket_registration_service.js';
 import { ProjectStateService } from './project_state_service.js';
 import { GovernanceService } from './governance_service.js';
 import { createDomainEvent } from '../observability/domain_event_factory.js';
+import { DomainAuditTrail } from '../observability/domain_audit_trail.js';
 import type { AttemptFailure } from '../execution/failure_classification.js';
-import { WorkScheduler, type ScheduledWork } from './work_scheduler.js';
+import type { TestOutcome } from '../execution/test_outcome.js';
+import type { DeliveryGateFinding } from '../../domain/quality/delivery_gate.js';
+import { buildDebugBrief, buildFailureSignature } from '../../core/debug_brief.js';
+import { WorkScheduler, workModeFor, type ScheduledWork } from './work_scheduler.js';
 import { CorrectiveWorkflowService } from './corrective_workflow_service.js';
 import {
   ProjectManagerIntakeService,
@@ -49,6 +53,7 @@ export class ProjectController {
   private readonly scheduler: WorkScheduler;
   private readonly corrective: CorrectiveWorkflowService;
   private readonly intake: ProjectManagerIntakeService;
+  private readonly traces: DomainAuditTrail;
 
   constructor(
     private readonly repository: DomainObjectRepositoryPort,
@@ -68,6 +73,7 @@ export class ProjectController {
     this.scheduler = new WorkScheduler(repository);
     this.corrective = new CorrectiveWorkflowService(repository);
     this.intake = new ProjectManagerIntakeService(repository);
+    this.traces = new DomainAuditTrail(repository);
   }
 
   async next(phaseId: ObjectId): Promise<ScheduledWork | undefined> {
@@ -78,7 +84,16 @@ export class ProjectController {
     return this.scheduler.resume(phaseId);
   }
 
+  async reconcilePhaseDeliveryBugs(
+    phaseId: ObjectId,
+    findings: readonly Pick<DeliveryGateFinding, 'code' | 'target'>[],
+    phaseGateAssessmentId: ObjectId,
+  ): Promise<ObjectId[]> {
+    return this.tickets.reconcilePhaseDeliveryBugs(phaseId, findings, phaseGateAssessmentId);
+  }
+
   async start(work: ScheduledWork): Promise<ScheduledWork> {
+    const mode = workModeFor(work.ticket);
     let ticket = await this.requireTicket(work.ticket.id);
     if (ticket.attempts >= ticket.maxAttempts) {
       ticket = await this.extendConvergingTicket(ticket);
@@ -107,15 +122,29 @@ export class ProjectController {
       ticket = await this.saveTicketTransition(ticket, 'in_progress');
     }
     if (ticket.type === 'story') await this.startTasks(ticket);
-    await this.checkpoint(step, `Started ${work.mode} work through ${ticket.name}`);
-    return { phase, step: await this.requireStep(step.id), ticket, mode: work.mode };
+    await this.checkpoint(step, `Started ${mode} work through ${ticket.name}`);
+    return { phase, step: await this.requireStep(step.id), ticket };
   }
 
   private async extendConvergingTicket(ticket: Ticket): Promise<Ticket> {
-    const evidence = [];
+    const evidence: Array<{
+      signature?: string;
+      category?: string;
+      toolchainBuildId?: string;
+      stepContextFingerprint?: string;
+    }> = [];
+    const recordedAttemptNumbers = new Set<number>();
     for (const logId of ticket.logIds) {
       const object = await this.repository.read(logId);
-      if (object.objectType !== 'log' || object.level !== 'error') continue;
+      if (object.objectType !== 'log') continue;
+      if (
+        object.level === 'info' &&
+        object.data.mode === 'change-request' &&
+        typeof object.data.attempt === 'number'
+      ) {
+        recordedAttemptNumbers.add(object.data.attempt);
+      }
+      if (object.level !== 'error') continue;
       evidence.push({
         signature: typeof object.data.failureSignature === 'string'
           ? object.data.failureSignature
@@ -126,9 +155,36 @@ export class ProjectController {
         toolchainBuildId: typeof object.data.toolchainBuildId === 'string'
           ? object.data.toolchainBuildId
           : undefined,
+        stepContextFingerprint: typeof object.data.stepContextFingerprint === 'string'
+          ? object.data.stepContextFingerprint
+          : undefined,
       });
     }
-    const decision = evaluateAttemptExtension(evidence, xcompilerBuildId());
+    // Older builds could return a CR attempt as successful without applying it or writing a failure
+    // log. The strict extension policy then has no fingerprint to evaluate and permanently blocks
+    // the fixed build before it can execute once. Recover only when append-only records prove every
+    // exhausted attempt started, while the CR has neither an application nor any terminal error.
+    // PM first materializes that missing outcome as a structured current-build failure; the ordinary
+    // recurrence policy remains the sole authority for the extension and every later attempt.
+    if (
+      evidence.length === 0 &&
+      ticket.type === 'change-request' &&
+      ticket.applications.length === 0 &&
+      ticket.attempts > 0 &&
+      recordedAttemptNumbers.size >= ticket.maxAttempts
+    ) {
+      evidence.push(await this.recordMissingChangeRequestOutcome(ticket, recordedAttemptNumbers));
+      ticket = await this.requireTicket(ticket.id);
+      if (ticket.type !== 'change-request') {
+        throw new Error('Change Request type changed while recording its missing attempt outcome');
+      }
+    }
+    const stepForContext = ticket.stepId ? await this.requireStep(ticket.stepId) : undefined;
+    const decision = evaluateAttemptExtension(
+      evidence,
+      xcompilerBuildId(),
+      stepForContext ? stepContextFingerprint(stepForContext) : undefined,
+    );
     if (!decision.extend) {
       throw new Error(
         `Ticket ${ticket.name} stopped after ${ticket.attempts} attempts: ${decision.reason}`,
@@ -183,6 +239,54 @@ export class ProjectController {
     return extended;
   }
 
+  private async recordMissingChangeRequestOutcome(
+    ticket: ChangeRequestTicket,
+    recordedAttemptNumbers: ReadonlySet<number>,
+  ): Promise<{ signature: string; category: string; toolchainBuildId: string }> {
+    const step = await this.requireStep(ticket.targetStepId);
+    const reason = `${ticket.name} exhausted its attempt budget without a Change Request application or terminal failure`;
+    const failure: AttemptFailure = {
+      kind: 'execution',
+      category: 'internal',
+      code: 'attempt_outcome_missing',
+      message: reason,
+      retryable: true,
+      switchProvider: false,
+      details: {
+        attempts: ticket.attempts,
+        maxAttempts: ticket.maxAttempts,
+        recordedAttemptNumbers: [...recordedAttemptNumbers].sort((left, right) => left - right),
+      },
+    };
+    const brief = buildDebugBrief({
+      reason,
+      failureLog: reason,
+      phase: step.type,
+      targetPhase: step.type,
+      typedFailure: failure,
+    });
+    const failureSignature = buildFailureSignature(brief, failure.code);
+    const toolchainBuildId = xcompilerBuildId();
+    await this.traces.recordLog({
+      projectId: ticket.projectId,
+      subject: { id: ticket.id, objectType: 'ticket' },
+      level: 'error',
+      message: reason,
+      data: {
+        stepId: ticket.targetStepId,
+        mode: 'change-request',
+        failureLog: reason,
+        failureCategory: brief.category,
+        structuredFailure: failure,
+        failureSignature,
+        toolchainBuildId,
+      },
+      correlationId: ticket.source.correlationId,
+      causationId: ticket.source.causationId,
+    });
+    return { signature: failureSignature, category: brief.category, toolchainBuildId };
+  }
+
   async deferInfrastructureFailure(work: ScheduledWork, reason: string): Promise<void> {
     await this.deferNonProjectAttempt(
       work,
@@ -219,6 +323,82 @@ export class ProjectController {
     );
   }
 
+  async recordChangeRequestVerificationFailure(input: {
+    work: ScheduledWork;
+    unprovenBugTicketIds: ObjectId[];
+    testOutcomes: readonly TestOutcome[];
+  }): Promise<string> {
+    if (input.work.ticket.type !== 'change-request') {
+      throw new Error('Change Request verification failure requires a Change Request');
+    }
+    const bugs: BugTicket[] = [];
+    for (const ticketId of input.unprovenBugTicketIds) {
+      const ticket = await this.requireTicket(ticketId);
+      if (ticket.type !== 'bug') throw new Error(`Unproven source ${ticket.name} is not a Bug`);
+      bugs.push(ticket);
+    }
+    const requiredSelectors = [...new Set(
+      bugs.flatMap((bug) => bug.verificationContract.testSelectors),
+    )].sort();
+    const executedSelectors = [...new Set(
+      input.testOutcomes.flatMap((outcome) => outcome.args.filter((arg) => !arg.startsWith('-'))),
+    )].sort();
+    const bugNames = bugs.map((bug) => bug.name).join(', ') || '(unknown Bug)';
+    const reason = `${input.work.ticket.name} did not replay the immutable verification contract for ${bugNames}`;
+    const failureLog = [
+      reason,
+      `required selectors: ${requiredSelectors.join(', ') || '(original gate scope)'}`,
+      `executed selectors: ${executedSelectors.join(', ') || '(none)'}`,
+      ...requiredSelectors.map((selector) => `FAIL ${selector}`),
+    ].join('\n');
+    const failure: AttemptFailure = {
+      kind: 'execution',
+      category: 'test',
+      code: 'bug_verification_not_replayed',
+      message: failureLog,
+      retryable: true,
+      switchProvider: false,
+      details: {
+        bugTicketIds: bugs.map((bug) => bug.id),
+        requiredSelectors,
+        executedSelectors,
+      },
+    };
+    const brief = buildDebugBrief({
+      reason,
+      failureLog,
+      phase: input.work.step.type,
+      targetPhase: input.work.step.type,
+      typedFailure: failure,
+    });
+    await this.traces.recordLog({
+      projectId: input.work.step.projectId,
+      subject: { id: input.work.ticket.id, objectType: 'ticket' },
+      level: 'error',
+      message: reason,
+      data: {
+        phaseId: input.work.step.phaseId,
+        stepId: input.work.step.id,
+        stepName: input.work.step.name,
+        mode: 'change-request',
+        failureLog,
+        failureCategory: brief.category,
+        structuredFailure: failure,
+        testOutcomes: input.testOutcomes,
+        failureSignature: buildFailureSignature(brief, failure.code),
+        toolchainBuildId: xcompilerBuildId(),
+        stepContextFingerprint: stepContextFingerprint(input.work.step),
+      },
+      correlationId: input.work.ticket.source.correlationId,
+      causationId: input.work.ticket.source.causationId,
+    });
+    await this.checkpoint(
+      await this.requireStep(input.work.step.id),
+      `${reason}; candidate retained without delivery or merge.`,
+    );
+    return reason;
+  }
+
   private async deferNonProjectAttempt(
     work: ScheduledWork,
     pendingReason: PendingReason,
@@ -250,7 +430,7 @@ export class ProjectController {
   }
 
   async deliverNormal(work: ScheduledWork, qualityAssessmentId: ObjectId): Promise<void> {
-    if (work.mode !== 'normal' || work.ticket.type !== 'story') {
+    if (work.ticket.type !== 'story') {
       throw new Error('deliverNormal requires normal Story work');
     }
     let step = await this.requireStep(work.step.id);
@@ -285,7 +465,7 @@ export class ProjectController {
     message: string;
     summary: string;
     failure: AttemptFailure;
-    bugKind?: BugTicket['bugKind'];
+    bugKind: BugTicket['bugKind'];
     rawEvidenceRef?: string;
     tool?: string;
     exitCode?: number;
@@ -298,6 +478,8 @@ export class ProjectController {
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
     workspaceBinding?: TicketWorkspaceBinding;
+    testOutcomes?: readonly TestOutcome[];
+    affectedArtifacts?: readonly string[];
   }): Promise<BugTicket> {
     return this.corrective.routeFailure(input);
   }
@@ -312,6 +494,8 @@ export class ProjectController {
     correlationId: ObjectId;
     causationId?: ObjectId;
     parentChangeRequestId?: ObjectId;
+    /** Corrective Bug whose work discovered this independent upstream quality gap. */
+    sourceBugTicketId?: ObjectId;
     creatorActorId: ObjectId;
     sourceKind?: TicketSource['kind'];
     sourceExternalId?: string;
@@ -324,6 +508,12 @@ export class ProjectController {
     input: Parameters<CorrectiveWorkflowService['routeDependencyChange']>[0],
   ): ReturnType<CorrectiveWorkflowService['routeDependencyChange']> {
     return this.corrective.routeDependencyChange(input);
+  }
+
+  routeContractChange(
+    input: Parameters<CorrectiveWorkflowService['routeContractChange']>[0],
+  ): ReturnType<CorrectiveWorkflowService['routeContractChange']> {
+    return this.corrective.routeContractChange(input);
   }
 
   /** The only boundary that may turn a Phase-external problem report into an internal Ticket. */
@@ -359,7 +549,8 @@ export class ProjectController {
     commit?: string;
     verification?: string[];
     application?: ChangeRequestApplicationDecision;
-  }): Promise<{ closed: boolean; sourceTicketId?: ObjectId; sourceTicketType?: 'bug' | 'enhancement' }> {
+    testOutcomes?: readonly TestOutcome[];
+  }): ReturnType<CorrectiveWorkflowService['completeChangeRequestStep']> {
     return this.corrective.completeChangeRequestStep(input);
   }
 

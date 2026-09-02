@@ -9,9 +9,8 @@ import { DebugWiki, bundledDebugWikiPath } from '../src/core/debug_wiki.js';
  * and the distinctions it encoded belong to the classifier that actually runs.
  *
  * The intent is unchanged and is what these assertions keep: a failure produced by *our* provider
- * must never be answered with advice aimed at the *generated project's* API integration. That advice
- * — switch to a public no-key API and verify the integration — rewrites working code to repair
- * something that was never broken.
+ * must never be answered with advice aimed at the *generated project's* API integration. That would
+ * rewrite working code to repair something that was never broken.
  */
 describe('provider failures never become project API defects', () => {
   const categoryOf = (failureLog: string) => buildDebugBrief({ failureLog }).category;

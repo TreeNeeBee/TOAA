@@ -9,7 +9,7 @@ import { runtimeOwnedAllows, runtimeOwnedFile } from '../src/core/runtime_owned_
  *
  * These paths are created by Runtime, so a Step refused one of them cannot discover why by guessing:
  * `not in this Step's writable allowlist` describes the allowlist, not the ownership. Three live
- * Tickets lost their entire attempt budget to that — dbc1 on the fixture directory, dbc2 on
+ * Tickets lost their entire attempt budget to that — one on the fixture directory, one on
  * `tests/conftest.py`, and an S003 on a fabricated assessment field. The registry exists so the owner
  * and the remedy arrive with the denial.
  */

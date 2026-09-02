@@ -728,7 +728,7 @@ describe('OpenAI-compatible streaming', () => {
  * Counting only `content` made every reasoning chunk invisible: `streamedContentChars` stayed 0
  * while hundreds of chunks arrived, the first-token watchdog fired on a fully active stream, and
  * the error told the operator to raise a timeout that could never be reached. Two live runs of the
- * dbc2excel project died this way — 300s per streaming attempt, 900s per non-stream retry.
+ * live project died this way — 300s per streaming attempt, 900s per non-stream retry.
  */
 describe('reasoning-model streams', () => {
   const reasoningServer = (opts: { reasoningChunks: number; then?: string }) => createServer((_req, res) => {
@@ -795,7 +795,7 @@ describe('reasoning-model streams', () => {
 
 /**
  * Two faults produce one message: a dead network and a model still thinking both surface as a
- * timeout, and they need opposite responses. Two live dbc2excel runs died 15 minutes apart with
+ * timeout, and they need opposite responses. Two live runs died 15 minutes apart with
  * `request timed out after 900000ms`, and nothing in the failure said which one it was.
  *
  * The diagnosis never ends the request — the timeouts own that. It exists so the failure can name
@@ -888,6 +888,44 @@ describe('stall diagnosis', () => {
       expect(out).toBe('done');
       expect(stalled).toBe(false);
     } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 20_000);
+
+  it('discards a late diagnosis after bytes arrive and diagnoses only once per request', async () => {
+    let response: import('node:http').ServerResponse | undefined;
+    let diagnoses = 0;
+    const server = createServer((_req, res) => {
+      response = res;
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const client = new OpenAIClient({
+        apiKey: '', baseUrl: `http://127.0.0.1:${port}/v1`, model: 'late-diagnosis',
+        requestTimeoutMs: 2_000, streamFirstTokenTimeoutMs: 350, streamIdleTimeoutMs: 350,
+        stallDiagnosisAfterMs: 60,
+      });
+      let failure: Error | undefined;
+      try {
+        await client.chat([{ role: 'user', content: 'hi' }], {
+          onToken: () => undefined,
+          onStall: async () => {
+            diagnoses += 1;
+            response?.writeHead(200, { 'content-type': 'text/event-stream' });
+            response?.write(': provider is alive\n\n');
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            return 'stale diagnosis that completed after provider bytes';
+          },
+        });
+      } catch (error) {
+        failure = error as Error;
+      }
+      expect(failure).toBeDefined();
+      expect(failure?.message).not.toContain('stale diagnosis');
+      expect(diagnoses).toBe(1);
+    } finally {
+      response?.end();
       await new Promise<void>((r) => server.close(() => r()));
     }
   }, 20_000);

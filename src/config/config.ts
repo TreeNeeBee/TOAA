@@ -6,6 +6,7 @@ import 'dotenv/config';
 import { xcEnv } from './env.js';
 import { ROLES } from '../core/plan.js';
 import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../llm/window.js';
+import { DEFAULT_PROVIDER_RETRY } from '../llm/retry.js';
 
 const ProviderStringScalarSchema = z.union([z.string(), z.number(), z.boolean()]);
 const OptionalProviderStringSchema = ProviderStringScalarSchema.nullish().transform((v) =>
@@ -35,6 +36,44 @@ const ContextWindowSchema = z.preprocess((value) => {
       : 1;
   return Math.floor(amount * multiplier);
 }, z.number().int().positive().default(DEFAULT_CONTEXT_WINDOW_TOKENS));
+
+/**
+ * A wait expressed as milliseconds, or as a duration string such as `32s` / `500ms`.
+ *
+ * Rate-limit budgets read naturally in seconds, and the surrounding timeout fields are already
+ * plain milliseconds; accepting both keeps one spelling from forcing the other.
+ */
+const DurationMsSchema = z.preprocess((value) => {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return value;
+  const match = /^\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s|m)?\s*$/iu.exec(value);
+  if (!match) return value;
+  const amount = Number(match[1]);
+  const unit = match[2]?.toLowerCase();
+  const multiplier = unit === 's' ? 1000 : unit === 'm' ? 60_000 : 1;
+  return Math.floor(amount * multiplier);
+}, z.number().int().nonnegative());
+
+/**
+ * How a provider waits before retrying a request it was rate limited on.
+ *
+ * A 429 says "not now", not "not ever", and switching providers does not answer it: an account
+ * limited on one route is usually limited on the others too, so a chain that only switches burns
+ * every candidate and fails the whole run over a wait of a few seconds.
+ */
+const ProviderRetrySchema = z.object({
+  /** Retries after the first attempt. 0 disables retrying a rate-limited request. */
+  max_retries: z.number().int().nonnegative().default(DEFAULT_PROVIDER_RETRY.max_retries),
+  /** Ceiling for one wait. Exponential growth stops here; a provider's own retry-after is capped by it too. */
+  max_delay: DurationMsSchema.default(DEFAULT_PROVIDER_RETRY.max_delay),
+  /**
+   * Whether concurrent callers spread their retries out.
+   * - random: half the computed delay plus a random share of the other half, so a chain that was
+   *   limited together does not return in lockstep and trip the same limit again.
+   * - none: the computed delay exactly, for reproducible runs.
+   */
+  jitter: z.enum(['random', 'none']).default(DEFAULT_PROVIDER_RETRY.jitter),
+}).default(DEFAULT_PROVIDER_RETRY);
 
 const ProviderSchema = z.object({
   /**
@@ -84,6 +123,8 @@ const ProviderSchema = z.object({
    * `json_object` but do support `json_schema`.
    */
   json_response_format: JsonResponseFormatSchema.optional(),
+  /** Exponential backoff for rate-limited (HTTP 429) requests. */
+  retry: ProviderRetrySchema,
   /** Ollama thinking 模型是否启用长思考；弱服务器上的结构化任务可设为 false。 */
   think: z.boolean().optional(),
 });
@@ -380,9 +421,10 @@ export async function loadConfigWithPath(explicitPath?: string): Promise<LoadedC
     tried.push(abs);
     try {
       const raw = await fs.readFile(abs, 'utf8');
-      const expanded = expandEnv(raw);
-      const data = YAML.parse(expanded.text);
-      const parsed = ConfigSchema.safeParse(data);
+      // Parse first so comments are not treated as active placeholders and substituted values stay
+      // strings even when a key happens to look numeric (for example, `1111`).
+      const expanded = expandEnvValues(YAML.parse(raw));
+      const parsed = ConfigSchema.safeParse(expanded.value);
       if (!parsed.success) throw new Error(describeConfigFailure(abs, parsed.error));
       return { config: parsed.data, path: abs, missingEnv: expanded.missing };
     } catch (err) {
@@ -426,15 +468,28 @@ function describeConfigFailure(configPath: string, error: z.ZodError): string {
   return lines.join('\n');
 }
 
-function expandEnv(s: string): { text: string; missing: string[] } {
+function expandEnvValues(input: unknown): { value: unknown; missing: string[] } {
   const missing = new Set<string>();
-  const out = s.replace(/\$\{([A-Z0-9_]+)\}/g, (_, name) => {
-    const v = process.env[name];
-    if (v === undefined || v === '') {
-      missing.add(name);
-      return '';
+
+  const visit = (value: unknown): unknown => {
+    if (typeof value === 'string') {
+      return value.replace(/\$\{([A-Z0-9_]+)\}/g, (_, name: string) => {
+        const environmentValue = process.env[name];
+        if (environmentValue === undefined || environmentValue === '') {
+          missing.add(name);
+          return '';
+        }
+        return environmentValue;
+      });
     }
-    return v;
-  });
-  return { text: out, missing: [...missing] };
+    if (Array.isArray(value)) return value.map(visit);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([key, child]) => [key, visit(child)]),
+      );
+    }
+    return value;
+  };
+
+  return { value: visit(input), missing: [...missing] };
 }
