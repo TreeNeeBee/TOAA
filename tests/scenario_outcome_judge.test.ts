@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { judgeScenarioOutcome } from '../src/application/execution/scenario_outcome_judge.js';
+import {
+  judgeScenarioOutcome,
+  ScenarioOutcomeJudgementError,
+} from '../src/application/execution/scenario_outcome_judge.js';
 
 /**
  * Exiting zero answers a narrower question than the Phase gate asks. A delivered project ran its
@@ -22,7 +25,7 @@ describe('scenario outcome judgement', () => {
   it('fails the scenario when the produced artifact contradicts the expectation', async () => {
     const seen: string[] = [];
     const verdict = await judgeScenarioOutcome({
-      router: router(seen, '{"ok": false, "reason": "every summary is duplicated"}'),
+      router: router(seen, '{"ok": false, "reason": "every summary is duplicated", "ticketType": "bug", "target": "code"}'),
       before: [{ path: 'output/report.md', mtimeMs: 1 }],
       artifacts: {
         snapshot: async () => [{ path: 'output/report.md', mtimeMs: 2 }],
@@ -66,16 +69,27 @@ describe('scenario outcome judgement', () => {
     expect(verdict.ok).toBe(true);
   });
 
-  // A model that answers unusably is not evidence of a defect. Failing delivery on it would open a
-  // Bug against work that may be perfectly correct.
-  it('does not fail delivery when the judgement cannot be read', async () => {
+  it('asks the LLM to judge an empty observable result instead of silently passing it', async () => {
+    const seen: string[] = [];
     const verdict = await judgeScenarioOutcome({
+      router: router(seen, '{"ok": false, "reason": "the required result is absent", "ticketType": "bug", "target": "code"}'),
+      before: [],
+      artifacts: { snapshot: async () => [], read: async () => undefined },
+      scenario,
+      scene: { ...scene, stdoutTail: undefined },
+    });
+    expect(verdict.ok).toBe(false);
+    expect(seen.join('\n')).toContain('No stdout, stderr, or changed text artifact was observed.');
+  });
+
+  // A malformed judgement is not a product Bug, but it cannot silently pass the Phase gate either.
+  it('stops the gate when the judgement cannot be read', async () => {
+    await expect(judgeScenarioOutcome({
       router: router([], 'I was unable to determine this.'),
       before: [],
       artifacts: { snapshot: async () => [{ path: 'a.md', mtimeMs: 2 }], read: async () => 'x' },
       scenario, scene,
-    });
-    expect(verdict.ok).toBe(true);
+    })).rejects.toBeInstanceOf(ScenarioOutcomeJudgementError);
   });
 
   // Only what the scenario changed is judged; everything already present is not its output.
@@ -114,6 +128,26 @@ function router(seen: string[], answer: string, roles: string[] = []) {
 
 // Covering the judgement without covering its call site leaves it able to pass while never running.
 describe('phase gate consumes the judgement', () => {
+  it('rejects a declared scenario when no LLM outcome judge is wired', async () => {
+    const { runProjectAudit } = await import('../src/core/project_audit.js');
+    const { getLanguageProfile } = await import('../src/core/language.js');
+    await expect(runProjectAudit({
+      ws: { abs: () => '/tmp', exists: async () => true, readFile: async () => 'x' } as never,
+      sandbox: {
+        exec: async () => ({ exitCode: 0, stdout: 'done', stderr: '', timedOut: false }),
+        runTests: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
+        runProgram: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
+        build: async () => ({ rebuilt: false, reason: 'ok' }),
+      } as never,
+      plan: { language: 'typescript', projectType: 'application', steps: [] } as never,
+      profile: getLanguageProfile('typescript'),
+      scenarios: [{
+        name: 'primary-user-flow', description: 'd', operation: 'run once',
+        environment: 'live', expected: 'a result', execution: { command: 'run', args: [] },
+      }],
+    })).rejects.toThrow(/require an LLM outcome judge/u);
+  });
+
   it('turns a contradicted expectation into a routable product-defect finding', async () => {
     const { runProjectAudit } = await import('../src/core/project_audit.js');
     const { getLanguageProfile } = await import('../src/core/language.js');
@@ -137,6 +171,8 @@ describe('phase gate consumes the judgement', () => {
         ok: false,
         reason: 'every summary is duplicated',
         evidence: ['artifact output/report.md:\nsummary A summary A'],
+        ticketType: 'bug',
+        target: 'code',
       }),
     });
 

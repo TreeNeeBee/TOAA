@@ -60,28 +60,59 @@ export const DeliveryGateSceneSchema = z.object({
 export type DeliveryGateScene = z.infer<typeof DeliveryGateSceneSchema>;
 
 /**
- * Whether what a live scenario produced matches what the scenario said to expect.
+ * Whether a live scenario met its expectation and, when it did not, who owns the correction.
  *
- * The process check answers a narrower question than the gate asks: a run that exits zero has not
- * shown that it did the right thing. A delivered project passed every Step gate and its own 115
- * tests while every one of its 100 output records carried the same text twice — the scenario's
- * `expected` described exactly that content, and nothing read it.
- *
- * Judged, not matched: `expected` is prose written for the project at hand, and a pattern language
- * general enough for every kind of project would express none of them well. The judgement is
- * supplied by Runtime rather than performed here, so this module keeps knowing only the contract.
+ * The process result is only evidence. A protocol status, exception, empty result, or timeout does
+ * not identify a Ticket type by itself. Runtime asks an LLM to compare the accepted project framing
+ * with the observed result, then persists the typed verdict so downstream control flow never has to
+ * match that explanation as prose.
  */
-export interface ScenarioOutcomeVerdict {
-  ok: boolean;
+export const SCENARIO_TICKET_TYPES = ['bug', 'change-request'] as const;
+export type ScenarioTicketType = typeof SCENARIO_TICKET_TYPES[number];
+
+export const SCENARIO_REPAIR_TARGETS = [
+  'requirement-analysis',
+  'high-level-design',
+  'detailed-design',
+  'code',
+] as const;
+export type ScenarioRepairTarget = typeof SCENARIO_REPAIR_TARGETS[number];
+
+interface ScenarioOutcomeVerdictBase {
   /** Why the produced result does or does not meet `expected`, in the judge's words. */
   reason: string;
   /** What the judgement was made from: output excerpts, artifact paths, command output. */
   evidence: string[];
 }
 
+export type ScenarioOutcomeVerdict = ScenarioOutcomeVerdictBase & (
+  | { ok: true; ticketType?: never; target?: never }
+  | {
+      ok: false;
+      /** Bug for an incorrect implementation; CR when an accepted capability/contract must change. */
+      ticketType: ScenarioTicketType;
+      /** V-model owner of the implementation repair or accepted contract change. */
+      target: ScenarioRepairTarget;
+    }
+);
+
+/** One file as it stood before a scenario ran, so what that scenario produced can be told apart. */
+export interface ScenarioArtifactSnapshot {
+  path: string;
+  mtimeMs: number;
+}
+
 export type ScenarioOutcomeJudge = (input: {
   scenario: DeliveryGateScenario;
   scene: DeliveryGateScene;
+  /**
+   * The workspace as it stood immediately before *this* scenario ran.
+   *
+   * Taken per scenario, not once per Phase: the audit runs its own test and entrypoint checks before
+   * the first scenario, and each scenario changes files the next one would otherwise inherit. A
+   * shared snapshot credits all of that to whichever scenario is being judged.
+   */
+  before: readonly ScenarioArtifactSnapshot[];
 }) => Promise<ScenarioOutcomeVerdict>;
 
 const DeliveryGateInputSchema = z.object({
@@ -112,6 +143,7 @@ export type DeliveryGate = z.infer<typeof DeliveryGateSchema>;
 export const DELIVERY_GATE_FINDING_CATEGORIES = [
   'test-defect',
   'product-defect',
+  'change-request',
   'test-incomplete',
   'quality-shortfall',
   'deliverable-defect',

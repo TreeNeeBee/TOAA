@@ -63,7 +63,8 @@ describe('debug brief extraction', () => {
 
     expect(brief.category).toBe('network_api_failure');
     expect(brief.statusCodes).toContain('403');
-    expect(brief.debugDemand).toContain('public no-key API');
+    expect(brief.debugDemand).toContain('accepted authentication/capability contract');
+    expect(brief.debugDemand).toContain('change-request');
     expect(brief.evidence.join('\n')).toContain('403');
   });
 
@@ -71,7 +72,7 @@ describe('debug brief extraction', () => {
     const brief = buildDebugBrief({
       reason: 'UNIT_TEST tool verification failed; rolling back to paired V-model source phase.',
       failureLog: [
-        "const url = 'https://news.example.test/v2/top-headlines';",
+        "const url = 'https://upstream.example.test/v2/records';",
         'run_tests failed npm test exit=1',
         'AssertionError: expected 1 to be 2 // Object.is equality',
       ].join('\n'),
@@ -87,7 +88,7 @@ describe('debug brief extraction', () => {
     const brief = buildDebugBrief({
       reason: 'all LLM providers failed for role Debugger',
       failureLog: [
-        'AssertionError: expected generated briefing to contain 未知',
+        'AssertionError: expected generated report to contain 未知',
         'run_tests failed npm test exit=1',
         'all LLM providers failed for role Debugger: low-quality Debugger response',
         'read-only/probe actions in read-only recovery mode',
@@ -138,7 +139,7 @@ describe('debug brief extraction', () => {
         'run_tests failed npm test exit=1',
         'FAIL tests/integration/web-server-flow.test.ts > serves the index',
         'Error: connect ECONNREFUSED 127.0.0.1:80',
-        'returns 404 for missing briefing',
+        'returns 404 for missing report',
       ].join('\n'),
       phase: 'INTEGRATION_TEST',
     });
@@ -154,8 +155,8 @@ describe('debug brief extraction', () => {
       failureLog: [
         'Network API failure detected. Treat this task as failed.',
         'run_tests failed npm test exit=1 args=tests/integration',
-        'FAIL  tests/integration/web-server-flow.test.ts > returns rendered briefing content',
-        "AssertionError: expected '<h1>Test Briefing</h1>' to contain '# Test Briefing'",
+        'FAIL  tests/integration/web-server-flow.test.ts > returns rendered report content',
+        "AssertionError: expected '<h1>Test Report</h1>' to contain '# Test Report'",
       ].join('\n'),
       phase: 'INTEGRATION_TEST',
     });
@@ -241,7 +242,7 @@ describe('debug brief extraction', () => {
  * Both runners say so in their own words, and both used to fall through to the generic
  * `pytest exit=[1-9]` catch, which answers `test_failure` — whose demand is "fix the root
  * implementation/contract defect… do not rewrite fixtures". That is the one repair that cannot
- * apply here: the implementation was fine and the files did not exist. A live dbc3 CODE Step spent
+ * apply here: the implementation was fine and the files did not exist. A live CODE Step spent
  * all ten of its rounds on that advice while owing five declared outputs.
  */
 describe('runner cannot find the test file', () => {
@@ -322,7 +323,7 @@ describe('provider outage is not a project API failure', () => {
 /**
  * File extraction must not depend on knowing the project's data format.
  *
- * The extension list had accumulated `dbc` and `xlsx` from one past project. Any project whose
+ * The extension list had accumulated two formats from one past project. Any project whose
  * format was absent lost file extraction entirely — and `files` feeds both the brief the Debugger
  * reads and the fingerprints the wiki ranks on, so the loss is silent and compounding.
  */
@@ -397,7 +398,7 @@ describe('primary error', () => {
 
 describe('failure signature stability', () => {
   const FAILED_CASES = [
-    'FAILED tests/modules/test_dbc_parser_module.py::TestDBCParserContract::test_signal_attributes_extraction - ValueError: Failed to parse DBC',
+    'FAILED tests/modules/test_config_parser_module.py::TestConfigParserContract::test_attributes_extraction - ValueError: Failed to parse config',
     "FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data - assert None == ''",
   ];
 
@@ -480,8 +481,8 @@ describe('failure signature stability', () => {
     const verbose = [
       'run_tests: pytest exit=1 args=tests/modules/test_excel_writer_module.py -v',
       'tests/modules/test_main_module.py::TestParseArgs::test_parse_args_minimal PASSED',
-      'tests/modules/test_main_module.py::TestMainFunction::test_main_success_flow Successfully wrote 1 signals to /tmp/out.xlsx',
-      'tests/modules/test_main_module.py::TestParseArgs::test_parse_args_help usage: dbc2excel [-h] --ecus ECUS [ECUS ...]',
+      'tests/modules/test_main_module.py::TestMainFunction::test_main_success_flow Successfully wrote 1 entries to /tmp/out.xlsx',
+      'tests/modules/test_main_module.py::TestParseArgs::test_parse_args_help usage: toolpkg [-h] --groups GROUPS [GROUPS ...]',
       "FAILED tests/modules/test_excel_writer_module.py::TestExcelWriterBehavior::test_writes_signal_data - assert None == ''",
       '1 failed, 36 passed',
     ].join('\n');

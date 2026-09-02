@@ -61,12 +61,28 @@ describe('detectNetworkApiFailure', () => {
     expect(pretty).toBeNull();
   });
 
+  it('does not treat assertion diff payloads as live network output', () => {
+    const diff = [
+      'FAIL  tests/report.test.ts > renders degraded sources',
+      'AssertionError: expected received output to equal the snapshot',
+      '- Expected',
+      '+ Received',
+      '+ - source-alpha: Network error',
+    ].join('\n');
+
+    expect(detectNetworkApiFailure(diff)).toBeNull();
+  });
+
+  it('still detects marker-prefixed application output without assertion context', () => {
+    expect(detectNetworkApiFailure('+ - upstream: Network error')).not.toBeNull();
+  });
+
   it('ignores API errors deliberately emitted inside Vitest captured stderr', () => {
     const log = [
       'stderr | tests/integration/cli.test.ts > missing API key logs error',
       '[ERROR] API key is required. Set NEWS_API_KEY env or use --api-key.',
       '',
-      'FAIL  tests/integration/cli.test.ts > normal fetch saves briefing file',
+      'FAIL  tests/integration/cli.test.ts > normal fetch saves report file',
       'Error: Test timed out in 5000ms.',
     ].join('\n');
 
@@ -86,5 +102,32 @@ describe('detectNetworkApiFailure', () => {
   it('does not treat loopback test-server failures as external API failures', () => {
     expect(detectNetworkApiFailure('Error: connect ECONNREFUSED 127.0.0.1:80')).toBeNull();
     expect(detectNetworkApiFailure('Request to http://localhost:3000 failed: connection refused')).toBeNull();
+  });
+
+  it('does not treat a test runner complaint about the workspace as a network failure', () => {
+    expect(
+      detectNetworkApiFailure(
+        'Error: [vitest] There was an error when mocking a module. If you are using "vi.mock" factory, make sure there are no top level variables inside, since this call is hoisted to top of the file. Read more: https://vitest.dev/api/vi.html#vi-mock',
+      ),
+    ).toBeNull();
+    expect(detectNetworkApiFailure('Error: [jest] Your test suite must contain at least one test.')).toBeNull();
+  });
+
+  it('does not let a documentation link supply the network vocabulary', () => {
+    expect(
+      detectNetworkApiFailure('Error: transform failed. See https://esbuild.github.io/api/#target'),
+    ).toBeNull();
+    expect(
+      detectNetworkApiFailure('Parsing error: unexpected token. \u8be6\u89c1 https://eslint.org/docs/rules/'),
+    ).toBeNull();
+  });
+
+  it('still detects a real failure that happens to cite documentation', () => {
+    expect(
+      detectNetworkApiFailure('Error: API request failed with status 503. See https://docs.example.com/api'),
+    ).not.toBeNull();
+    expect(
+      detectNetworkApiFailure('\u7f51\u7edc\u8fde\u63a5\u8d85\u65f6\uff0c\u53c2\u8003 https://docs.example.com/api'),
+    ).not.toBeNull();
   });
 });

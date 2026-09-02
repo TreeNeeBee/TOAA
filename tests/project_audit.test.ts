@@ -138,23 +138,28 @@ describe('project quality audit', () => {
       plan: tsPlan(),
       profile: getLanguageProfile('typescript'),
       scenarios: [{
-        name: 'fetch-latest-news',
+        name: 'fetch-latest-record',
         description: 'Use the application as an end user.',
-        operation: 'Request the latest news and render one result.',
+        operation: 'Request the latest records and render one result.',
         environment: 'live',
-        expected: 'A usable headline is rendered.',
+        expected: 'A usable entry is rendered.',
         execution: { command: 'node', args: ['src/main.ts', '--limit', '1'] },
       }],
       runLiveScenario: async (operation) => {
         liveBoundaryCalls += 1;
         return operation();
       },
+      judgeScenarioOutcome: async () => ({
+        ok: true,
+        reason: 'a usable entry was rendered',
+        evidence: [],
+      }),
     });
 
     expect(liveBoundaryCalls).toBe(1);
     expect(calls).toContain('node src/main.ts --limit 1');
     expect(result.checks).toContainEqual(expect.objectContaining({
-      name: 'scenario:fetch-latest-news',
+      name: 'scenario:fetch-latest-record',
       ok: true,
       scene: expect.objectContaining({
         command: 'node src/main.ts --limit 1',
@@ -163,6 +168,106 @@ describe('project quality audit', () => {
       }),
     }));
   });
+
+  it('routes the same status evidence according to the LLM contract verdict, not the status', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-audit-'));
+    const ws = new Workspace(root);
+    await writeBaseDeliveryDocs(ws);
+    await ws.writeFile('src/main.ts', 'export function main() {}\n');
+    await ws.writeFile('tests/main.test.ts', 'import { describe, it, expect } from "vitest";\n');
+    await ws.writeFile('package.json', JSON.stringify({ name: 'audit-app', type: 'module', scripts: {} }));
+
+    const scenario = {
+      name: 'primary-user-flow',
+      description: 'Use the application as an end user.',
+      operation: 'Fetch and render.',
+      environment: 'live' as const,
+      expected: 'entries from two sources appear',
+      execution: { command: 'node', args: ['src/main.ts'] },
+    };
+
+    const auditWith = async (ticketType: 'bug' | 'change-request') => runProjectAudit({
+      ws,
+      sandbox: new FakeSandbox({ exec: () => okResult({ stdout: 'fetched 0 items\n' }), runTests: okResult() }),
+      plan: tsPlan(),
+      profile: getLanguageProfile('typescript'),
+      scenarios: [scenario],
+      runLiveScenario: async (operation) => operation(),
+      judgeScenarioOutcome: async () => ({
+        ok: false,
+        reason: ticketType === 'change-request'
+          ? 'the accepted external capability is no longer viable'
+          : 'the implementation omitted required authentication',
+        evidence: ['- upstream: Request failed with status code 403'],
+        ticketType,
+        target: ticketType === 'change-request' ? 'high-level-design' : 'code',
+      }),
+    });
+
+    const capabilityFailure = await auditWith('change-request');
+    const capabilityCheck = capabilityFailure.checks.find((check) => check.name === 'scenario:primary-user-flow');
+    expect(capabilityCheck?.finding?.target).toBe('high-level-design');
+    // The artifact list follows the target: naming another Step's outputs narrows its allowlist to
+    // nothing it may write.
+    expect(capabilityCheck?.finding?.affectedArtifacts).toEqual(['docs/02-high-level-design.md']);
+
+    expect(capabilityCheck?.finding?.category).toBe('change-request');
+
+    const ours = await auditWith('bug');
+    const oursCheck = ours.checks.find((check) => check.name === 'scenario:primary-user-flow');
+    expect(oursCheck?.finding?.target).toBe('code');
+    expect(oursCheck?.finding?.affectedArtifacts).toEqual(['src/']);
+  });
+
+  it('uses the LLM classification even when the live scenario process exits non-zero', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-audit-'));
+    const ws = new Workspace(root);
+    await writeBaseDeliveryDocs(ws);
+    await ws.writeFile('src/main.ts', 'export function main() {}\n');
+    await ws.writeFile('tests/main.test.ts', 'import { describe, it, expect } from "vitest";\n');
+    await ws.writeFile('package.json', JSON.stringify({ name: 'audit-app', type: 'module', scripts: {} }));
+    const scenario = {
+      name: 'primary-user-flow',
+      description: 'Use the application as an end user.',
+      operation: 'Fetch and render.',
+      environment: 'live' as const,
+      expected: 'entries from two sources appear',
+      execution: { command: 'node', args: ['src/main.ts'] },
+    };
+    let judgeCalls = 0;
+
+    const result = await runProjectAudit({
+      ws,
+      sandbox: new FakeSandbox({
+        exec: () => okResult({ exitCode: 1, stderr: 'Request failed with status code 403' }),
+        runTests: okResult(),
+      }),
+      plan: tsPlan(),
+      profile: getLanguageProfile('typescript'),
+      scenarios: [scenario],
+      judgeScenarioOutcome: async () => {
+        judgeCalls += 1;
+        return {
+          ok: false,
+          reason: 'the declared public source refused this client',
+          evidence: ['status=403'],
+          ticketType: 'change-request',
+          target: 'high-level-design',
+        };
+      },
+    });
+
+    const check = result.checks.find((candidate) => candidate.name === 'scenario:primary-user-flow');
+    expect(judgeCalls).toBe(1);
+    expect(check?.ok).toBe(false);
+    expect(check?.finding).toMatchObject({
+      category: 'change-request',
+      code: 'scenario_execution_failed:primary-user-flow:change-request:high-level-design',
+      target: 'high-level-design',
+      affectedArtifacts: ['docs/02-high-level-design.md'],
+    });
+  });
+
 
   it('fails a library project whose API guide is missing', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'xcompiler-audit-'));

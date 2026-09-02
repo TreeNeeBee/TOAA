@@ -46,6 +46,7 @@ export interface QualityGateEvaluation {
   passed: boolean;
   enhancementFailures: string[];
   bugFailures: string[];
+  changeRequestFailures: string[];
 }
 
 export interface QualityAssessmentConsistencyContext {
@@ -112,6 +113,7 @@ export function withDefaultQualityGate(step: Step): Step {
 
 export function normalizeQualityAssessment(value: unknown): StageQualityAssessment | undefined {
   if (!isRecord(value)) return undefined;
+  if (qualityAssessmentShapeIssues(value).length > 0) return undefined;
   const findingValue = value.findings ?? value.deliveryFindings;
   const findings = normalizeDeliveryGateFindings(findingValue);
   if (findingValue !== undefined && findings === undefined) return undefined;
@@ -133,6 +135,32 @@ export function normalizeQualityAssessment(value: unknown): StageQualityAssessme
     findings: findings ?? [],
   };
   return assessment;
+}
+
+/**
+ * Reports model-protocol shape errors before normalization can erase them.
+ *
+ * These fields are deliberately prose lists. Accepting an object and silently filtering it out
+ * turns a valid-looking CR disposition into an unexplained missing blocker, which makes the model
+ * repeat the same response without any actionable correction.
+ */
+export function qualityAssessmentShapeIssues(value: unknown): string[] {
+  if (!isRecord(value)) return value === undefined
+    ? []
+    : ['qualityAssessment must be a JSON object'];
+  const issues: string[] = [];
+  for (const [canonical, candidate] of [
+    ['evidence', value.evidence],
+    ['unavailableMetrics', value.unavailableMetrics ?? value.unavailable_metrics],
+    ['gaps', value.gaps],
+    ['blockedBy', value.blockedBy ?? value.blocked_by],
+  ] as const) {
+    if (candidate === undefined) continue;
+    if (!Array.isArray(candidate) || candidate.some((item) => typeof item !== 'string')) {
+      issues.push(`qualityAssessment.${canonical} must be a JSON string array`);
+    }
+  }
+  return issues;
 }
 
 /**
@@ -195,9 +223,10 @@ export function evaluateQualityGate(
   const policy = resolveQualityGate(step);
   const enhancementFailures: string[] = [];
   const bugFailures: string[] = [];
+  const changeRequestFailures: string[] = [];
   if (!assessment) {
     enhancementFailures.push(`${step.phase} did not provide a qualityAssessment`);
-    return { passed: false, enhancementFailures, bugFailures };
+    return { passed: false, enhancementFailures, bugFailures, changeRequestFailures };
   }
 
   const tolerance = policy.tolerance.metricShortfall;
@@ -256,14 +285,20 @@ export function evaluateQualityGate(
     const rendered = `${finding.category}: ${finding.summary}`;
     if (finding.category === 'test-defect' || finding.category === 'product-defect') {
       bugFailures.push(rendered);
+    } else if (finding.category === 'change-request') {
+      changeRequestFailures.push(rendered);
     } else if (finding.category !== 'dependency') {
       enhancementFailures.push(rendered);
     }
   }
   return {
-    passed: enhancementFailures.length === 0 && bugFailures.length === 0,
+    passed:
+      enhancementFailures.length === 0 &&
+      bugFailures.length === 0 &&
+      changeRequestFailures.length === 0,
     enhancementFailures,
     bugFailures,
+    changeRequestFailures,
   };
 }
 

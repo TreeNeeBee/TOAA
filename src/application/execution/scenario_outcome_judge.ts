@@ -4,12 +4,14 @@ import type {
   DeliveryGateScenario,
   ScenarioOutcomeVerdict,
 } from '../../domain/quality/delivery_gate.js';
+import {
+  type ScenarioArtifactSnapshot,
+  SCENARIO_REPAIR_TARGETS,
+  SCENARIO_TICKET_TYPES,
+} from '../../domain/quality/delivery_gate.js';
 
 /** What the workspace held before the scenario ran, so its own output can be told apart. */
-export interface ScenarioArtifactSnapshot {
-  path: string;
-  mtimeMs: number;
-}
+export type { ScenarioArtifactSnapshot } from '../../domain/quality/delivery_gate.js';
 
 export interface ScenarioArtifactReader {
   /** Every tracked path with its modification time. */
@@ -50,25 +52,36 @@ export async function judgeScenarioOutcome(input: {
   before: readonly ScenarioArtifactSnapshot[];
   scenario: DeliveryGateScenario;
   scene: DeliveryGateScene;
+  /** Project framing needed to distinguish a broken implementation from an obsolete accepted contract. */
+  requirementDigest?: string;
 }): Promise<ScenarioOutcomeVerdict> {
   const produced = await producedArtifacts(input.artifacts, input.before);
-  const evidence: string[] = [];
+  // What the run left behind, kept apart from how it ended: silence is a finding about the output,
+  // and a process line would hide it by making the list never empty.
+  const observations: string[] = [];
   if (input.scene.stdoutTail) {
-    evidence.push(`stdout:\n${truncate(input.scene.stdoutTail, MAX_STREAM_CHARS)}`);
+    observations.push(`stdout:\n${truncate(input.scene.stdoutTail, MAX_STREAM_CHARS)}`);
   }
   if (input.scene.stderrTail) {
-    evidence.push(`stderr:\n${truncate(input.scene.stderrTail, MAX_STREAM_CHARS)}`);
+    observations.push(`stderr:\n${truncate(input.scene.stderrTail, MAX_STREAM_CHARS)}`);
   }
   for (const artifact of produced) {
-    evidence.push(`artifact ${artifact.path}:\n${artifact.content}`);
+    observations.push(`artifact ${artifact.path}:\n${artifact.content}`);
   }
-
-  // Nothing observable means nothing to judge. Reporting a defect here would accuse the project of
-  // a fault this function cannot see, and a scenario whose result leaves no trace is a gap in the
-  // scenario, not in the product.
-  if (evidence.length === 0) {
-    return { ok: true, reason: 'the scenario left no observable result to judge', evidence: [] };
+  // Absence is evidence too. Whether silence is valid depends on the scenario expectation, so the
+  // judge must decide it instead of Runtime silently treating an unobservable run as successful.
+  if (observations.length === 0) {
+    observations.push('No stdout, stderr, or changed text artifact was observed.');
   }
+  // How the process ended, stated rather than implied. The judge is asked whether the run produced
+  // what it was supposed to, and a non-zero exit or a timeout answers part of that already — it was
+  // reading the output without being told either.
+  const evidence = [
+    input.scene.timedOut
+      ? 'process: timed out before it finished'
+      : `process: exited with code ${input.scene.exitCode}`,
+    ...observations,
+  ];
 
   const answer = await input.router.for(SCENARIO_JUDGE_ROLE).chat([
     {
@@ -80,13 +93,30 @@ export async function judgeScenarioOutcome(input: {
         'comment on style, and do not fail a run for anything the expectation does not ask for.',
         'Report a failure when the evidence contradicts the expectation, including when a required',
         'element is absent, duplicated, empty, or obviously wrong for the field it fills.',
-        'Answer with JSON only: {"ok": boolean, "reason": string}.',
-        'Keep `reason` to one sentence naming the concrete discrepancy.',
+        'When it failed, classify the work without relying on any particular protocol, status code,',
+        'vendor, or project domain. Use ticketType="bug" when the accepted requirement and design',
+        'remain valid and the implementation, configuration, or integration realizes them',
+        'incorrectly. Use ticketType="change-request" when satisfying the expectation requires',
+        'changing an accepted requirement, capability, external dependency, interface, data source,',
+        'or design premise because the accepted one is no longer viable.',
+        'Choose target by ownership: requirement-analysis for requirement/scope changes,',
+        'high-level-design for system interfaces, external capabilities and dependency selection,',
+        'detailed-design for internal module contracts, and code for implementation errors.',
+        'An HTTP status, timeout, exception, or empty result is evidence only; it never determines',
+        'ticketType or target by itself. Explain which accepted premise can remain or must change.',
+        'If evidence is insufficient to prove a contract change, choose bug/code.',
+        'Answer with JSON only:',
+        '{"ok": boolean, "reason": string, "ticketType": "bug"|"change-request",',
+        '"target": "requirement-analysis"|"high-level-design"|"detailed-design"|"code"}.',
+        'Keep `reason` to one sentence naming the concrete discrepancy and ownership rationale.',
       ].join(' '),
     },
     {
       role: 'user',
       content: [
+        // The accepted framing tells the judge whether the implementation can satisfy the contract
+        // as written or whether that contract/capability itself has to change.
+        ...(input.requirementDigest ? [`Project statement: ${input.requirementDigest}`] : []),
         `Expectation: ${input.scenario.expected}`,
         `Operation: ${input.scenario.operation}`,
         '',
@@ -94,15 +124,19 @@ export async function judgeScenarioOutcome(input: {
         ...evidence,
       ].join('\n'),
     },
-  ]);
+  ], { scoreSuccess: false });
 
   const verdict = parseVerdict(answer);
-  // An unreadable judgement is not a defect in the project. Failing delivery on it would turn a
-  // model hiccup into a Bug against work that may be correct.
+  // A malformed judgement is neither evidence that the project passed nor evidence for a Bug. Stop
+  // the gate without manufacturing a product Ticket; the runtime/provider failure remains visible.
   if (!verdict) {
-    return { ok: true, reason: 'scenario outcome could not be judged', evidence: [] };
+    throw new ScenarioOutcomeJudgementError(
+      'Scenario outcome judgement must be valid JSON and classify every failure as bug or change-request',
+    );
   }
-  return { ...verdict, evidence: verdict.ok ? [] : evidence };
+  return verdict.ok
+    ? { ok: true, reason: verdict.reason, evidence: [] }
+    : { ...verdict, evidence };
 }
 
 async function producedArtifacts(
@@ -124,21 +158,41 @@ async function producedArtifacts(
   return out;
 }
 
-function parseVerdict(answer: string): { ok: boolean; reason: string } | undefined {
+/** Whether a failure is the judge returning something unusable, rather than a verdict about the project. */
+export function isScenarioOutcomeJudgementError(error: unknown): error is ScenarioOutcomeJudgementError {
+  return error instanceof ScenarioOutcomeJudgementError;
+}
+
+export class ScenarioOutcomeJudgementError extends Error {
+  readonly code = 'scenario_outcome_judgement_invalid';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ScenarioOutcomeJudgementError';
+  }
+}
+
+function parseVerdict(answer: string): ScenarioOutcomeVerdict | undefined {
   const start = answer.indexOf('{');
   const end = answer.lastIndexOf('}');
   if (start < 0 || end <= start) return undefined;
   try {
     const parsed: unknown = JSON.parse(answer.slice(start, end + 1));
     if (typeof parsed !== 'object' || parsed === null) return undefined;
-    const value = parsed as { ok?: unknown; reason?: unknown };
-    if (typeof value.ok !== 'boolean') return undefined;
-    return {
-      ok: value.ok,
-      reason: typeof value.reason === 'string' && value.reason.trim().length > 0
-        ? value.reason.trim()
-        : 'the produced result does not meet the declared expectation',
+    const value = parsed as {
+      ok?: unknown;
+      reason?: unknown;
+      ticketType?: unknown;
+      target?: unknown;
     };
+    if (typeof value.ok !== 'boolean' || typeof value.reason !== 'string' || !value.reason.trim()) {
+      return undefined;
+    }
+    if (value.ok) return { ok: true, reason: value.reason.trim(), evidence: [] };
+    const ticketType = SCENARIO_TICKET_TYPES.find((candidate) => candidate === value.ticketType);
+    const target = SCENARIO_REPAIR_TARGETS.find((candidate) => candidate === value.target);
+    if (!ticketType || !target) return undefined;
+    return { ok: false, reason: value.reason.trim(), evidence: [], ticketType, target };
   } catch {
     return undefined;
   }
